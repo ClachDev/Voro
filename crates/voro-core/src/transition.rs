@@ -160,6 +160,11 @@ impl Store {
 
         if to.is_terminal() {
             reconcile_dependants(&tx, task_id)?;
+        } else if to == TaskState::Ready {
+            // `ready` must mean genuinely actionable: a transition landing here
+            // while a blocker is still open (triage, abort, unpark) reconciles
+            // straight back to `parked` so the scheduler never surfaces it.
+            reconcile_readiness(&tx, task_id)?;
         }
 
         tx.commit()?;
@@ -576,6 +581,61 @@ mod tests {
         s.apply(blocker, Action::Complete).unwrap();
         s.apply(blocker, Action::Accept).unwrap();
         assert_eq!(s.task(task).unwrap().state, TaskState::Ready);
+    }
+
+    #[test]
+    fn triaging_to_ready_parks_a_blocked_task() {
+        let (mut s, p) = store_with_project();
+        let blocker = create(&mut s, p, TaskState::Ready);
+        let task = create(&mut s, p, TaskState::Proposed);
+        s.add_dep(task, blocker, DepKind::Blocks).unwrap();
+
+        // The human triages it "ready", but an open blocker overrides that: it
+        // lands in parked and never reaches the scheduler.
+        let triaged = s.apply(task, Action::Triage(Triage::Ready)).unwrap();
+        assert_eq!(triaged.state, TaskState::Parked);
+
+        // closing the blocker auto-promotes it exactly like any parked task
+        s.apply(blocker, Action::Start).unwrap();
+        s.apply(blocker, Action::Complete).unwrap();
+        s.apply(blocker, Action::Accept).unwrap();
+        assert_eq!(s.task(task).unwrap().state, TaskState::Ready);
+    }
+
+    #[test]
+    fn triaging_to_ready_stays_ready_when_unblocked() {
+        let (mut s, p) = store_with_project();
+        let closed = task_in_state(&mut s, p, TaskState::Done);
+        let task = create(&mut s, p, TaskState::Proposed);
+        s.add_dep(task, closed, DepKind::Blocks).unwrap();
+        // a closed blocker does not gate readiness
+        let triaged = s.apply(task, Action::Triage(Triage::Ready)).unwrap();
+        assert_eq!(triaged.state, TaskState::Ready);
+    }
+
+    #[test]
+    fn aborting_parks_a_task_blocked_while_running() {
+        let (mut s, p) = store_with_project();
+        let task = task_in_state(&mut s, p, TaskState::Running);
+        let blocker = create(&mut s, p, TaskState::Ready);
+        // adding a blocker to a running task leaves it running...
+        s.add_dep(task, blocker, DepKind::Blocks).unwrap();
+        assert_eq!(s.task(task).unwrap().state, TaskState::Running);
+        // ...but aborting must not expose it as ready while still blocked
+        let aborted = s.apply(task, Action::Abort).unwrap();
+        assert_eq!(aborted.state, TaskState::Parked);
+    }
+
+    #[test]
+    fn unparking_a_blocked_task_reparks_it() {
+        let (mut s, p) = store_with_project();
+        let blocker = create(&mut s, p, TaskState::Ready);
+        let task = create(&mut s, p, TaskState::Ready);
+        s.add_dep(task, blocker, DepKind::Blocks).unwrap();
+        assert_eq!(s.task(task).unwrap().state, TaskState::Parked);
+        // a manual unpark cannot override an open blocker
+        let unparked = s.apply(task, Action::Unpark).unwrap();
+        assert_eq!(unparked.state, TaskState::Parked);
     }
 
     #[test]
