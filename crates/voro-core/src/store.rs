@@ -71,6 +71,16 @@ impl Store {
         Ok(store)
     }
 
+    /// SQLite's `PRAGMA data_version`, which increments whenever another
+    /// connection commits a change to the database. The value is stable across
+    /// commits made on this connection, so a caller can poll it to detect
+    /// external writes without reacting to its own mutations.
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))?)
+    }
+
     /// Migrations may rebuild tables (SQLite cannot alter CHECK constraints),
     /// so foreign-key enforcement is suspended for the duration and integrity
     /// verified afterwards — the procedure SQLite documents for schema changes.
@@ -360,5 +370,33 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 2);
+    }
+
+    /// A unique scratch database path under the OS temp dir.
+    fn scratch_db() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("voro-dataversion-{}-{n}.db", std::process::id()))
+    }
+
+    #[test]
+    fn data_version_tracks_external_commits_only() {
+        let path = scratch_db();
+        let mut a = Store::open(&path).unwrap();
+        let mut b = Store::open(&path).unwrap();
+
+        let start = a.data_version().unwrap();
+
+        // Our own writes must not move the version this connection observes.
+        a.create_project("alpha", "/tmp/alpha").unwrap();
+        assert_eq!(a.data_version().unwrap(), start);
+
+        // A commit from another connection must move it.
+        b.create_project("beta", "/tmp/beta").unwrap();
+        assert_ne!(a.data_version().unwrap(), start);
+
+        drop(a);
+        drop(b);
+        let _ = std::fs::remove_file(&path);
     }
 }
