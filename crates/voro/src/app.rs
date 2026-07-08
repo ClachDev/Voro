@@ -1,6 +1,6 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use voro_core::{
-    Action, Candidate, Project, ScoreBreakdown, Store, Task, TaskState, Triage, scheduler,
+    Action, Blocker, Candidate, Project, ScoreBreakdown, Store, Task, TaskState, Triage, scheduler,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +21,9 @@ pub struct TaskRow {
     pub task: Task,
     pub project: String,
     pub weight: i64,
+    /// The task's `blocks` dependencies with each blocker's state, so the
+    /// browser can show a parked row what it is waiting on.
+    pub blockers: Vec<Blocker>,
 }
 
 /// What a text prompt is collecting, and the transition it feeds.
@@ -203,6 +206,7 @@ impl App {
         let candidates = self.store.candidates()?;
         self.queue = scheduler::queue(&candidates).into_iter().cloned().collect();
 
+        let mut blockers = self.store.blockers_by_task()?;
         let mut all: Vec<TaskRow> = self
             .store
             .tasks()?
@@ -214,10 +218,12 @@ impl App {
                     .find(|p| p.id == task.project_id)
                     .map(|p| (p.name.clone(), p.weight))
                     .unwrap_or_default();
+                let blockers = blockers.remove(&task.id).unwrap_or_default();
                 TaskRow {
                     task,
                     project,
                     weight,
+                    blockers,
                 }
             })
             .collect();
