@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::model::TaskState;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -18,6 +20,24 @@ pub enum Error {
 
     #[error("cannot {action} a task in state '{from}'")]
     InvalidTransition { from: TaskState, action: String },
+
+    #[error(
+        "agents config not found at {}; expected a TOML file with `default = \"<name>\"` \
+         and an [agents.<name>] table per agent",
+        .0.display()
+    )]
+    AgentConfigMissing(PathBuf),
+
+    #[error("invalid agents config at {}: {message}", path.display())]
+    AgentConfigInvalid { path: PathBuf, message: String },
+
+    #[error("no agent named '{name}' ({origin}) in {}; defined agents: {known}", path.display())]
+    UnknownAgent {
+        name: String,
+        origin: &'static str,
+        path: PathBuf,
+        known: String,
+    },
 
     #[error("{0}")]
     Invalid(String),

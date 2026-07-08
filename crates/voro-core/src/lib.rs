@@ -3,12 +3,14 @@
 //! is a thin consumer of this crate. Concepts and invariants are specified in
 //! `docs/DESIGN.md`.
 
+mod agent;
 mod error;
 mod model;
 pub mod scheduler;
 mod store;
 mod transition;
 
+pub use agent::{AgentTemplate, AgentsConfig, PROMPT_FILE_PLACEHOLDER, ResolvedAgent};
 pub use error::{Error, Result};
 pub use model::{Dep, DepKind, Event, Priority, Project, Session, SessionOutcome, Task, TaskState};
 pub use scheduler::{Candidate, ScoreBreakdown};

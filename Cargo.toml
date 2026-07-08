@@ -11,4 +11,5 @@ repository = "https://github.com/ClachDev/Voro"
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 ratatui = "0.30"
