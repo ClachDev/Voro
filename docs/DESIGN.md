@@ -61,7 +61,7 @@ CREATE TABLE tasks (
   body       TEXT NOT NULL DEFAULT '',   -- markdown; written as a dispatchable prompt
   priority   INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 0 AND 3),  -- P0..P3
   state      TEXT NOT NULL DEFAULT 'proposed'
-             CHECK (state IN ('proposed','backlog','ready','running',
+             CHECK (state IN ('proposed','parked','ready','running',
                               'needs-input','review','done','rejected')),
   agent      TEXT,                        -- optional override; NULL = resolve at dispatch
   question   TEXT,                        -- set iff state = 'needs-input'
@@ -98,7 +98,7 @@ CREATE TABLE events (            -- append-only audit of state transitions & ans
 );
 ```
 
-Ready-work detection — the thing beads would have provided — is one query: a task is *unblocked* when no `blocks` dependency points at a task not in `done`/`rejected`. Only `blocks` gates readiness; `discovered-from`, `parent`, and `related` are navigational metadata. When a task's last blocker closes, the store promotes it `backlog → ready` and stamps `state_since`, which is what makes the prepared-prompt pattern work: tomorrow's task, written today and chained behind its blocker, surfaces fully loaded the moment it becomes actionable. Auto-promotion applies only to backlog tasks that *have* blockers — a backlog task with none is deliberately parked and moves only by manual unpark. The reverse holds too: adding an open blocker to a `ready` task demotes it back to `backlog` in the same write.
+Ready-work detection — the thing beads would have provided — is one query: a task is *unblocked* when no `blocks` dependency points at a task not in `done`/`rejected`. Only `blocks` gates readiness; `discovered-from`, `parent`, and `related` are navigational metadata. When a task's last blocker closes, the store promotes it `parked → ready` and stamps `state_since`, which is what makes the prepared-prompt pattern work: tomorrow's task, written today and chained behind its blocker, surfaces fully loaded the moment it becomes actionable. Auto-promotion applies only to parked tasks that *have* blockers — a parked task with none is deliberately deferred and moves only by manual unpark. The reverse holds too: adding an open blocker to a `ready` task demotes it back to `parked` in the same write. (This state was called `backlog` until migration 0002; the Kanban connotation — work you still intend to do soon — was exactly wrong for a state the scheduler ignores.)
 
 Agent definitions live in a small config file rather than the database, since they are command templates, not state — `~/.config/voro/agents.toml`:
 
@@ -116,15 +116,15 @@ cmd = "codex exec {prompt_file}"
 
 | State | Meaning | Enters by | Leaves by |
 |---|---|---|---|
-| `proposed` | Suggested (often by an agent post-task); not yet triaged. Invisible to scheduler. | agent proposal, quick capture | human triage → `backlog`/`ready`, or → `rejected` |
-| `backlog` | Triaged, real, but dependencies open or deliberately parked. | triage; dependency added | dependencies close → `ready`; manual unpark → `ready`; abandon → `rejected` |
-| `ready` | Actionable now. Eligible for the focus view. | triage; last blocker closes | dispatch or manual start → `running`; park → `backlog`; abandon → `rejected` |
+| `proposed` | Suggested (often by an agent post-task); not yet triaged. Invisible to scheduler. | agent proposal, quick capture | human triage → `ready`/`parked`, or → `rejected` |
+| `parked` | Triaged, real, but out of the running: dependencies open or deliberately deferred. Invisible to scheduler. | triage; dependency added | dependencies close → `ready`; manual unpark → `ready`; abandon → `rejected` |
+| `ready` | Actionable now. Eligible for the focus view. | triage; last blocker closes | dispatch or manual start → `running`; park → `parked`; abandon → `rejected` |
 | `running` | An agent (or the human) is actively on it. | dispatch | agent raises question → `needs-input`; work lands → `review`; cap/failure → `ready` (flagged for redispatch); abort → `ready` |
 | `needs-input` | Blocked on a human decision; `question` is set. **The inbox is exactly this set.** | agent verb; manual flag | answer supplied → `running` (answer appended to the task body under an `## Answers` heading, logged as an event, and fed to the session); abandon → `rejected` |
 | `review` | Agent believes it is done; awaiting human acceptance. | agent completion | accept → `done`; reject with feedback → `running`; abandon → `rejected` |
 | `done` / `rejected` | Closed. `done` prompts triage of any `discovered-from` proposals. | acceptance / triage | — |
 
-Three deliberate choices. Any triaged, non-terminal state can be *abandoned* straight to `rejected` — obsolete work must not need walking through the rest of the machine to close, and parking (`ready` → `backlog`) has a manual inverse for the same reason. Second, `needs-input` and `review` are both human-attention states but are kept distinct because they sort differently: an unanswered question stalls in-flight work and outranks a completed diff waiting for review at equal score. Third, `proposed` exists precisely so agent-generated tasks can be captured freely without polluting the queues — the triage act is itself surfaced (a standing "triage N proposed tasks" inbox entry when N > 0), which keeps the generation pipeline honest without automating it.
+Three deliberate choices. Any triaged, non-terminal state can be *abandoned* straight to `rejected` — obsolete work must not need walking through the rest of the machine to close, and parking (`ready` → `parked`) has a manual inverse for the same reason. Second, `needs-input` and `review` are both human-attention states but are kept distinct because they sort differently: an unanswered question stalls in-flight work and outranks a completed diff waiting for review at equal score. Third, `proposed` exists precisely so agent-generated tasks can be captured freely without polluting the queues — the triage act is itself surfaced (a standing "triage N proposed tasks" inbox entry when N > 0), which keeps the generation pipeline honest without automating it.
 
 ## 7. Scoring
 

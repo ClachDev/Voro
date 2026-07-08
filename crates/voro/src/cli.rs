@@ -24,7 +24,7 @@ projects
 
 tasks
   add <project> <title> [--body TEXT | --body-file PATH] [--priority 0-3]
-      [--state proposed|backlog|ready] [--agent NAME] [--blocks IDS]
+      [--state proposed|parked|ready] [--agent NAME] [--blocks IDS]
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
       [--body TEXT | --body-file PATH] [--blocks IDS]
   show <task-id>                  full task: body, deps, events
@@ -34,7 +34,7 @@ tasks
   explain <task-id>               score decomposition
 
 transitions
-  triage <task-id> <backlog|ready|reject>
+  triage <task-id> <parked|ready|reject>
   start <task-id>                 ready → running
   ask <task-id> --question TEXT   running → needs-input
   answer <task-id> TEXT           needs-input → running
@@ -42,9 +42,9 @@ transitions
   accept <task-id>                review → done
   reject <task-id> TEXT           review → running (TEXT is the feedback)
   abort <task-id>                 running → ready
-  park <task-id>                  ready → backlog
-  unpark <task-id>                backlog → ready
-  abandon <task-id>               backlog|ready|needs-input|review → rejected
+  park <task-id>                  ready → parked
+  unpark <task-id>                parked → ready
+  abandon <task-id>               parked|ready|needs-input|review → rejected
 ";
 
 pub fn run(store: &mut Store, args: Vec<String>) -> Result<String, String> {
@@ -206,7 +206,7 @@ fn add_verb(
             let state = TaskState::parse(raw).map_err(|e| e.to_string())?;
             if !matches!(
                 state,
-                TaskState::Proposed | TaskState::Backlog | TaskState::Ready
+                TaskState::Proposed | TaskState::Parked | TaskState::Ready
             ) {
                 return Err(format!("a task cannot be created in state '{state}'"));
             }
@@ -423,13 +423,13 @@ fn transition_verb(
 ) -> Result<String, String> {
     let id = task_id(pos, 1)?;
     let action = match verb {
-        "triage" => match need(pos, 2, "triage target (backlog|ready|reject)")? {
-            "backlog" => Action::Triage(Triage::Backlog),
+        "triage" => match need(pos, 2, "triage target (parked|ready|reject)")? {
+            "parked" => Action::Triage(Triage::Parked),
             "ready" => Action::Triage(Triage::Ready),
             "reject" => Action::Triage(Triage::Reject),
             other => {
                 return Err(format!(
-                    "triage target must be backlog|ready|reject, got '{other}'"
+                    "triage target must be parked|ready|reject, got '{other}'"
                 ));
             }
         },
@@ -542,7 +542,7 @@ mod tests {
                 "1",
             ],
         );
-        assert!(out.contains("(backlog)"), "{out}");
+        assert!(out.contains("(parked)"), "{out}");
 
         ok(&mut s, &["start", "1"]);
         ok(&mut s, &["done", "1"]);

@@ -48,8 +48,8 @@ state the acceptance criteria).
 
 ## Transitions
 
-States: `proposed → backlog|ready → running → needs-input|review → done/rejected`.
-`blocks` deps gate readiness automatically: a backlog task promotes to ready
+States: `proposed → parked|ready → running → needs-input|review → done/rejected`.
+`blocks` deps gate readiness automatically: a parked task promotes to ready
 when its last blocker closes.
 
 ```

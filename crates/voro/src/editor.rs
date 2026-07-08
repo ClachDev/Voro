@@ -21,7 +21,7 @@ pub struct TaskForm {
 
 pub fn template_new() -> String {
     "# New task. The body below --- is the dispatchable prompt.\n\
-     # Save an empty file to cancel. state: proposed | backlog | ready\n\
+     # Save an empty file to cancel. state: proposed | parked | ready\n\
      title: \n\
      priority: 2\n\
      state: ready\n\
@@ -112,7 +112,7 @@ pub fn parse(text: &str, allow_state: bool) -> Result<TaskForm, String> {
                 let state = TaskState::parse(value).map_err(|e| e.to_string())?;
                 if !matches!(
                     state,
-                    TaskState::Proposed | TaskState::Backlog | TaskState::Ready
+                    TaskState::Proposed | TaskState::Parked | TaskState::Ready
                 ) {
                     return Err(format!("a task cannot be created in state '{state}'"));
                 }
@@ -176,7 +176,7 @@ pub fn run_editor(initial: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    const VALID: &str = "title: Fix parser\npriority: 1\nstate: backlog\nagent: codex\n\
+    const VALID: &str = "title: Fix parser\npriority: 1\nstate: parked\nagent: codex\n\
                          blocks: 3, 7\n---\nThe parser crashes on empty input.\n";
 
     #[test]
@@ -184,7 +184,7 @@ mod tests {
         let form = parse(VALID, true).unwrap();
         assert_eq!(form.title, "Fix parser");
         assert_eq!(form.priority, Priority::P1);
-        assert_eq!(form.state, Some(TaskState::Backlog));
+        assert_eq!(form.state, Some(TaskState::Parked));
         assert_eq!(form.agent.as_deref(), Some("codex"));
         assert_eq!(form.blocks, vec![3, 7]);
         assert_eq!(form.body, "The parser crashes on empty input.");

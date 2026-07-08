@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskState {
     Proposed,
-    Backlog,
+    Parked,
     Ready,
     Running,
     NeedsInput,
@@ -19,7 +19,7 @@ pub enum TaskState {
 impl TaskState {
     pub const ALL: [TaskState; 8] = [
         TaskState::Proposed,
-        TaskState::Backlog,
+        TaskState::Parked,
         TaskState::Ready,
         TaskState::Running,
         TaskState::NeedsInput,
@@ -31,7 +31,7 @@ impl TaskState {
     pub fn as_str(self) -> &'static str {
         match self {
             TaskState::Proposed => "proposed",
-            TaskState::Backlog => "backlog",
+            TaskState::Parked => "parked",
             TaskState::Ready => "ready",
             TaskState::Running => "running",
             TaskState::NeedsInput => "needs-input",

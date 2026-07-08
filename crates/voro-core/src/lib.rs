@@ -82,7 +82,7 @@ mod tests {
         let mut s = store();
         let p = s.create_project("voro", "/tmp/voro").unwrap();
         let t = s
-            .create_task(new_task(p.id, "t", TaskState::Backlog))
+            .create_task(new_task(p.id, "t", TaskState::Parked))
             .unwrap();
         assert!(s.add_dep(t.id, t.id, DepKind::Blocks).is_err());
     }
@@ -95,7 +95,7 @@ mod tests {
             .create_task(new_task(p.id, "a", TaskState::Ready))
             .unwrap();
         let b = s
-            .create_task(new_task(p.id, "b", TaskState::Backlog))
+            .create_task(new_task(p.id, "b", TaskState::Parked))
             .unwrap();
         s.add_dep(b.id, a.id, DepKind::Blocks).unwrap();
         let deps = s.deps_of(b.id).unwrap();

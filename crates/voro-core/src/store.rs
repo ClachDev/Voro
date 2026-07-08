@@ -5,7 +5,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::{Error, Result};
 use crate::model::{Dep, DepKind, Event, Priority, Project, Task, TaskState};
 
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_rename_backlog_to_parked.sql"),
+];
 
 /// Owns the SQLite database. All writes go through this type; task state in
 /// particular is only ever changed by the transition API in `transition.rs`.
@@ -14,7 +17,7 @@ pub struct Store {
 }
 
 /// Initial state for a task created by a human. `proposed` is quick capture;
-/// `backlog`/`ready` mean the creator has already triaged their own task.
+/// `parked`/`ready` mean the creator has already triaged their own task.
 #[derive(Debug, Clone)]
 pub struct NewTask {
     pub project_id: i64,
@@ -68,7 +71,29 @@ impl Store {
         Ok(store)
     }
 
+    /// Migrations may rebuild tables (SQLite cannot alter CHECK constraints),
+    /// so foreign-key enforcement is suspended for the duration and integrity
+    /// verified afterwards — the procedure SQLite documents for schema changes.
     fn migrate(&mut self) -> Result<()> {
+        self.conn.pragma_update(None, "foreign_keys", false)?;
+        let applied = self.apply_migrations();
+        let restored = self.conn.pragma_update(None, "foreign_keys", true);
+        applied?;
+        restored?;
+        let violations: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get(0)
+                })?;
+        if violations > 0 {
+            return Err(Error::Invalid(format!(
+                "{violations} foreign key violation(s) after migration"
+            )));
+        }
+        Ok(())
+    }
+
+    fn apply_migrations(&mut self) -> Result<()> {
         let tx = self.conn.transaction()?;
         let version: usize =
             tx.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as usize;
@@ -128,7 +153,7 @@ impl Store {
     pub fn create_task(&mut self, new: NewTask) -> Result<Task> {
         if !matches!(
             new.state,
-            TaskState::Proposed | TaskState::Backlog | TaskState::Ready
+            TaskState::Proposed | TaskState::Parked | TaskState::Ready
         ) {
             return Err(Error::Invalid(format!(
                 "a task cannot be created in state '{}'",
@@ -289,4 +314,51 @@ pub(crate) fn log_event(
         params![task_id, kind, detail],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A database created at schema version 1 (state still named 'backlog')
+    /// must convert on open: rows renamed, deps/events surviving the table
+    /// rebuild, version stamped.
+    #[test]
+    fn migration_0002_converts_backlog_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute("INSERT INTO projects (name, path) VALUES ('p', '/tmp')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (project_id, title, state, state_since, created_at)
+             VALUES (1, 'blocker', 'ready', datetime('now'), datetime('now')),
+                    (1, 'waiting', 'backlog', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO deps (task_id, depends_on) VALUES (2, 1)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO events (task_id, at, kind, detail)
+             VALUES (2, datetime('now'), 'created', 'backlog')",
+            [],
+        )
+        .unwrap();
+
+        let store = Store::from_connection(conn).unwrap();
+        assert_eq!(store.task(2).unwrap().state, TaskState::Parked);
+        assert_eq!(store.task(1).unwrap().state, TaskState::Ready);
+        assert_eq!(store.deps_of(2).unwrap().len(), 1);
+        // the event log is history and keeps its original wording
+        assert_eq!(
+            store.events_for(2).unwrap()[0].detail.as_deref(),
+            Some("backlog")
+        );
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+    }
 }

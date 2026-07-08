@@ -90,7 +90,7 @@ pub enum EditorRequest {
 
 pub fn action_label(action: &Action) -> &'static str {
     match action {
-        Action::Triage(Triage::Backlog) => "triage → backlog",
+        Action::Triage(Triage::Parked) => "triage → parked",
         Action::Triage(Triage::Ready) => "triage → ready",
         Action::Triage(Triage::Reject) => "triage → rejected",
         Action::Start => "start → running",
@@ -100,7 +100,7 @@ pub fn action_label(action: &Action) -> &'static str {
         Action::Accept => "accept → done",
         Action::RejectWork(_) => "reject with feedback → running",
         Action::Abort => "abort → ready",
-        Action::Park => "park → backlog",
+        Action::Park => "park → parked",
         Action::Unpark => "unpark → ready",
         Action::Abandon => "abandon → rejected",
     }
@@ -135,7 +135,7 @@ fn browse_order(state: TaskState) -> u8 {
         TaskState::Review => 2,
         TaskState::Ready => 3,
         TaskState::Running => 4,
-        TaskState::Backlog => 5,
+        TaskState::Parked => 5,
         TaskState::Done => 6,
         TaskState::Rejected => 7,
     }
