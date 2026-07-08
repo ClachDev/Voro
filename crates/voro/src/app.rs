@@ -118,6 +118,10 @@ pub struct App {
     pub queue: Vec<Candidate>,
     pub running: Vec<TaskRow>,
     pub all: Vec<TaskRow>,
+    /// Ready tasks whose most recent session ended `failed` or `capped`
+    /// (DESIGN.md §8) — read fresh from session history on every refresh,
+    /// never stored on the task itself.
+    pub redispatch: std::collections::HashSet<i64>,
 
     pub cockpit_rows: Vec<CockpitRow>,
     pub cockpit_sel: usize,
@@ -156,6 +160,7 @@ impl App {
             queue: Vec::new(),
             running: Vec::new(),
             all: Vec::new(),
+            redispatch: std::collections::HashSet::new(),
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
             tasks_sel: 0,
@@ -183,6 +188,11 @@ impl App {
     /// Reload every view from the store. Called after any mutation; the data
     /// volumes are trivial, so correctness beats cleverness.
     pub fn refresh(&mut self) -> voro_core::Result<()> {
+        // Reconcile-on-read (DESIGN.md §8): finalise any session whose
+        // process has already exited before anything below reads state that
+        // depends on it.
+        crate::reconcile::reconcile_live_sessions(&mut self.store)?;
+
         self.projects = self.store.projects()?;
         let candidates = self.store.candidates()?;
         self.queue = scheduler::queue(&candidates).into_iter().cloned().collect();
@@ -210,6 +220,16 @@ impl App {
             .iter()
             .filter(|r| r.task.state == TaskState::Running)
             .cloned()
+            .collect();
+        self.redispatch = all
+            .iter()
+            .filter(|r| r.task.state == TaskState::Ready)
+            .filter_map(|r| {
+                self.store
+                    .redispatch_flag(r.task.id)
+                    .ok()?
+                    .then_some(r.task.id)
+            })
             .collect();
         self.all = all;
 

@@ -134,6 +134,17 @@ pub fn dispatch(
         }
     };
 
+    // Nothing in this process waits on the child otherwise, since dispatch
+    // must return as soon as the session is recorded. Left unreaped, an
+    // exited child sits as a zombie for as long as this process runs — and
+    // `kill -0` on a zombie still succeeds, which would permanently defeat
+    // reconciliation's pid-liveness check in a long-lived TUI session. A
+    // detached reaper thread collects the exit status the moment it's
+    // available without blocking dispatch.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+
     Ok(format!(
         "dispatched task {} to {} (session {}, pid {}) — log {}",
         task.id,

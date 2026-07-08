@@ -275,11 +275,7 @@ impl Store {
 
     /// Close a session with its outcome, stamping `ended_at`.
     pub fn end_session(&mut self, id: i64, outcome: SessionOutcome) -> Result<Session> {
-        let changed = self.conn.execute(
-            "UPDATE sessions SET ended_at = datetime('now'), outcome = ?1 WHERE id = ?2",
-            params![outcome, id],
-        )?;
-        if changed == 0 {
+        if set_session_outcome(&self.conn, id, outcome)? == 0 {
             return Err(Error::SessionNotFound(id));
         }
         self.session(id)
@@ -311,6 +307,29 @@ impl Store {
         ))?;
         let rows = stmt.query_map([], session_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether `task_id`'s most recent session ended `failed` or `capped` —
+    /// the redispatch flag (DESIGN.md §8). Derived from session history on
+    /// every read rather than stored on the task, per the queue/task browser
+    /// rendering it rather than owning it. Only ever true for a task that is
+    /// currently `ready`: that is the only way a task with a failed/capped
+    /// last session can be sitting still, since a fresh dispatch opens a new
+    /// session ahead of any later failure.
+    pub fn redispatch_flag(&self, task_id: i64) -> Result<bool> {
+        let outcome: Option<SessionOutcome> = self
+            .conn
+            .query_row(
+                "SELECT outcome FROM sessions WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(matches!(
+            outcome,
+            Some(SessionOutcome::Failed | SessionOutcome::Capped)
+        ))
     }
 
     // --- events ---
@@ -364,6 +383,16 @@ pub(crate) fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
 pub(crate) const SESSION_COLUMNS: &str =
     "id, task_id, agent, pid, log_path, started_at, ended_at, outcome";
 
+pub(crate) fn get_session(conn: &Connection, id: i64) -> Result<Option<Session>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
+            [id],
+            session_from_row,
+        )
+        .optional()?)
+}
+
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
         id: row.get(0)?,
@@ -401,6 +430,21 @@ pub(crate) fn insert_session(
         params![task_id, agent, pid, log_path],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Stamp `ended_at` and record `outcome` on a session, returning the number
+/// of rows changed (0 if the id is unknown). Shared by [`Store::end_session`]
+/// and reconciliation (`transition.rs`), which folds it into the same
+/// transaction as the task's `running → ready` drop.
+pub(crate) fn set_session_outcome(
+    conn: &Connection,
+    id: i64,
+    outcome: SessionOutcome,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE sessions SET ended_at = datetime('now'), outcome = ?1 WHERE id = ?2",
+        params![outcome, id],
+    )?)
 }
 
 pub(crate) fn log_event(
