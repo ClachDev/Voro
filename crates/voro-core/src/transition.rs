@@ -65,12 +65,15 @@ impl Action {
 impl Store {
     /// Legal target of `action` from `state`, if any. Exposed so interfaces
     /// can offer exactly the legal actions without duplicating the machine.
+    /// Order matters: interfaces render these as menus with the first entry
+    /// selected, so the most common action leads — for triage that is
+    /// `ready`, since `backlog` means blocked or deliberately parked.
     pub fn legal_actions(state: TaskState) -> Vec<Action> {
         use TaskState::*;
         match state {
             Proposed => vec![
-                Action::Triage(Triage::Backlog),
                 Action::Triage(Triage::Ready),
+                Action::Triage(Triage::Backlog),
                 Action::Triage(Triage::Reject),
             ],
             Backlog => vec![Action::Unpark, Action::Abandon],
