@@ -8,7 +8,7 @@ use rusqlite::{Connection, params};
 
 use crate::error::{Error, Result};
 use crate::model::{Session, Task, TaskState};
-use crate::store::{Store, get_task, log_event};
+use crate::store::{Store, get_task, insert_session, log_event};
 
 /// Where a `proposed` task goes at triage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,12 +110,7 @@ impl Store {
     ) -> Result<(Task, Session)> {
         let tx = self.conn.transaction()?;
         apply_action(&tx, task_id, Action::Start)?;
-        tx.execute(
-            "INSERT INTO sessions (task_id, agent, pid, log_path, started_at)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-            params![task_id, agent, pid, log_path],
-        )?;
-        let session_id = tx.last_insert_rowid();
+        let session_id = insert_session(&tx, task_id, agent, pid, log_path)?;
         tx.commit()?;
         Ok((self.task(task_id)?, self.session(session_id)?))
     }

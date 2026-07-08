@@ -70,7 +70,15 @@ pub fn dispatch(
 
     std::fs::create_dir_all(&ctx.runtime_dir)
         .map_err(|e| format!("cannot create {}: {e}", ctx.runtime_dir.display()))?;
-    let prompt_path = ctx.runtime_dir.join(format!("task-{task_id}.prompt.md"));
+    // One stamp names both artefacts, pairing each session's prompt with its
+    // log and keeping earlier sessions' files intact across redispatch.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let prompt_path = ctx
+        .runtime_dir
+        .join(format!("task-{task_id}-{stamp}.prompt.md"));
     let prompt = if task.body.is_empty() {
         format!("# {}\n", task.title)
     } else {
@@ -79,10 +87,6 @@ pub fn dispatch(
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("cannot write prompt {}: {e}", prompt_path.display()))?;
 
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     let log_path = ctx.runtime_dir.join(format!("task-{task_id}-{stamp}.log"));
     let log = File::create(&log_path)
         .map_err(|e| format!("cannot create log {}: {e}", log_path.display()))?;
@@ -93,7 +97,7 @@ pub fn dispatch(
     let command = agent
         .cmd
         .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path));
-    let child = Command::new("sh")
+    let mut child = Command::new("sh")
         .arg("-c")
         .arg(&command)
         .current_dir(&project.path)
@@ -107,9 +111,28 @@ pub fn dispatch(
         .map_err(|e| format!("cannot spawn agent '{}': {e}", agent.name))?;
     let pid = i64::from(child.id());
 
-    let (task, session) = store
-        .record_dispatch(task_id, &agent.name, Some(pid), log_path.to_str())
-        .map_err(|e| e.to_string())?;
+    let recorded = store.record_dispatch(
+        task_id,
+        &agent.name,
+        Some(pid),
+        Some(log_path.to_string_lossy().as_ref()),
+    );
+    let (task, session) = match recorded {
+        Ok(pair) => pair,
+        Err(e) => {
+            // An agent whose task never reached `running` must not keep
+            // working unrecorded: kill its process group (pgid = pid, set at
+            // spawn) and reap the shell before surfacing the error.
+            let _ = Command::new("kill")
+                .args(["-TERM", "--"])
+                .arg(format!("-{pid}"))
+                .status();
+            let _ = child.wait();
+            return Err(format!(
+                "recording the dispatch failed ({e}); the spawned agent (pid {pid}) was killed"
+            ));
+        }
+    };
 
     Ok(format!(
         "dispatched task {} to {} (session {}, pid {}) — log {}",
@@ -133,9 +156,13 @@ fn guard_clean_tree(path: &str) -> Result<(), String> {
         .output()
         .map_err(|e| format!("cannot run git in {path}: {e}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "{path} is not a git repository, so its cleanliness cannot be verified"
-        ));
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        return Err(if detail.is_empty() {
+            format!("cannot verify {path} is clean: git status failed")
+        } else {
+            format!("cannot verify {path} is clean: {detail}")
+        });
     }
     if !output.stdout.is_empty() {
         return Err(format!(
@@ -237,10 +264,35 @@ mod tests {
         assert!(Path::new(log).exists(), "log file {log} should exist");
 
         // the prompt carries the task title and body
-        let prompt =
-            std::fs::read_to_string(ctx.runtime_dir.join(format!("task-{id}.prompt.md"))).unwrap();
+        let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
         assert!(prompt.contains("Do the thing"));
         assert!(prompt.contains("Detailed prompt."));
+    }
+
+    fn prompt_files(ctx: &DispatchCtx) -> Vec<PathBuf> {
+        std::fs::read_dir(&ctx.runtime_dir)
+            .unwrap()
+            .filter_map(|e| Some(e.ok()?.path()))
+            .filter(|p| p.to_string_lossy().ends_with(".prompt.md"))
+            .collect()
+    }
+
+    #[test]
+    fn redispatch_keeps_each_sessions_prompt_and_log() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let id = ready_task(&mut store, &project);
+
+        dispatch(&mut store, &ctx, id, None).unwrap();
+        store.apply(id, voro_core::Action::Abort).unwrap();
+        dispatch(&mut store, &ctx, id, None).unwrap();
+
+        let sessions = store.sessions_for(id).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_ne!(
+            sessions[0].log_path, sessions[1].log_path,
+            "each session must own its log"
+        );
+        assert_eq!(prompt_files(&ctx).len(), 2);
     }
 
     #[test]
