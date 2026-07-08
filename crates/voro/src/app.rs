@@ -125,6 +125,10 @@ pub struct App {
 
     pub mode: Mode,
     pub pending_editor: Option<EditorRequest>,
+
+    /// Last `PRAGMA data_version` seen, used to detect commits from other
+    /// processes and refresh without reacting to our own mutations.
+    last_data_version: i64,
 }
 
 /// Browser grouping: attention states first, closed last.
@@ -159,9 +163,23 @@ impl App {
             tasks_sel: 0,
             mode: Mode::Normal,
             pending_editor: None,
+            last_data_version: 0,
         };
         app.refresh()?;
+        app.last_data_version = app.store.data_version()?;
         Ok(app)
+    }
+
+    /// Refresh if another process has committed since the last check. Cheap
+    /// enough to call every poll tick; `PRAGMA data_version` ignores our own
+    /// writes, so this fires only on genuinely external changes.
+    pub fn poll_external(&mut self) -> voro_core::Result<()> {
+        let version = self.store.data_version()?;
+        if version != self.last_data_version {
+            self.last_data_version = version;
+            self.refresh()?;
+        }
+        Ok(())
     }
 
     /// Reload every view from the store. Called after any mutation; the data

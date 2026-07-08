@@ -63,6 +63,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(false) => {}
             Err(e) => break Err(e.into()),
         }
+        if let Err(e) = app.poll_external() {
+            break Err(e.into());
+        }
         if let Some(request) = app.pending_editor.take() {
             // $EDITOR owns the terminal for the duration; tear the TUI down
             // around it rather than fighting over raw mode.
