@@ -181,6 +181,60 @@ impl ToSql for DepKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionOutcome {
+    Completed,
+    Asked,
+    Failed,
+    Capped,
+    Aborted,
+}
+
+impl SessionOutcome {
+    pub const ALL: [SessionOutcome; 5] = [
+        SessionOutcome::Completed,
+        SessionOutcome::Asked,
+        SessionOutcome::Failed,
+        SessionOutcome::Capped,
+        SessionOutcome::Aborted,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionOutcome::Completed => "completed",
+            SessionOutcome::Asked => "asked",
+            SessionOutcome::Failed => "failed",
+            SessionOutcome::Capped => "capped",
+            SessionOutcome::Aborted => "aborted",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<SessionOutcome> {
+        Self::ALL
+            .into_iter()
+            .find(|outcome| outcome.as_str() == s)
+            .ok_or_else(|| Error::Invalid(format!("unknown session outcome '{s}'")))
+    }
+}
+
+impl fmt::Display for SessionOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromSql for SessionOutcome {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        SessionOutcome::parse(value.as_str()?).map_err(|e| FromSqlError::Other(Box::new(e)))
+    }
+}
+
+impl ToSql for SessionOutcome {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub id: i64,
@@ -218,4 +272,16 @@ pub struct Event {
     pub at: String,
     pub kind: String,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub id: i64,
+    pub task_id: i64,
+    pub agent: String,
+    pub pid: Option<i64>,
+    pub log_path: Option<String>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub outcome: Option<SessionOutcome>,
 }
