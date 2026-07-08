@@ -13,6 +13,7 @@ use voro_core::{
 };
 
 use crate::dispatch::{self, DispatchCtx};
+use crate::import;
 
 const HELP: &str = "\
 voro — prioritised attention across projects
@@ -43,6 +44,10 @@ tasks
                                   proposals, top ready tasks — by score
   next                            the single highest-scoring ready task
   explain <task-id>               score decomposition
+  import <project> [--repo owner/name]
+                                  import open GitHub issues as proposed
+                                  tasks via `gh issue list`; idempotent,
+                                  --repo overrides the checkout's own remote
 
 dispatch
   dispatch <task-id> [--agent NAME]
@@ -95,6 +100,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         "dispatch" => dispatch_verb(store, &pos, &flags, ctx),
         "continue" => continue_verb(store, &pos, &flags, ctx),
         "answer" => answer_verb(store, &pos, &flags, ctx),
+        "import" => import_verb(store, &pos, &flags),
         "triage" | "start" | "ask" | "done" | "accept" | "reject" | "abort" | "park" | "unpark"
         | "abandon" => transition_verb(store, verb, &pos, &flags),
         other => Err(format!("unknown verb '{other}' — try 'voro help'")),
@@ -609,6 +615,33 @@ fn answer_verb(
     }
 }
 
+/// Milestone C's one-way GitHub import (DESIGN.md §10): shells out to `gh
+/// issue list` in the project's path (or `--repo owner/name` if the checkout
+/// itself doesn't name the repo to import from) and captures each issue as a
+/// `proposed` task, skipping ones already imported.
+fn import_verb(
+    store: &mut Store,
+    pos: &[String],
+    flags: &HashMap<String, String>,
+) -> Result<String, String> {
+    let project = resolve_project(store, need(pos, 1, "project")?)?;
+    let repo = flags.get("repo").map(String::as_str);
+    let json = import::fetch_issues(&project.path, repo)?;
+    let summary = import::import_issues(store, &project, &json)?;
+    let mut out = String::new();
+    for task in &summary.imported {
+        writeln!(out, "{}", task_line(task, &project.name)).unwrap();
+    }
+    writeln!(
+        out,
+        "{} imported, {} already present",
+        summary.imported.len(),
+        summary.skipped
+    )
+    .unwrap();
+    Ok(out)
+}
+
 fn transition_verb(
     store: &mut Store,
     verb: &str,
@@ -878,6 +911,22 @@ mod tests {
         assert!(shown.contains("ready"));
         ok(&mut s, &["set", "1", "--no-agent"]);
         assert!(!ok(&mut s, &["show", "1"]).contains("codex"));
+    }
+
+    #[test]
+    fn help_documents_import() {
+        let mut s = store();
+        let out = ok(&mut s, &["help"]);
+        assert!(out.contains("import <project>"), "{out}");
+        assert!(out.contains("gh issue list"), "{out}");
+    }
+
+    #[test]
+    fn import_rejects_an_unknown_project_before_touching_gh() {
+        // Never gets as far as shelling out to `gh` — resolve_project fails
+        // first — so this stays a safe, network-free test.
+        let mut s = store();
+        assert!(err(&mut s, &["import", "nope"]).contains("no project"));
     }
 
     #[test]
