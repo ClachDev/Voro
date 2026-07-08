@@ -15,7 +15,8 @@ pub use agent::{AgentTemplate, AgentsConfig, PROMPT_FILE_PLACEHOLDER, ResolvedAg
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};
 pub use model::{
-    Blocker, Dep, DepKind, Event, Priority, Project, Session, SessionOutcome, Task, TaskState,
+    Blocker, Dep, DepKind, Event, LiveSession, Priority, Project, Session, SessionOutcome, Task,
+    TaskState,
 };
 pub use scheduler::{Candidate, ScoreBreakdown};
 pub use store::{NewTask, Store, TaskEdit};

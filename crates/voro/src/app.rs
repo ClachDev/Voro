@@ -1,7 +1,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use voro_core::{
-    Action, Blocker, Candidate, Event, Project, ScoreBreakdown, Store, Task, TaskState, Triage,
-    scheduler,
+    Action, Blocker, Candidate, Event, LiveSession, Project, ScoreBreakdown, Store, Task,
+    TaskState, Triage, scheduler,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +133,10 @@ pub struct App {
 
     pub projects: Vec<Project>,
     pub queue: Vec<Candidate>,
-    pub running: Vec<TaskRow>,
+    /// Live agent sessions for the cockpit's running strip (DESIGN.md §9),
+    /// sourced from the store's session/task join rather than task state —
+    /// a task started by hand has no session to show here.
+    pub running: Vec<LiveSession>,
     pub all: Vec<TaskRow>,
     /// Ready tasks whose most recent session ended `failed` or `capped`
     /// (DESIGN.md §8) — read fresh from session history on every refresh,
@@ -237,11 +240,6 @@ impl App {
             })
             .collect();
         all.sort_by_key(|r| (browse_order(r.task.state), r.task.id));
-        self.running = all
-            .iter()
-            .filter(|r| r.task.state == TaskState::Running)
-            .cloned()
-            .collect();
         self.redispatch = all
             .iter()
             .filter(|r| r.task.state == TaskState::Ready)
@@ -253,6 +251,7 @@ impl App {
             })
             .collect();
         self.all = all;
+        self.running = self.store.live_sessions_with_tasks()?;
 
         self.cockpit_rows = (0..self.queue.len()).map(CockpitRow::Queue).collect();
         self.cockpit_rows
@@ -269,7 +268,7 @@ impl App {
         match self.screen {
             Screen::Cockpit => match self.cockpit_rows.get(self.cockpit_sel)? {
                 CockpitRow::Queue(i) => Some(self.queue.get(*i)?.task.id),
-                CockpitRow::Running(i) => Some(self.running.get(*i)?.task.id),
+                CockpitRow::Running(i) => Some(self.running.get(*i)?.task_id),
             },
             Screen::Tasks => Some(self.all.get(self.tasks_sel)?.task.id),
         }
