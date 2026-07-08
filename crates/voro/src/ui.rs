@@ -139,9 +139,9 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             ];
             if !matches!(
                 state,
-                focus_core::TaskState::Ready
-                    | focus_core::TaskState::NeedsInput
-                    | focus_core::TaskState::Review
+                voro_core::TaskState::Ready
+                    | voro_core::TaskState::NeedsInput
+                    | voro_core::TaskState::Review
             ) {
                 lines.push(Line::from(Span::styled(
                     format!("({state} tasks are not scheduled)"),
@@ -180,7 +180,7 @@ fn draw_cockpit(frame: &mut Frame, app: &App) {
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![Span::styled("focus", Style::new().bold()), Span::raw("  ")];
+    let mut spans = vec![Span::styled("voro", Style::new().bold()), Span::raw("  ")];
     for p in &app.projects {
         let style = if p.weight == 0 {
             Style::new().dim()

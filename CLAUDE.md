@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Focus is a local, single-operator command centre that prioritises tasks across many
+Voro is a local, single-operator command centre that prioritises tasks across many
 projects and dispatches them to coding agents. **Read `docs/DESIGN.md` before any
 non-trivial work** — it is authoritative for concepts (§3), the SQLite schema (§5),
 the task state machine (§6), scoring (§7), and dispatch semantics (§8). If your
@@ -9,10 +9,10 @@ and say so explicitly.
 
 ## Architecture rules
 
-- Cargo workspace with two crates: `focus-core` (store, state machine, scheduler,
-  scoring — pure logic, no terminal I/O) and `focus` (the ratatui TUI). Business
+- Cargo workspace with two crates: `voro-core` (store, state machine, scheduler,
+  scoring — pure logic, no terminal I/O) and `voro` (the ratatui TUI). Business
   logic never lives in the TUI crate; the TUI renders and forwards intents.
-- Task state changes go through the `focus-core` transition API, which enforces
+- Task state changes go through the `voro-core` transition API, which enforces
   the state machine in DESIGN.md §6. Never mutate `tasks.state` with raw SQL.
 - Schema changes are numbered migrations, additive where possible. The `events`
   table is append-only.
@@ -28,7 +28,7 @@ and say so explicitly.
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Format: `cargo fmt --all`
 
-`focus-core` requires tests; state-machine transitions and scheduler ordering are
+`voro-core` requires tests; state-machine transitions and scheduler ordering are
 the highest-value targets. TUI code is tested where practical, not dogmatically.
 
 ## Git conventions

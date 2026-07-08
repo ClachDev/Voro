@@ -1,4 +1,4 @@
-//! Core logic for Focus: the SQLite store, the task state machine, and the
+//! Core logic for Voro: the SQLite store, the task state machine, and the
 //! scheduler/scoring. Pure of terminal I/O; every interface (TUI, CLI verbs)
 //! is a thin consumer of this crate. Concepts and invariants are specified in
 //! `docs/DESIGN.md`.
@@ -37,7 +37,7 @@ mod tests {
     #[test]
     fn project_crud_and_weight_bounds() {
         let mut s = store();
-        let p = s.create_project("focus", "/tmp/focus").unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
         assert_eq!(p.weight, 3);
         s.set_weight(p.id, 5).unwrap();
         assert_eq!(s.project(p.id).unwrap().weight, 5);
@@ -48,7 +48,7 @@ mod tests {
     #[test]
     fn task_create_defaults_and_event() {
         let mut s = store();
-        let p = s.create_project("focus", "/tmp/focus").unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
         let t = s
             .create_task(new_task(p.id, "First", TaskState::Ready))
             .unwrap();
@@ -65,7 +65,7 @@ mod tests {
     #[test]
     fn task_cannot_be_created_in_active_or_closed_states() {
         let mut s = store();
-        let p = s.create_project("focus", "/tmp/focus").unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
         for state in [
             TaskState::Running,
             TaskState::NeedsInput,
@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn dep_rejects_self_reference() {
         let mut s = store();
-        let p = s.create_project("focus", "/tmp/focus").unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
         let t = s
             .create_task(new_task(p.id, "t", TaskState::Backlog))
             .unwrap();
@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn dep_add_and_remove() {
         let mut s = store();
-        let p = s.create_project("focus", "/tmp/focus").unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
         let a = s
             .create_task(new_task(p.id, "a", TaskState::Ready))
             .unwrap();

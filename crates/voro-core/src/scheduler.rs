@@ -114,7 +114,7 @@ impl Store {
     }
 
     /// Score decomposition for any single task, whatever its state — the
-    /// TUI popup today, `focus explain <task>` later.
+    /// TUI popup today, `voro explain <task>` later.
     pub fn explain(&self, task_id: i64) -> Result<ScoreBreakdown> {
         let (weight, priority, age_days): (i64, Priority, f64) = self.conn.query_row(
             "SELECT p.weight, t.priority, julianday('now') - julianday(t.state_since)

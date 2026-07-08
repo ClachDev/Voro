@@ -1,6 +1,6 @@
-# Focus
+# Voro
 
-A local command centre for AI-assisted development across many projects. Focus
+A local command centre for AI-assisted development across many projects. Voro
 tracks tasks per project, weights each project by how much it matters *today*,
 and answers one question: **where should my attention go right now?**
 
@@ -18,12 +18,12 @@ read [`CLAUDE.md`](CLAUDE.md) first.
 
 ## Building
 
-Rust workspace: `focus-core` (store, scheduler) and `focus` (ratatui TUI).
+Rust workspace: `voro-core` (store, scheduler) and `voro` (ratatui TUI).
 
 ```bash
 cargo build --workspace
 cargo test --workspace
-cargo run -p focus
+cargo run -p voro
 ```
 
 ## License

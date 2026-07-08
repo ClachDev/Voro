@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/focus-core", "crates/focus"]
+members = ["crates/voro-core", "crates/voro"]
 
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/ClachDev/focus"
+repository = "https://github.com/ClachDev/Voro"
 
 [workspace.dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -7,15 +7,15 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use focus_core::{
+use voro_core::{
     Action, NewTask, Priority, Project, Store, Task, TaskEdit, TaskState, Triage, scheduler,
 };
 
 const HELP: &str = "\
-focus — prioritised attention across projects
+voro — prioritised attention across projects
 
-usage: focus [--db PATH]                 launch the TUI
-       focus [--db PATH] <verb> [args]
+usage: voro [--db PATH]                 launch the TUI
+       voro [--db PATH] <verb> [args]
 
 projects
   project add <name> <path>       create a project (weight 3)
@@ -63,7 +63,7 @@ pub fn run(store: &mut Store, args: Vec<String>) -> Result<String, String> {
         "explain" => explain_verb(store, &pos),
         "triage" | "start" | "ask" | "answer" | "done" | "accept" | "reject" | "abort" | "park"
         | "unpark" | "abandon" => transition_verb(store, verb, &pos, &flags),
-        other => Err(format!("unknown verb '{other}' — try 'focus help'")),
+        other => Err(format!("unknown verb '{other}' — try 'voro help'")),
     }
 }
 
@@ -90,7 +90,7 @@ fn split_args(args: Vec<String>) -> Result<(Vec<String>, HashMap<String, String>
 fn need<'a>(pos: &'a [String], index: usize, what: &str) -> Result<&'a str, String> {
     pos.get(index)
         .map(String::as_str)
-        .ok_or_else(|| format!("missing {what} — try 'focus help'"))
+        .ok_or_else(|| format!("missing {what} — try 'voro help'"))
 }
 
 fn task_id(pos: &[String], index: usize) -> Result<i64, String> {
@@ -144,7 +144,7 @@ fn body_from(flags: &HashMap<String, String>) -> Result<Option<String>, String> 
 fn rest_text(pos: &[String], from: usize, what: &str) -> Result<String, String> {
     let text = pos[from.min(pos.len())..].join(" ");
     if text.trim().is_empty() {
-        return Err(format!("missing {what} — try 'focus help'"));
+        return Err(format!("missing {what} — try 'voro help'"));
     }
     Ok(text)
 }

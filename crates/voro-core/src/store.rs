@@ -47,7 +47,7 @@ impl Store {
         Store::from_connection(Connection::open_in_memory()?)
     }
 
-    /// `$XDG_DATA_HOME/focus/focus.db`, defaulting to `~/.local/share`.
+    /// `$XDG_DATA_HOME/voro/voro.db`, defaulting to `~/.local/share`.
     pub fn default_db_path() -> PathBuf {
         let data_home = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -58,7 +58,7 @@ impl Store {
                     .unwrap_or_default();
                 home.join(".local/share")
             });
-        data_home.join("focus/focus.db")
+        data_home.join("voro/voro.db")
     }
 
     fn from_connection(conn: Connection) -> Result<Store> {

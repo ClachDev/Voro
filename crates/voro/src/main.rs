@@ -9,7 +9,7 @@ use std::time::Duration;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 use app::{App, EditorRequest};
-use focus_core::Store;
+use voro_core::Store;
 
 /// Pull `--db PATH` out of the argument list; whatever remains is the CLI
 /// verb and its arguments (empty → launch the TUI).
@@ -25,7 +25,7 @@ fn split_db(args: Vec<String>) -> (PathBuf, Vec<String>) {
         }
     }
     let db = db
-        .or_else(|| std::env::var_os("FOCUS_DB").map(PathBuf::from))
+        .or_else(|| std::env::var_os("VORO_DB").map(PathBuf::from))
         .unwrap_or_else(Store::default_db_path);
     (db, rest)
 }
@@ -91,7 +91,7 @@ fn editor_session(app: &mut App, request: EditorRequest) {
             let blocks: Vec<i64> = match app.store.deps_of(task_id) {
                 Ok(deps) => deps
                     .iter()
-                    .filter(|d| d.kind == focus_core::DepKind::Blocks)
+                    .filter(|d| d.kind == voro_core::DepKind::Blocks)
                     .map(|d| d.depends_on)
                     .collect(),
                 Err(e) => {

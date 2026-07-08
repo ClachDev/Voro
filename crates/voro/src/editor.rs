@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use focus_core::{Priority, Task, TaskState};
+use voro_core::{Priority, Task, TaskState};
 
 #[derive(Debug, Clone)]
 pub struct TaskForm {
@@ -151,7 +151,7 @@ pub fn run_editor(initial: &str) -> Result<String, String> {
         .unwrap_or_default()
         .as_nanos();
     let path: PathBuf =
-        std::env::temp_dir().join(format!("focus-task-{}-{stamp}.md", std::process::id()));
+        std::env::temp_dir().join(format!("voro-task-{}-{stamp}.md", std::process::id()));
     std::fs::write(&path, initial).map_err(|e| format!("cannot write {path:?}: {e}"))?;
 
     let editor = std::env::var("EDITOR")
@@ -159,8 +159,8 @@ pub fn run_editor(initial: &str) -> Result<String, String> {
         .unwrap_or_else(|_| "vi".to_string());
     let status = Command::new("sh")
         .arg("-c")
-        .arg(format!("{editor} \"$FOCUS_EDIT_FILE\""))
-        .env("FOCUS_EDIT_FILE", &path)
+        .arg(format!("{editor} \"$VORO_EDIT_FILE\""))
+        .env("VORO_EDIT_FILE", &path)
         .status()
         .map_err(|e| format!("cannot launch editor '{editor}': {e}"))?;
 

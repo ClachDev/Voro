@@ -1,7 +1,7 @@
-use focus_core::{
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use voro_core::{
     Action, Candidate, Project, ScoreBreakdown, Store, Task, TaskState, Triage, scheduler,
 };
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -142,7 +142,7 @@ fn browse_order(state: TaskState) -> u8 {
 }
 
 impl App {
-    pub fn new(store: Store) -> focus_core::Result<App> {
+    pub fn new(store: Store) -> voro_core::Result<App> {
         let mut app = App {
             store,
             screen: Screen::Cockpit,
@@ -166,7 +166,7 @@ impl App {
 
     /// Reload every view from the store. Called after any mutation; the data
     /// volumes are trivial, so correctness beats cleverness.
-    pub fn refresh(&mut self) -> focus_core::Result<()> {
+    pub fn refresh(&mut self) -> voro_core::Result<()> {
         self.projects = self.store.projects()?;
         let candidates = self.store.candidates()?;
         self.inbox = scheduler::inbox(&candidates).into_iter().cloned().collect();
@@ -259,7 +259,7 @@ impl App {
         }
     }
 
-    pub fn report<T>(&mut self, result: focus_core::Result<T>) -> Option<T> {
+    pub fn report<T>(&mut self, result: voro_core::Result<T>) -> Option<T> {
         match result {
             Ok(v) => Some(v),
             Err(e) => {
@@ -570,11 +570,11 @@ impl App {
         &mut self,
         project_id: i64,
         form: crate::editor::TaskForm,
-    ) -> focus_core::Result<()> {
+    ) -> voro_core::Result<()> {
         for dep in &form.blocks {
             self.store.task(*dep)?;
         }
-        let task = self.store.create_task(focus_core::NewTask {
+        let task = self.store.create_task(voro_core::NewTask {
             project_id,
             title: form.title,
             body: form.body,
@@ -592,10 +592,10 @@ impl App {
         &mut self,
         task_id: i64,
         form: crate::editor::TaskForm,
-    ) -> focus_core::Result<()> {
+    ) -> voro_core::Result<()> {
         self.store.update_task(
             task_id,
-            focus_core::TaskEdit {
+            voro_core::TaskEdit {
                 title: form.title,
                 body: form.body,
                 priority: form.priority,

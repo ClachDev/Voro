@@ -1,6 +1,6 @@
-# Focus — Design Document
+# Voro — Design Document
 
-**Working title:** Focus (binary: `focus`)
+**Working title:** Voro (binary: `voro`; formerly Voro)
 **Status:** Draft v2 — beads dropped in favour of an owned store; TUI-first; per-dispatch agent selection
 **Author:** Michael Johnson (with Claude)
 **Date:** 2026-07-08
@@ -9,7 +9,7 @@
 
 When developing with AI agents, the scarce resource is no longer typing speed or even code review bandwidth — it is directed human attention. Work is spread across many projects, each with its own repository, its own backlog (sometimes GitHub issues, sometimes nothing), and its own shifting importance. Existing tools each solve a fragment of this: GitHub issues hold tasks but are siloed per repo and unprioritised across them; Claude Code's Agent screen shows active sessions but nothing about what *should* be active; Jira and Linear model priority but are heavyweight, remote, and hostile to fast iteration; agent orchestrators (Vibe Kanban, Crystal, Gas Town and dozens of others) answer "what are my agents doing?" rather than "where should I look next?".
 
-Focus is an operational command centre whose single organising question is: **given how much I care about each project today, what is the one thing most worth my attention right now?** It has two outputs, in strict order of precedence:
+Voro is an operational command centre whose single organising question is: **given how much I care about each project today, what is the one thing most worth my attention right now?** It has two outputs, in strict order of precedence:
 
 1. **The inbox** — tasks blocked on human input, sorted by attention score. These are cheap to unblock and expensive to leave: an idle agent or a stale decision. Drain this first.
 2. **The focus** — the single highest-scoring ready task across all projects, presented with enough context (ideally a prepared prompt) to act on immediately, either personally or by dispatching an agent.
@@ -18,7 +18,7 @@ Focus is an operational command centre whose single organising question is: **gi
 
 **Goals.** A local, text-first tool that aggregates tasks across an arbitrary set of projects, including third-party repositories where we have no write access to the upstream issue tracker. Tasks are fully described — a task body should be able to serve as a ready-to-run agent prompt, prepared in advance and held behind a dependency until it becomes actionable. Project priority is a first-class, cheaply editable quantity that can change daily. The tool can dispatch tasks to coding agents — Claude Code by default, others selected per dispatch — and receive "I need a decision" signals back from them, closing the loop between the inbox and running work.
 
-**Non-goals**, at least for v1. No automatic task generation — agents may *propose* tasks, but nothing enters the priority queues without explicit human triage. No team features, sync servers, or cloud components; this is a single-operator tool. No two-way sync with GitHub issues in v1 — issues can be imported as tasks, but Focus's store is the source of truth for priority and state. No terminal multiplexing: Focus tracks and steers sessions at the task level, but attaching to a live agent is the agent's own tooling's job.
+**Non-goals**, at least for v1. No automatic task generation — agents may *propose* tasks, but nothing enters the priority queues without explicit human triage. No team features, sync servers, or cloud components; this is a single-operator tool. No two-way sync with GitHub issues in v1 — issues can be imported as tasks, but Voro's store is the source of truth for priority and state. No terminal multiplexing: Voro tracks and steers sessions at the task level, but attaching to a live agent is the agent's own tooling's job.
 
 ## 3. Concepts
 
@@ -32,13 +32,13 @@ The **attention score** is the scalar that merges project weight and task priori
 
 ## 4. Architecture
 
-Three layers, deliberately decoupled so each can be replaced without disturbing the others. All three ship as one Rust workspace: a `focus-core` library crate (store + scheduler) and thin binaries over it.
+Three layers, deliberately decoupled so each can be replaced without disturbing the others. All three ship as one Rust workspace: a `voro-core` library crate (store + scheduler) and thin binaries over it.
 
-The **store** is a single SQLite database owned by Focus (`~/.local/share/focus/focus.db`), holding projects, tasks, dependencies, and an event log. Schema in §5. SQLite because the access pattern is a single writer with trivial volumes, transactions matter (dispatch touches task state and session records together), and every future consumer — TUI, CLI verbs, a GUI, an ad-hoc `sqlite3` query when debugging — reads it natively.
+The **store** is a single SQLite database owned by Voro (`~/.local/share/voro/voro.db`), holding projects, tasks, dependencies, and an event log. Schema in §5. SQLite because the access pattern is a single writer with trivial volumes, transactions matter (dispatch touches task state and session records together), and every future consumer — TUI, CLI verbs, a GUI, an ad-hoc `sqlite3` query when debugging — reads it natively.
 
-The **scheduler** is pure logic: it pulls candidate tasks from the store, computes attention scores, and produces the two ordered views. It lives in `focus-core` with no I/O of its own — trivially testable, and identical beneath every interface.
+The **scheduler** is pure logic: it pulls candidate tasks from the store, computes attention scores, and produces the two ordered views. It lives in `voro-core` with no I/O of its own — trivially testable, and identical beneath every interface.
 
-The **cockpit** is the interface, and it is built first: a ratatui TUI rendering the inbox and the focus, with in-place editing of tasks and project weights, and hosting the dispatch actions (§9). The agent-facing CLI verbs (§8) are a second, later consumer of `focus-core`; a GUI would be a third. Building the TUI first is safe precisely because the scheduler is a library — the interface risk is contained to rendering and keybindings, not logic.
+The **cockpit** is the interface, and it is built first: a ratatui TUI rendering the inbox and the focus, with in-place editing of tasks and project weights, and hosting the dispatch actions (§9). The agent-facing CLI verbs (§8) are a second, later consumer of `voro-core`; a GUI would be a third. Building the TUI first is safe precisely because the scheduler is a library — the interface risk is contained to rendering and keybindings, not logic.
 
 **Dispatch** is the bridge to agents: given a task and a resolved agent, spawn a headless session in the project's path with the task body as the prompt, record the session, and observe its lifecycle. A thin verb surface lets the running agent write back to the store — most importantly, to raise a needs-input question.
 
@@ -100,7 +100,7 @@ CREATE TABLE events (            -- append-only audit of state transitions & ans
 
 Ready-work detection — the thing beads would have provided — is one query: a task is *unblocked* when no `blocks` dependency points at a task not in `done`/`rejected`. Only `blocks` gates readiness; `discovered-from`, `parent`, and `related` are navigational metadata. When a task's last blocker closes, the store promotes it `backlog → ready` and stamps `state_since`, which is what makes the prepared-prompt pattern work: tomorrow's task, written today and chained behind its blocker, surfaces fully loaded the moment it becomes actionable. Auto-promotion applies only to backlog tasks that *have* blockers — a backlog task with none is deliberately parked and moves only by manual unpark. The reverse holds too: adding an open blocker to a `ready` task demotes it back to `backlog` in the same write.
 
-Agent definitions live in a small config file rather than the database, since they are command templates, not state — `~/.config/focus/agents.toml`:
+Agent definitions live in a small config file rather than the database, since they are command templates, not state — `~/.config/voro/agents.toml`:
 
 ```toml
 default = "claude"
@@ -137,7 +137,7 @@ priority_value: P0 → 8, P1 → 4, P2 → 2, P3 → 1
 age_bonus:      0.1 × days_in_current_state, capped at 2
 ```
 
-Project weight is an integer 0–5, where 0 means "parked — hide entirely" (this is how a project is snoozed without deleting anything). The geometric priority values ensure a P0 in a weight-2 project (16) still beats a P2 in a weight-5 project (10) — priorities within a project should mean something absolute, not just relative. The age bonus is a gentle anti-starvation nudge so old P2s eventually surface, capped so it can never masquerade as a priority level. It applies uniformly to every scored state — `ready`, `needs-input`, and `review` alike — because a week-old unanswered question is a smell worth amplifying, not just an old task. Taskwarrior's experience suggests urgency formulae accrete coefficients until nobody trusts the number; resist that. Any tuning should be observable via a score-decomposition view in the TUI (and later `focus explain <task>`).
+Project weight is an integer 0–5, where 0 means "parked — hide entirely" (this is how a project is snoozed without deleting anything). The geometric priority values ensure a P0 in a weight-2 project (16) still beats a P2 in a weight-5 project (10) — priorities within a project should mean something absolute, not just relative. The age bonus is a gentle anti-starvation nudge so old P2s eventually surface, capped so it can never masquerade as a priority level. It applies uniformly to every scored state — `ready`, `needs-input`, and `review` alike — because a week-old unanswered question is a smell worth amplifying, not just an old task. Taskwarrior's experience suggests urgency formulae accrete coefficients until nobody trusts the number; resist that. Any tuning should be observable via a score-decomposition view in the TUI (and later `voro explain <task>`).
 
 Ordering of the two views: the inbox is all `needs-input` tasks (plus `review` items and the triage meta-item) sorted by score; the focus is the top `ready` task by score. The cockpit always shows the inbox above the focus — drain decisions before starting new work.
 
@@ -150,12 +150,12 @@ Ordering of the two views: the inbox is all `needs-input` tasks (plus `review` i
 **The return path** is a small verb surface agents call from within their sessions, advertised to them via a CLAUDE.md/AGENTS.md snippet per project:
 
 ```
-focus ask <task-id> --question "Schema A or B? Trade-offs: ..."   # → needs-input
-focus done <task-id> --summary "Implemented X, tests pass"        # → review
-focus propose <project> "title" --body-file plan.md               # → proposed (discovered-from)
+voro ask <task-id> --question "Schema A or B? Trade-offs: ..."   # → needs-input
+voro done <task-id> --summary "Implemented X, tests pass"        # → review
+voro propose <project> "title" --body-file plan.md               # → proposed (discovered-from)
 ```
 
-Because these are plain CLI calls writing to a local SQLite file, they work identically for Claude Code, Codex, or anything that can run a shell command — no per-agent integration beyond the command template in `agents.toml`. An MCP server wrapping the same three verbs is a later nicety, not a requirement. Note these verbs are a thin second consumer of `focus-core`, not a prerequisite for the TUI — they arrive in the milestone that closes the agent loop.
+Because these are plain CLI calls writing to a local SQLite file, they work identically for Claude Code, Codex, or anything that can run a shell command — no per-agent integration beyond the command template in `agents.toml`. An MCP server wrapping the same three verbs is a later nicety, not a requirement. Note these verbs are a thin second consumer of `voro-core`, not a prerequisite for the TUI — they arrive in the milestone that closes the agent loop.
 
 Dispatch runs in the project's path with a dirty-tree guard in v1; per-dispatch worktrees are deferred until parallel dispatch within one project is actually wanted (§11).
 
@@ -171,9 +171,9 @@ Every action ultimately gets a CLI equivalent so the whole tool is scriptable an
 
 Ordered by dependency and by time-to-useful, not by calendar — with agents doing the implementation, phases are checkpoints for *validation*, not estimates.
 
-**Milestone A — usable command centre.** `focus-core` (schema, state machine, scheduler, scoring) plus the TUI with manual task management: create/edit tasks, weights modal, inbox and focus views, mark states by hand. No dispatch yet — dispatching is copy-the-body-into-Claude-Code by hand. This is already the tool you are missing: cross-project prioritised attention. Live in it immediately; everything after this is judged against real use.
+**Milestone A — usable command centre.** `voro-core` (schema, state machine, scheduler, scoring) plus the TUI with manual task management: create/edit tasks, weights modal, inbox and focus views, mark states by hand. No dispatch yet — dispatching is copy-the-body-into-Claude-Code by hand. This is already the tool you are missing: cross-project prioritised attention. Live in it immediately; everything after this is judged against real use.
 
-**Milestone B — the loop.** Dispatch with agent resolution, the session table, the `focus ask/done/propose` verbs, CLAUDE.md snippets per project, needs-input flowing back into the inbox, redispatch. The command centre now commands.
+**Milestone B — the loop.** Dispatch with agent resolution, the session table, the `voro ask/done/propose` verbs, CLAUDE.md snippets per project, needs-input flowing back into the inbox, redispatch. The command centre now commands.
 
 **Milestone C — refinement from usage.** Review UX (inline diff pane vs. open-in-Zed), triage ergonomics, GitHub issue *import* for owned repos, the human CLI surface, worktrees if parallel dispatch has become real.
 
@@ -181,7 +181,7 @@ Ordered by dependency and by time-to-useful, not by calendar — with agents doi
 
 ## 11. Open questions
 
-Worktrees per dispatch, or run in the main checkout? In-place with a dirty-tree guard until parallel dispatch within a single project is genuinely wanted. How does `review` get its diff in front of you — is opening the repo in Zed enough, or does the TUI need an inline diff pane (Vibe Kanban's strongest feature)? ~~Should the age bonus apply to `needs-input` items too?~~ — resolved: it applies uniformly to all scored states (§7). How much session output should Focus retain — full logs per session, or just the tail plus the outcome? And naming: `focus` collides with shell muscle memory for some; bikeshed at leisure.
+Worktrees per dispatch, or run in the main checkout? In-place with a dirty-tree guard until parallel dispatch within a single project is genuinely wanted. How does `review` get its diff in front of you — is opening the repo in Zed enough, or does the TUI need an inline diff pane (Vibe Kanban's strongest feature)? ~~Should the age bonus apply to `needs-input` items too?~~ — resolved: it applies uniformly to all scored states (§7). How much session output should Voro retain — full logs per session, or just the tail plus the outcome? ~~And naming: `focus` collides with shell muscle memory for some?~~ — resolved: renamed to `voro` (unclaimed on crates.io, easy to type, no shell collision).
 
 ## 12. Risks
 
