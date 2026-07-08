@@ -218,10 +218,13 @@ impl Store {
     // --- deps ---
 
     pub fn add_dep(&mut self, task_id: i64, depends_on: i64, kind: DepKind) -> Result<()> {
-        if task_id == depends_on {
+        if kind != DepKind::Blocks && task_id == depends_on {
             return Err(Error::Invalid("a task cannot depend on itself".into()));
         }
         let tx = self.conn.transaction()?;
+        if kind == DepKind::Blocks {
+            crate::transition::reject_blocks_cycle(&tx, task_id, depends_on)?;
+        }
         tx.execute(
             "INSERT INTO deps (task_id, depends_on, kind) VALUES (?1, ?2, ?3)",
             params![task_id, depends_on, kind],

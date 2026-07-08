@@ -4,6 +4,8 @@
 //! the event log, and cascades readiness of dependant tasks — all in one
 //! transaction.
 
+use std::collections::{HashMap, VecDeque};
+
 use rusqlite::{Connection, params};
 
 use crate::error::{Error, Result};
@@ -216,9 +218,6 @@ impl Store {
     /// reconcile its readiness. This is the dep-editing entry point for
     /// interfaces; `add_dep`/`remove_dep` reconcile too.
     pub fn set_blocks_deps(&mut self, task_id: i64, depends_on: &[i64]) -> Result<Task> {
-        if depends_on.contains(&task_id) {
-            return Err(Error::Invalid("a task cannot depend on itself".into()));
-        }
         let tx = self.conn.transaction()?;
         if get_task(&tx, task_id)?.is_none() {
             return Err(Error::TaskNotFound(task_id));
@@ -231,6 +230,7 @@ impl Store {
             if get_task(&tx, *dep)?.is_none() {
                 return Err(Error::TaskNotFound(*dep));
             }
+            reject_blocks_cycle(&tx, task_id, *dep)?;
             tx.execute(
                 "INSERT OR IGNORE INTO deps (task_id, depends_on, kind) VALUES (?1, ?2, 'blocks')",
                 params![task_id, dep],
@@ -325,6 +325,66 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
     }
 
     Ok(to)
+}
+
+/// Reject `from` acquiring a `blocks` dependency on `to` if doing so would
+/// close a cycle in the `blocks` graph (a task blocking itself, directly or
+/// transitively). Called by every write path that adds a `blocks` edge.
+pub(crate) fn reject_blocks_cycle(conn: &Connection, from: i64, to: i64) -> Result<()> {
+    if let Some(cycle) = find_blocks_cycle(conn, from, to)? {
+        let path = cycle
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        return Err(Error::DependencyCycle(path));
+    }
+    Ok(())
+}
+
+/// Would adding the edge `from` --blocks--> `to` close a cycle? Equivalent to
+/// asking whether `to` can already reach `from` by following existing
+/// `blocks` edges (`task_id -> depends_on`) — if so, the new edge would let
+/// `from` walk out to `to` and back to itself. Self-deps are the degenerate
+/// case where `from == to`, a zero-hop cycle. Returns the cycle in task-id
+/// order starting and ending at `from`, e.g. `[3, 7, 3]`.
+fn find_blocks_cycle(conn: &Connection, from: i64, to: i64) -> Result<Option<Vec<i64>>> {
+    if from == to {
+        return Ok(Some(vec![from, from]));
+    }
+
+    // BFS outward from `to`, following `blocks` edges, recording each node's
+    // predecessor so a path back to `to` can be rebuilt if `from` turns up.
+    let mut predecessor: HashMap<i64, i64> = HashMap::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(to);
+
+    while let Some(node) = queue.pop_front() {
+        if node == from {
+            let mut path = vec![node];
+            let mut cur = node;
+            while cur != to {
+                cur = predecessor[&cur];
+                path.push(cur);
+            }
+            path.reverse(); // now to -> ... -> from
+            let mut cycle = vec![from];
+            cycle.extend(path);
+            return Ok(Some(cycle));
+        }
+        let mut stmt = conn
+            .prepare_cached("SELECT depends_on FROM deps WHERE task_id = ?1 AND kind = 'blocks'")?;
+        let children: Vec<i64> = stmt
+            .query_map([node], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for child in children {
+            if child != to && !predecessor.contains_key(&child) {
+                predecessor.insert(child, node);
+                queue.push_back(child);
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Append `text` under a `## {heading}` section at the end of the body,
@@ -1013,5 +1073,103 @@ mod tests {
             let id = create(&mut s, p, TaskState::Ready);
             assert!(!s.redispatch_flag(id).unwrap());
         }
+    }
+
+    #[test]
+    fn add_dep_rejects_self_blocks() {
+        let (mut s, p) = store_with_project();
+        let task = create(&mut s, p, TaskState::Ready);
+        let err = s.add_dep(task, task, DepKind::Blocks).unwrap_err();
+        assert!(
+            matches!(&err, Error::DependencyCycle(path) if path == &format!("{task} -> {task}")),
+            "expected a self-cycle error, got {err}"
+        );
+    }
+
+    #[test]
+    fn add_dep_rejects_direct_cycle() {
+        let (mut s, p) = store_with_project();
+        let a = create(&mut s, p, TaskState::Ready);
+        let b = create(&mut s, p, TaskState::Ready);
+        s.add_dep(b, a, DepKind::Blocks).unwrap();
+
+        let err = s.add_dep(a, b, DepKind::Blocks).unwrap_err();
+        assert!(
+            matches!(&err, Error::DependencyCycle(path) if path == &format!("{a} -> {b} -> {a}")),
+            "expected a direct cycle error, got {err}"
+        );
+        // the rejected write must not have landed
+        assert!(s.deps_of(a).unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_dep_rejects_transitive_cycle() {
+        let (mut s, p) = store_with_project();
+        let a = create(&mut s, p, TaskState::Ready);
+        let b = create(&mut s, p, TaskState::Ready);
+        let c = create(&mut s, p, TaskState::Ready);
+        s.add_dep(b, c, DepKind::Blocks).unwrap();
+        s.add_dep(c, a, DepKind::Blocks).unwrap();
+
+        let err = s.add_dep(a, b, DepKind::Blocks).unwrap_err();
+        assert!(
+            matches!(&err, Error::DependencyCycle(path)
+                if path == &format!("{a} -> {b} -> {c} -> {a}")),
+            "expected a transitive cycle error, got {err}"
+        );
+    }
+
+    #[test]
+    fn add_dep_allows_a_diamond() {
+        // a depends on b and c; b and c both depend on d. Not a cycle.
+        let (mut s, p) = store_with_project();
+        let a = create(&mut s, p, TaskState::Ready);
+        let b = create(&mut s, p, TaskState::Ready);
+        let c = create(&mut s, p, TaskState::Ready);
+        let d = create(&mut s, p, TaskState::Ready);
+        s.add_dep(b, d, DepKind::Blocks).unwrap();
+        s.add_dep(c, d, DepKind::Blocks).unwrap();
+        s.add_dep(a, b, DepKind::Blocks).unwrap();
+        s.add_dep(a, c, DepKind::Blocks).unwrap();
+
+        let deps = s.deps_of(a).unwrap();
+        assert_eq!(
+            deps.iter().map(|d| d.depends_on).collect::<Vec<_>>(),
+            vec![b, c]
+        );
+    }
+
+    #[test]
+    fn set_blocks_deps_rejects_self_and_transitive_cycles() {
+        let (mut s, p) = store_with_project();
+        let a = create(&mut s, p, TaskState::Ready);
+        let b = create(&mut s, p, TaskState::Ready);
+        let c = create(&mut s, p, TaskState::Ready);
+
+        let err = s.set_blocks_deps(a, &[a]).unwrap_err();
+        assert!(matches!(&err, Error::DependencyCycle(path) if path == &format!("{a} -> {a}")));
+
+        // b -> c -> a, then a -> b would close the cycle
+        s.set_blocks_deps(b, &[c]).unwrap();
+        s.set_blocks_deps(c, &[a]).unwrap();
+        let err = s.set_blocks_deps(a, &[b]).unwrap_err();
+        assert!(matches!(&err, Error::DependencyCycle(path)
+                if path == &format!("{a} -> {b} -> {c} -> {a}")));
+        // the rejected write must leave the task's existing blocks deps alone
+        assert!(s.deps_of(a).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_blocks_deps_allows_a_diamond() {
+        let (mut s, p) = store_with_project();
+        let a = create(&mut s, p, TaskState::Ready);
+        let b = create(&mut s, p, TaskState::Ready);
+        let c = create(&mut s, p, TaskState::Ready);
+        let d = create(&mut s, p, TaskState::Ready);
+        s.set_blocks_deps(b, &[d]).unwrap();
+        s.set_blocks_deps(c, &[d]).unwrap();
+
+        let t = s.set_blocks_deps(a, &[b, c]).unwrap();
+        assert_eq!(t.state, TaskState::Parked);
     }
 }
