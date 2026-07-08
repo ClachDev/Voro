@@ -15,6 +15,12 @@ pub enum Error {
     #[error("project {0} not found")]
     ProjectNotFound(i64),
 
+    #[error(
+        "project {id} has {count} task(s) and cannot be deleted — set its weight to 0 to park \
+         it instead, which snoozes it without losing history"
+    )]
+    ProjectHasTasks { id: i64, count: i64 },
+
     #[error("session {0} not found")]
     SessionNotFound(i64),
 

@@ -160,6 +160,53 @@ impl Store {
         Ok(())
     }
 
+    /// Tasks reference a project by id, not name, so renaming is a pure
+    /// label change — no task or dependency is touched.
+    pub fn rename_project(&mut self, project_id: i64, name: &str) -> Result<Project> {
+        let changed = self.conn.execute(
+            "UPDATE projects SET name = ?1 WHERE id = ?2",
+            params![name, project_id],
+        )?;
+        if changed == 0 {
+            return Err(Error::ProjectNotFound(project_id));
+        }
+        self.project(project_id)
+    }
+
+    pub fn set_path(&mut self, project_id: i64, path: &str) -> Result<Project> {
+        let changed = self.conn.execute(
+            "UPDATE projects SET path = ?1 WHERE id = ?2",
+            params![path, project_id],
+        )?;
+        if changed == 0 {
+            return Err(Error::ProjectNotFound(project_id));
+        }
+        self.project(project_id)
+    }
+
+    /// Delete a project outright — only ever safe when it has no tasks, since
+    /// tasks reference their project by id and deleting from under them would
+    /// orphan history. A project with tasks in any state (including `done` and
+    /// `rejected`) refuses; weight 0 is the designed way to snooze a project
+    /// without losing its history.
+    pub fn delete_project(&mut self, project_id: i64) -> Result<()> {
+        self.project(project_id)?;
+        let task_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE project_id = ?1",
+            [project_id],
+            |r| r.get(0),
+        )?;
+        if task_count > 0 {
+            return Err(Error::ProjectHasTasks {
+                id: project_id,
+                count: task_count,
+            });
+        }
+        self.conn
+            .execute("DELETE FROM projects WHERE id = ?1", [project_id])?;
+        Ok(())
+    }
+
     // --- tasks ---
 
     pub fn create_task(&mut self, new: NewTask) -> Result<Task> {
@@ -463,6 +510,140 @@ pub(crate) fn log_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transition::{Action, Triage};
+
+    #[test]
+    fn rename_project_updates_name_and_leaves_task_references_intact() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("old-name", "/tmp/old").unwrap();
+        let task = s
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "t".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+
+        let renamed = s.rename_project(p.id, "new-name").unwrap();
+        assert_eq!(renamed.id, p.id);
+        assert_eq!(renamed.name, "new-name");
+
+        // the task still resolves to the same project by id, under its new name
+        let reloaded = s.task(task.id).unwrap();
+        assert_eq!(reloaded.project_id, p.id);
+        assert_eq!(s.project(reloaded.project_id).unwrap().name, "new-name");
+    }
+
+    #[test]
+    fn rename_project_rejects_unknown_id() {
+        let mut s = Store::open_in_memory().unwrap();
+        assert!(matches!(
+            s.rename_project(999, "x"),
+            Err(Error::ProjectNotFound(999))
+        ));
+    }
+
+    #[test]
+    fn set_path_updates_path() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("proj", "/tmp/old").unwrap();
+        let updated = s.set_path(p.id, "/tmp/new").unwrap();
+        assert_eq!(updated.path, "/tmp/new");
+        assert_eq!(s.project(p.id).unwrap().path, "/tmp/new");
+    }
+
+    #[test]
+    fn set_path_rejects_unknown_id() {
+        let mut s = Store::open_in_memory().unwrap();
+        assert!(matches!(
+            s.set_path(999, "/tmp"),
+            Err(Error::ProjectNotFound(999))
+        ));
+    }
+
+    #[test]
+    fn delete_project_removes_a_taskless_project() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("empty", "/tmp/empty").unwrap();
+        s.delete_project(p.id).unwrap();
+        assert!(matches!(s.project(p.id), Err(Error::ProjectNotFound(_))));
+        assert!(s.projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_project_rejects_unknown_id() {
+        let mut s = Store::open_in_memory().unwrap();
+        assert!(matches!(
+            s.delete_project(999),
+            Err(Error::ProjectNotFound(999))
+        ));
+    }
+
+    /// Walk a fresh task into `state` through the transition API, mirroring
+    /// the equivalent helper in `transition.rs`'s own tests.
+    fn task_in_state(s: &mut Store, project_id: i64, state: TaskState) -> i64 {
+        use TaskState::*;
+        let create = |s: &mut Store, state| {
+            s.create_task(NewTask {
+                project_id,
+                title: format!("task in {state}"),
+                body: String::new(),
+                priority: Priority::P1,
+                state,
+                agent: None,
+            })
+            .unwrap()
+            .id
+        };
+        match state {
+            Proposed | Parked | Ready => create(s, state),
+            Running => {
+                let id = create(s, Ready);
+                s.apply(id, Action::Start).unwrap();
+                id
+            }
+            NeedsInput => {
+                let id = task_in_state(s, project_id, Running);
+                s.apply(id, Action::Ask("which schema?".into())).unwrap();
+                id
+            }
+            Review => {
+                let id = task_in_state(s, project_id, Running);
+                s.apply(id, Action::Complete).unwrap();
+                id
+            }
+            Done => {
+                let id = task_in_state(s, project_id, Review);
+                s.apply(id, Action::Accept).unwrap();
+                id
+            }
+            Rejected => {
+                let id = create(s, Proposed);
+                s.apply(id, Action::Triage(Triage::Reject)).unwrap();
+                id
+            }
+        }
+    }
+
+    #[test]
+    fn delete_project_refuses_with_a_task_in_any_state() {
+        for state in TaskState::ALL {
+            let mut s = Store::open_in_memory().unwrap();
+            let p = s.create_project("proj", "/tmp/proj").unwrap();
+            task_in_state(&mut s, p.id, state);
+
+            let err = s.delete_project(p.id).unwrap_err();
+            assert!(
+                matches!(err, Error::ProjectHasTasks { id, count } if id == p.id && count == 1),
+                "state {state}: expected ProjectHasTasks, got {err}"
+            );
+            // the refusal must not have touched the project
+            assert!(s.project(p.id).is_ok());
+        }
+    }
 
     /// A database created at schema version 1 (state still named 'backlog')
     /// must convert on open: rows renamed, deps/events surviving the table

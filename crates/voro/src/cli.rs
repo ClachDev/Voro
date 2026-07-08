@@ -23,6 +23,10 @@ usage: voro [--db PATH]                 launch the TUI
 projects
   project add <name> <path>       create a project (weight 3)
   project list                    list projects with weights
+  project rename <project> <name> rename a project (tasks reference it by id)
+  project path <project> <path>   change a project's checkout path
+  project delete <project>        delete a project with no tasks — park it
+                                  (weight 0) instead to snooze one that has any
   weight <project> <0-5>          set a project's weight (0 parks it)
 
 tasks
@@ -189,7 +193,7 @@ fn project_verb(
     pos: &[String],
     _flags: &HashMap<String, String>,
 ) -> Result<String, String> {
-    match need(pos, 1, "project subcommand (add|list)")? {
+    match need(pos, 1, "project subcommand (add|list|rename|path|delete)")? {
         "add" => {
             let name = need(pos, 2, "project name")?;
             let path = need(pos, 3, "project path")?;
@@ -207,6 +211,32 @@ fn project_verb(
                 writeln!(out, "{:3}  w{}  {}  {}", p.id, p.weight, p.name, p.path).unwrap();
             }
             Ok(out)
+        }
+        "rename" => {
+            let project = resolve_project(store, need(pos, 2, "project")?)?;
+            let name = need(pos, 3, "new name")?;
+            let p = store
+                .rename_project(project.id, name)
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "project {} renamed '{}' -> '{}'",
+                p.id, project.name, p.name
+            ))
+        }
+        "path" => {
+            let project = resolve_project(store, need(pos, 2, "project")?)?;
+            let path = need(pos, 3, "new path")?;
+            let p = store
+                .set_path(project.id, path)
+                .map_err(|e| e.to_string())?;
+            Ok(format!("project {} path -> {}", p.id, p.path))
+        }
+        "delete" => {
+            let project = resolve_project(store, need(pos, 2, "project")?)?;
+            store
+                .delete_project(project.id)
+                .map_err(|e| e.to_string())?;
+            Ok(format!("project {} '{}' deleted", project.id, project.name))
         }
         other => Err(format!("unknown project subcommand '{other}'")),
     }
@@ -645,6 +675,35 @@ mod tests {
     fn err(store: &mut Store, args: &[&str]) -> String {
         run(store, args.iter().map(|s| s.to_string()).collect(), &ctx())
             .expect_err(&format!("{args:?} should fail"))
+    }
+
+    #[test]
+    fn project_rename_path_and_delete_through_the_cli() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp/demo"]);
+
+        let out = ok(&mut s, &["project", "rename", "demo", "renamed"]);
+        assert!(out.contains("'demo' -> 'renamed'"), "{out}");
+        assert!(ok(&mut s, &["project", "list"]).contains("renamed"));
+
+        let out = ok(&mut s, &["project", "path", "renamed", "/tmp/moved"]);
+        assert!(out.contains("/tmp/moved"), "{out}");
+        assert!(ok(&mut s, &["project", "list"]).contains("/tmp/moved"));
+
+        let out = ok(&mut s, &["project", "delete", "renamed"]);
+        assert!(out.contains("deleted"), "{out}");
+        assert!(!ok(&mut s, &["project", "list"]).contains("renamed"));
+    }
+
+    #[test]
+    fn project_delete_refuses_when_it_has_a_task() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T"]);
+        let e = err(&mut s, &["project", "delete", "demo"]);
+        assert!(e.contains("park") && e.contains("weight to 0"), "{e}");
+        // the refusal must not have deleted anything
+        assert!(ok(&mut s, &["project", "list"]).contains("demo"));
     }
 
     #[test]

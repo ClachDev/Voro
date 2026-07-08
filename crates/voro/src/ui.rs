@@ -37,7 +37,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title("Weights — press 0-5, esc to close"),
+                        .title("Weights — 0-5 weight, r rename/path, d delete, esc to close"),
                 )
                 .highlight_style(SELECTED);
             frame.render_stateful_widget(list, area, &mut state);
@@ -46,6 +46,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             name,
             path,
             on_path,
+            editing,
         } => {
             let area = popup_area(frame, 56, 4);
             let field = |label: &str, value: &str, active: bool| {
@@ -59,15 +60,15 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                     Span::styled(format!("{value}▏"), style),
                 ])
             };
+            let title = match editing {
+                Some(id) => format!("Edit project #{id} — tab to switch, ⏎ to save"),
+                None => "New project — tab to switch, ⏎ to save".to_string(),
+            };
             let para = Paragraph::new(vec![
                 field("name", name, !*on_path),
                 field("path", path, *on_path),
             ])
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("New project — tab to switch, ⏎ to save"),
-            );
+            .block(Block::default().borders(Borders::ALL).title(title));
             frame.render_widget(para, area);
         }
         Mode::PickProject { sel } => {
