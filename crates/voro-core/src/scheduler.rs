@@ -449,6 +449,29 @@ mod tests {
     }
 
     #[test]
+    fn tasks_with_open_blockers_never_reach_the_queue() {
+        let mut s = setup();
+        let p = add_project(&mut s, "p", 3);
+        let blocker = add_task(&mut s, p, "blocker", Priority::P2);
+        let blocked = add_task(&mut s, p, "blocked", Priority::P0);
+        s.add_dep(blocked, blocker, crate::DepKind::Blocks).unwrap();
+
+        // the high-priority blocked task is out of the running until its
+        // blocker closes — neither view offers it
+        let candidates = s.candidates().unwrap();
+        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
+        assert_eq!(ids, vec![blocker]);
+        assert_eq!(focus(&candidates).unwrap().task.id, blocker);
+
+        // once the blocker closes it surfaces, and now outranks it
+        s.apply(blocker, crate::Action::Start).unwrap();
+        s.apply(blocker, crate::Action::Complete).unwrap();
+        s.apply(blocker, crate::Action::Accept).unwrap();
+        let candidates = s.candidates().unwrap();
+        assert_eq!(focus(&candidates).unwrap().task.id, blocked);
+    }
+
+    #[test]
     fn deterministic_tail_ordering() {
         let mut s = setup();
         let p = add_project(&mut s, "p", 3);
