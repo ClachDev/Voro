@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
-use crate::model::{Dep, DepKind, Event, Priority, Project, Task, TaskState};
+use crate::model::{
+    Dep, DepKind, Event, Priority, Project, Session, SessionOutcome, Task, TaskState,
+};
 
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
@@ -256,6 +258,65 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    // --- sessions ---
+
+    /// Open a session for a running task, stamping `started_at`. `ended_at` and
+    /// `outcome` stay NULL until [`end_session`](Store::end_session).
+    pub fn create_session(
+        &mut self,
+        task_id: i64,
+        agent: &str,
+        pid: Option<i64>,
+        log_path: Option<&str>,
+    ) -> Result<Session> {
+        self.conn.execute(
+            "INSERT INTO sessions (task_id, agent, pid, log_path, started_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            params![task_id, agent, pid, log_path],
+        )?;
+        self.session(self.conn.last_insert_rowid())
+    }
+
+    /// Close a session with its outcome, stamping `ended_at`.
+    pub fn end_session(&mut self, id: i64, outcome: SessionOutcome) -> Result<Session> {
+        let changed = self.conn.execute(
+            "UPDATE sessions SET ended_at = datetime('now'), outcome = ?1 WHERE id = ?2",
+            params![outcome, id],
+        )?;
+        if changed == 0 {
+            return Err(Error::SessionNotFound(id));
+        }
+        self.session(id)
+    }
+
+    pub fn session(&self, id: i64) -> Result<Session> {
+        self.conn
+            .query_row(
+                &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
+                [id],
+                session_from_row,
+            )
+            .optional()?
+            .ok_or(Error::SessionNotFound(id))
+    }
+
+    pub fn sessions_for(&self, task_id: i64) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE task_id = ?1 ORDER BY id DESC"
+        ))?;
+        let rows = stmt.query_map([task_id], session_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Sessions that have not yet ended, newest first.
+    pub fn live_sessions(&self) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE ended_at IS NULL ORDER BY id DESC"
+        ))?;
+        let rows = stmt.query_map([], session_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     // --- events ---
 
     pub fn events_for(&self, task_id: i64) -> Result<Vec<Event>> {
@@ -301,6 +362,22 @@ pub(crate) fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         state_since: row.get(8)?,
         created_at: row.get(9)?,
         closed_at: row.get(10)?,
+    })
+}
+
+pub(crate) const SESSION_COLUMNS: &str =
+    "id, task_id, agent, pid, log_path, started_at, ended_at, outcome";
+
+fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
+    Ok(Session {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        agent: row.get(2)?,
+        pid: row.get(3)?,
+        log_path: row.get(4)?,
+        started_at: row.get(5)?,
+        ended_at: row.get(6)?,
+        outcome: row.get(7)?,
     })
 }
 
@@ -370,6 +447,98 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 2);
+    }
+
+    /// A project + running task to hang sessions off of.
+    fn task_fixture(s: &mut Store) -> i64 {
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO tasks (project_id, title, state, state_since, created_at)
+                 VALUES (?1, 'run me', 'running', datetime('now'), datetime('now'))",
+                params![p.id],
+            )
+            .unwrap();
+        s.conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn session_create_end_round_trip() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+
+        let opened = s
+            .create_session(task_id, "claude", Some(4321), Some("/var/log/s.log"))
+            .unwrap();
+        assert_eq!(opened.task_id, task_id);
+        assert_eq!(opened.agent, "claude");
+        assert_eq!(opened.pid, Some(4321));
+        assert_eq!(opened.log_path.as_deref(), Some("/var/log/s.log"));
+        assert!(!opened.started_at.is_empty());
+        assert!(opened.ended_at.is_none());
+        assert!(opened.outcome.is_none());
+
+        let ended = s.end_session(opened.id, SessionOutcome::Completed).unwrap();
+        assert_eq!(ended.id, opened.id);
+        assert!(ended.ended_at.is_some());
+        assert_eq!(ended.outcome, Some(SessionOutcome::Completed));
+
+        assert_eq!(s.session(opened.id).unwrap(), ended);
+    }
+
+    #[test]
+    fn session_optional_fields_are_null() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+        let opened = s.create_session(task_id, "codex", None, None).unwrap();
+        assert!(opened.pid.is_none());
+        assert!(opened.log_path.is_none());
+    }
+
+    #[test]
+    fn end_session_rejects_unknown_id() {
+        let mut s = Store::open_in_memory().unwrap();
+        assert!(matches!(
+            s.end_session(999, SessionOutcome::Aborted),
+            Err(Error::SessionNotFound(999))
+        ));
+    }
+
+    #[test]
+    fn sessions_for_returns_newest_first() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+        let first = s.create_session(task_id, "claude", None, None).unwrap();
+        let second = s.create_session(task_id, "claude", None, None).unwrap();
+
+        let sessions = s.sessions_for(task_id).unwrap();
+        assert_eq!(
+            sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![second.id, first.id]
+        );
+    }
+
+    #[test]
+    fn live_sessions_excludes_ended() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+        let done = s.create_session(task_id, "claude", None, None).unwrap();
+        let live = s.create_session(task_id, "claude", None, None).unwrap();
+        s.end_session(done.id, SessionOutcome::Failed).unwrap();
+
+        let ids = s.live_sessions().unwrap();
+        assert_eq!(ids.iter().map(|s| s.id).collect::<Vec<_>>(), vec![live.id]);
+    }
+
+    #[test]
+    fn session_outcome_serialises_for_all_variants() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+        for outcome in SessionOutcome::ALL {
+            let opened = s.create_session(task_id, "claude", None, None).unwrap();
+            let ended = s.end_session(opened.id, outcome).unwrap();
+            assert_eq!(ended.outcome, Some(outcome));
+        }
     }
 
     /// A unique scratch database path under the OS temp dir.

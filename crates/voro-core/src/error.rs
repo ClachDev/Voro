@@ -13,6 +13,9 @@ pub enum Error {
     #[error("project {0} not found")]
     ProjectNotFound(i64),
 
+    #[error("session {0} not found")]
+    SessionNotFound(i64),
+
     #[error("cannot {action} a task in state '{from}'")]
     InvalidTransition { from: TaskState, action: String },
 
