@@ -206,6 +206,42 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             );
             frame.render_widget(para, area);
         }
+        Mode::History {
+            task_id,
+            events,
+            scroll,
+        } => {
+            let frame_area = frame.area();
+            let width = frame_area.width.saturating_sub(8).clamp(30, 100);
+            let height = frame_area.height.saturating_sub(4).clamp(8, 40);
+            let area = popup_area(frame, width, height);
+            let lines: Vec<Line> = if events.is_empty() {
+                vec![Line::from(Span::styled(
+                    "no events yet",
+                    Style::new().dim(),
+                ))]
+            } else {
+                events
+                    .iter()
+                    .map(|e| {
+                        Line::from(vec![
+                            Span::styled(format!("{:<19} ", e.at), Style::new().dim()),
+                            Span::styled(format!("{:<10} ", e.kind), Style::new().bold()),
+                            Span::raw(e.detail.clone().unwrap_or_default()),
+                        ])
+                    })
+                    .collect()
+            };
+            let para = Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((*scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!("History of #{task_id} — j/k scroll · h/esc close")),
+                );
+            frame.render_widget(para, area);
+        }
     }
 }
 
@@ -474,7 +510,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 hints.push_str(" · ");
                 hints.push_str(enter);
             }
-            hints.push_str(" · n new · e edit · s state · x score · w weights · P project");
+            hints.push_str(
+                " · n new · e edit · s state · x score · h history · w weights · P project",
+            );
             Line::from(Span::styled(hints, Style::new().dim()))
         }
     };

@@ -730,6 +730,44 @@ mod tests {
         s.conn.last_insert_rowid()
     }
 
+    /// `events_for` must return the audit trail oldest-first (newest last),
+    /// since that's the order the history popup renders it in.
+    #[test]
+    fn events_for_orders_oldest_first() {
+        use crate::transition::Action;
+
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let task = s
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "trace me".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+        s.apply(task.id, Action::Start).unwrap();
+        s.apply(task.id, Action::Ask("A or B?".into())).unwrap();
+        s.apply(task.id, Action::Answer("B".into())).unwrap();
+
+        let events = s.events_for(task.id).unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "created",
+                "transition",
+                "transition",
+                "transition",
+                "answer"
+            ]
+        );
+        // ids strictly increase with insertion order
+        assert!(events.windows(2).all(|w| w[0].id < w[1].id));
+    }
+
     #[test]
     fn session_create_end_round_trip() {
         let mut s = Store::open_in_memory().unwrap();
