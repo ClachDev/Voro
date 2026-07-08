@@ -1,4 +1,5 @@
 mod app;
+mod cli;
 mod editor;
 mod ui;
 
@@ -10,24 +11,42 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use app::{App, EditorRequest};
 use focus_core::Store;
 
-fn db_path() -> PathBuf {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--db"
-            && let Some(path) = args.next()
-        {
-            return PathBuf::from(path);
+/// Pull `--db PATH` out of the argument list; whatever remains is the CLI
+/// verb and its arguments (empty → launch the TUI).
+fn split_db(args: Vec<String>) -> (PathBuf, Vec<String>) {
+    let mut rest = Vec::new();
+    let mut db = None;
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        if arg == "--db" {
+            db = it.next().map(PathBuf::from);
+        } else {
+            rest.push(arg);
         }
     }
-    if let Some(path) = std::env::var_os("FOCUS_DB") {
-        return PathBuf::from(path);
-    }
-    Store::default_db_path()
+    let db = db
+        .or_else(|| std::env::var_os("FOCUS_DB").map(PathBuf::from))
+        .unwrap_or_else(Store::default_db_path);
+    (db, rest)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = db_path();
-    let store = Store::open(&path)?;
+    let (path, verb_args) = split_db(std::env::args().skip(1).collect());
+    let mut store = Store::open(&path)?;
+
+    if !verb_args.is_empty() {
+        match cli::run(&mut store, verb_args) {
+            Ok(output) => {
+                println!("{}", output.trim_end_matches('\n'));
+                return Ok(());
+            }
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let mut app = App::new(store)?;
 
     let mut terminal = ratatui::init();
