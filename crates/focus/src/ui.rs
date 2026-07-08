@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::app::{App, CockpitRow, Screen};
+use crate::app::{App, CockpitRow, Mode, Screen};
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
@@ -12,6 +12,151 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
         Screen::Cockpit => draw_cockpit(frame, app),
         Screen::Tasks => draw_tasks(frame, app),
+    }
+    draw_mode(frame, app);
+}
+
+fn draw_mode(frame: &mut Frame, app: &App) {
+    match &app.mode {
+        Mode::Normal => {}
+        Mode::Weights { sel } => {
+            let items: Vec<ListItem> = app
+                .projects
+                .iter()
+                .map(|p| ListItem::new(format!("{}  {}", p.weight, p.name)))
+                .collect();
+            let height = items.len() as u16 + 2;
+            let area = popup_area(frame, 44, height.max(3));
+            let mut state = ListState::default().with_selected(Some(*sel));
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Weights — press 0-5, esc to close"),
+                )
+                .highlight_style(SELECTED);
+            frame.render_stateful_widget(list, area, &mut state);
+        }
+        Mode::AddProject {
+            name,
+            path,
+            on_path,
+        } => {
+            let area = popup_area(frame, 56, 4);
+            let field = |label: &str, value: &str, active: bool| {
+                let style = if active {
+                    Style::new().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::new()
+                };
+                Line::from(vec![
+                    Span::raw(format!("{label}: ")),
+                    Span::styled(format!("{value}▏"), style),
+                ])
+            };
+            let para = Paragraph::new(vec![
+                field("name", name, !*on_path),
+                field("path", path, *on_path),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("New project — tab to switch, ⏎ to save"),
+            );
+            frame.render_widget(para, area);
+        }
+        Mode::PickProject { sel } => {
+            let items: Vec<ListItem> = app
+                .projects
+                .iter()
+                .map(|p| ListItem::new(p.name.clone()))
+                .collect();
+            let height = items.len() as u16 + 2;
+            let area = popup_area(frame, 44, height.max(3));
+            let mut state = ListState::default().with_selected(Some(*sel));
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Project for the new task"),
+                )
+                .highlight_style(SELECTED);
+            frame.render_stateful_widget(list, area, &mut state);
+        }
+        Mode::Transition {
+            task_id,
+            actions,
+            sel,
+        } => {
+            let items: Vec<ListItem> = actions
+                .iter()
+                .map(|a| ListItem::new(crate::app::action_label(a)))
+                .collect();
+            let height = items.len() as u16 + 2;
+            let area = popup_area(frame, 48, height.max(3));
+            let mut state = ListState::default().with_selected(Some(*sel));
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!("Transition task {task_id}")),
+                )
+                .highlight_style(SELECTED);
+            frame.render_stateful_widget(list, area, &mut state);
+        }
+        Mode::Prompt { kind, buffer, .. } => {
+            let area = popup_area(frame, 64, 3);
+            let para = Paragraph::new(Line::from(vec![Span::raw(format!("{buffer}▏"))])).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("{} — ⏎ to submit, esc to cancel", kind.title())),
+            );
+            frame.render_widget(para, area);
+        }
+        Mode::Score {
+            task_id,
+            state,
+            breakdown,
+        } => {
+            let b = breakdown;
+            let mut lines = vec![
+                Line::from(format!("weight          {:>6}", b.weight)),
+                Line::from(format!(
+                    "priority        {:>6}  (value {})",
+                    b.priority.to_string(),
+                    b.priority_value
+                )),
+                Line::from(format!("base w × p      {:>6.1}", b.base)),
+                Line::from(format!("age             {:>6.1} days", b.age_days)),
+                Line::from(format!(
+                    "age bonus       {:>6.2}  (0.1/day, cap 2)",
+                    b.age_bonus
+                )),
+                Line::from(Span::styled(
+                    format!("total           {:>6.2}", b.total),
+                    Style::new().bold().fg(Color::Yellow),
+                )),
+            ];
+            if !matches!(
+                state,
+                focus_core::TaskState::Ready
+                    | focus_core::TaskState::NeedsInput
+                    | focus_core::TaskState::Review
+            ) {
+                lines.push(Line::from(Span::styled(
+                    format!("({state} tasks are not scheduled)"),
+                    Style::new().dim(),
+                )));
+            }
+            let height = lines.len() as u16 + 2;
+            let area = popup_area(frame, 44, height);
+            let para = Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("Score of task {task_id}")),
+            );
+            frame.render_widget(para, area);
+        }
     }
 }
 
