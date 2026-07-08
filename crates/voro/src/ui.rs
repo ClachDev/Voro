@@ -8,6 +8,11 @@ use crate::app::{App, CockpitRow, Mode, Screen};
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
+/// The canonical rendering of a task identifier, right-aligned for list columns.
+fn task_ref(id: i64) -> String {
+    format!("{:>4}", format!("#{id}"))
+}
+
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
         Screen::Cockpit => draw_cockpit(frame, app),
@@ -99,7 +104,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(format!("Transition task {task_id}")),
+                        .title(format!("Transition #{task_id}")),
                 )
                 .highlight_style(SELECTED);
             frame.render_stateful_widget(list, area, &mut state);
@@ -146,7 +151,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(format!("Task {task_id} — ⏎ state · j/k scroll · esc close")),
+                        .title(format!("#{task_id} — ⏎ state · j/k scroll · esc close")),
                 );
             frame.render_widget(para, area);
         }
@@ -196,7 +201,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             let para = Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!("Score of task {task_id}")),
+                    .title(format!("Score of #{task_id}")),
             );
             frame.render_widget(para, area);
         }
@@ -271,7 +276,8 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
                     score,
                     Span::styled(
                         format!(
-                            "{:6} {} {}: {}",
+                            "{} {:6} {} {}: {}",
+                            task_ref(c.task.id),
                             action_verb(c.task.state),
                             c.task.priority,
                             c.project_name,
@@ -329,8 +335,8 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut meta = vec![Span::raw(format!(
-        "{} · {} · {} · task {}",
-        project, task.priority, task.state, task.id
+        "#{} · {} · {} · {}",
+        task.id, project, task.priority, task.state
     ))];
     if let Some(total) = score {
         meta.push(Span::raw(" · "));
@@ -362,7 +368,7 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect) {
                 selected = Some(items.len());
             }
             items.push(ListItem::new(format!(
-                "{} ({}): {}",
+                "#{} ({}): {}",
                 r.task.id, r.project, r.task.title
             )));
         }
@@ -390,8 +396,13 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
             };
             ListItem::new(Line::from(Span::styled(
                 format!(
-                    "{:4} {:11} {} w{} {:14} {}",
-                    r.task.id, r.task.state, r.task.priority, r.weight, r.project, r.task.title
+                    "{} {:11} {} w{} {:14} {}",
+                    task_ref(r.task.id),
+                    r.task.state,
+                    r.task.priority,
+                    r.weight,
+                    r.project,
+                    r.task.title
                 ),
                 style,
             )))
