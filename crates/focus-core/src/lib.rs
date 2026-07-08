@@ -6,10 +6,12 @@
 mod error;
 mod model;
 mod store;
+mod transition;
 
 pub use error::{Error, Result};
 pub use model::{Dep, DepKind, Event, Priority, Project, Task, TaskState};
 pub use store::{NewTask, Store, TaskEdit};
+pub use transition::{Action, Triage};
 
 #[cfg(test)]
 mod tests {

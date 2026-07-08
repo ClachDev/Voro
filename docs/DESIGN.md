@@ -98,7 +98,7 @@ CREATE TABLE events (            -- append-only audit of state transitions & ans
 );
 ```
 
-Ready-work detection — the thing beads would have provided — is one query: a task is *unblocked* when no `blocks` dependency points at a task not in `done`/`rejected`. Only `blocks` gates readiness; `discovered-from`, `parent`, and `related` are navigational metadata. When a task's last blocker closes, the store promotes it `backlog → ready` and stamps `state_since`, which is what makes the prepared-prompt pattern work: tomorrow's task, written today and chained behind its blocker, surfaces fully loaded the moment it becomes actionable.
+Ready-work detection — the thing beads would have provided — is one query: a task is *unblocked* when no `blocks` dependency points at a task not in `done`/`rejected`. Only `blocks` gates readiness; `discovered-from`, `parent`, and `related` are navigational metadata. When a task's last blocker closes, the store promotes it `backlog → ready` and stamps `state_since`, which is what makes the prepared-prompt pattern work: tomorrow's task, written today and chained behind its blocker, surfaces fully loaded the moment it becomes actionable. Auto-promotion applies only to backlog tasks that *have* blockers — a backlog task with none is deliberately parked and moves only by manual unpark. The reverse holds too: adding an open blocker to a `ready` task demotes it back to `backlog` in the same write.
 
 Agent definitions live in a small config file rather than the database, since they are command templates, not state — `~/.config/focus/agents.toml`:
 
@@ -117,14 +117,14 @@ cmd = "codex exec {prompt_file}"
 | State | Meaning | Enters by | Leaves by |
 |---|---|---|---|
 | `proposed` | Suggested (often by an agent post-task); not yet triaged. Invisible to scheduler. | agent proposal, quick capture | human triage → `backlog`/`ready`, or → `rejected` |
-| `backlog` | Triaged, real, but dependencies open or deliberately parked. | triage; dependency added | dependencies close → `ready` |
-| `ready` | Actionable now. Eligible for the focus view. | triage; last blocker closes | dispatch or manual start → `running` |
+| `backlog` | Triaged, real, but dependencies open or deliberately parked. | triage; dependency added | dependencies close → `ready`; manual unpark → `ready`; abandon → `rejected` |
+| `ready` | Actionable now. Eligible for the focus view. | triage; last blocker closes | dispatch or manual start → `running`; park → `backlog`; abandon → `rejected` |
 | `running` | An agent (or the human) is actively on it. | dispatch | agent raises question → `needs-input`; work lands → `review`; cap/failure → `ready` (flagged for redispatch); abort → `ready` |
-| `needs-input` | Blocked on a human decision; `question` is set. **The inbox is exactly this set.** | agent verb; manual flag | answer supplied → `running` (answer appended to notes and fed to the session) |
-| `review` | Agent believes it is done; awaiting human acceptance. | agent completion | accept → `done`; reject with feedback → `running` |
+| `needs-input` | Blocked on a human decision; `question` is set. **The inbox is exactly this set.** | agent verb; manual flag | answer supplied → `running` (answer appended to the task body under an `## Answers` heading, logged as an event, and fed to the session); abandon → `rejected` |
+| `review` | Agent believes it is done; awaiting human acceptance. | agent completion | accept → `done`; reject with feedback → `running`; abandon → `rejected` |
 | `done` / `rejected` | Closed. `done` prompts triage of any `discovered-from` proposals. | acceptance / triage | — |
 
-Two deliberate choices. First, `needs-input` and `review` are both human-attention states but are kept distinct because they sort differently: an unanswered question stalls in-flight work and outranks a completed diff waiting for review at equal score. Second, `proposed` exists precisely so agent-generated tasks can be captured freely without polluting the queues — the triage act is itself surfaced (a standing "triage N proposed tasks" inbox entry when N > 0), which keeps the generation pipeline honest without automating it.
+Three deliberate choices. Any triaged, non-terminal state can be *abandoned* straight to `rejected` — obsolete work must not need walking through the rest of the machine to close, and parking (`ready` → `backlog`) has a manual inverse for the same reason. Second, `needs-input` and `review` are both human-attention states but are kept distinct because they sort differently: an unanswered question stalls in-flight work and outranks a completed diff waiting for review at equal score. Third, `proposed` exists precisely so agent-generated tasks can be captured freely without polluting the queues — the triage act is itself surfaced (a standing "triage N proposed tasks" inbox entry when N > 0), which keeps the generation pipeline honest without automating it.
 
 ## 7. Scoring
 
@@ -137,7 +137,7 @@ priority_value: P0 → 8, P1 → 4, P2 → 2, P3 → 1
 age_bonus:      0.1 × days_in_current_state, capped at 2
 ```
 
-Project weight is an integer 0–5, where 0 means "parked — hide entirely" (this is how a project is snoozed without deleting anything). The geometric priority values ensure a P0 in a weight-2 project (16) still beats a P2 in a weight-5 project (10) — priorities within a project should mean something absolute, not just relative. The age bonus is a gentle anti-starvation nudge so old P2s eventually surface, capped so it can never masquerade as a priority level. Taskwarrior's experience suggests urgency formulae accrete coefficients until nobody trusts the number; resist that. Any tuning should be observable via a score-decomposition view in the TUI (and later `focus explain <task>`).
+Project weight is an integer 0–5, where 0 means "parked — hide entirely" (this is how a project is snoozed without deleting anything). The geometric priority values ensure a P0 in a weight-2 project (16) still beats a P2 in a weight-5 project (10) — priorities within a project should mean something absolute, not just relative. The age bonus is a gentle anti-starvation nudge so old P2s eventually surface, capped so it can never masquerade as a priority level. It applies uniformly to every scored state — `ready`, `needs-input`, and `review` alike — because a week-old unanswered question is a smell worth amplifying, not just an old task. Taskwarrior's experience suggests urgency formulae accrete coefficients until nobody trusts the number; resist that. Any tuning should be observable via a score-decomposition view in the TUI (and later `focus explain <task>`).
 
 Ordering of the two views: the inbox is all `needs-input` tasks (plus `review` items and the triage meta-item) sorted by score; the focus is the top `ready` task by score. The cockpit always shows the inbox above the focus — drain decisions before starting new work.
 
@@ -181,7 +181,7 @@ Ordered by dependency and by time-to-useful, not by calendar — with agents doi
 
 ## 11. Open questions
 
-Worktrees per dispatch, or run in the main checkout? In-place with a dirty-tree guard until parallel dispatch within a single project is genuinely wanted. How does `review` get its diff in front of you — is opening the repo in Zed enough, or does the TUI need an inline diff pane (Vibe Kanban's strongest feature)? Should the age bonus apply to `needs-input` items too (a week-old unanswered question is a smell worth amplifying)? How much session output should Focus retain — full logs per session, or just the tail plus the outcome? And naming: `focus` collides with shell muscle memory for some; bikeshed at leisure.
+Worktrees per dispatch, or run in the main checkout? In-place with a dirty-tree guard until parallel dispatch within a single project is genuinely wanted. How does `review` get its diff in front of you — is opening the repo in Zed enough, or does the TUI need an inline diff pane (Vibe Kanban's strongest feature)? ~~Should the age bonus apply to `needs-input` items too?~~ — resolved: it applies uniformly to all scored states (§7). How much session output should Focus retain — full logs per session, or just the tail plus the outcome? And naming: `focus` collides with shell muscle memory for some; bikeshed at leisure.
 
 ## 12. Risks
 

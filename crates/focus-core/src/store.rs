@@ -156,14 +156,7 @@ impl Store {
     }
 
     pub fn task(&self, id: i64) -> Result<Task> {
-        self.conn
-            .query_row(
-                &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
-                [id],
-                task_from_row,
-            )
-            .optional()?
-            .ok_or(Error::TaskNotFound(id))
+        get_task(&self.conn, id)?.ok_or(Error::TaskNotFound(id))
     }
 
     pub fn tasks(&self) -> Result<Vec<Task>> {
@@ -191,18 +184,26 @@ impl Store {
         if task_id == depends_on {
             return Err(Error::Invalid("a task cannot depend on itself".into()));
         }
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "INSERT INTO deps (task_id, depends_on, kind) VALUES (?1, ?2, ?3)",
             params![task_id, depends_on, kind],
         )?;
+        if kind == DepKind::Blocks {
+            crate::transition::reconcile_readiness(&tx, task_id)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn remove_dep(&mut self, task_id: i64, depends_on: i64) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "DELETE FROM deps WHERE task_id = ?1 AND depends_on = ?2",
             params![task_id, depends_on],
         )?;
+        crate::transition::reconcile_readiness(&tx, task_id)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -241,6 +242,16 @@ impl Store {
 
 pub(crate) const TASK_COLUMNS: &str = "id, project_id, title, body, priority, state, agent, \
                                        question, state_since, created_at, closed_at";
+
+pub(crate) fn get_task(conn: &Connection, id: i64) -> Result<Option<Task>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
+            [id],
+            task_from_row,
+        )
+        .optional()?)
+}
 
 pub(crate) fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
