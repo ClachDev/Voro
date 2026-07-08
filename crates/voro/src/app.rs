@@ -110,6 +110,11 @@ pub fn action_label(action: &Action) -> &'static str {
 
 pub struct App {
     pub store: Store,
+    /// Where a continuation dispatch (DESIGN.md §6, "fed to the session")
+    /// finds its inputs and puts its artefacts — the same context the CLI's
+    /// `dispatch`/`continue`/`answer` verbs use, so the TUI's answer action
+    /// behaves identically.
+    dispatch_ctx: crate::dispatch::DispatchCtx,
     pub screen: Screen,
     pub should_quit: bool,
     pub status: Option<String>,
@@ -150,9 +155,10 @@ fn browse_order(state: TaskState) -> u8 {
 }
 
 impl App {
-    pub fn new(store: Store) -> voro_core::Result<App> {
+    pub fn new(store: Store, dispatch_ctx: crate::dispatch::DispatchCtx) -> voro_core::Result<App> {
         let mut app = App {
             store,
+            dispatch_ctx,
             screen: Screen::Cockpit,
             should_quit: false,
             status: None,
@@ -335,9 +341,32 @@ impl App {
         self.all.iter().map(|r| &r.task).find(|t| t.id == id)
     }
 
+    /// Apply a transition and refresh. An `Answer` on a task with prior
+    /// session history additionally triggers a continuation dispatch
+    /// (DESIGN.md §6: "fed to the session" means resuming the work with the
+    /// answer in hand, not writing to a live pipe) — the same rule and the
+    /// same mechanics `voro answer` uses on the CLI, so the two stay
+    /// consistent. A task that was only ever started by hand has no session
+    /// history and the transition stands alone.
     fn apply_and_refresh(&mut self, task_id: i64, action: Action) {
+        let has_history = matches!(action, Action::Answer(_))
+            && self
+                .store
+                .sessions_for(task_id)
+                .is_ok_and(|sessions| !sessions.is_empty());
         let result = self.store.apply(task_id, action);
         if self.report(result).is_some() {
+            if has_history {
+                match crate::dispatch::continue_dispatch(
+                    &mut self.store,
+                    &self.dispatch_ctx,
+                    task_id,
+                    None,
+                ) {
+                    Ok(summary) => self.status = Some(summary),
+                    Err(e) => self.status = Some(format!("answered, but continuation failed: {e}")),
+                }
+            }
             let result = self.refresh();
             self.report(result);
         }
@@ -694,6 +723,13 @@ mod tests {
         app.on_key(KeyEvent::from(code));
     }
 
+    /// A `DispatchCtx` that is never actually used to spawn anything in these
+    /// tests — none of them build up session history on a task before
+    /// answering it, so `apply_and_refresh`'s continuation path never fires.
+    fn dummy_ctx() -> crate::dispatch::DispatchCtx {
+        crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new("/nonexistent/voro.db"))
+    }
+
     /// A store with one project and one task per requested state, reached
     /// through the real transition machine.
     fn app_with(states: &[TaskState]) -> App {
@@ -733,7 +769,7 @@ mod tests {
                 other => panic!("fixture does not build {other} tasks"),
             }
         }
-        App::new(store).unwrap()
+        App::new(store, dummy_ctx()).unwrap()
     }
 
     #[test]
@@ -759,6 +795,87 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
         assert!(app.queue.is_empty());
+    }
+
+    /// The TUI's answer action is the CLI's `voro answer` under a different
+    /// keybinding (task #31, DESIGN.md §6): a task with prior session history
+    /// gets a continuation dispatched automatically when answered here too.
+    #[test]
+    fn answering_a_task_with_session_history_triggers_a_continuation() {
+        use std::process::{Command, Stdio};
+
+        let root = std::env::temp_dir().join(format!(
+            "voro-app-answer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project_path = root.join("project");
+        std::fs::create_dir_all(&project_path).unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&project_path)
+            .args(["init", "-q"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+
+        let db_path = root.join("voro.db");
+        let agents_path = root.join("agents.toml");
+        // The continuation this test triggers must still be alive when
+        // `apply_and_refresh`'s own `self.refresh()` reconciles-on-read
+        // immediately afterwards — an instantly-exiting stub (`cat`, as
+        // `dispatch.rs`'s tests use) would otherwise race that read and get
+        // finalised as a failed session before the assertions below run.
+        std::fs::write(
+            &agents_path,
+            "default = \"stub\"\n\n[agents.stub]\ncmd = \"sleep 1 && cat {prompt_file}\"\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(&db_path).unwrap();
+        let ctx = crate::dispatch::DispatchCtx {
+            db_path: db_path.clone(),
+            agents_path,
+            runtime_dir: root.join("sessions"),
+        };
+        let project = store
+            .create_project("demo", project_path.to_str().unwrap())
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: project.id,
+                title: "Do the thing".into(),
+                body: "Detailed prompt.".into(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+        crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
+        store.apply(task.id, Action::Ask("A or B?".into())).unwrap();
+
+        let mut app = App::new(store, ctx).unwrap();
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('B'));
+        key(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.store.task(task.id).unwrap().state, TaskState::Running);
+        assert_eq!(app.store.sessions_for(task.id).unwrap().len(), 2);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("continued task"),
+            "{:?}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

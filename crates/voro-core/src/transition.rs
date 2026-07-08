@@ -115,6 +115,36 @@ impl Store {
         Ok((self.task(task_id)?, self.session(session_id)?))
     }
 
+    /// Record a continuation session (DESIGN.md §6/§8): the answer to a
+    /// `needs-input` question is fed back to the work not by writing to a live
+    /// pipe — the asking session has typically already exited — but by
+    /// dispatching a fresh session whose prompt is the task body, now carrying
+    /// the `## Answers` section `apply`'s `Answer` action just appended.
+    /// Unlike [`record_dispatch`](Store::record_dispatch), which performs the
+    /// `ready → running` transition itself, continuation asserts the task is
+    /// *already* `running` — `answer` puts it there — so this never weakens
+    /// the ready-only rule normal dispatch enforces; it only ever adds a
+    /// session to a task that reached `running` through the transition API.
+    pub fn record_continuation(
+        &mut self,
+        task_id: i64,
+        agent: &str,
+        pid: Option<i64>,
+        log_path: Option<&str>,
+    ) -> Result<(Task, Session)> {
+        let tx = self.conn.transaction()?;
+        let task = get_task(&tx, task_id)?.ok_or(Error::TaskNotFound(task_id))?;
+        if task.state != TaskState::Running {
+            return Err(Error::InvalidTransition {
+                from: task.state,
+                action: "continue".to_string(),
+            });
+        }
+        let session_id = insert_session(&tx, task_id, agent, pid, log_path)?;
+        tx.commit()?;
+        Ok((self.task(task_id)?, self.session(session_id)?))
+    }
+
     /// Close out a session whose backing process is no longer running
     /// (DESIGN.md §8, the observation half of dispatch). `pid_alive` and
     /// `likely_capped` are supplied by the caller — voro-core stays free of
@@ -779,6 +809,53 @@ mod tests {
         // the failed transaction must leave neither state change nor session
         assert_eq!(s.task(id).unwrap().state, TaskState::Proposed);
         assert!(s.sessions_for(id).unwrap().is_empty());
+    }
+
+    // --- record_continuation (DESIGN.md §6/§8: answer → running → continue) ---
+
+    #[test]
+    fn record_continuation_adds_a_session_without_touching_state() {
+        let (mut s, p) = store_with_project();
+        let id = task_in_state(&mut s, p, TaskState::NeedsInput);
+        s.apply(id, Action::Answer("B, with a covering index".into()))
+            .unwrap();
+        assert_eq!(s.task(id).unwrap().state, TaskState::Running);
+
+        let (task, session) = s
+            .record_continuation(id, "claude", Some(777), Some("/var/log/31.log"))
+            .unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(session.task_id, id);
+        assert_eq!(session.agent, "claude");
+        assert_eq!(session.pid, Some(777));
+        assert_eq!(session.log_path.as_deref(), Some("/var/log/31.log"));
+        assert!(session.ended_at.is_none());
+        assert_eq!(s.sessions_for(id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_continuation_refuses_a_task_that_is_not_running() {
+        let (mut s, p) = store_with_project();
+        for state in [
+            TaskState::Proposed,
+            TaskState::Parked,
+            TaskState::Ready,
+            TaskState::NeedsInput,
+            TaskState::Review,
+            TaskState::Done,
+            TaskState::Rejected,
+        ] {
+            let id = task_in_state(&mut s, p, state);
+            assert!(
+                matches!(
+                    s.record_continuation(id, "claude", None, None),
+                    Err(Error::InvalidTransition { .. })
+                ),
+                "continuation should be refused from {state}"
+            );
+            // refusal must not create a session
+            assert!(s.sessions_for(id).unwrap().is_empty());
+        }
     }
 
     #[test]

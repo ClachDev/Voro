@@ -35,9 +35,9 @@ fn split_db(args: Vec<String>) -> (PathBuf, Vec<String>) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (path, verb_args) = split_db(std::env::args().skip(1).collect());
     let mut store = Store::open(&path)?;
+    let ctx = dispatch::DispatchCtx::from_db_path(&path);
 
     if !verb_args.is_empty() {
-        let ctx = dispatch::DispatchCtx::from_db_path(&path);
         match cli::run(&mut store, verb_args, &ctx) {
             Ok(output) => {
                 println!("{}", output.trim_end_matches('\n'));
@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut app = App::new(store)?;
+    let mut app = App::new(store, ctx)?;
 
     let mut terminal = ratatui::init();
     let result = loop {
