@@ -24,7 +24,7 @@ scratch path; only deliberate task management touches the real database.
 ## Reading
 
 ```
-voro inbox              # what needs the human: questions + reviews, by score
+voro inbox              # the next-action queue: questions, reviews, proposals, top ready tasks — one list by score
 voro next               # the single top ready task, with its full body
 voro list [--state ready] [--project NAME]
 voro show <id>          # body, deps, event history

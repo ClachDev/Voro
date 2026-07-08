@@ -12,9 +12,7 @@ pub enum Screen {
 /// One selectable row on the cockpit; indices point into the App caches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CockpitRow {
-    Inbox(usize),
-    Triage,
-    Focus,
+    Queue(usize),
     Running(usize),
 }
 
@@ -79,6 +77,10 @@ pub enum Mode {
         state: TaskState,
         breakdown: ScoreBreakdown,
     },
+    Detail {
+        task_id: i64,
+        scroll: u16,
+    },
 }
 
 /// A request for main() to suspend the terminal and run $EDITOR.
@@ -113,11 +115,9 @@ pub struct App {
     pub status: Option<String>,
 
     pub projects: Vec<Project>,
-    pub inbox: Vec<Candidate>,
-    pub focus: Option<Candidate>,
+    pub queue: Vec<Candidate>,
     pub running: Vec<TaskRow>,
     pub all: Vec<TaskRow>,
-    pub proposed: i64,
 
     pub cockpit_rows: Vec<CockpitRow>,
     pub cockpit_sel: usize,
@@ -153,11 +153,9 @@ impl App {
             should_quit: false,
             status: None,
             projects: Vec::new(),
-            inbox: Vec::new(),
-            focus: None,
+            queue: Vec::new(),
             running: Vec::new(),
             all: Vec::new(),
-            proposed: 0,
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
             tasks_sel: 0,
@@ -187,9 +185,7 @@ impl App {
     pub fn refresh(&mut self) -> voro_core::Result<()> {
         self.projects = self.store.projects()?;
         let candidates = self.store.candidates()?;
-        self.inbox = scheduler::inbox(&candidates).into_iter().cloned().collect();
-        self.focus = scheduler::focus(&candidates).cloned();
-        self.proposed = self.store.proposed_count()?;
+        self.queue = scheduler::queue(&candidates).into_iter().cloned().collect();
 
         let mut all: Vec<TaskRow> = self
             .store
@@ -217,13 +213,7 @@ impl App {
             .collect();
         self.all = all;
 
-        self.cockpit_rows = (0..self.inbox.len()).map(CockpitRow::Inbox).collect();
-        if self.proposed > 0 {
-            self.cockpit_rows.push(CockpitRow::Triage);
-        }
-        if self.focus.is_some() {
-            self.cockpit_rows.push(CockpitRow::Focus);
-        }
+        self.cockpit_rows = (0..self.queue.len()).map(CockpitRow::Queue).collect();
         self.cockpit_rows
             .extend((0..self.running.len()).map(CockpitRow::Running));
 
@@ -237,10 +227,8 @@ impl App {
     pub fn selected_task_id(&self) -> Option<i64> {
         match self.screen {
             Screen::Cockpit => match self.cockpit_rows.get(self.cockpit_sel)? {
-                CockpitRow::Inbox(i) => Some(self.inbox.get(*i)?.task.id),
-                CockpitRow::Focus => Some(self.focus.as_ref()?.task.id),
+                CockpitRow::Queue(i) => Some(self.queue.get(*i)?.task.id),
                 CockpitRow::Running(i) => Some(self.running.get(*i)?.task.id),
-                CockpitRow::Triage => None,
             },
             Screen::Tasks => Some(self.all.get(self.tasks_sel)?.task.id),
         }
@@ -264,16 +252,51 @@ impl App {
         };
     }
 
-    /// Jump to the first proposed task in the browser (the triage row's
-    /// Enter action).
-    pub fn jump_to_proposed(&mut self) {
-        self.screen = Screen::Tasks;
-        if let Some(i) = self
-            .all
-            .iter()
-            .position(|r| r.task.state == TaskState::Proposed)
-        {
-            self.tasks_sel = i;
+    /// The primary action of the current selection. On the Tasks screen every
+    /// row opens its detail view. On the cockpit — where the detail pane
+    /// already shows the body — a needs-input task opens the answer prompt
+    /// directly and any other task opens its transition menu.
+    fn activate_selection(&mut self) {
+        if self.screen == Screen::Tasks {
+            if let Some(task_id) = self.selected_task_id() {
+                self.mode = Mode::Detail { task_id, scroll: 0 };
+            }
+            return;
+        }
+        if let Some(task) = self.selected_task() {
+            if task.state == TaskState::NeedsInput {
+                self.mode = Mode::Prompt {
+                    task_id: task.id,
+                    kind: PromptKind::Answer,
+                    buffer: String::new(),
+                };
+            } else {
+                let actions = Store::legal_actions(task.state);
+                if !actions.is_empty() {
+                    self.mode = Mode::Transition {
+                        task_id: task.id,
+                        actions,
+                        sel: 0,
+                    };
+                }
+            }
+        }
+    }
+
+    /// What Enter does for the current selection, phrased for the status
+    /// line; None when it does nothing.
+    pub fn enter_hint(&self) -> Option<&'static str> {
+        match self.screen {
+            Screen::Tasks => self.all.get(self.tasks_sel).map(|_| "⏎ view"),
+            Screen::Cockpit => match self.cockpit_rows.get(self.cockpit_sel)? {
+                CockpitRow::Queue(i) => match self.queue.get(*i)?.task.state {
+                    TaskState::NeedsInput => Some("⏎ answer"),
+                    TaskState::Proposed => Some("⏎ triage"),
+                    TaskState::Review => Some("⏎ review"),
+                    _ => Some("⏎ act"),
+                },
+                CockpitRow::Running(_) => Some("⏎ act"),
+            },
         }
     }
 
@@ -325,6 +348,7 @@ impl App {
                 buffer,
             } => self.key_prompt(key, task_id, kind, buffer),
             Mode::Score { .. } => {} // any key closes
+            Mode::Detail { task_id, scroll } => self.key_detail(key, task_id, scroll),
         }
     }
 
@@ -338,16 +362,7 @@ impl App {
                 let result = self.refresh();
                 self.report(result);
             }
-            KeyCode::Enter => {
-                if self.screen == Screen::Cockpit
-                    && matches!(
-                        self.cockpit_rows.get(self.cockpit_sel),
-                        Some(CockpitRow::Triage)
-                    )
-                {
-                    self.jump_to_proposed();
-                }
-            }
+            KeyCode::Enter => self.activate_selection(),
             KeyCode::Char('w') => {
                 if self.projects.is_empty() {
                     self.status = Some("no projects yet — press P to add one".into());
@@ -582,6 +597,31 @@ impl App {
         };
     }
 
+    fn key_detail(&mut self, key: KeyEvent, task_id: i64, mut scroll: u16) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Char('j') | KeyCode::Down => scroll = scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => scroll = scroll.saturating_sub(1),
+            KeyCode::Enter | KeyCode::Char('s') => {
+                if let Some(task) = self.all.iter().map(|r| &r.task).find(|t| t.id == task_id) {
+                    let actions = Store::legal_actions(task.state);
+                    if actions.is_empty() {
+                        self.status = Some(format!("task is {} — nowhere to go", task.state));
+                    } else {
+                        self.mode = Mode::Transition {
+                            task_id,
+                            actions,
+                            sel: 0,
+                        };
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::Detail { task_id, scroll };
+    }
+
     // --- editor application (called by main after the $EDITOR round-trip) ---
 
     pub fn create_from_form(
@@ -622,5 +662,201 @@ impl App {
         )?;
         self.store.set_blocks_deps(task_id, &form.blocks)?;
         self.refresh()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use voro_core::{NewTask, Priority};
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::from(code));
+    }
+
+    /// A store with one project and one task per requested state, reached
+    /// through the real transition machine.
+    fn app_with(states: &[TaskState]) -> App {
+        let mut store = Store::open_in_memory().unwrap();
+        let project = store.create_project("demo", "/tmp/demo").unwrap();
+        for state in states {
+            let created = if *state == TaskState::Proposed {
+                TaskState::Proposed
+            } else {
+                TaskState::Ready
+            };
+            let task = store
+                .create_task(NewTask {
+                    project_id: project.id,
+                    title: format!("{state} task"),
+                    body: String::new(),
+                    priority: Priority::P1,
+                    state: created,
+                    agent: None,
+                })
+                .unwrap();
+            match state {
+                TaskState::Ready | TaskState::Proposed => {}
+                TaskState::NeedsInput => {
+                    store.apply(task.id, Action::Start).unwrap();
+                    store.apply(task.id, Action::Ask("A or B?".into())).unwrap();
+                }
+                TaskState::Review => {
+                    store.apply(task.id, Action::Start).unwrap();
+                    store.apply(task.id, Action::Complete).unwrap();
+                }
+                TaskState::Done => {
+                    store.apply(task.id, Action::Start).unwrap();
+                    store.apply(task.id, Action::Complete).unwrap();
+                    store.apply(task.id, Action::Accept).unwrap();
+                }
+                other => panic!("fixture does not build {other} tasks"),
+            }
+        }
+        App::new(store).unwrap()
+    }
+
+    #[test]
+    fn enter_on_needs_input_row_answers_and_requeues() {
+        let mut app = app_with(&[TaskState::NeedsInput]);
+        assert!(matches!(
+            app.cockpit_rows[app.cockpit_sel],
+            CockpitRow::Queue(_)
+        ));
+        assert_eq!(app.enter_hint(), Some("⏎ answer"));
+
+        key(&mut app, KeyCode::Enter);
+        let task_id = match app.mode {
+            Mode::Prompt {
+                task_id,
+                kind: PromptKind::Answer,
+                ..
+            } => task_id,
+            _ => panic!("enter on a needs-input row should open the answer prompt"),
+        };
+
+        key(&mut app, KeyCode::Char('B'));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn enter_on_review_row_opens_review_actions() {
+        let mut app = app_with(&[TaskState::Review]);
+        assert_eq!(app.enter_hint(), Some("⏎ review"));
+
+        key(&mut app, KeyCode::Enter);
+        match &app.mode {
+            Mode::Transition { actions, .. } => {
+                assert_eq!(*actions, Store::legal_actions(TaskState::Review));
+            }
+            _ => panic!("enter on a review row should open the transition menu"),
+        }
+    }
+
+    #[test]
+    fn enter_on_ready_row_leads_with_start() {
+        let mut app = app_with(&[TaskState::Ready]);
+        assert!(matches!(
+            app.cockpit_rows[app.cockpit_sel],
+            CockpitRow::Queue(_)
+        ));
+        assert_eq!(app.enter_hint(), Some("⏎ act"));
+
+        key(&mut app, KeyCode::Enter);
+        let task_id = match &app.mode {
+            Mode::Transition {
+                actions,
+                sel: 0,
+                task_id,
+            } => {
+                assert_eq!(actions[0], Action::Start);
+                *task_id
+            }
+            _ => panic!("enter on a ready row should open the transition menu"),
+        };
+
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
+    }
+
+    #[test]
+    fn enter_hint_is_absent_where_enter_does_nothing() {
+        let mut app = app_with(&[]);
+        assert_eq!(app.enter_hint(), None);
+        app.toggle_screen();
+        assert_eq!(app.screen, Screen::Tasks);
+        assert_eq!(app.enter_hint(), None);
+    }
+
+    #[test]
+    fn enter_on_proposed_row_opens_triage_menu() {
+        let mut app = app_with(&[TaskState::Proposed]);
+        assert!(matches!(
+            app.cockpit_rows[app.cockpit_sel],
+            CockpitRow::Queue(_)
+        ));
+        assert_eq!(app.enter_hint(), Some("⏎ triage"));
+
+        key(&mut app, KeyCode::Enter);
+        let task_id = match &app.mode {
+            Mode::Transition {
+                actions, task_id, ..
+            } => {
+                assert_eq!(*actions, Store::legal_actions(TaskState::Proposed));
+                *task_id
+            }
+            _ => panic!("enter on a proposed row should open the triage menu"),
+        };
+
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Ready);
+        // the triaged task re-enters the queue as startable work
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.enter_hint(), Some("⏎ act"));
+    }
+
+    #[test]
+    fn tasks_screen_enter_opens_detail_then_transitions() {
+        let mut app = app_with(&[TaskState::Ready]);
+        app.toggle_screen();
+        assert_eq!(app.enter_hint(), Some("⏎ view"));
+
+        key(&mut app, KeyCode::Enter);
+        let task_id = match app.mode {
+            Mode::Detail { task_id, scroll: 0 } => task_id,
+            _ => panic!("enter on a tasks-screen row should open the detail view"),
+        };
+
+        key(&mut app, KeyCode::Enter);
+        match &app.mode {
+            Mode::Transition { actions, .. } => {
+                assert_eq!(*actions, Store::legal_actions(TaskState::Ready));
+            }
+            _ => panic!("enter in the detail view should open the transition menu"),
+        }
+
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
+    }
+
+    #[test]
+    fn detail_view_scrolls_closes_and_dead_ends_gracefully() {
+        let mut app = app_with(&[TaskState::Done]);
+        app.toggle_screen();
+
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char('k'));
+        assert!(matches!(app.mode, Mode::Detail { scroll: 1, .. }));
+
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Detail { .. }));
+        assert!(app.status.as_deref().unwrap_or("").contains("nowhere"));
+
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
     }
 }

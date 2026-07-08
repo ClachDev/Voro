@@ -113,6 +113,43 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             );
             frame.render_widget(para, area);
         }
+        Mode::Detail { task_id, scroll } => {
+            let Some(row) = app.all.iter().find(|r| r.task.id == *task_id) else {
+                return;
+            };
+            let frame_area = frame.area();
+            let width = frame_area.width.saturating_sub(8).clamp(30, 90);
+            let height = frame_area.height.saturating_sub(4).clamp(8, 40);
+            let area = popup_area(frame, width, height);
+            let t = &row.task;
+            let mut lines = vec![
+                Line::from(Span::styled(t.title.clone(), Style::new().bold())),
+                Line::from(Span::styled(
+                    format!(
+                        "{} · {} · {} · w{}",
+                        row.project, t.priority, t.state, row.weight
+                    ),
+                    Style::new().dim(),
+                )),
+            ];
+            if let Some(q) = &t.question {
+                lines.push(Line::from(Span::styled(
+                    format!("question: {q}"),
+                    Style::new().fg(Color::Cyan),
+                )));
+            }
+            lines.push(Line::default());
+            lines.extend(t.body.lines().map(|l| Line::from(l.to_string())));
+            let para = Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((*scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!("Task {task_id} — ⏎ state · j/k scroll · esc close")),
+                );
+            frame.render_widget(para, area);
+        }
         Mode::Score {
             task_id,
             state,
@@ -142,6 +179,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 voro_core::TaskState::Ready
                     | voro_core::TaskState::NeedsInput
                     | voro_core::TaskState::Review
+                    | voro_core::TaskState::Proposed
             ) {
                 lines.push(Line::from(Span::styled(
                     format!("({state} tasks are not scheduled)"),
@@ -161,11 +199,10 @@ fn draw_mode(frame: &mut Frame, app: &App) {
 }
 
 fn draw_cockpit(frame: &mut Frame, app: &App) {
-    let inbox_rows = app.inbox.len() + usize::from(app.proposed > 0);
-    let inbox_height = (inbox_rows as u16 + 2).clamp(3, 12);
-    let [header, inbox, focus, running, status] = Layout::vertical([
+    let queue_height = (app.queue.len() as u16 + 2).clamp(3, 12);
+    let [header, queue, detail, running, status] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(inbox_height),
+        Constraint::Length(queue_height),
         Constraint::Min(5),
         Constraint::Length(4),
         Constraint::Length(1),
@@ -173,8 +210,8 @@ fn draw_cockpit(frame: &mut Frame, app: &App) {
     .areas(frame.area());
 
     draw_header(frame, app, header);
-    draw_inbox(frame, app, inbox);
-    draw_focus(frame, app, focus);
+    draw_queue(frame, app, queue);
+    draw_detail(frame, app, detail);
     draw_running(frame, app, running);
     draw_status(frame, app, status);
 }
@@ -196,19 +233,47 @@ fn score_span(total: f64) -> Span<'static> {
     Span::styled(format!("{total:5.1} "), Style::new().fg(Color::Yellow))
 }
 
-fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
+/// The verb a queue row's Enter performs, from its state.
+fn action_verb(state: voro_core::TaskState) -> &'static str {
+    match state {
+        voro_core::TaskState::NeedsInput => "answer",
+        voro_core::TaskState::Review => "review",
+        voro_core::TaskState::Proposed => "triage",
+        voro_core::TaskState::Ready => "start",
+        _ => "",
+    }
+}
+
+fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
     let mut items: Vec<ListItem> = Vec::new();
     let mut selected: Option<usize> = None;
     for (i, row) in app.cockpit_rows.iter().enumerate() {
         let item = match row {
-            CockpitRow::Inbox(idx) => {
-                let c = &app.inbox[*idx];
+            CockpitRow::Queue(idx) => {
+                let c = &app.queue[*idx];
+                let untriaged = c.task.state == voro_core::TaskState::Proposed;
+                let style = if untriaged {
+                    Style::new().dim()
+                } else {
+                    Style::new()
+                };
+                let score = if untriaged {
+                    Span::styled(format!("{:5.1} ", c.score.total), style)
+                } else {
+                    score_span(c.score.total)
+                };
                 let mut spans = vec![
-                    score_span(c.score.total),
-                    Span::raw(format!(
-                        "{} {:11} {}: {}",
-                        c.task.priority, c.task.state, c.project_name, c.task.title
-                    )),
+                    score,
+                    Span::styled(
+                        format!(
+                            "{:6} {} {}: {}",
+                            action_verb(c.task.state),
+                            c.task.priority,
+                            c.project_name,
+                            c.task.title
+                        ),
+                        style,
+                    ),
                 ];
                 if let Some(q) = &c.task.question {
                     spans.push(Span::styled(
@@ -218,10 +283,6 @@ fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 ListItem::new(Line::from(spans))
             }
-            CockpitRow::Triage => ListItem::new(Line::from(Span::styled(
-                format!("      triage {} proposed task(s)  ⏎", app.proposed),
-                Style::new().fg(Color::Magenta),
-            ))),
             _ => continue,
         };
         if i == app.cockpit_sel {
@@ -232,56 +293,58 @@ fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
     let empty = items.is_empty();
     let mut state = ListState::default().with_selected(selected);
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Inbox"))
+        .block(Block::default().borders(Borders::ALL).title("Next"))
         .highlight_style(SELECTED);
     frame.render_stateful_widget(list, area, &mut state);
     if empty {
         let inner = area.inner(ratatui::layout::Margin::new(1, 1));
-        frame.render_widget(Paragraph::new("nothing needs you").dim(), inner);
+        frame.render_widget(Paragraph::new("nothing to do — press n").dim(), inner);
     }
 }
 
-fn draw_focus(frame: &mut Frame, app: &App, area: Rect) {
-    let is_selected = matches!(
-        app.cockpit_rows.get(app.cockpit_sel),
-        Some(CockpitRow::Focus)
-    );
-    let border_style = if is_selected {
-        Style::new().fg(Color::Yellow)
-    } else {
-        Style::new()
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title("Focus");
+/// The body of whichever row is selected — the pane follows the selection
+/// instead of holding its own concept of "the" task.
+fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title("Detail");
 
-    let content = match &app.focus {
-        Some(c) => {
-            let mut lines = vec![
-                Line::from(Span::styled(
-                    c.task.title.clone(),
-                    Style::new().bold().add_modifier(if is_selected {
-                        Modifier::REVERSED
-                    } else {
-                        Modifier::empty()
-                    }),
-                )),
-                Line::from(vec![
-                    score_span(c.score.total),
-                    Span::raw(format!(
-                        "{} · {} · task {} · weight {}",
-                        c.project_name, c.task.priority, c.task.id, c.score.weight
-                    )),
-                ]),
-                Line::default(),
-            ];
-            lines.extend(c.task.body.lines().map(|l| Line::from(l.to_string())));
-            Paragraph::new(lines).wrap(Wrap { trim: false })
+    let selected = app.cockpit_rows.get(app.cockpit_sel);
+    let (task, project, score) = match selected {
+        Some(CockpitRow::Queue(i)) => {
+            let c = &app.queue[*i];
+            (&c.task, c.project_name.as_str(), Some(c.score.total))
         }
-        None => Paragraph::new("no ready tasks").dim(),
+        Some(CockpitRow::Running(i)) => {
+            let r = &app.running[*i];
+            (&r.task, r.project.as_str(), None)
+        }
+        None => {
+            frame.render_widget(Paragraph::new("").block(block), area);
+            return;
+        }
     };
-    frame.render_widget(content.block(block), area);
+
+    let mut meta = vec![Span::raw(format!(
+        "{} · {} · {} · task {}",
+        project, task.priority, task.state, task.id
+    ))];
+    if let Some(total) = score {
+        meta.push(Span::raw(" · "));
+        meta.push(score_span(total));
+    }
+    let mut lines = vec![
+        Line::from(Span::styled(task.title.clone(), Style::new().bold())),
+        Line::from(meta),
+    ];
+    if let Some(q) = &task.question {
+        lines.push(Line::from(Span::styled(
+            format!("question: {q}"),
+            Style::new().fg(Color::Cyan),
+        )));
+    }
+    lines.push(Line::default());
+    lines.extend(task.body.lines().map(|l| Line::from(l.to_string())));
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para.block(block), area);
 }
 
 fn draw_running(frame: &mut Frame, app: &App, area: Rect) {
@@ -344,10 +407,15 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let line = match &app.status {
         Some(msg) => Line::from(Span::styled(msg.clone(), Style::new().fg(Color::Red))),
-        None => Line::from(Span::styled(
-            "q quit · tab screen · j/k move · ⏎ open · n new · e edit · s state · x score · w weights · P project",
-            Style::new().dim(),
-        )),
+        None => {
+            let mut hints = String::from("q quit · tab screen · j/k move");
+            if let Some(enter) = app.enter_hint() {
+                hints.push_str(" · ");
+                hints.push_str(enter);
+            }
+            hints.push_str(" · n new · e edit · s state · x score · w weights · P project");
+            Line::from(Span::styled(hints, Style::new().dim()))
+        }
     };
     frame.render_widget(line, area);
 }

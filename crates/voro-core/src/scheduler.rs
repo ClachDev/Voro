@@ -45,19 +45,34 @@ pub struct Candidate {
     pub score: ScoreBreakdown,
 }
 
-/// All `needs-input` and `review` tasks, sorted by score. The "triage N
-/// proposed tasks" meta-item is a count, not a task; interfaces render it
-/// from `Store::proposed_count`.
-pub fn inbox(candidates: &[Candidate]) -> Vec<&Candidate> {
+/// How many `ready` tasks the queue offers: enough autonomy to choose
+/// around the top one, few enough that the queue stays an answer rather
+/// than a todo list — the browser holds the rest.
+pub const QUEUE_READY_ROWS: usize = 3;
+
+/// The next-action queue (§1): every `needs-input`, `review`, and
+/// `proposed` task plus the top `QUEUE_READY_ROWS` ready tasks, in one list
+/// ordered purely by score. Each row is an action — answer, review, triage,
+/// or start; the human picks from the top, the score does not dictate.
+pub fn queue(candidates: &[Candidate]) -> Vec<&Candidate> {
+    let mut ready: Vec<&Candidate> = candidates
+        .iter()
+        .filter(|c| c.task.state == TaskState::Ready)
+        .collect();
+    ready.sort_by(|a, b| rank(a, b));
+    ready.truncate(QUEUE_READY_ROWS);
+
     let mut items: Vec<&Candidate> = candidates
         .iter()
-        .filter(|c| matches!(c.task.state, TaskState::NeedsInput | TaskState::Review))
+        .filter(|c| c.task.state != TaskState::Ready)
+        .chain(ready)
         .collect();
     items.sort_by(|a, b| rank(a, b));
     items
 }
 
-/// The single highest-scoring `ready` task.
+/// The single highest-scoring `ready` task — what `voro next` hands an
+/// agent asking for work.
 pub fn focus(candidates: &[Candidate]) -> Option<&Candidate> {
     candidates
         .iter()
@@ -65,9 +80,10 @@ pub fn focus(candidates: &[Candidate]) -> Option<&Candidate> {
         .min_by(|a, b| rank(a, b))
 }
 
-/// Total order for views: score desc; then an unanswered question outranks a
-/// finished diff (§6); then priority, older `state_since`, id — the tail
-/// exists only to make the ordering deterministic.
+/// Total order for views: score desc; at equal score an unanswered question
+/// outranks a finished diff, which outranks startable work, which outranks
+/// an untriaged proposal (§6); then priority, older `state_since`, id — the
+/// tail exists only to make the ordering deterministic.
 fn rank(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     b.score
         .total
@@ -82,7 +98,8 @@ fn state_rank(state: TaskState) -> u8 {
     match state {
         TaskState::NeedsInput => 0,
         TaskState::Review => 1,
-        _ => 2,
+        TaskState::Ready => 2,
+        _ => 3,
     }
 }
 
@@ -96,7 +113,7 @@ impl Store {
                     p.name, p.weight,
                     julianday('now') - julianday(t.state_since)
              FROM tasks t JOIN projects p ON p.id = t.project_id
-             WHERE p.weight > 0 AND t.state IN ('ready','needs-input','review')",
+             WHERE p.weight > 0 AND t.state IN ('ready','needs-input','review','proposed')",
         )?;
         let rows = stmt.query_map([], |row| {
             let task = task_from_row(row)?;
@@ -126,8 +143,8 @@ impl Store {
         Ok(score(weight, priority, age_days))
     }
 
-    /// Size of the standing "triage N proposed tasks" inbox entry. Parked
-    /// (weight-0) projects are hidden here too.
+    /// Count of untriaged tasks. Parked (weight-0) projects are hidden
+    /// here too.
     pub fn proposed_count(&self) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM tasks t JOIN projects p ON p.id = t.project_id
@@ -213,6 +230,19 @@ mod tests {
         s.apply(id, crate::Action::Complete).unwrap();
     }
 
+    fn add_proposed(s: &mut Store, project_id: i64, title: &str, priority: Priority) -> i64 {
+        s.create_task(NewTask {
+            project_id,
+            title: title.into(),
+            body: String::new(),
+            priority,
+            state: TaskState::Proposed,
+            agent: None,
+        })
+        .unwrap()
+        .id
+    }
+
     fn set_age_days(s: &mut Store, id: i64, days: f64) {
         s.conn
             .execute(
@@ -237,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn inbox_contains_exactly_needs_input_and_review_sorted_by_score() {
+    fn queue_interleaves_every_actionable_state_by_score() {
         let mut s = setup();
         let a = add_project(&mut s, "a", 3);
         let b = add_project(&mut s, "b", 1);
@@ -248,12 +278,29 @@ mod tests {
         to_review(&mut s, diff);
         let small = add_task(&mut s, b, "small question", Priority::P3); // 1×1 = 1
         to_needs_input(&mut s, small);
-        add_task(&mut s, a, "ready task", Priority::P0); // not inbox material
+        let ready = add_task(&mut s, a, "ready task", Priority::P1); // 3×4 = 12
+        let proposed = add_proposed(&mut s, a, "proposal", Priority::P2); // 3×2 = 6
 
         let candidates = s.candidates().unwrap();
-        let inbox = inbox(&candidates);
-        let ids: Vec<i64> = inbox.iter().map(|c| c.task.id).collect();
-        assert_eq!(ids, vec![diff, question, small]);
+        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
+        // pure score ordering; question beats proposal at the 6.0 tie
+        assert_eq!(ids, vec![diff, ready, question, proposed, small]);
+    }
+
+    #[test]
+    fn queue_offers_only_the_top_ready_rows() {
+        let mut s = setup();
+        let p = add_project(&mut s, "p", 3);
+        let keep: Vec<i64> = (0..QUEUE_READY_ROWS)
+            .map(|i| add_task(&mut s, p, &format!("keep {i}"), Priority::P1))
+            .collect();
+        let dropped = add_task(&mut s, p, "dropped", Priority::P3);
+
+        let candidates = s.candidates().unwrap();
+        let queued = queue(&candidates);
+        let ids: Vec<i64> = queued.iter().map(|c| c.task.id).collect();
+        assert_eq!(ids, keep);
+        assert!(!ids.contains(&dropped));
     }
 
     #[test]
@@ -266,7 +313,7 @@ mod tests {
         to_needs_input(&mut s, question);
 
         let candidates = s.candidates().unwrap();
-        let ids: Vec<i64> = inbox(&candidates).iter().map(|c| c.task.id).collect();
+        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
         assert_eq!(ids, vec![question, diff]);
     }
 
@@ -312,7 +359,8 @@ mod tests {
         let visible = add_task(&mut s, active, "visible", Priority::P3);
 
         let candidates = s.candidates().unwrap();
-        assert!(inbox(&candidates).is_empty());
+        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
+        assert_eq!(ids, vec![visible]);
         assert_eq!(focus(&candidates).unwrap().task.id, visible);
         assert_eq!(s.proposed_count().unwrap(), 0);
     }

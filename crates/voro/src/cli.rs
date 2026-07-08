@@ -29,7 +29,8 @@ tasks
       [--body TEXT | --body-file PATH] [--blocks IDS]
   show <task-id>                  full task: body, deps, events
   list [--state STATE] [--project P]
-  inbox                           needs-input + review, sorted by score
+  inbox                           the next-action queue: questions, reviews,
+                                  proposals, top ready tasks — by score
   next                            the single highest-scoring ready task
   explain <task-id>               score decomposition
 
@@ -339,7 +340,7 @@ fn list_verb(store: &mut Store, flags: &HashMap<String, String>) -> Result<Strin
 fn inbox_verb(store: &mut Store) -> Result<String, String> {
     let candidates = store.candidates().map_err(|e| e.to_string())?;
     let mut out = String::new();
-    for c in scheduler::inbox(&candidates) {
+    for c in scheduler::queue(&candidates) {
         write!(
             out,
             "{:5.1}  {}",
@@ -351,10 +352,6 @@ fn inbox_verb(store: &mut Store) -> Result<String, String> {
             write!(out, "  — {q}").unwrap();
         }
         writeln!(out).unwrap();
-    }
-    let proposed = store.proposed_count().map_err(|e| e.to_string())?;
-    if proposed > 0 {
-        writeln!(out, "triage {proposed} proposed task(s)").unwrap();
     }
     if out.is_empty() {
         out = "nothing needs you\n".to_string();
@@ -520,7 +517,7 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "An idea"]);
-        assert!(ok(&mut s, &["inbox"]).contains("triage 1 proposed"));
+        assert!(ok(&mut s, &["inbox"]).contains("proposed P2 demo: An idea"));
         ok(&mut s, &["triage", "1", "ready"]);
         assert!(ok(&mut s, &["next"]).contains("An idea"));
     }
