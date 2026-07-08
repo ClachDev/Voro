@@ -12,6 +12,8 @@ use voro_core::{
     scheduler,
 };
 
+use crate::dispatch::{self, DispatchCtx};
+
 const HELP: &str = "\
 voro — prioritised attention across projects
 
@@ -38,6 +40,11 @@ tasks
   next                            the single highest-scoring ready task
   explain <task-id>               score decomposition
 
+dispatch
+  dispatch <task-id> [--agent NAME]
+                                  spawn a headless agent session on a ready
+                                  task; --agent overrides the resolved agent
+
 transitions
   triage <task-id> <parked|ready|reject>
   start <task-id>                 ready → running
@@ -52,7 +59,7 @@ transitions
   abandon <task-id>               parked|ready|needs-input|review → rejected
 ";
 
-pub fn run(store: &mut Store, args: Vec<String>) -> Result<String, String> {
+pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<String, String> {
     let (pos, flags) = split_args(args)?;
     let verb = pos.first().map(String::as_str).unwrap_or("help");
     match verb {
@@ -67,6 +74,7 @@ pub fn run(store: &mut Store, args: Vec<String>) -> Result<String, String> {
         "inbox" => inbox_verb(store),
         "next" => next_verb(store),
         "explain" => explain_verb(store, &pos),
+        "dispatch" => dispatch_verb(store, &pos, &flags, ctx),
         "triage" | "start" | "ask" | "answer" | "done" | "accept" | "reject" | "abort" | "park"
         | "unpark" | "abandon" => transition_verb(store, verb, &pos, &flags),
         other => Err(format!("unknown verb '{other}' — try 'voro help'")),
@@ -467,6 +475,16 @@ fn explain_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     Ok(out)
 }
 
+fn dispatch_verb(
+    store: &mut Store,
+    pos: &[String],
+    flags: &HashMap<String, String>,
+    ctx: &DispatchCtx,
+) -> Result<String, String> {
+    let id = task_id(pos, 1)?;
+    dispatch::dispatch(store, ctx, id, flags.get("agent").map(String::as_str))
+}
+
 fn transition_verb(
     store: &mut Store,
     verb: &str,
@@ -522,13 +540,17 @@ mod tests {
         Store::open_in_memory().unwrap()
     }
 
+    fn ctx() -> DispatchCtx {
+        DispatchCtx::from_db_path(std::path::Path::new("/nonexistent/voro.db"))
+    }
+
     fn ok(store: &mut Store, args: &[&str]) -> String {
-        run(store, args.iter().map(|s| s.to_string()).collect())
+        run(store, args.iter().map(|s| s.to_string()).collect(), &ctx())
             .unwrap_or_else(|e| panic!("{args:?} failed: {e}"))
     }
 
     fn err(store: &mut Store, args: &[&str]) -> String {
-        run(store, args.iter().map(|s| s.to_string()).collect())
+        run(store, args.iter().map(|s| s.to_string()).collect(), &ctx())
             .expect_err(&format!("{args:?} should fail"))
     }
 

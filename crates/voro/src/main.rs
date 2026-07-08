@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod dispatch;
 mod editor;
 mod ui;
 
@@ -35,7 +36,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::open(&path)?;
 
     if !verb_args.is_empty() {
-        match cli::run(&mut store, verb_args) {
+        let ctx = dispatch::DispatchCtx::from_db_path(&path);
+        match cli::run(&mut store, verb_args, &ctx) {
             Ok(output) => {
                 println!("{}", output.trim_end_matches('\n'));
                 return Ok(());

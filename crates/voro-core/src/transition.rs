@@ -7,7 +7,7 @@
 use rusqlite::{Connection, params};
 
 use crate::error::{Error, Result};
-use crate::model::{Task, TaskState};
+use crate::model::{Session, Task, TaskState};
 use crate::store::{Store, get_task, log_event};
 
 /// Where a `proposed` task goes at triage.
@@ -91,84 +91,33 @@ impl Store {
 
     pub fn apply(&mut self, task_id: i64, action: Action) -> Result<Task> {
         let tx = self.conn.transaction()?;
-        let task = get_task(&tx, task_id)?.ok_or(Error::TaskNotFound(task_id))?;
-
-        use TaskState::*;
-        let to = match (task.state, &action) {
-            (Proposed, Action::Triage(Triage::Parked)) => Parked,
-            (Proposed, Action::Triage(Triage::Ready)) => Ready,
-            (Proposed, Action::Triage(Triage::Reject)) => Rejected,
-            (Ready, Action::Start) => Running,
-            (Running, Action::Ask(_)) => NeedsInput,
-            (NeedsInput, Action::Answer(_)) => Running,
-            (Running, Action::Complete) => Review,
-            (Review, Action::Accept) => Done,
-            (Review, Action::RejectWork(_)) => Running,
-            (Running, Action::Abort) => Ready,
-            (Ready, Action::Park) => Parked,
-            (Parked, Action::Unpark) => Ready,
-            (Parked | Ready | NeedsInput | Review, Action::Abandon) => Rejected,
-            _ => {
-                return Err(Error::InvalidTransition {
-                    from: task.state,
-                    action: action.name().to_string(),
-                });
-            }
-        };
-
-        match &action {
-            Action::Ask(q) if q.trim().is_empty() => {
-                return Err(Error::Invalid("a question is required".into()));
-            }
-            Action::Answer(a) if a.trim().is_empty() => {
-                return Err(Error::Invalid("an answer is required".into()));
-            }
-            Action::RejectWork(f) if f.trim().is_empty() => {
-                return Err(Error::Invalid("rejection feedback is required".into()));
-            }
-            _ => {}
-        }
-        let question = match &action {
-            Action::Ask(q) => Some(q.trim().to_string()),
-            _ => None,
-        };
-
-        tx.execute(
-            "UPDATE tasks SET state = ?1, state_since = datetime('now'), question = ?2,
-                    closed_at = CASE WHEN ?3 THEN datetime('now') ELSE closed_at END
-             WHERE id = ?4",
-            params![to, question, to.is_terminal(), task_id],
-        )?;
-        log_event(
-            &tx,
-            task_id,
-            "transition",
-            Some(&format!("{} -> {}", task.state, to)),
-        )?;
-
-        match &action {
-            Action::Answer(a) => {
-                append_section(&tx, task_id, "Answers", a.trim())?;
-                log_event(&tx, task_id, "answer", Some(a.trim()))?;
-            }
-            Action::RejectWork(f) => {
-                append_section(&tx, task_id, "Feedback", f.trim())?;
-                log_event(&tx, task_id, "feedback", Some(f.trim()))?;
-            }
-            _ => {}
-        }
-
-        if to.is_terminal() {
-            reconcile_dependants(&tx, task_id)?;
-        } else if to == TaskState::Ready {
-            // `ready` must mean genuinely actionable: a transition landing here
-            // while a blocker is still open (triage, abort, unpark) reconciles
-            // straight back to `parked` so the scheduler never surfaces it.
-            reconcile_readiness(&tx, task_id)?;
-        }
-
+        apply_action(&tx, task_id, action)?;
         tx.commit()?;
         self.task(task_id)
+    }
+
+    /// Dispatch's atomic write (DESIGN.md §8): move the task `ready → running`
+    /// and open its session in one transaction, so a running task always has a
+    /// session and a session always has a running task. The state change goes
+    /// through the same machine as [`apply`](Store::apply); spawning the process
+    /// is the caller's job and happens before this commits.
+    pub fn record_dispatch(
+        &mut self,
+        task_id: i64,
+        agent: &str,
+        pid: Option<i64>,
+        log_path: Option<&str>,
+    ) -> Result<(Task, Session)> {
+        let tx = self.conn.transaction()?;
+        apply_action(&tx, task_id, Action::Start)?;
+        tx.execute(
+            "INSERT INTO sessions (task_id, agent, pid, log_path, started_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            params![task_id, agent, pid, log_path],
+        )?;
+        let session_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok((self.task(task_id)?, self.session(session_id)?))
     }
 
     /// Replace the `blocks` dependencies of a task with the given set, then
@@ -199,6 +148,91 @@ impl Store {
         tx.commit()?;
         self.task(task_id)
     }
+}
+
+/// The state machine proper: validate `action` against the task's current
+/// state, restamp `state_since`, maintain the `question`/`closed_at`
+/// invariants, append to the event log, and cascade dependant readiness — all
+/// against an already-open transaction so callers can bundle further writes
+/// (a session insert, for dispatch) into the same atomic unit.
+fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskState> {
+    let task = get_task(tx, task_id)?.ok_or(Error::TaskNotFound(task_id))?;
+
+    use TaskState::*;
+    let to = match (task.state, &action) {
+        (Proposed, Action::Triage(Triage::Parked)) => Parked,
+        (Proposed, Action::Triage(Triage::Ready)) => Ready,
+        (Proposed, Action::Triage(Triage::Reject)) => Rejected,
+        (Ready, Action::Start) => Running,
+        (Running, Action::Ask(_)) => NeedsInput,
+        (NeedsInput, Action::Answer(_)) => Running,
+        (Running, Action::Complete) => Review,
+        (Review, Action::Accept) => Done,
+        (Review, Action::RejectWork(_)) => Running,
+        (Running, Action::Abort) => Ready,
+        (Ready, Action::Park) => Parked,
+        (Parked, Action::Unpark) => Ready,
+        (Parked | Ready | NeedsInput | Review, Action::Abandon) => Rejected,
+        _ => {
+            return Err(Error::InvalidTransition {
+                from: task.state,
+                action: action.name().to_string(),
+            });
+        }
+    };
+
+    match &action {
+        Action::Ask(q) if q.trim().is_empty() => {
+            return Err(Error::Invalid("a question is required".into()));
+        }
+        Action::Answer(a) if a.trim().is_empty() => {
+            return Err(Error::Invalid("an answer is required".into()));
+        }
+        Action::RejectWork(f) if f.trim().is_empty() => {
+            return Err(Error::Invalid("rejection feedback is required".into()));
+        }
+        _ => {}
+    }
+    let question = match &action {
+        Action::Ask(q) => Some(q.trim().to_string()),
+        _ => None,
+    };
+
+    tx.execute(
+        "UPDATE tasks SET state = ?1, state_since = datetime('now'), question = ?2,
+                closed_at = CASE WHEN ?3 THEN datetime('now') ELSE closed_at END
+         WHERE id = ?4",
+        params![to, question, to.is_terminal(), task_id],
+    )?;
+    log_event(
+        tx,
+        task_id,
+        "transition",
+        Some(&format!("{} -> {}", task.state, to)),
+    )?;
+
+    match &action {
+        Action::Answer(a) => {
+            append_section(tx, task_id, "Answers", a.trim())?;
+            log_event(tx, task_id, "answer", Some(a.trim()))?;
+        }
+        Action::RejectWork(f) => {
+            append_section(tx, task_id, "Feedback", f.trim())?;
+            log_event(tx, task_id, "feedback", Some(f.trim()))?;
+        }
+        _ => {}
+    }
+
+    if to.is_terminal() {
+        reconcile_dependants(tx, task_id)?;
+    } else if to == TaskState::Ready {
+        // `ready` must mean genuinely actionable: a transition landing here
+        // while a blocker is still open (triage, abort, unpark) reconciles
+        // straight back to `parked` so the scheduler never surfaces it.
+        reconcile_readiness(tx, task_id)?;
+    }
+
+    Ok(to)
 }
 
 /// Append `text` under a `## {heading}` section at the end of the body,
@@ -654,6 +688,35 @@ mod tests {
 
         assert!(s.set_blocks_deps(task, &[task]).is_err());
         assert!(s.set_blocks_deps(task, &[9999]).is_err());
+    }
+
+    #[test]
+    fn record_dispatch_starts_the_task_and_opens_a_session() {
+        let (mut s, p) = store_with_project();
+        let id = create(&mut s, p, TaskState::Ready);
+        let (task, session) = s
+            .record_dispatch(id, "claude", Some(4321), Some("/var/log/26.log"))
+            .unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(session.task_id, id);
+        assert_eq!(session.agent, "claude");
+        assert_eq!(session.pid, Some(4321));
+        assert_eq!(session.log_path.as_deref(), Some("/var/log/26.log"));
+        assert!(session.ended_at.is_none());
+        assert_eq!(s.sessions_for(id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_dispatch_on_a_non_ready_task_writes_nothing() {
+        let (mut s, p) = store_with_project();
+        let id = create(&mut s, p, TaskState::Proposed);
+        assert!(matches!(
+            s.record_dispatch(id, "claude", None, None),
+            Err(Error::InvalidTransition { .. })
+        ));
+        // the failed transaction must leave neither state change nor session
+        assert_eq!(s.task(id).unwrap().state, TaskState::Proposed);
+        assert!(s.sessions_for(id).unwrap().is_empty());
     }
 
     #[test]
