@@ -6,3 +6,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+focus-core = { path = "../focus-core" }
+ratatui.workspace = true

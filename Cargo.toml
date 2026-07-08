@@ -11,3 +11,4 @@ repository = "https://github.com/ClachDev/focus"
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
+ratatui = "0.30"

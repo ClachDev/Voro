@@ -113,6 +113,19 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Score decomposition for any single task, whatever its state — the
+    /// TUI popup today, `focus explain <task>` later.
+    pub fn explain(&self, task_id: i64) -> Result<ScoreBreakdown> {
+        let (weight, priority, age_days): (i64, Priority, f64) = self.conn.query_row(
+            "SELECT p.weight, t.priority, julianday('now') - julianday(t.state_since)
+             FROM tasks t JOIN projects p ON p.id = t.project_id
+             WHERE t.id = ?1",
+            [task_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(score(weight, priority, age_days))
+    }
+
     /// Size of the standing "triage N proposed tasks" inbox entry. Parked
     /// (weight-0) projects are hidden here too.
     pub fn proposed_count(&self) -> Result<i64> {
