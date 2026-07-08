@@ -1,14 +1,15 @@
 //! The command-line verb surface: every TUI action, scriptable and
 //! agent-legible (DESIGN.md §9). Verbs that §8 names for the agent return
-//! path (`ask`, `done`) keep those names and flags so Milestone B extends
-//! rather than renames. Parsing is hand-rolled: positionals plus `--flag
-//! value` pairs is all the grammar this needs.
+//! path (`ask`, `done`, `propose`) keep those names and flags so Milestone B
+//! extends rather than renames. Parsing is hand-rolled: positionals plus
+//! `--flag value` pairs is all the grammar this needs.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use voro_core::{
-    Action, NewTask, Priority, Project, Store, Task, TaskEdit, TaskState, Triage, scheduler,
+    Action, DepKind, NewTask, Priority, Project, Store, Task, TaskEdit, TaskState, Triage,
+    scheduler,
 };
 
 const HELP: &str = "\
@@ -25,6 +26,9 @@ projects
 tasks
   add <project> <title> [--body TEXT | --body-file PATH] [--priority 0-3]
       [--state proposed|parked|ready] [--agent NAME] [--blocks IDS]
+  propose <project> <title> [--body TEXT | --body-file PATH] [--from TASK-ID]
+                                  create a proposed task; --from (default
+                                  $VORO_TASK_ID) links it discovered-from
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
       [--body TEXT | --body-file PATH] [--blocks IDS]
   show <task-id>                  full task: body, deps, events
@@ -56,6 +60,7 @@ pub fn run(store: &mut Store, args: Vec<String>) -> Result<String, String> {
         "project" => project_verb(store, &pos, &flags),
         "weight" => weight_verb(store, &pos),
         "add" => add_verb(store, &pos, &flags),
+        "propose" => propose_verb(store, &pos, &flags, std::env::var("VORO_TASK_ID").ok()),
         "set" => set_verb(store, &pos, &flags),
         "show" => show_verb(store, &pos),
         "list" => list_verb(store, &flags),
@@ -238,6 +243,49 @@ fn add_verb(
         "task {} '{}' created ({})",
         task.id, task.title, task.state
     ))
+}
+
+/// The agent return-path form of `add` (DESIGN.md §8): always lands in
+/// `proposed`, and links the new task discovered-from its source — `--from`
+/// explicitly, or the `VORO_TASK_ID` a dispatched session runs under.
+fn propose_verb(
+    store: &mut Store,
+    pos: &[String],
+    flags: &HashMap<String, String>,
+    env_source: Option<String>,
+) -> Result<String, String> {
+    if flags.contains_key("state") {
+        return Err("propose always creates 'proposed' tasks — use 'add --state' instead".into());
+    }
+    let project = resolve_project(store, need(pos, 1, "project")?)?;
+    let title = rest_text(pos, 2, "title")?;
+    let source = match flags.get("from").cloned().or(env_source) {
+        Some(raw) => {
+            let id: i64 = raw
+                .parse()
+                .map_err(|_| format!("'{raw}' is not a task id"))?;
+            Some(store.task(id).map_err(|e| e.to_string())?)
+        }
+        None => None,
+    };
+    let task = store
+        .create_task(NewTask {
+            project_id: project.id,
+            title,
+            body: body_from(flags)?.unwrap_or_default(),
+            priority: Priority::P2,
+            state: TaskState::Proposed,
+            agent: None,
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = format!("task {} '{}' proposed", task.id, task.title);
+    if let Some(source) = source {
+        store
+            .add_dep(task.id, source.id, DepKind::DiscoveredFrom)
+            .map_err(|e| e.to_string())?;
+        write!(out, " (discovered from #{})", source.id).unwrap();
+    }
+    Ok(out)
 }
 
 fn set_verb(
@@ -552,6 +600,83 @@ mod tests {
         ok(&mut s, &["done", "1"]);
         ok(&mut s, &["accept", "1"]);
         assert!(ok(&mut s, &["list", "--state", "ready"]).contains("Dependent"));
+    }
+
+    fn propose(store: &mut Store, args: &[&str], env: Option<&str>) -> Result<String, String> {
+        let (pos, flags) = split_args(args.iter().map(|s| s.to_string()).collect())?;
+        propose_verb(store, &pos, &flags, env.map(str::to_string))
+    }
+
+    #[test]
+    fn propose_lands_proposed() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        let out = propose(&mut s, &["propose", "demo", "An idea"], None).unwrap();
+        assert!(out.contains("task 1 'An idea' proposed"), "{out}");
+        assert!(ok(&mut s, &["show", "1"]).contains("#1 proposed"));
+        assert!(s.deps_of(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn propose_cannot_specify_a_state() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        let e = propose(
+            &mut s,
+            &["propose", "demo", "An idea", "--state", "ready"],
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("proposed"), "{e}");
+        assert!(ok(&mut s, &["list"]).is_empty());
+    }
+
+    #[test]
+    fn propose_from_records_the_discovered_from_dep() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Source", "--state", "ready"]);
+        propose(
+            &mut s,
+            &["propose", "demo", "Follow-up", "--from", "1"],
+            None,
+        )
+        .unwrap();
+        assert!(ok(&mut s, &["show", "2"]).contains("dep: discovered-from 1"));
+        assert!(ok(&mut s, &["show", "2"]).contains("#2 proposed"));
+    }
+
+    #[test]
+    fn propose_falls_back_to_the_dispatch_env_task() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Source", "--state", "ready"]);
+        propose(&mut s, &["propose", "demo", "Follow-up"], Some("1")).unwrap();
+        assert!(ok(&mut s, &["show", "2"]).contains("dep: discovered-from 1"));
+    }
+
+    #[test]
+    fn propose_from_flag_wins_over_env() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "A", "--state", "ready"]);
+        ok(&mut s, &["add", "demo", "B", "--state", "ready"]);
+        propose(
+            &mut s,
+            &["propose", "demo", "Follow-up", "--from", "2"],
+            Some("1"),
+        )
+        .unwrap();
+        assert!(ok(&mut s, &["show", "3"]).contains("dep: discovered-from 2"));
+    }
+
+    #[test]
+    fn propose_rejects_an_unknown_source_without_creating() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        propose(&mut s, &["propose", "demo", "Orphan", "--from", "99"], None).unwrap_err();
+        propose(&mut s, &["propose", "demo", "Orphan"], Some("nonsense")).unwrap_err();
+        assert!(ok(&mut s, &["list"]).is_empty());
     }
 
     #[test]

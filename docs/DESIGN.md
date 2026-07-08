@@ -157,6 +157,8 @@ voro done <task-id> --summary "Implemented X, tests pass"        # → review
 voro propose <project> "title" --body-file plan.md               # → proposed (discovered-from)
 ```
 
+Dispatch exports `VORO_TASK_ID` into the session's environment; when `propose` is called without `--from`, it uses that variable as the discovered-from source, so proposals made mid-session link back to the task that spawned them without the agent having to think about it. `propose` always creates tasks in `proposed` — it cannot take a state.
+
 Because these are plain CLI calls writing to a local SQLite file, they work identically for Claude Code, Codex, or anything that can run a shell command — no per-agent integration beyond the command template in `agents.toml`. An MCP server wrapping the same three verbs is a later nicety, not a requirement. Note these verbs are a thin second consumer of `voro-core`, not a prerequisite for the TUI — they arrive in the milestone that closes the agent loop.
 
 Dispatch runs in the project's path with a dirty-tree guard in v1; per-dispatch worktrees are deferred until parallel dispatch within one project is actually wanted (§11).
