@@ -394,7 +394,14 @@ fn explain_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
         b.priority_value
     )
     .unwrap();
-    writeln!(out, "base w × p      {:>6.1}", b.base).unwrap();
+    writeln!(
+        out,
+        "state           {:>6}  (bonus +{})",
+        b.state.to_string(),
+        b.state_bonus
+    )
+    .unwrap();
+    writeln!(out, "base w×(p+s)    {:>6.1}", b.base).unwrap();
     writeln!(out, "age             {:>6.1} days", b.age_days).unwrap();
     writeln!(
         out,
@@ -584,7 +591,8 @@ mod tests {
             &["add", "demo", "T", "--priority", "0", "--state", "ready"],
         );
         let out = ok(&mut s, &["explain", "1"]);
-        assert!(out.contains("base w × p        16.0"), "{out}");
+        assert!(out.contains("base w×(p+s)      16.0"), "{out}");
+        assert!(out.contains("state            ready  (bonus +0)"), "{out}");
     }
 
     #[test]

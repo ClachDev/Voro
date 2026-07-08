@@ -14,7 +14,10 @@ pub struct ScoreBreakdown {
     pub weight: i64,
     pub priority: Priority,
     pub priority_value: f64,
-    /// weight × priority_value
+    pub state: TaskState,
+    /// Static per-state nudge folded into the priority term (§7).
+    pub state_bonus: f64,
+    /// weight × (priority_value + state_bonus)
     pub base: f64,
     pub age_days: f64,
     /// 0.1 × age_days, capped at 2
@@ -22,14 +25,31 @@ pub struct ScoreBreakdown {
     pub total: f64,
 }
 
-pub fn score(weight: i64, priority: Priority, age_days: f64) -> ScoreBreakdown {
+/// A static per-state weight folded into the priority term (§7). It ranks the
+/// human-attention states above plain startable work so agents stall as little
+/// as possible: `needs-input` blocks an idle agent, so it outweighs `review`,
+/// which only blocks a finished task; `ready` and `proposed` earn nothing —
+/// startable work rides its own priority and an untriaged proposal is trusted
+/// with nothing but the ties its score already deserves.
+pub fn state_bonus(state: TaskState) -> f64 {
+    match state {
+        TaskState::NeedsInput => 4.0,
+        TaskState::Review => 2.0,
+        _ => 0.0,
+    }
+}
+
+pub fn score(weight: i64, priority: Priority, state: TaskState, age_days: f64) -> ScoreBreakdown {
     let priority_value = priority.value();
-    let base = weight as f64 * priority_value;
+    let state_bonus = state_bonus(state);
+    let base = weight as f64 * (priority_value + state_bonus);
     let age_bonus = (0.1 * age_days).min(2.0);
     ScoreBreakdown {
         weight,
         priority,
         priority_value,
+        state,
+        state_bonus,
         base,
         age_days,
         age_bonus,
@@ -80,10 +100,11 @@ pub fn focus(candidates: &[Candidate]) -> Option<&Candidate> {
         .min_by(|a, b| rank(a, b))
 }
 
-/// Total order for views: score desc; at equal score an unanswered question
-/// outranks a finished diff, which outranks startable work, which outranks
-/// an untriaged proposal (§6); then priority, older `state_since`, id — the
-/// tail exists only to make the ordering deterministic.
+/// Total order for views: score desc. Score already folds in the per-state
+/// bonus (§7), so state usually settles itself; the `state_rank` tiebreak
+/// only decides genuinely equal totals, where an unanswered question still
+/// outranks a finished diff, startable work, then an untriaged proposal (§6).
+/// Priority, older `state_since`, and id tail it so the order is deterministic.
 fn rank(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     b.score
         .total
@@ -120,7 +141,7 @@ impl Store {
             let project_name: String = row.get(11)?;
             let weight: i64 = row.get(12)?;
             let age_days: f64 = row.get(13)?;
-            let score = score(weight, task.priority, age_days);
+            let score = score(weight, task.priority, task.state, age_days);
             Ok(Candidate {
                 task,
                 project_name,
@@ -133,14 +154,16 @@ impl Store {
     /// Score decomposition for any single task, whatever its state — the
     /// TUI popup today, `voro explain <task>` later.
     pub fn explain(&self, task_id: i64) -> Result<ScoreBreakdown> {
-        let (weight, priority, age_days): (i64, Priority, f64) = self.conn.query_row(
-            "SELECT p.weight, t.priority, julianday('now') - julianday(t.state_since)
+        let (weight, priority, state, age_days): (i64, Priority, TaskState, f64) =
+            self.conn.query_row(
+                "SELECT p.weight, t.priority, t.state,
+                        julianday('now') - julianday(t.state_since)
              FROM tasks t JOIN projects p ON p.id = t.project_id
              WHERE t.id = ?1",
-            [task_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        Ok(score(weight, priority, age_days))
+                [task_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+        Ok(score(weight, priority, state, age_days))
     }
 
     /// Count of untriaged tasks. Parked (weight-0) projects are hidden
@@ -164,8 +187,8 @@ mod tests {
     #[test]
     fn worked_example_from_design_doc() {
         // P0 in a weight-2 project (16) beats P2 in a weight-5 project (10).
-        let p0_low_weight = score(2, Priority::P0, 0.0);
-        let p2_high_weight = score(5, Priority::P2, 0.0);
+        let p0_low_weight = score(2, Priority::P0, TaskState::Ready, 0.0);
+        let p2_high_weight = score(5, Priority::P2, TaskState::Ready, 0.0);
         assert_eq!(p0_low_weight.total, 16.0);
         assert_eq!(p2_high_weight.total, 10.0);
         assert!(p0_low_weight.total > p2_high_weight.total);
@@ -173,26 +196,50 @@ mod tests {
 
     #[test]
     fn priority_values_are_geometric() {
-        assert_eq!(score(1, Priority::P0, 0.0).total, 8.0);
-        assert_eq!(score(1, Priority::P1, 0.0).total, 4.0);
-        assert_eq!(score(1, Priority::P2, 0.0).total, 2.0);
-        assert_eq!(score(1, Priority::P3, 0.0).total, 1.0);
+        assert_eq!(score(1, Priority::P0, TaskState::Ready, 0.0).total, 8.0);
+        assert_eq!(score(1, Priority::P1, TaskState::Ready, 0.0).total, 4.0);
+        assert_eq!(score(1, Priority::P2, TaskState::Ready, 0.0).total, 2.0);
+        assert_eq!(score(1, Priority::P3, TaskState::Ready, 0.0).total, 1.0);
     }
 
     #[test]
     fn age_bonus_grows_then_caps_at_two() {
-        assert_eq!(score(3, Priority::P2, 0.0).age_bonus, 0.0);
-        assert_eq!(score(3, Priority::P2, 5.0).age_bonus, 0.5);
-        assert_eq!(score(3, Priority::P2, 20.0).age_bonus, 2.0);
-        assert_eq!(score(3, Priority::P2, 365.0).age_bonus, 2.0);
-        assert_eq!(score(3, Priority::P2, 365.0).total, 8.0);
+        assert_eq!(score(3, Priority::P2, TaskState::Ready, 0.0).age_bonus, 0.0);
+        assert_eq!(score(3, Priority::P2, TaskState::Ready, 5.0).age_bonus, 0.5);
+        assert_eq!(
+            score(3, Priority::P2, TaskState::Ready, 20.0).age_bonus,
+            2.0
+        );
+        assert_eq!(
+            score(3, Priority::P2, TaskState::Ready, 365.0).age_bonus,
+            2.0
+        );
+        assert_eq!(score(3, Priority::P2, TaskState::Ready, 365.0).total, 8.0);
     }
 
     #[test]
     fn decomposition_terms_sum_to_total() {
-        let s = score(4, Priority::P1, 7.3);
+        let s = score(4, Priority::P1, TaskState::Ready, 7.3);
         assert_eq!(s.base, 16.0);
         assert_eq!(s.total, s.base + s.age_bonus);
+    }
+
+    #[test]
+    fn state_bonus_folds_into_the_priority_term() {
+        // needs-input +4, review +2, everything else nothing — multiplied by
+        // project weight just like priority.
+        assert_eq!(state_bonus(TaskState::NeedsInput), 4.0);
+        assert_eq!(state_bonus(TaskState::Review), 2.0);
+        assert_eq!(state_bonus(TaskState::Ready), 0.0);
+        assert_eq!(state_bonus(TaskState::Proposed), 0.0);
+
+        // P2 in a weight-3 project: 3×(2+4) = 18 as a question, 3×2 = 6 ready.
+        assert_eq!(
+            score(3, Priority::P2, TaskState::NeedsInput, 0.0).base,
+            18.0
+        );
+        assert_eq!(score(3, Priority::P2, TaskState::Review, 0.0).base, 12.0);
+        assert_eq!(score(3, Priority::P2, TaskState::Ready, 0.0).base, 6.0);
     }
 
     // --- ordering over a real store ---
@@ -272,19 +319,20 @@ mod tests {
         let a = add_project(&mut s, "a", 3);
         let b = add_project(&mut s, "b", 1);
 
-        let question = add_task(&mut s, a, "question", Priority::P2); // 3×2 = 6
+        let question = add_task(&mut s, a, "question", Priority::P2); // 3×(2+4) = 18
         to_needs_input(&mut s, question);
-        let diff = add_task(&mut s, a, "diff", Priority::P0); // 3×8 = 24
+        let diff = add_task(&mut s, a, "diff", Priority::P0); // 3×(8+2) = 30
         to_review(&mut s, diff);
-        let small = add_task(&mut s, b, "small question", Priority::P3); // 1×1 = 1
+        let small = add_task(&mut s, b, "small question", Priority::P3); // 1×(1+4) = 5
         to_needs_input(&mut s, small);
         let ready = add_task(&mut s, a, "ready task", Priority::P1); // 3×4 = 12
         let proposed = add_proposed(&mut s, a, "proposal", Priority::P2); // 3×2 = 6
 
         let candidates = s.candidates().unwrap();
         let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
-        // pure score ordering; question beats proposal at the 6.0 tie
-        assert_eq!(ids, vec![diff, ready, question, proposed, small]);
+        // score folds in the state bonus, so the P2 question outranks the P1
+        // ready task despite a lower raw priority
+        assert_eq!(ids, vec![diff, question, ready, proposed, small]);
     }
 
     #[test]
@@ -304,15 +352,50 @@ mod tests {
     }
 
     #[test]
-    fn question_outranks_review_at_equal_score() {
+    fn state_bonus_lifts_a_question_over_an_equal_priority_review() {
+        // Same weight and priority: the +4 needs-input bonus outscores the +2
+        // review bonus outright — no longer a tie broken by precedence.
         let mut s = setup();
         let p = add_project(&mut s, "p", 3);
-        let diff = add_task(&mut s, p, "diff", Priority::P1);
+        let diff = add_task(&mut s, p, "diff", Priority::P1); // 3×(4+2) = 18
         to_review(&mut s, diff);
-        let question = add_task(&mut s, p, "question", Priority::P1);
+        let question = add_task(&mut s, p, "question", Priority::P1); // 3×(4+4) = 24
         to_needs_input(&mut s, question);
 
         let candidates = s.candidates().unwrap();
+        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
+        assert_eq!(ids, vec![question, diff]);
+    }
+
+    #[test]
+    fn state_precedence_still_breaks_genuinely_equal_totals() {
+        // Contrived so the folded scores collide: needs-input 3×(1+4) = 15,
+        // review 5×(1+2) = 15. With ages pinned equal the totals tie exactly,
+        // and the state precedence (§6) decides it.
+        let mut s = setup();
+        let a = add_project(&mut s, "a", 3);
+        let b = add_project(&mut s, "b", 5);
+        let diff = add_task(&mut s, b, "diff", Priority::P3);
+        to_review(&mut s, diff);
+        let question = add_task(&mut s, a, "question", Priority::P3);
+        to_needs_input(&mut s, question);
+        s.conn
+            .execute(
+                "UPDATE tasks SET state_since = '2020-01-01 00:00:00' WHERE id IN (?1, ?2)",
+                (diff, question),
+            )
+            .unwrap();
+
+        let candidates = s.candidates().unwrap();
+        let total = |id| {
+            candidates
+                .iter()
+                .find(|c| c.task.id == id)
+                .unwrap()
+                .score
+                .total
+        };
+        assert_eq!(total(diff), total(question));
         let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
         assert_eq!(ids, vec![question, diff]);
     }

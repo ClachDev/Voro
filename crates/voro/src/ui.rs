@@ -163,7 +163,12 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                     b.priority.to_string(),
                     b.priority_value
                 )),
-                Line::from(format!("base w × p      {:>6.1}", b.base)),
+                Line::from(format!(
+                    "state           {:>6}  (bonus +{})",
+                    b.state.to_string(),
+                    b.state_bonus
+                )),
+                Line::from(format!("base w×(p+s)    {:>6.1}", b.base)),
                 Line::from(format!("age             {:>6.1} days", b.age_days)),
                 Line::from(format!(
                     "age bonus       {:>6.2}  (0.1/day, cap 2)",

@@ -128,15 +128,20 @@ Three deliberate choices. Any triaged, non-terminal state can be *abandoned* str
 Start embarrassingly simple and only add terms that earn their place:
 
 ```
-score(task) = project.weight × priority_value(task) + age_bonus(task)
+score(task) = project.weight × (priority_value(task) + state_bonus(task)) + age_bonus(task)
 
 priority_value: P0 → 8, P1 → 4, P2 → 2, P3 → 1
+state_bonus:    needs-input → 4, review → 2, ready → 0, proposed → 0
 age_bonus:      0.1 × days_in_current_state, capped at 2
 ```
 
-Project weight is an integer 0–5, where 0 means "parked — hide entirely" (this is how a project is snoozed without deleting anything). The geometric priority values ensure a P0 in a weight-2 project (16) still beats a P2 in a weight-5 project (10) — priorities within a project should mean something absolute, not just relative. The age bonus is a gentle anti-starvation nudge so old P2s eventually surface, capped so it can never masquerade as a priority level. It applies uniformly to every scored state — `ready`, `needs-input`, `review`, and `proposed` alike — because a week-old unanswered question is a smell worth amplifying, not just an old task. Taskwarrior's experience suggests urgency formulae accrete coefficients until nobody trusts the number; resist that. Any tuning should be observable via a score-decomposition view in the TUI (and later `voro explain <task>`).
+Project weight is an integer 0–5, where 0 means "parked — hide entirely" (this is how a project is snoozed without deleting anything). The geometric priority values ensure a P0 in a weight-2 project (16) still beats a P2 in a weight-5 project (10) — priorities within a project should mean something absolute, not just relative.
 
-Ordering of the queue: every `needs-input`, `review`, and `proposed` task plus the top three `ready` tasks, in one list sorted by score, ties broken by the state precedence above. `voro next` still answers with the single top ready task — that is what an agent asking for work should be handed, and the dispatch default.
+The `state_bonus` folds task state into the priority term rather than leaving it a pure tiebreaker, because the states are not just labels — they say *what a delay costs*. `needs-input` blocks an idle agent, so unblocking it keeps work flowing and earns the largest bonus; `review` only blocks a finished task from closing, so it earns half as much; `ready` and `proposed` earn nothing — startable work rides its own priority, and an untriaged proposal's priority is agent-asserted and untrusted, so it wins nothing but the ties its raw score already deserves. Folding the bonus *inside* the weight multiply (rather than adding a flat constant) keeps project weight the single master gain and the whole formula head-computable: a question is worth "one extra P1's worth" of priority in its own project, no more. The chosen magnitudes mean an attention item floats above routine startable work but a genuine emergency still wins — a P0 ready task (weight×8) still outranks a P2 question (weight×6) in the same project.
+
+The age bonus is a gentle anti-starvation nudge so old P2s eventually surface, capped so it can never masquerade as a priority level. It applies uniformly to every scored state — `ready`, `needs-input`, `review`, and `proposed` alike — because a week-old unanswered question is a smell worth amplifying, not just an old task. Taskwarrior's experience suggests urgency formulae accrete coefficients until nobody trusts the number; resist that — this is the one and only additive state term. Any tuning should be observable via a score-decomposition view in the TUI (and later `voro explain <task>`).
+
+Ordering of the queue: every `needs-input`, `review`, and `proposed` task plus the top three `ready` tasks, in one list sorted by score. Because the state bonus now lives in the score, state usually settles itself; the state precedence (§6) only breaks genuinely equal totals. `voro next` still answers with the single top ready task — that is what an agent asking for work should be handed, and the dispatch default.
 
 ## 8. Dispatch and agent integration
 
