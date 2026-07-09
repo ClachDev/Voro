@@ -45,6 +45,11 @@ dispatched session runs unattended, so most agents need a non-interactive
 permission flag. Once configured, `voro dispatch <task-id>` (or the dispatch
 key in the TUI) launches a headless session on a ready task.
 
+A dispatched agent reports back through the return-path verbs (`voro ask/done/
+propose`). For the `CLAUDE.md`/`AGENTS.md` snippet that advertises them, and a
+sample Claude Code hooks configuration that reports for a session that forgets
+to, see [`docs/agent-integration.md`](docs/agent-integration.md).
+
 ## License
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
