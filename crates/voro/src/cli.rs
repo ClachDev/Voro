@@ -60,6 +60,10 @@ transitions
 ";
 
 pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<String, String> {
+    // Reconcile-on-read (DESIGN.md §8): before any verb consults session or
+    // task state, close out sessions whose process has already exited.
+    crate::reconcile::reconcile_live_sessions(store).map_err(|e| e.to_string())?;
+
     let (pos, flags) = split_args(args)?;
     let verb = pos.first().map(String::as_str).unwrap_or("help");
     match verb {
@@ -345,6 +349,9 @@ fn show_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     if let Some(q) = &task.question {
         writeln!(out, "question: {q}").unwrap();
     }
+    if store.redispatch_flag(id).map_err(|e| e.to_string())? {
+        writeln!(out, "flagged for redispatch").unwrap();
+    }
     let deps = store.deps_of(id).map_err(|e| e.to_string())?;
     for dep in &deps {
         writeln!(out, "dep: {} {}", dep.kind, dep.depends_on).unwrap();
@@ -388,7 +395,13 @@ fn list_verb(store: &mut Store, flags: &HashMap<String, String>) -> Result<Strin
             .find(|p| p.id == task.project_id)
             .map(|p| p.name.as_str())
             .unwrap_or("?");
-        writeln!(out, "{}", task_line(&task, name)).unwrap();
+        writeln!(
+            out,
+            "{}{}",
+            task_line(&task, name),
+            redispatch_suffix(store, task.id)
+        )
+        .unwrap();
     }
     Ok(out)
 }
@@ -407,6 +420,7 @@ fn inbox_verb(store: &mut Store) -> Result<String, String> {
         if let Some(q) = &c.task.question {
             write!(out, "  — {q}").unwrap();
         }
+        write!(out, "{}", redispatch_suffix(store, c.task.id)).unwrap();
         writeln!(out).unwrap();
     }
     if out.is_empty() {
@@ -422,9 +436,10 @@ fn next_verb(store: &mut Store) -> Result<String, String> {
             let mut out = String::new();
             writeln!(
                 out,
-                "{:5.1}  {}",
+                "{:5.1}  {}{}",
                 c.score.total,
-                task_line(&c.task, &c.project_name)
+                task_line(&c.task, &c.project_name),
+                redispatch_suffix(store, c.task.id)
             )
             .unwrap();
             if !c.task.body.is_empty() {
@@ -433,6 +448,17 @@ fn next_verb(store: &mut Store) -> Result<String, String> {
             Ok(out)
         }
         None => Ok("no ready tasks\n".to_string()),
+    }
+}
+
+/// `  [redispatch]` when the task's most recent session ended `failed` or
+/// `capped` (DESIGN.md §8), else empty — the flag lives in session history,
+/// not on the task, so every place that prints a task line re-derives it.
+fn redispatch_suffix(store: &Store, task_id: i64) -> &'static str {
+    if store.redispatch_flag(task_id).unwrap_or(false) {
+        "  [redispatch]"
+    } else {
+        ""
     }
 }
 
@@ -762,5 +788,80 @@ mod tests {
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
         err(&mut s, &["done", "1"]);
         assert!(ok(&mut s, &["show", "1"]).contains("#1 ready"));
+    }
+
+    /// End to end (DESIGN.md §8): a task really dispatched, whose agent
+    /// process really exits without calling `voro done`/`ask`, is finalised
+    /// and flagged for redispatch purely by a later CLI verb reading state —
+    /// no code here ever calls the reconciliation function directly.
+    #[test]
+    fn a_dead_dispatched_session_surfaces_the_redispatch_flag_on_read() {
+        use std::process::{Command, Stdio};
+
+        let root = std::env::temp_dir().join(format!(
+            "voro-cli-reconcile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+
+        let db_path = root.join("voro.db");
+        let agents_path = root.join("agents.toml");
+        // an agent command that exits immediately with failure, as if it crashed
+        std::fs::write(
+            &agents_path,
+            "default = \"stub\"\n\n[agents.stub]\ncmd = \"false {prompt_file}\"\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(&db_path).unwrap();
+        let dispatch_ctx = crate::dispatch::DispatchCtx {
+            db_path: db_path.clone(),
+            agents_path,
+            runtime_dir: root.join("sessions"),
+        };
+        ok(
+            &mut store,
+            &["project", "add", "demo", project.to_str().unwrap()],
+        );
+        ok(
+            &mut store,
+            &["add", "demo", "Do the thing", "--state", "ready"],
+        );
+
+        let summary = crate::dispatch::dispatch(&mut store, &dispatch_ctx, 1, None).unwrap();
+        assert!(summary.contains("dispatched task"), "{summary}");
+        assert_eq!(store.task(1).unwrap().state, TaskState::Running);
+
+        // give the spawned shell a moment to actually exit
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // a plain read-only verb — not a direct call to the reconciler —
+        // must notice the dead process and finalise it
+        let out = run(&mut store, vec!["inbox".to_string()], &dispatch_ctx).unwrap();
+        assert!(out.contains("[redispatch]"), "{out}");
+        assert_eq!(store.task(1).unwrap().state, TaskState::Ready);
+        assert!(store.redispatch_flag(1).unwrap());
+
+        let shown = ok(&mut store, &["show", "1"]);
+        assert!(shown.contains("flagged for redispatch"), "{shown}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod dispatch;
 mod editor;
+mod reconcile;
 mod ui;
 
 use std::path::PathBuf;

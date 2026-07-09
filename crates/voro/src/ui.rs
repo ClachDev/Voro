@@ -243,6 +243,16 @@ fn score_span(total: f64) -> Span<'static> {
     Span::styled(format!("{total:5.1} "), Style::new().fg(Color::Yellow))
 }
 
+/// The redispatch flag (DESIGN.md §8): a `ready` task whose most recent
+/// session ended `failed` or `capped`, read fresh from session history
+/// rather than a stored column.
+fn redispatch_span() -> Span<'static> {
+    Span::styled(
+        "  [redispatch]",
+        Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+    )
+}
+
 /// The verb a queue row's Enter performs, from its state.
 fn action_verb(state: voro_core::TaskState) -> &'static str {
     match state {
@@ -291,6 +301,9 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
                         format!("  — {q}"),
                         Style::new().fg(Color::Cyan),
                     ));
+                }
+                if app.redispatch.contains(&c.task.id) {
+                    spans.push(redispatch_span());
                 }
                 ListItem::new(Line::from(spans))
             }
@@ -352,6 +365,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Cyan),
         )));
     }
+    if app.redispatch.contains(&task.id) {
+        lines.push(Line::from(redispatch_span()));
+    }
     lines.push(Line::default());
     lines.extend(task.body.lines().map(|l| Line::from(l.to_string())));
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -394,7 +410,7 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
             } else {
                 Style::new()
             };
-            ListItem::new(Line::from(Span::styled(
+            let mut spans = vec![Span::styled(
                 format!(
                     "{} {:11} {} w{} {:14} {}",
                     task_ref(r.task.id),
@@ -405,7 +421,11 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
                     r.task.title
                 ),
                 style,
-            )))
+            )];
+            if app.redispatch.contains(&r.task.id) {
+                spans.push(redispatch_span());
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let mut state = ListState::default().with_selected(if app.all.is_empty() {

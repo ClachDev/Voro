@@ -7,8 +7,8 @@
 use rusqlite::{Connection, params};
 
 use crate::error::{Error, Result};
-use crate::model::{Session, Task, TaskState};
-use crate::store::{Store, get_task, insert_session, log_event};
+use crate::model::{Session, SessionOutcome, Task, TaskState};
+use crate::store::{Store, get_session, get_task, insert_session, log_event, set_session_outcome};
 
 /// Where a `proposed` task goes at triage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +113,73 @@ impl Store {
         let session_id = insert_session(&tx, task_id, agent, pid, log_path)?;
         tx.commit()?;
         Ok((self.task(task_id)?, self.session(session_id)?))
+    }
+
+    /// Close out a session whose backing process is no longer running
+    /// (DESIGN.md §8, the observation half of dispatch). `pid_alive` and
+    /// `likely_capped` are supplied by the caller — voro-core stays free of
+    /// process and log I/O — so this is a pure decision over the session and
+    /// its task's current state:
+    ///
+    /// - `pid_alive`: nothing to do, the session is left untouched (`Ok(None)`).
+    /// - the session already ended: also a no-op, so a caller looping over
+    ///   `live_sessions` repeatedly can't double-finalise one.
+    /// - the task is still `running`: the agent's process died without
+    ///   calling `done` or `ask`. The session outcome is `capped` if
+    ///   `likely_capped`, else `failed`, and the task drops `running → ready`
+    ///   flagged for redispatch (via the same transition `Abort` uses, tagged
+    ///   with a distinct `reconcile` event so the log tells an automatic
+    ///   reconciliation apart from a human abort).
+    /// - the task already left `running` on its own — `done`/`ask` landed it
+    ///   in `review`/`needs-input` before the process exited, or a human
+    ///   otherwise moved it — the session outcome reflects that instead
+    ///   (`completed`/`asked`/`aborted`) and the task is left alone.
+    pub fn reconcile_session(
+        &mut self,
+        session_id: i64,
+        pid_alive: bool,
+        likely_capped: bool,
+    ) -> Result<Option<(Session, Task)>> {
+        if pid_alive {
+            return Ok(None);
+        }
+        let tx = self.conn.transaction()?;
+        let session = get_session(&tx, session_id)?.ok_or(Error::SessionNotFound(session_id))?;
+        if session.ended_at.is_some() {
+            return Ok(None);
+        }
+        let task = get_task(&tx, session.task_id)?.ok_or(Error::TaskNotFound(session.task_id))?;
+
+        let outcome = match task.state {
+            TaskState::Running => {
+                if likely_capped {
+                    SessionOutcome::Capped
+                } else {
+                    SessionOutcome::Failed
+                }
+            }
+            TaskState::NeedsInput => SessionOutcome::Asked,
+            TaskState::Review => SessionOutcome::Completed,
+            _ => SessionOutcome::Aborted,
+        };
+        set_session_outcome(&tx, session_id, outcome)?;
+
+        if task.state == TaskState::Running {
+            apply_action(&tx, task.id, Action::Abort)?;
+            log_event(
+                &tx,
+                task.id,
+                "reconcile",
+                Some(&format!(
+                    "session {session_id} exited ({outcome}); flagged for redispatch"
+                )),
+            )?;
+        }
+        tx.commit()?;
+        Ok(Some((
+            self.session(session_id)?,
+            self.task(session.task_id)?,
+        )))
     }
 
     /// Replace the `blocks` dependencies of a task with the given set, then
@@ -722,6 +789,152 @@ mod tests {
             for action in all_actions() {
                 assert!(s.apply(id, action).is_err(), "{state} must be terminal");
             }
+        }
+    }
+
+    // --- reconcile_session (DESIGN.md §8, the observation half of dispatch) ---
+
+    mod reconcile {
+        use super::*;
+        use crate::model::SessionOutcome;
+
+        fn dispatch(s: &mut Store, p: i64) -> (i64, i64) {
+            let task_id = create(s, p, TaskState::Ready);
+            let (_, session) = s
+                .record_dispatch(task_id, "claude", Some(4242), Some("/var/log/s.log"))
+                .unwrap();
+            (task_id, session.id)
+        }
+
+        #[test]
+        fn live_pid_is_left_untouched() {
+            let (mut s, p) = store_with_project();
+            let (task_id, session_id) = dispatch(&mut s, p);
+
+            let result = s.reconcile_session(session_id, true, false).unwrap();
+            assert!(result.is_none());
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
+            assert!(s.session(session_id).unwrap().ended_at.is_none());
+        }
+
+        #[test]
+        fn dead_pid_on_a_running_task_fails_and_drops_to_ready() {
+            let (mut s, p) = store_with_project();
+            let (task_id, session_id) = dispatch(&mut s, p);
+
+            let (session, task) = s
+                .reconcile_session(session_id, false, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(session.outcome, Some(SessionOutcome::Failed));
+            assert!(session.ended_at.is_some());
+            assert_eq!(task.state, TaskState::Ready);
+            assert!(s.redispatch_flag(task_id).unwrap());
+
+            let events = s.events_for(task_id).unwrap();
+            assert_eq!(events.last().unwrap().kind, "reconcile");
+            assert!(
+                events
+                    .last()
+                    .unwrap()
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("failed")
+            );
+            // the transition itself reads exactly like Abort's
+            let transition = events.iter().rev().nth(1).unwrap();
+            assert_eq!(transition.kind, "transition");
+            assert_eq!(transition.detail.as_deref(), Some("running -> ready"));
+        }
+
+        #[test]
+        fn dead_pid_reports_capped_when_the_caller_says_so() {
+            let (mut s, p) = store_with_project();
+            let (task_id, session_id) = dispatch(&mut s, p);
+
+            let (session, task) = s
+                .reconcile_session(session_id, false, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(session.outcome, Some(SessionOutcome::Capped));
+            assert_eq!(task.state, TaskState::Ready);
+            assert!(s.redispatch_flag(task_id).unwrap());
+        }
+
+        #[test]
+        fn a_task_the_agent_already_asked_is_left_alone() {
+            let (mut s, p) = store_with_project();
+            let (task_id, session_id) = dispatch(&mut s, p);
+            s.apply(task_id, Action::Ask("A or B?".into())).unwrap();
+
+            let (session, task) = s
+                .reconcile_session(session_id, false, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(session.outcome, Some(SessionOutcome::Asked));
+            assert_eq!(task.state, TaskState::NeedsInput);
+            assert!(!s.redispatch_flag(task_id).unwrap());
+        }
+
+        #[test]
+        fn a_task_the_agent_already_completed_is_left_alone() {
+            let (mut s, p) = store_with_project();
+            let (task_id, session_id) = dispatch(&mut s, p);
+            s.apply(task_id, Action::Complete).unwrap();
+
+            let (session, task) = s
+                .reconcile_session(session_id, false, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(session.outcome, Some(SessionOutcome::Completed));
+            assert_eq!(task.state, TaskState::Review);
+            assert!(!s.redispatch_flag(task_id).unwrap());
+        }
+
+        #[test]
+        fn a_task_already_moved_off_running_some_other_way_is_marked_aborted() {
+            // e.g. a human aborted by hand before the process was noticed dead.
+            let (mut s, p) = store_with_project();
+            let (task_id, session_id) = dispatch(&mut s, p);
+            s.apply(task_id, Action::Abort).unwrap();
+
+            let (session, task) = s
+                .reconcile_session(session_id, false, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(session.outcome, Some(SessionOutcome::Aborted));
+            assert_eq!(task.state, TaskState::Ready);
+            // a manual abort must not itself read as a redispatch flag
+            assert!(!s.redispatch_flag(task_id).unwrap());
+        }
+
+        #[test]
+        fn an_already_ended_session_is_not_reprocessed() {
+            let (mut s, p) = store_with_project();
+            let (_, session_id) = dispatch(&mut s, p);
+            s.reconcile_session(session_id, false, false).unwrap();
+            let first_ended_at = s.session(session_id).unwrap().ended_at;
+
+            let result = s.reconcile_session(session_id, false, false).unwrap();
+            assert!(result.is_none());
+            assert_eq!(s.session(session_id).unwrap().ended_at, first_ended_at);
+        }
+
+        #[test]
+        fn unknown_session_is_an_error() {
+            let (mut s, _p) = store_with_project();
+            assert!(matches!(
+                s.reconcile_session(9999, false, false),
+                Err(Error::SessionNotFound(9999))
+            ));
+        }
+
+        #[test]
+        fn redispatch_flag_is_false_with_no_sessions() {
+            let (mut s, p) = store_with_project();
+            let id = create(&mut s, p, TaskState::Ready);
+            assert!(!s.redispatch_flag(id).unwrap());
         }
     }
 }
