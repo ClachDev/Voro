@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use voro_core::{
-    Action, AgentsConfig, DepKind, NewTask, Priority, Project, Store, Task, TaskEdit, TaskState,
-    Triage, scheduler,
+    Action, AgentsConfig, DepKind, NewTask, PrRef, Priority, Project, Store, Task, TaskEdit,
+    TaskState, Triage, scheduler,
 };
 
 use crate::dispatch::{self, DispatchCtx};
@@ -37,7 +37,9 @@ tasks
                                   create a proposed task; --from (default
                                   $VORO_TASK_ID) links it discovered-from
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
-      [--body TEXT | --body-file PATH] [--blocks IDS]
+      [--body TEXT | --body-file PATH] [--blocks IDS] [--pr URL | --no-pr]
+                                  --pr tracks a GitHub PR (URL or owner/repo#N)
+                                  for review; --no-pr clears it
   show <task-id>                  full task: body, deps, events
   list [--state STATE] [--project P]
   inbox                           the next-action queue: questions, reviews,
@@ -66,6 +68,8 @@ dispatch
   open <task-id>                  open a review/running task's checkout in the
                                   configured [viewer] (agents.toml) to see its
                                   diff — reports what to configure if none is set
+  pr <task-id>                    open the task's tracked GitHub PR in a browser
+                                  (jump-to-PR); set one with `set --pr`
 
 transitions
   triage <task-id> <parked|ready|reject>
@@ -78,7 +82,10 @@ transitions
                                   (--no-dispatch skips that)
   done <task-id>                  running → review
   accept <task-id>                review → done
-  reject <task-id> TEXT           review → running (TEXT is the feedback)
+  reject <task-id> [TEXT] [--from-pr]
+                                  review → running; TEXT is the feedback, or
+                                  --from-pr pulls the tracked PR's review
+                                  comments as the feedback (TEXT appended)
   abort <task-id>                 running → ready
   park <task-id>                  ready → parked
   unpark <task-id>                parked → ready
@@ -108,9 +115,11 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         "dispatch" => dispatch_verb(store, &pos, &flags, ctx),
         "continue" => continue_verb(store, &pos, &flags, ctx),
         "open" => open_verb(store, &pos, ctx),
+        "pr" => pr_verb(store, &pos),
+        "reject" => reject_verb(store, &pos, &flags),
         "answer" => answer_verb(store, &pos, &flags, ctx),
         "import" => import_verb(store, &pos, &flags),
-        "triage" | "start" | "ask" | "done" | "accept" | "reject" | "abort" | "park" | "unpark"
+        "triage" | "start" | "ask" | "done" | "accept" | "abort" | "park" | "unpark"
         | "abandon" => transition_verb(store, verb, &pos, &flags),
         other => Err(format!("unknown verb '{other}' — try 'voro help'")),
     }
@@ -127,6 +136,12 @@ fn split_args(args: Vec<String>) -> Result<(Vec<String>, HashMap<String, String>
             }
             Some("no-dispatch") => {
                 flags.insert("no-dispatch".to_string(), String::new());
+            }
+            Some("no-pr") => {
+                flags.insert("no-pr".to_string(), String::new());
+            }
+            Some("from-pr") => {
+                flags.insert("from-pr".to_string(), String::new());
             }
             Some("help") => pos.insert(0, "help".to_string()),
             Some(key) => {
@@ -419,7 +434,51 @@ fn set_verb(
             .map_err(|e| e.to_string())?,
         None => task,
     };
+    let task = match (flags.contains_key("no-pr"), flags.get("pr")) {
+        (true, Some(_)) => return Err("--pr and --no-pr are mutually exclusive".into()),
+        (true, None) => store.set_pr(id, None).map_err(|e| e.to_string())?,
+        (false, Some(raw)) => {
+            // Validate and canonicalise the reference before storing, so a
+            // tracked PR is always addressable and the stored form is stable.
+            let pr = PrRef::parse(raw).map_err(|e| e.to_string())?;
+            store.set_pr(id, Some(&pr.url)).map_err(|e| e.to_string())?
+        }
+        (false, None) => task,
+    };
     Ok(format!("task {} updated ({})", task.id, task.state))
+}
+
+/// `pr <task-id>` (DESIGN.md §11c): open the task's tracked GitHub PR in a
+/// browser — the jump-to-PR that lands on the diff and its comments. The `gh`
+/// shell-out lives in the `pr` module beside the other process work.
+fn pr_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
+    let id = task_id(pos, 1)?;
+    crate::pr::open(store, id)
+}
+
+/// `reject <task-id> [TEXT] [--from-pr]` (DESIGN.md §6/§11c): review → running
+/// with feedback. `--from-pr` pulls the tracked PR's review comments as that
+/// feedback so a GitHub review reaches the agent without retyping; any extra
+/// TEXT is appended below them. Without the flag, TEXT is the feedback as before.
+fn reject_verb(
+    store: &mut Store,
+    pos: &[String],
+    flags: &HashMap<String, String>,
+) -> Result<String, String> {
+    let id = task_id(pos, 1)?;
+    let feedback = if flags.contains_key("from-pr") {
+        let pulled = crate::pr::pull_review_feedback(store, id)?;
+        match pos.get(2..).map(|rest| rest.join(" ")) {
+            Some(extra) if !extra.trim().is_empty() => format!("{pulled}\n{extra}"),
+            _ => pulled,
+        }
+    } else {
+        rest_text(pos, 2, "rejection feedback")?
+    };
+    let task = store
+        .apply(id, Action::RejectWork(feedback))
+        .map_err(|e| e.to_string())?;
+    Ok(format!("task {} -> {}", task.id, task.state))
 }
 
 fn show_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
@@ -439,6 +498,9 @@ fn show_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     }
     if let Some(q) = &task.question {
         writeln!(out, "question: {q}").unwrap();
+    }
+    if let Some(pr) = &task.pr_url {
+        writeln!(out, "pr: {pr}").unwrap();
     }
     if store.redispatch_flag(id).map_err(|e| e.to_string())? {
         writeln!(out, "flagged for redispatch").unwrap();
@@ -719,7 +781,6 @@ fn transition_verb(
         }
         "done" => Action::Complete,
         "accept" => Action::Accept,
-        "reject" => Action::RejectWork(rest_text(pos, 2, "rejection feedback")?),
         "abort" => Action::Abort,
         "park" => Action::Park,
         "unpark" => Action::Unpark,
@@ -1012,6 +1073,91 @@ mod tests {
         let e = err(&mut s, &["open", "1"]);
         assert!(e.contains("review or running"), "{e}");
         assert!(ok(&mut s, &["help"]).contains("open <task-id>"), "help");
+    }
+
+    // --- PR tracking (task, DESIGN.md §11c) ---
+
+    #[test]
+    fn set_tracks_canonicalises_and_clears_a_pr() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+
+        // the owner/repo#n shorthand is accepted and stored as a canonical URL
+        ok(&mut s, &["set", "1", "--pr", "acme/widget#42"]);
+        let shown = ok(&mut s, &["show", "1"]);
+        assert!(
+            shown.contains("pr: https://github.com/acme/widget/pull/42"),
+            "{shown}"
+        );
+
+        // --no-pr clears it
+        ok(&mut s, &["set", "1", "--no-pr"]);
+        assert!(!ok(&mut s, &["show", "1"]).contains("pr:"));
+    }
+
+    #[test]
+    fn set_rejects_a_non_pr_reference_without_tracking() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        let e = err(
+            &mut s,
+            &[
+                "set",
+                "1",
+                "--pr",
+                "https://github.com/acme/widget/issues/9",
+            ],
+        );
+        assert!(e.contains("not a GitHub PR"), "{e}");
+        assert!(!ok(&mut s, &["show", "1"]).contains("pr:"));
+    }
+
+    #[test]
+    fn set_pr_and_no_pr_are_mutually_exclusive() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        let e = err(&mut s, &["set", "1", "--pr", "acme/w#1", "--no-pr"]);
+        assert!(e.contains("mutually exclusive"), "{e}");
+    }
+
+    /// `reject --from-pr` on a task with no tracked PR reports the missing
+    /// reference before shelling out to `gh` — a network-free failure — and
+    /// leaves the task in `review`.
+    #[test]
+    fn reject_from_pr_without_a_tracked_pr_reports_and_does_not_transition() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["done", "1"]);
+        let e = err(&mut s, &["reject", "1", "--from-pr"]);
+        assert!(e.contains("no tracked PR"), "{e}");
+        assert!(ok(&mut s, &["show", "1"]).contains("#1 review"));
+    }
+
+    /// Plain `reject <id> TEXT` is unchanged by the `--from-pr` addition.
+    #[test]
+    fn reject_with_text_still_feeds_back_and_requeues() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["done", "1"]);
+        let out = ok(&mut s, &["reject", "1", "tests missing"]);
+        assert!(out.contains("-> running"), "{out}");
+        assert!(ok(&mut s, &["show", "1"]).contains("tests missing"));
+    }
+
+    #[test]
+    fn help_documents_pr_tracking() {
+        let mut s = store();
+        let out = ok(&mut s, &["help"]);
+        assert!(out.contains("pr <task-id>"), "{out}");
+        assert!(out.contains("--pr URL"), "{out}");
+        assert!(out.contains("--from-pr"), "{out}");
     }
 
     #[test]

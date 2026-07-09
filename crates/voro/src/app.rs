@@ -518,6 +518,7 @@ impl App {
                 }
             }
             KeyCode::Char('o') => self.open_selected_in_viewer(),
+            KeyCode::Char('g') => self.open_selected_pr(),
             _ => {}
         }
     }
@@ -595,6 +596,52 @@ impl App {
         match crate::dispatch::open(&mut self.store, &self.dispatch_ctx, id) {
             Ok(summary) => self.status = Some(summary),
             Err(e) => self.status = Some(e),
+        }
+    }
+
+    /// Jump to the selected task's tracked GitHub PR in a browser (DESIGN.md
+    /// §11c). A task with no PR reports through the status line — the same
+    /// "no-op with an explanation" style as the dispatch and open keys —
+    /// rather than doing nothing. Opening the PR never touches the store, so
+    /// no refresh follows.
+    fn open_selected_pr(&mut self) {
+        let Some(id) = self.selected_task_id() else {
+            return;
+        };
+        match crate::pr::open(&self.store, id) {
+            Ok(summary) => self.status = Some(summary),
+            Err(e) => self.status = Some(e),
+        }
+    }
+
+    /// The initial text of a transition prompt. A `RejectWork` prompt on a task
+    /// with a tracked PR is pre-filled with that PR's review comments (DESIGN.md
+    /// §11c), so a GitHub review reaches the agent without retyping; the human
+    /// can still edit before submitting. Everything else — and a PR with no
+    /// pullable comments, or a `gh` failure — starts empty, with the reason on
+    /// the status line.
+    fn prompt_seed(&mut self, task_id: i64, kind: PromptKind) -> String {
+        if kind != PromptKind::RejectWork {
+            return String::new();
+        }
+        let tracked = self
+            .store
+            .task(task_id)
+            .ok()
+            .and_then(|t| t.pr_url)
+            .is_some();
+        if !tracked {
+            return String::new();
+        }
+        match crate::pr::pull_review_feedback(&self.store, task_id) {
+            Ok(body) => {
+                self.status = Some("pre-filled feedback from the PR's review comments".into());
+                body
+            }
+            Err(e) => {
+                self.status = Some(format!("{e}; type the feedback instead"));
+                String::new()
+            }
         }
     }
 
@@ -827,10 +874,11 @@ impl App {
                 };
                 match kind {
                     Some(kind) => {
+                        let buffer = self.prompt_seed(task_id, kind);
                         self.mode = Mode::Prompt {
                             task_id,
                             kind,
-                            buffer: String::new(),
+                            buffer,
                         };
                     }
                     None => self.apply_and_refresh(task_id, action),
@@ -1590,6 +1638,44 @@ mod tests {
             "{:?}",
             app.status
         );
+    }
+
+    // --- PR tracking (task, DESIGN.md §11c) ---
+
+    /// `g` on a task with no tracked PR reports through the status line rather
+    /// than shelling out to `gh` — a network-free no-op-with-explanation.
+    #[test]
+    fn jump_to_pr_key_on_a_task_without_a_pr_reports() {
+        let mut app = app_with(&[TaskState::Ready]);
+        key(&mut app, KeyCode::Char('g'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("no tracked PR"),
+            "{:?}",
+            app.status
+        );
+    }
+
+    /// Rejecting a review task with no tracked PR opens the ordinary feedback
+    /// prompt, empty — the pre-fill only fires when a PR is tracked (DESIGN.md
+    /// §11c), so this path never touches `gh`.
+    #[test]
+    fn reject_prompt_starts_empty_without_a_tracked_pr() {
+        let mut app = app_with(&[TaskState::Review]);
+        key(&mut app, KeyCode::Enter); // transition menu for the review row
+        key(&mut app, KeyCode::Char('j')); // Accept -> RejectWork
+        key(&mut app, KeyCode::Enter);
+        match &app.mode {
+            Mode::Prompt {
+                kind: PromptKind::RejectWork,
+                buffer,
+                ..
+            } => assert!(buffer.is_empty(), "buffer was {buffer:?}"),
+            _ => panic!("expected an empty reject prompt"),
+        }
     }
 
     /// `D` shares the same readiness precondition as `d`.
