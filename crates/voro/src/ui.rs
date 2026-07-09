@@ -30,7 +30,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 .iter()
                 .map(|p| ListItem::new(format!("{}  {}", p.weight, p.name)))
                 .collect();
-            let area = popup_area(frame, 44, (items.len() as u16 + 3).max(4));
+            let area = popup_area(frame, 48, (items.len() as u16 + 3).max(4));
             let content = popup_block(
                 frame,
                 area,
