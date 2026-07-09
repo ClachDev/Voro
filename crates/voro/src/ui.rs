@@ -247,11 +247,18 @@ fn draw_mode(frame: &mut Frame, app: &App) {
 
 fn draw_cockpit(frame: &mut Frame, app: &App) {
     let queue_height = (app.queue.len() as u16 + 2).clamp(3, 12);
+    // Collapsed to nothing when no session is live, so the queue and detail
+    // pane keep the space in the common case (DESIGN.md §9).
+    let running_height = if app.running.is_empty() {
+        0
+    } else {
+        (app.running.len() as u16 + 2).clamp(3, 6)
+    };
     let [header, queue, detail, running, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(queue_height),
         Constraint::Min(5),
-        Constraint::Length(4),
+        Constraint::Length(running_height),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -376,7 +383,13 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         }
         Some(CockpitRow::Running(i)) => {
             let r = &app.running[*i];
-            (&r.task, r.project.as_str(), None)
+            match app.all.iter().find(|row| row.task.id == r.task_id) {
+                Some(row) => (&row.task, row.project.as_str(), None),
+                None => {
+                    frame.render_widget(Paragraph::new("").block(block), area);
+                    return;
+                }
+            }
         }
         None => {
             frame.render_widget(Paragraph::new("").block(block), area);
@@ -411,7 +424,13 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para.block(block), area);
 }
 
+/// Live sessions (DESIGN.md §9): agent, task state, and elapsed time since
+/// dispatch. Collapsed to a zero-height area by `draw_cockpit` when nothing
+/// is running, so there is nothing to draw here in the common case.
 fn draw_running(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
     let mut items: Vec<ListItem> = Vec::new();
     let mut selected: Option<usize> = None;
     for (i, row) in app.cockpit_rows.iter().enumerate() {
@@ -420,10 +439,16 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect) {
             if i == app.cockpit_sel {
                 selected = Some(items.len());
             }
-            items.push(ListItem::new(format!(
-                "#{} ({}): {}",
-                r.task.id, r.project, r.task.title
-            )));
+            items.push(ListItem::new(Line::from(vec![
+                Span::raw(format!("{} ", task_ref(r.task_id))),
+                Span::styled(format!("{:8} ", r.agent), Style::new().fg(Color::Magenta)),
+                Span::raw(format!("{:11} ", r.task_state.to_string())),
+                Span::styled(
+                    format!("{:>6}  ", format_elapsed(r.elapsed_secs)),
+                    Style::new().dim(),
+                ),
+                Span::raw(r.task_title.clone()),
+            ])));
         }
     }
     let mut state = ListState::default().with_selected(selected);
@@ -431,6 +456,20 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title("Running"))
         .highlight_style(SELECTED);
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Seconds since a session's `started_at` as a compact clock — `12s`,
+/// `3m07s`, `1h05m` — so the running strip's column stays a stable width.
+fn format_elapsed(secs: i64) -> String {
+    let secs = secs.max(0);
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 fn draw_tasks(frame: &mut Frame, app: &App) {

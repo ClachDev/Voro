@@ -5,7 +5,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    Blocker, Dep, DepKind, Event, Priority, Project, Session, SessionOutcome, Task, TaskState,
+    Blocker, Dep, DepKind, Event, LiveSession, Priority, Project, Session, SessionOutcome, Task,
+    TaskState,
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -407,6 +408,31 @@ impl Store {
             outcome,
             Some(SessionOutcome::Failed | SessionOutcome::Capped)
         ))
+    }
+
+    /// Live sessions joined with their task's current title and state, newest
+    /// first — the cockpit's running strip (DESIGN.md §9). Elapsed time is
+    /// computed against the database's clock so the TUI only formats it.
+    pub fn live_sessions_with_tasks(&self) -> Result<Vec<LiveSession>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.task_id, t.title, t.state, s.agent, s.started_at,
+                    CAST(strftime('%s', 'now') - strftime('%s', s.started_at) AS INTEGER)
+             FROM sessions s JOIN tasks t ON t.id = s.task_id
+             WHERE s.ended_at IS NULL
+             ORDER BY s.id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(LiveSession {
+                session_id: row.get(0)?,
+                task_id: row.get(1)?,
+                task_title: row.get(2)?,
+                task_state: row.get(3)?,
+                agent: row.get(4)?,
+                started_at: row.get(5)?,
+                elapsed_secs: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     // --- events ---
@@ -834,6 +860,60 @@ mod tests {
 
         let ids = s.live_sessions().unwrap();
         assert_eq!(ids.iter().map(|s| s.id).collect::<Vec<_>>(), vec![live.id]);
+    }
+
+    #[test]
+    fn live_sessions_with_tasks_joins_current_task_fields() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+        let session = s.create_session(task_id, "claude", None, None).unwrap();
+
+        let rows = s.live_sessions_with_tasks().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, session.id);
+        assert_eq!(rows[0].task_id, task_id);
+        assert_eq!(rows[0].task_title, "run me");
+        assert_eq!(rows[0].task_state, TaskState::Running);
+        assert_eq!(rows[0].agent, "claude");
+        assert!(rows[0].elapsed_secs >= 0);
+    }
+
+    #[test]
+    fn live_sessions_with_tasks_excludes_ended_and_orders_newest_first() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+        let done = s.create_session(task_id, "claude", None, None).unwrap();
+        let live = s.create_session(task_id, "codex", None, None).unwrap();
+        s.end_session(done.id, SessionOutcome::Completed).unwrap();
+
+        let rows = s.live_sessions_with_tasks().unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.session_id).collect::<Vec<_>>(),
+            vec![live.id]
+        );
+        assert_eq!(rows[0].agent, "codex");
+    }
+
+    #[test]
+    fn live_sessions_with_tasks_computes_elapsed_from_started_at() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+        let session = s.create_session(task_id, "claude", None, None).unwrap();
+        s.conn
+            .execute(
+                "UPDATE sessions SET started_at = datetime('now', '-90 seconds') WHERE id = ?1",
+                params![session.id],
+            )
+            .unwrap();
+
+        let rows = s.live_sessions_with_tasks().unwrap();
+        assert_eq!(rows.len(), 1);
+        // allow a couple of seconds of test-execution slack either side
+        assert!(
+            (85..=95).contains(&rows[0].elapsed_secs),
+            "expected ~90s elapsed, got {}",
+            rows[0].elapsed_secs
+        );
     }
 
     #[test]

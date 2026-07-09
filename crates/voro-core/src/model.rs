@@ -307,6 +307,21 @@ pub struct Session {
     pub outcome: Option<SessionOutcome>,
 }
 
+/// A live session joined with the task it is running, for the cockpit's
+/// running strip (DESIGN.md §9) — what's live, on what task, and for how
+/// long. `elapsed_secs` is computed in SQL against the database's clock so
+/// the TUI only has to format it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveSession {
+    pub session_id: i64,
+    pub task_id: i64,
+    pub task_title: String,
+    pub task_state: TaskState,
+    pub agent: String,
+    pub started_at: String,
+    pub elapsed_secs: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
