@@ -31,8 +31,8 @@ pub enum Error {
     DependencyCycle(String),
 
     #[error(
-        "agents config not found at {}; expected a TOML file with `default = \"<name>\"` \
-         and an [agents.<name>] table per agent",
+        "agents config not found at {}; run `voro agents init` to create a starter file, \
+         then edit it to match the agents you have installed",
         .0.display()
     )]
     AgentConfigMissing(PathBuf),
