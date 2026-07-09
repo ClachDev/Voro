@@ -10,7 +10,9 @@ use rusqlite::{Connection, params};
 
 use crate::error::{Error, Result};
 use crate::model::{Session, SessionOutcome, Task, TaskState};
-use crate::store::{Store, get_session, get_task, insert_session, log_event, set_session_outcome};
+use crate::store::{
+    Store, get_session, get_task, insert_session, latest_session_id, log_event, set_session_outcome,
+};
 
 /// Where a `proposed` task goes at triage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,12 +158,17 @@ impl Store {
     /// - `pid_alive`: nothing to do, the session is left untouched (`Ok(None)`).
     /// - the session already ended: also a no-op, so a caller looping over
     ///   `live_sessions` repeatedly can't double-finalise one.
-    /// - the task is still `running`: the agent's process died without
-    ///   calling `done` or `ask`. The session outcome is `capped` if
-    ///   `likely_capped`, else `failed`, and the task drops `running → ready`
-    ///   flagged for redispatch (via the same transition `Abort` uses, tagged
-    ///   with a distinct `reconcile` event so the log tells an automatic
-    ///   reconciliation apart from a human abort).
+    /// - the task is still `running` and this is its most recent session: the
+    ///   agent's process died without calling `done` or `ask`. The session
+    ///   outcome is `capped` if `likely_capped`, else `failed`, and the task
+    ///   drops `running → ready` flagged for redispatch (via the same
+    ///   transition `Abort` uses, tagged with a distinct `reconcile` event so
+    ///   the log tells an automatic reconciliation apart from a human abort).
+    /// - the task is `running` but an *older* session is the one that exited —
+    ///   it was aborted and redispatched (#41), and a newer session now owns
+    ///   the running state. Its outcome is backfilled (`failed`/`capped`) but
+    ///   the task is left in `running`, so a dead predecessor can't demote a
+    ///   legitimately-running task.
     /// - the task already left `running` on its own — `done`/`ask` landed it
     ///   in `review`/`needs-input` before the process exited, or a human
     ///   otherwise moved it — the session outcome reflects that instead
@@ -196,7 +203,8 @@ impl Store {
         };
         set_session_outcome(&tx, session_id, outcome)?;
 
-        if task.state == TaskState::Running {
+        let is_current_session = latest_session_id(&tx, task.id)? == Some(session_id);
+        if task.state == TaskState::Running && is_current_session {
             apply_action(&tx, task.id, Action::Abort)?;
             log_event(
                 &tx,
@@ -1056,6 +1064,39 @@ mod tests {
             let result = s.reconcile_session(session_id, false, false).unwrap();
             assert!(result.is_none());
             assert_eq!(s.session(session_id).unwrap().ended_at, first_ended_at);
+        }
+
+        #[test]
+        fn a_dead_older_session_does_not_demote_a_redispatched_task() {
+            // dispatch, abort (session stays open, #41), redispatch: the task
+            // is running behind a fresh, live session when the first session's
+            // process is finally noticed dead. Reconciling that older session
+            // must backfill only its own outcome, not knock the task back.
+            let (mut s, p) = store_with_project();
+            let (task_id, older_session) = dispatch(&mut s, p);
+            s.apply(task_id, Action::Abort).unwrap();
+            let newer_session = s
+                .record_dispatch(task_id, "claude", Some(4343), Some("/var/log/s2.log"))
+                .unwrap()
+                .1
+                .id;
+
+            let (session, task) = s
+                .reconcile_session(older_session, false, false)
+                .unwrap()
+                .unwrap();
+
+            // the older session is finalised as failed...
+            assert_eq!(session.id, older_session);
+            assert_eq!(session.outcome, Some(SessionOutcome::Failed));
+            // ...but the task stays running behind the still-live newer session
+            assert_eq!(task.state, TaskState::Running);
+            assert!(!s.redispatch_flag(task_id).unwrap());
+            assert!(s.session(newer_session).unwrap().ended_at.is_none());
+
+            // and no reconcile/transition event was logged against the task
+            let events = s.events_for(task_id).unwrap();
+            assert!(events.iter().all(|e| e.kind != "reconcile"));
         }
 
         #[test]

@@ -1,0 +1,176 @@
+# Agent integration
+
+This is the glue that lives *between* Voro and a coding agent, for the one agent
+that has richer integration hooks than "run a shell command": Claude Code. None
+of it is required — dispatch works for any agent through the command template in
+`agents.toml` alone (DESIGN.md §8) — and none of it lives in `voro-core` or the
+dispatch path. It is per-agent configuration you drop into a project.
+
+Voro's boundary with an agent is task state versus session state (DESIGN.md §8):
+Voro does not watch the process, it is *told* what happened. The telling is the
+**return path** — a few CLI verbs the agent calls from inside its session. Hooks
+are a belt-and-braces layer under that: a way for a Claude session that forgets
+to call the verbs to still report, driven by Claude Code's own lifecycle events
+rather than the agent's discipline.
+
+## The return path
+
+Dispatch runs the agent in the project checkout with two environment variables
+set (DESIGN.md §8): `VORO_TASK_ID`, the task being worked, and `VORO_DB`, the
+database that dispatched it. Every return-path verb reads them, so the agent
+addresses the right task in the right store without being told either. Advertise
+the verbs to the agent by pasting this into the project's `CLAUDE.md` (or
+`AGENTS.md`):
+
+```markdown
+## Reporting back to Voro
+
+You were dispatched by Voro on task $VORO_TASK_ID. When you reach one of these
+points, run the matching command — Voro surfaces it in the operator's queue:
+
+    voro ask "$VORO_TASK_ID" --question "Schema A or B? Trade-offs: ..."
+    voro done "$VORO_TASK_ID"
+    voro propose <project> "Follow-up title" --body-file plan.md
+
+- `ask` when you are blocked on a human decision and cannot proceed.
+- `done` when the work is complete and ready for review.
+- `propose` to record follow-up work you noticed; it links back to this task.
+
+`VORO_TASK_ID` and `VORO_DB` are already in your environment — do not set them.
+```
+
+`ask` moves the task `running → needs-input` (it becomes first among equals in
+the queue); `done` moves it `running → review`; `propose` files a `proposed`
+task discovered-from this one. That is the whole surface — see DESIGN.md §8 for
+why it is deliberately this small.
+
+## Hooks as a fallback
+
+The return path depends on the agent remembering to call it. A session that does
+the work and exits without calling `done` is indistinguishable, to Voro, from one
+that crashed: the pid-liveness reconciler (DESIGN.md §8) finds the process gone
+with the task still `running`, marks the session `failed`, and drops the task
+back to `ready` flagged for redispatch. That is the safe default, but it is
+pessimistic — the work may have been finished and only the report forgotten.
+
+Claude Code fires [lifecycle hooks](https://docs.claude.com/en/docs/claude-code/hooks)
+that can close that gap by calling the verbs on the agent's behalf. Each hook
+runs as a subprocess of the session, so it inherits `VORO_TASK_ID` and `VORO_DB`
+and has everything it needs to address the right task.
+
+The hooks that matter here, and what each can honestly do:
+
+| Hook | Fires when | Fallback | Value it adds |
+|---|---|---|---|
+| `SessionEnd` | the session terminates normally | `voro done` if the task is still `running` | upgrades a forgotten `done` from a `failed`-flagged reconcile to a real `review` — the operator sees the diff instead of a redispatch |
+| `Notification` | Claude needs permission, or has idled waiting for input | `voro ask` with the notification message | the *only* signal for a session that is alive but stuck: its process is still running, so the pid-liveness reconciler never fires for it |
+| `Stop` | the main agent finishes responding | same as `SessionEnd` | an earlier anchor for the same completion case; redundant with `SessionEnd` and optional |
+
+Two honest limits shape this.
+
+**There is no failure hook.** A hard crash or a usage-cap `SIGKILL` bypasses
+`SessionEnd` entirely, and no Claude Code hook cleanly signals "this agent
+failed." So the fallback deliberately does *not* try to synthesise a `failed`
+outcome — that case stays with the pid-liveness reconciler, which already labels
+it `failed`/`capped` and flags the task for redispatch (DESIGN.md §8). The hooks
+only ever improve the *graceful* paths.
+
+**`SessionEnd → done` is optimistic.** It marks the task `review` on the
+assumption the work is finished, which is wrong if the agent gave up mid-task and
+merely finished talking about it. That costs little: `review` is human-gated, so
+a false completion is one rejection away from going back to `running`, and it
+routes the diff to the operator's eyes rather than silently re-queuing. Prefer
+that the agent call `done` itself with a real summary; treat the hook as the net,
+not the plan.
+
+### Double transitions are already safe
+
+The obvious worry is a double transition: the agent calls `done`, *then* the
+`SessionEnd` hook fires `voro done` again. It is a non-issue. Voro's transition
+API rejects any illegal transition before it writes anything — no state change,
+no event, the transaction never commits (`voro-core`'s `apply`; the
+`full_transition_matrix` test pins every rejected pair). Once the agent has moved
+the task to `review` or `needs-input`, a second `voro done` from a hook is
+rejected and leaves the task exactly as it was.
+
+So the hooks never need to inspect the task's current state before acting — the
+rejection is all the protection required. This composes with the reconciler for
+the same reason: whichever of the hook and the reconciler reaches the task first
+wins, and the other finds a task that has already left `running` and no-ops (the
+reconciler records the session `completed` and leaves the task alone, DESIGN.md
+§8). Wiring the hooks cannot corrupt state; the worst case is a harmless rejected
+command.
+
+## Sample configuration
+
+Two things make this safe to leave installed:
+
+- **Guard on `VORO_TASK_ID`.** Only a dispatched session has it set. Without the
+  guard, these hooks in a user-level `~/.claude/settings.json` would fire
+  `voro done` at the end of *every* ordinary interactive session. The guard makes
+  them inert outside dispatch, so they are safe at any settings scope; putting
+  them in the dispatched project's `.claude/settings.json` narrows them further.
+- **Swallow the exit code.** A rejected transition exits non-zero; `|| true`
+  keeps Claude Code from surfacing it to the operator as a failed hook.
+
+The `SessionEnd` fallback needs no payload, so it can live inline. The
+`Notification` fallback reads the hook's JSON from stdin to lift out the message,
+which is fiddly to inline; give it a small wrapper script on your `PATH` instead.
+
+`.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -n \"$VORO_TASK_ID\" && voro done \"$VORO_TASK_ID\" >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          { "type": "command", "command": "voro-notify-hook" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`voro-notify-hook` (make it executable, put it on `PATH`):
+
+```sh
+#!/bin/sh
+# Claude Code Notification hook -> voro ask, for a stuck-but-alive session.
+[ -n "$VORO_TASK_ID" ] || exit 0          # inert outside a dispatched session
+payload=$(cat)
+if command -v jq >/dev/null 2>&1; then
+  message=$(printf '%s' "$payload" | jq -r '.message // empty')
+fi
+[ -n "$message" ] || message="agent signalled it needs input"
+voro ask "$VORO_TASK_ID" --question "$message" >/dev/null 2>&1 || true
+```
+
+`Stop` can be wired identically to `SessionEnd` if you want the earlier anchor,
+but it adds nothing once `SessionEnd` is in place.
+
+## What this is verified against
+
+The transition-rejection guarantee the double-transition safety rests on is
+verified in code (`voro-core`'s `full_transition_matrix` test, plus reading the
+`apply` path: an illegal transition returns before any write and never commits).
+The verb-to-state mapping and the `VORO_TASK_ID`/`VORO_DB` export are verified
+against the dispatch and CLI source (DESIGN.md §8; `voro done` takes no
+`--summary` in the current CLI, unlike §8's illustrative example).
+
+Not yet verified against a live Claude Code session is the *firing* of the hooks
+themselves — that `SessionEnd`, `Notification`, and `Stop` fire with the payloads
+and environment assumed here. Confirm that once against a real dispatched session
+before relying on the fallback, and adjust the event names or the `message`
+extraction if Claude Code's hook contract has moved.

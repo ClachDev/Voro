@@ -496,6 +496,21 @@ pub(crate) fn get_session(conn: &Connection, id: i64) -> Result<Option<Session>>
         .optional()?)
 }
 
+/// The id of a task's most recent session — the one that last put it in
+/// `running`, matching the newest-first ordering of [`Store::sessions_for`].
+/// `None` when the task has no sessions. Used by reconciliation to tell a
+/// task's live session apart from an older, superseded one.
+pub(crate) fn latest_session_id(conn: &Connection, task_id: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT MAX(id) FROM sessions WHERE task_id = ?1",
+            [task_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
         id: row.get(0)?,

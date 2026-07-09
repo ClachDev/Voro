@@ -15,7 +15,7 @@ to the database with raw SQL or a sqlite client.**
 From this repo: `cargo run -q -p voro -- <verb> [args]` (or `./target/debug/voro`
 after a build; `voro` if installed on PATH).
 
-Database resolution: `--db PATH` flag → `FOCUS_DB` env var → the real one at
+Database resolution: `--db PATH` flag → `VORO_DB` env var → the real one at
 `~/.local/share/voro/voro.db`. Tests and experiments must use `--db` with a
 scratch path; only deliberate task management touches the real database.
 
@@ -60,7 +60,12 @@ voro done <id>                       # running → review (work finished, await 
 voro abort <id>                      # running → ready (backing out)
 ```
 
-As an agent, your lifecycle is exactly: `start` when you begin, `ask` when
+**When you are asked to work on a task, run `voro start <id>` before you do
+anything else.** This claims the task and moves it to `running`, so the queue
+reflects that it is being worked rather than still waiting. The task id is in
+the request (e.g. "implement task 35"); if it is unclear, ask.
+
+Your lifecycle as an agent is exactly: `start` when you begin, `ask` when
 blocked on a decision, `done` when finished. **Do not** `triage`, `accept`,
 `reject`, or `abandon` — closing the loop is the human's job, and proposed
 tasks you create must be left proposed.

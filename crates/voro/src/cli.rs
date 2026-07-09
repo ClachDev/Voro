@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use voro_core::{
-    Action, DepKind, NewTask, Priority, Project, Store, Task, TaskEdit, TaskState, Triage,
-    scheduler,
+    Action, AgentsConfig, DepKind, NewTask, Priority, Project, Store, Task, TaskEdit, TaskState,
+    Triage, scheduler,
 };
 
 use crate::dispatch::{self, DispatchCtx};
@@ -50,6 +50,10 @@ tasks
                                   --repo overrides the checkout's own remote
 
 dispatch
+  agents init                     write a starter ~/.config/voro/agents.toml
+                                  (won't overwrite an existing one)
+  agents list                     list configured agents; * marks the default
+  agents path                     print where dispatch looks for agents.toml
   dispatch <task-id> [--agent NAME]
                                   spawn a headless agent session on a ready
                                   task; --agent overrides the resolved agent
@@ -59,6 +63,9 @@ dispatch
                                   `answer` does automatically for a
                                   previously-dispatched task, exposed to retry
                                   a continuation that failed
+  open <task-id>                  open a review/running task's checkout in the
+                                  configured [viewer] (agents.toml) to see its
+                                  diff — reports what to configure if none is set
 
 transitions
   triage <task-id> <parked|ready|reject>
@@ -97,8 +104,10 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         "inbox" => inbox_verb(store),
         "next" => next_verb(store),
         "explain" => explain_verb(store, &pos),
+        "agents" => agents_verb(&pos, ctx),
         "dispatch" => dispatch_verb(store, &pos, &flags, ctx),
         "continue" => continue_verb(store, &pos, &flags, ctx),
+        "open" => open_verb(store, &pos, ctx),
         "answer" => answer_verb(store, &pos, &flags, ctx),
         "import" => import_verb(store, &pos, &flags),
         "triage" | "start" | "ask" | "done" | "accept" | "reject" | "abort" | "park" | "unpark"
@@ -245,6 +254,37 @@ fn project_verb(
             Ok(format!("project {} '{}' deleted", project.id, project.name))
         }
         other => Err(format!("unknown project subcommand '{other}'")),
+    }
+}
+
+/// Manage the `agents.toml` that dispatch resolves against — the config that
+/// lives outside the database (DESIGN.md §8), so this verb takes no `store`.
+/// `init` scaffolds a starter file, `list` shows what is configured, and
+/// `path` prints where dispatch looks for it.
+fn agents_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
+    let path = &ctx.agents_path;
+    match need(pos, 1, "agents subcommand (init|list|path)")? {
+        "init" => {
+            AgentsConfig::write_starter(path).map_err(|e| e.to_string())?;
+            Ok(format!(
+                "wrote starter agents config to {} — edit it to match your installed agents, \
+                 then `voro dispatch <task-id>`",
+                path.display()
+            ))
+        }
+        "list" => {
+            let config = AgentsConfig::load(path).map_err(|e| e.to_string())?;
+            let default = config.default_name();
+            let mut out = String::new();
+            for (name, cmd) in config.entries() {
+                let marker = if name == default { "* " } else { "  " };
+                writeln!(out, "{marker}{name}  {cmd}").unwrap();
+            }
+            writeln!(out, "\n({} — * is the default)", path.display()).unwrap();
+            Ok(out)
+        }
+        "path" => Ok(path.display().to_string()),
+        other => Err(format!("unknown agents subcommand '{other}'")),
     }
 }
 
@@ -615,6 +655,15 @@ fn answer_verb(
     }
 }
 
+/// `open <task-id>` (DESIGN.md §11a): run the configured `[viewer]` command on
+/// a review/running task's checkout so its diff can be seen. Spawning lives in
+/// the dispatch module beside the other process work; `voro-core` stays
+/// process-free.
+fn open_verb(store: &mut Store, pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
+    let id = task_id(pos, 1)?;
+    dispatch::open(store, ctx, id)
+}
+
 /// Milestone C's one-way GitHub import (DESIGN.md §10): shells out to `gh
 /// issue list` in the project's path (or `--repo owner/name` if the checkout
 /// itself doesn't name the repo to import from) and captures each issue as a
@@ -726,6 +775,46 @@ mod tests {
         let out = ok(&mut s, &["project", "delete", "renamed"]);
         assert!(out.contains("deleted"), "{out}");
         assert!(!ok(&mut s, &["project", "list"]).contains("renamed"));
+    }
+
+    #[test]
+    fn agents_init_then_list_through_the_cli() {
+        let dir = std::env::temp_dir().join(format!(
+            "voro-cli-agents-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agents_path = dir.join("voro/agents.toml");
+        let ctx = DispatchCtx {
+            db_path: dir.join("voro.db"),
+            agents_path: agents_path.clone(),
+            runtime_dir: dir.join("sessions"),
+        };
+        let mut s = store();
+        let call = |s: &mut Store, args: &[&str]| {
+            run(s, args.iter().map(|x| x.to_string()).collect(), &ctx)
+        };
+
+        // no config yet: dispatch-facing verbs report the missing file and
+        // point at `agents init`
+        let e = call(&mut s, &["agents", "list"]).unwrap_err();
+        assert!(e.contains("agents init"), "{e}");
+
+        let out = call(&mut s, &["agents", "init"]).unwrap();
+        assert!(out.contains(&agents_path.display().to_string()), "{out}");
+        assert!(agents_path.exists());
+
+        let listed = call(&mut s, &["agents", "list"]).unwrap();
+        assert!(listed.contains("* claude"), "{listed}");
+
+        // a second init refuses rather than clobbering
+        let e = call(&mut s, &["agents", "init"]).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -911,6 +1000,18 @@ mod tests {
         assert!(shown.contains("ready"));
         ok(&mut s, &["set", "1", "--no-agent"]);
         assert!(!ok(&mut s, &["show", "1"]).contains("codex"));
+    }
+
+    #[test]
+    fn open_refuses_a_non_review_task_and_help_documents_it() {
+        // The state guard fires before any config is loaded, so a `ready` task
+        // is refused without touching the real user agents.toml `ctx()` names.
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        let e = err(&mut s, &["open", "1"]);
+        assert!(e.contains("review or running"), "{e}");
+        assert!(ok(&mut s, &["help"]).contains("open <task-id>"), "help");
     }
 
     #[test]

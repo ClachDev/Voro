@@ -10,15 +10,65 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 
-/// The only substitution in a v1 command template. The working directory is
-/// handled by the spawner, not the template.
+/// The only substitution in a v1 agent command template. The working directory
+/// is handled by the spawner, not the template.
 pub const PROMPT_FILE_PLACEHOLDER: &str = "{prompt_file}";
+
+/// The substitution in the `[viewer]` command template (DESIGN.md §11a): the
+/// checkout path of the task's project. Optional — a viewer that operates on
+/// the current directory (`git difftool -d`) needs no placeholder, since the
+/// command is run in the project's path regardless.
+pub const VIEWER_PATH_PLACEHOLDER: &str = "{path}";
+
+/// A working starter config, written by `voro agents init` so a fresh install
+/// can dispatch without hand-authoring TOML. The default agent is a headless
+/// Claude Code invocation reading the task prompt from `{prompt_file}`; the
+/// commented second agent shows the shape for adding others. This must parse
+/// and pass [`AgentsConfig::parse`]'s validation — it is exercised by a test.
+pub const STARTER_CONFIG: &str = "\
+# Voro agent command templates (~/.config/voro/agents.toml).
+#
+# Each [agents.<name>] table is a shell command Voro runs (via `sh -c`) in a
+# task's project checkout to dispatch it to a coding agent. `{prompt_file}` is
+# replaced with the path to a file holding the task's title and body as the
+# prompt. `default` names the agent used for tasks without an --agent override.
+#
+# Tune the commands below for the agents you have installed. A dispatched
+# session runs unattended, so most agents need a non-interactive permission
+# flag (for Claude Code, e.g. --permission-mode acceptEdits or, to run fully
+# hands-off, --dangerously-skip-permissions).
+
+default = \"claude\"
+
+[agents.claude]
+cmd = \"claude -p --permission-mode acceptEdits \\\"$(cat {prompt_file})\\\"\"
+
+# [agents.codex]
+# cmd = \"codex exec \\\"$(cat {prompt_file})\\\"\"
+
+# An optional [viewer] command opens a review (or running) task's checkout so
+# you can see its diff — `voro open <task-id>`, or the open key in the TUI.
+# `{path}` is replaced with the project's checkout path, and the command runs
+# in that directory. Uncomment and tune for the tool you use.
+#
+# [viewer]
+# cmd = \"zed {path}\"
+";
 
 /// A named command template from `agents.toml`. `cmd` always contains
 /// [`PROMPT_FILE_PLACEHOLDER`]; parsing rejects templates without it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTemplate {
+    pub cmd: String,
+}
+
+/// The `[viewer]` command template from `agents.toml` (DESIGN.md §11a): a
+/// shell command run in a task's checkout to open its diff. Unlike an agent
+/// template, `{path}` is optional, so nothing is validated at parse time.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerTemplate {
     pub cmd: String,
 }
 
@@ -36,6 +86,8 @@ pub struct ResolvedAgent {
 pub struct AgentsConfig {
     default: String,
     agents: BTreeMap<String, AgentTemplate>,
+    #[serde(default)]
+    viewer: Option<ViewerTemplate>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -110,6 +162,48 @@ impl AgentsConfig {
         Ok(ResolvedAgent {
             name: name.to_string(),
             cmd: agent.cmd.clone(),
+        })
+    }
+
+    /// The `[viewer]` command template, if one is configured (DESIGN.md §11a).
+    /// `None` when the config has no `[viewer]` table, which the open-in-viewer
+    /// action turns into "add a `[viewer]` entry" rather than a silent no-op.
+    pub fn viewer(&self) -> Option<&str> {
+        self.viewer.as_ref().map(|v| v.cmd.as_str())
+    }
+
+    /// The name of the agent used when a task has no override, for the CLI's
+    /// `agents list` to flag it.
+    pub fn default_name(&self) -> &str {
+        &self.default
+    }
+
+    /// Every agent as `(name, cmd)`, sorted by name, for `agents list`.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.agents
+            .iter()
+            .map(|(name, agent)| (name.as_str(), agent.cmd.as_str()))
+    }
+
+    /// Write [`STARTER_CONFIG`] to `path`, creating parent directories. Refuses
+    /// to overwrite an existing file so a hand-tuned config is never clobbered
+    /// — `agents init` is a one-time bootstrap, not a reset.
+    pub fn write_starter(path: &Path) -> Result<()> {
+        if path.exists() {
+            return Err(Error::Invalid(format!(
+                "{} already exists; edit it directly rather than reinitialising",
+                path.display()
+            )));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::AgentConfigInvalid {
+                path: path.to_path_buf(),
+                message: e.to_string(),
+            })?;
+        }
+        std::fs::write(path, STARTER_CONFIG).map_err(|e| Error::AgentConfigInvalid {
+            path: path.to_path_buf(),
+            message: e.to_string(),
         })
     }
 }
@@ -215,5 +309,72 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("/nonexistent/agents.toml"), "{message}");
+    }
+
+    #[test]
+    fn viewer_is_none_without_a_viewer_table() {
+        assert_eq!(config().viewer(), None);
+    }
+
+    #[test]
+    fn viewer_is_read_from_the_viewer_table() {
+        let text = r#"
+            default = "claude"
+
+            [agents.claude]
+            cmd = "claude -p {prompt_file}"
+
+            [viewer]
+            cmd = "zed {path}"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/agents.toml")).unwrap();
+        assert_eq!(config.viewer(), Some("zed {path}"));
+    }
+
+    #[test]
+    fn starter_config_has_no_active_viewer() {
+        let config = AgentsConfig::parse(STARTER_CONFIG, Path::new("/tmp/agents.toml")).unwrap();
+        assert_eq!(config.viewer(), None);
+    }
+
+    #[test]
+    fn starter_config_parses_and_resolves() {
+        let config = AgentsConfig::parse(STARTER_CONFIG, Path::new("/tmp/agents.toml")).unwrap();
+        assert_eq!(config.default_name(), "claude");
+        assert_eq!(config.resolve(None).unwrap().name, "claude");
+        assert_eq!(config.agent_names(), vec!["claude"]);
+    }
+
+    #[test]
+    fn entries_lists_name_and_cmd() {
+        let config = config();
+        let entries: Vec<_> = config.entries().collect();
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    "claude",
+                    "claude -p --output-format stream-json {prompt_file}"
+                ),
+                ("codex", "codex exec {prompt_file}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn write_starter_creates_parent_and_refuses_to_clobber() {
+        let dir = std::env::temp_dir().join(format!("voro-init-{}", std::process::id()));
+        let path = dir.join("voro/agents.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        AgentsConfig::write_starter(&path).unwrap();
+        // the written file loads back into a usable config
+        assert_eq!(AgentsConfig::load(&path).unwrap().default_name(), "claude");
+
+        // a second init refuses rather than overwriting a tuned config
+        let err = AgentsConfig::write_starter(&path).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
