@@ -156,6 +156,32 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 );
             frame.render_widget(para, area);
         }
+        Mode::AgentPicker {
+            task_id,
+            agents,
+            resolved,
+            sel,
+        } => {
+            let items: Vec<ListItem> = agents
+                .iter()
+                .map(|a| {
+                    if resolved.as_deref() == Some(a.as_str()) {
+                        ListItem::new(format!("{a}  (resolved)"))
+                    } else {
+                        ListItem::new(a.clone())
+                    }
+                })
+                .collect();
+            let height = items.len() as u16 + 2;
+            let area = popup_area(frame, 44, height.max(3));
+            let mut state = ListState::default().with_selected(Some(*sel));
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(format!(
+                    "Dispatch #{task_id} — pick agent, ⏎ dispatch, esc cancel"
+                )))
+                .highlight_style(SELECTED);
+            frame.render_stateful_widget(list, area, &mut state);
+        }
         Mode::Score {
             task_id,
             state,
@@ -550,7 +576,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 hints.push_str(enter);
             }
             hints.push_str(
-                " · n new · e edit · s state · x score · h history · w weights · P project",
+                " · n new · e edit · s state · d dispatch · D agent · x score · h history · w weights · P project",
             );
             Line::from(Span::styled(hints, Style::new().dim()))
         }

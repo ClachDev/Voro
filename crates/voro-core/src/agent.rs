@@ -87,6 +87,12 @@ impl AgentsConfig {
         Ok(config)
     }
 
+    /// Every agent name defined in the config, for the TUI's dispatch picker
+    /// (DESIGN.md §8/§9). `agents` is a `BTreeMap`, so this is already sorted.
+    pub fn agent_names(&self) -> Vec<String> {
+        self.agents.keys().cloned().collect()
+    }
+
     /// The agent for a task: its `agent` override if set, otherwise the
     /// global default. An override or default naming an agent absent from
     /// the config is an error here, not a panic at spawn time.
@@ -124,6 +130,11 @@ mod tests {
 
     fn config() -> AgentsConfig {
         AgentsConfig::parse(CONFIG, Path::new("/tmp/agents.toml")).unwrap()
+    }
+
+    #[test]
+    fn agent_names_lists_every_configured_agent() {
+        assert_eq!(config().agent_names(), vec!["claude", "codex"]);
     }
 
     #[test]
