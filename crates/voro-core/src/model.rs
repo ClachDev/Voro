@@ -271,6 +271,21 @@ pub struct Dep {
     pub kind: DepKind,
 }
 
+/// A `blocks` dependency resolved to the blocker's current state, so callers
+/// can tell an open blocker from one that has already closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Blocker {
+    pub id: i64,
+    pub state: TaskState,
+}
+
+impl Blocker {
+    /// A blocker still holding its dependant back: not yet in a closed state.
+    pub fn is_open(self) -> bool {
+        !self.state.is_terminal()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Event {
     pub id: i64,

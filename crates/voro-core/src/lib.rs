@@ -12,7 +12,9 @@ mod transition;
 
 pub use agent::{AgentTemplate, AgentsConfig, PROMPT_FILE_PLACEHOLDER, ResolvedAgent};
 pub use error::{Error, Result};
-pub use model::{Dep, DepKind, Event, Priority, Project, Session, SessionOutcome, Task, TaskState};
+pub use model::{
+    Blocker, Dep, DepKind, Event, Priority, Project, Session, SessionOutcome, Task, TaskState,
+};
 pub use scheduler::{Candidate, ScoreBreakdown};
 pub use store::{NewTask, Store, TaskEdit};
 pub use transition::{Action, Triage};
