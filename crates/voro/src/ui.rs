@@ -576,7 +576,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 hints.push_str(enter);
             }
             hints.push_str(
-                " · n new · e edit · s state · d dispatch · D agent · x score · h history · w weights · P project",
+                " · n new · e edit · s state · d dispatch · D agent · o open · x score · h history · w weights · P project",
             );
             Line::from(Span::styled(hints, Style::new().dim()))
         }

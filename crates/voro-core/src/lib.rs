@@ -13,6 +13,7 @@ mod transition;
 
 pub use agent::{
     AgentTemplate, AgentsConfig, PROMPT_FILE_PLACEHOLDER, ResolvedAgent, STARTER_CONFIG,
+    VIEWER_PATH_PLACEHOLDER, ViewerTemplate,
 };
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};
