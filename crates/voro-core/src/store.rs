@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    Blocker, Dep, DepKind, Event, LiveSession, Priority, Project, Session, SessionOutcome, Task,
+    Blocker, Dep, DepKind, Event, Priority, Project, RunningRow, Session, SessionOutcome, Task,
     TaskState,
 };
 
@@ -428,19 +428,36 @@ impl Store {
         ))
     }
 
-    /// Live sessions joined with their task's current title and state, newest
-    /// first — the cockpit's running strip (DESIGN.md §9). Elapsed time is
-    /// computed against the database's clock so the TUI only formats it.
-    pub fn live_sessions_with_tasks(&self) -> Result<Vec<LiveSession>> {
+    /// Rows for the cockpit's running strip (DESIGN.md §9): every live session
+    /// joined with its task (newest first), followed by every `running` task
+    /// that has no live session. The latter is a task nothing is actively
+    /// driving — started by hand, or a session that died before the reconciler
+    /// demoted it — surfaced because it is in the wrong state and needs
+    /// attention; its `session_id`/`agent` are `NULL` and its elapsed time is
+    /// measured from when it entered `running` rather than from a session
+    /// start. Elapsed time is computed against the database's clock so the TUI
+    /// only formats it.
+    pub fn running_rows(&self) -> Result<Vec<RunningRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.task_id, t.title, t.state, s.agent, s.started_at,
-                    CAST(strftime('%s', 'now') - strftime('%s', s.started_at) AS INTEGER)
+            "SELECT s.id AS session_id, s.task_id, t.title, t.state, s.agent, s.started_at,
+                    CAST(strftime('%s', 'now') - strftime('%s', s.started_at) AS INTEGER),
+                    0 AS orphan
              FROM sessions s JOIN tasks t ON t.id = s.task_id
              WHERE s.ended_at IS NULL
-             ORDER BY s.id DESC",
+             UNION ALL
+             SELECT NULL, t.id, t.title, t.state, NULL, t.state_since,
+                    CAST(strftime('%s', 'now') - strftime('%s', t.state_since) AS INTEGER),
+                    1 AS orphan
+             FROM tasks t
+             WHERE t.state = 'running'
+               AND NOT EXISTS (
+                   SELECT 1 FROM sessions s
+                   WHERE s.task_id = t.id AND s.ended_at IS NULL
+               )
+             ORDER BY orphan ASC, session_id DESC, task_id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok(LiveSession {
+            Ok(RunningRow {
                 session_id: row.get(0)?,
                 task_id: row.get(1)?,
                 task_title: row.get(2)?,
@@ -814,12 +831,23 @@ mod tests {
 
     /// A project + running task to hang sessions off of.
     fn task_fixture(s: &mut Store) -> i64 {
-        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        s.conn
+            .execute(
+                "INSERT OR IGNORE INTO projects (name, path) VALUES ('voro', '/tmp/voro')",
+                [],
+            )
+            .unwrap();
+        let project_id: i64 = s
+            .conn
+            .query_row("SELECT id FROM projects WHERE name = 'voro'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         s.conn
             .execute(
                 "INSERT INTO tasks (project_id, title, state, state_since, created_at)
                  VALUES (?1, 'run me', 'running', datetime('now'), datetime('now'))",
-                params![p.id],
+                params![project_id],
             )
             .unwrap();
         s.conn.last_insert_rowid()
@@ -932,39 +960,39 @@ mod tests {
     }
 
     #[test]
-    fn live_sessions_with_tasks_joins_current_task_fields() {
+    fn running_rows_join_current_task_fields() {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
         let session = s.create_session(task_id, "claude", None, None).unwrap();
 
-        let rows = s.live_sessions_with_tasks().unwrap();
+        let rows = s.running_rows().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].session_id, session.id);
+        assert_eq!(rows[0].session_id, Some(session.id));
         assert_eq!(rows[0].task_id, task_id);
         assert_eq!(rows[0].task_title, "run me");
         assert_eq!(rows[0].task_state, TaskState::Running);
-        assert_eq!(rows[0].agent, "claude");
+        assert_eq!(rows[0].agent.as_deref(), Some("claude"));
         assert!(rows[0].elapsed_secs >= 0);
     }
 
     #[test]
-    fn live_sessions_with_tasks_excludes_ended_and_orders_newest_first() {
+    fn running_rows_exclude_ended_sessions_and_order_newest_first() {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
         let done = s.create_session(task_id, "claude", None, None).unwrap();
         let live = s.create_session(task_id, "codex", None, None).unwrap();
         s.end_session(done.id, SessionOutcome::Completed).unwrap();
 
-        let rows = s.live_sessions_with_tasks().unwrap();
+        let rows = s.running_rows().unwrap();
         assert_eq!(
             rows.iter().map(|r| r.session_id).collect::<Vec<_>>(),
-            vec![live.id]
+            vec![Some(live.id)]
         );
-        assert_eq!(rows[0].agent, "codex");
+        assert_eq!(rows[0].agent.as_deref(), Some("codex"));
     }
 
     #[test]
-    fn live_sessions_with_tasks_computes_elapsed_from_started_at() {
+    fn running_rows_compute_elapsed_from_started_at() {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
         let session = s.create_session(task_id, "claude", None, None).unwrap();
@@ -975,7 +1003,7 @@ mod tests {
             )
             .unwrap();
 
-        let rows = s.live_sessions_with_tasks().unwrap();
+        let rows = s.running_rows().unwrap();
         assert_eq!(rows.len(), 1);
         // allow a couple of seconds of test-execution slack either side
         assert!(
@@ -983,6 +1011,66 @@ mod tests {
             "expected ~90s elapsed, got {}",
             rows[0].elapsed_secs
         );
+    }
+
+    /// A task can be `running` with no live session — started by hand, or a
+    /// session that died before the reconciler demoted it. The running strip
+    /// must still surface it (DESIGN.md §9), with no session id or agent and
+    /// elapsed measured from when it entered `running`.
+    #[test]
+    fn running_rows_include_running_task_without_live_session() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+        s.conn
+            .execute(
+                "UPDATE tasks SET state_since = datetime('now', '-90 seconds') WHERE id = ?1",
+                params![task_id],
+            )
+            .unwrap();
+
+        let rows = s.running_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, None);
+        assert_eq!(rows[0].agent, None);
+        assert_eq!(rows[0].task_id, task_id);
+        assert_eq!(rows[0].task_state, TaskState::Running);
+        assert!(
+            (85..=95).contains(&rows[0].elapsed_secs),
+            "expected ~90s in running, got {}",
+            rows[0].elapsed_secs
+        );
+    }
+
+    /// A running task whose only session has ended is session-less too, so it
+    /// stays visible rather than dropping off the strip.
+    #[test]
+    fn running_rows_include_task_whose_sessions_all_ended() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+        let done = s.create_session(task_id, "claude", None, None).unwrap();
+        s.end_session(done.id, SessionOutcome::Failed).unwrap();
+
+        let rows = s.running_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, None);
+        assert_eq!(rows[0].task_id, task_id);
+    }
+
+    /// Live sessions sort ahead of session-less running tasks, so what an agent
+    /// is actively driving stays at the top of the strip.
+    #[test]
+    fn running_rows_order_live_sessions_before_session_less_tasks() {
+        let mut s = Store::open_in_memory().unwrap();
+        let live_task = task_fixture(&mut s);
+        let session = s.create_session(live_task, "claude", None, None).unwrap();
+        let orphan_task = task_fixture(&mut s);
+
+        let rows = s.running_rows().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].session_id, Some(session.id));
+        assert_eq!(rows[0].task_id, live_task);
+        assert_eq!(rows[1].session_id, None);
+        assert_eq!(rows[1].task_id, orphan_task);
     }
 
     #[test]

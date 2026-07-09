@@ -492,16 +492,27 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect) {
             if i == app.cockpit_sel {
                 selected = Some(items.len());
             }
-            items.push(ListItem::new(Line::from(vec![
+            let agent = match &r.agent {
+                Some(agent) => Span::styled(format!("{agent:8} "), Style::new().fg(Color::Magenta)),
+                None => Span::styled(format!("{:8} ", "—"), Style::new().dim()),
+            };
+            let mut spans = vec![
                 Span::raw(format!("{} ", task_ref(r.task_id))),
-                Span::styled(format!("{:8} ", r.agent), Style::new().fg(Color::Magenta)),
+                agent,
                 Span::raw(format!("{:11} ", r.task_state.to_string())),
                 Span::styled(
                     format!("{:>6}  ", format_elapsed(r.elapsed_secs)),
                     Style::new().dim(),
                 ),
                 Span::raw(r.task_title.clone()),
-            ])));
+            ];
+            if r.session_id.is_none() {
+                spans.push(Span::styled(
+                    "  ⚠ no live session",
+                    Style::new().fg(Color::Yellow),
+                ));
+            }
+            items.push(ListItem::new(Line::from(spans)));
         }
     }
     let mut state = ListState::default().with_selected(selected);
