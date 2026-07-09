@@ -56,7 +56,7 @@ impl TaskState {
 
 impl fmt::Display for TaskState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
@@ -114,7 +114,13 @@ impl Priority {
 
 impl fmt::Display for Priority {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "P{}", self.as_int())
+        let s = match self {
+            Priority::P0 => "P0",
+            Priority::P1 => "P1",
+            Priority::P2 => "P2",
+            Priority::P3 => "P3",
+        };
+        f.pad(s)
     }
 }
 
@@ -284,4 +290,22 @@ pub struct Session {
     pub started_at: String,
     pub ended_at: Option<String>,
     pub outcome: Option<SessionOutcome>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_state_display_honors_width() {
+        assert_eq!(format!("{:11}", TaskState::Ready), "ready      ");
+        assert_eq!(format!("{:>6}", TaskState::Done), "  done");
+        assert_eq!(format!("{:>6}", TaskState::NeedsInput), "needs-input");
+    }
+
+    #[test]
+    fn priority_display_honors_width() {
+        assert_eq!(format!("{:>6}", Priority::P0), "    P0");
+        assert_eq!(format!("{:>6}", Priority::P2), "    P2");
+    }
 }
