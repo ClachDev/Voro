@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use voro_core::{AgentsConfig, PROMPT_FILE_PLACEHOLDER, Session, Store, Task, TaskState};
+use voro_core::{
+    AgentsConfig, PROMPT_FILE_PLACEHOLDER, Session, Store, Task, TaskState, VIEWER_PATH_PLACEHOLDER,
+};
 
 /// Prepended verbatim to every dispatched prompt so the agent learns the
 /// return-path verbs (DESIGN.md §8) with no per-project install and no reliance
@@ -154,6 +156,61 @@ pub fn continue_dispatch(
     agent_override: Option<&str>,
 ) -> Result<String, String> {
     spawn_session(store, ctx, task_id, agent_override, SpawnKind::Continuation)
+}
+
+/// Open a `review` (or `running`) task's checkout in the configured viewer so
+/// its diff can be seen (DESIGN.md §11a). The `[viewer]` command from
+/// `agents.toml` is run detached in the project's path — a shell-out baseline
+/// that reuses the command-template model rather than hard-coding an editor.
+/// With no viewer configured, the caller gets back what to add rather than a
+/// silent no-op; opening never touches task state, so no clean-tree guard and
+/// no `Store` mutation are involved (the diff being reviewed is often the
+/// uncommitted work itself).
+pub fn open(store: &mut Store, ctx: &DispatchCtx, task_id: i64) -> Result<String, String> {
+    let task = store.task(task_id).map_err(|e| e.to_string())?;
+    if !matches!(task.state, TaskState::Review | TaskState::Running) {
+        return Err(format!(
+            "only review or running tasks can be opened in a viewer; task {task_id} is {}",
+            task.state
+        ));
+    }
+    let project = store.project(task.project_id).map_err(|e| e.to_string())?;
+
+    let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
+    let viewer = config.viewer().ok_or_else(|| {
+        format!(
+            "no viewer configured; add a [viewer] table to {} with a cmd such as \
+             'zed {{path}}' or 'git difftool -d' to see a task's diff",
+            ctx.agents_path.display()
+        )
+    })?;
+
+    let command = viewer.replace(
+        VIEWER_PATH_PLACEHOLDER,
+        &shell_quote(Path::new(&project.path)),
+    );
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .current_dir(&project.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("cannot spawn viewer in {}: {e}", project.path))?;
+    let pid = i64::from(child.id());
+
+    // Nothing waits on the viewer — like dispatch, reap it in a detached thread
+    // so an exited child never lingers as a zombie in a long-lived TUI session.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+
+    Ok(format!(
+        "opened task {task_id} in {} (pid {pid})",
+        project.name
+    ))
 }
 
 fn spawn_session(
@@ -479,6 +536,61 @@ mod tests {
         let err = dispatch(&mut store, &ctx, id, None).unwrap_err();
         assert!(err.contains("ready"), "{err}");
         assert!(store.sessions_for(id).unwrap().is_empty());
+    }
+
+    /// A ready task moved into `review` through the transition machine, so
+    /// `open`'s state guard is exercised against a genuine review row.
+    fn review_task(store: &mut Store, project_path: &Path) -> i64 {
+        let id = ready_task(store, project_path);
+        store.apply(id, voro_core::Action::Start).unwrap();
+        store.apply(id, voro_core::Action::Complete).unwrap();
+        id
+    }
+
+    #[test]
+    fn open_runs_the_configured_viewer_in_the_project_path() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        // a [viewer] whose command drops a marker at the substituted {path}
+        std::fs::write(
+            &ctx.agents_path,
+            "default = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
+             [viewer]\ncmd = \"touch {path}/opened.marker\"\n",
+        )
+        .unwrap();
+        let id = review_task(&mut store, &project);
+
+        let summary = open(&mut store, &ctx, id).unwrap();
+        assert!(summary.contains(&format!("opened task {id}")), "{summary}");
+
+        // the viewer is spawned detached, so wait briefly for it to run
+        let marker = project.join("opened.marker");
+        for _ in 0..50 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "the viewer should have run in the project");
+    }
+
+    #[test]
+    fn open_without_a_viewer_reports_what_to_configure() {
+        // the fixture's agents.toml has no [viewer] table
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let id = review_task(&mut store, &project);
+
+        let err = open(&mut store, &ctx, id).unwrap_err();
+        assert!(err.contains("[viewer]"), "{err}");
+        assert!(err.contains(ctx.agents_path.to_str().unwrap()), "{err}");
+    }
+
+    #[test]
+    fn open_refuses_a_task_that_is_not_review_or_running() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let id = ready_task(&mut store, &project); // still ready
+
+        let err = open(&mut store, &ctx, id).unwrap_err();
+        assert!(err.contains("review or running"), "{err}");
     }
 
     #[test]

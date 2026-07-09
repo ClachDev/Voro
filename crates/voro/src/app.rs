@@ -517,6 +517,7 @@ impl App {
                     self.open_agent_picker(task_id, agent);
                 }
             }
+            KeyCode::Char('o') => self.open_selected_in_viewer(),
             _ => {}
         }
     }
@@ -573,6 +574,28 @@ impl App {
         }
         let refreshed = self.refresh();
         self.report(refreshed);
+    }
+
+    /// Open the selected task's checkout in the configured viewer (DESIGN.md
+    /// §11a) so its diff can be seen. Only `review`/`running` tasks have a diff
+    /// worth opening; anything else, or a missing `[viewer]`, reports through
+    /// the status line rather than doing nothing — the same "no-op with an
+    /// explanation" style the dispatch keys use.
+    fn open_selected_in_viewer(&mut self) {
+        let (id, state) = match self.selected_task() {
+            Some(task) => (task.id, task.state),
+            None => return,
+        };
+        if !matches!(state, TaskState::Review | TaskState::Running) {
+            self.status = Some(format!(
+                "task is {state} — only review or running tasks open in a viewer"
+            ));
+            return;
+        }
+        match crate::dispatch::open(&mut self.store, &self.dispatch_ctx, id) {
+            Ok(summary) => self.status = Some(summary),
+            Err(e) => self.status = Some(e),
+        }
     }
 
     /// Open the agent picker (DESIGN.md §8): agents are loaded from
@@ -1505,6 +1528,68 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    // --- open-in-viewer keybinding (task #24, DESIGN.md §11a) ---
+
+    /// `o` on a review row runs the configured `[viewer]` and reports the
+    /// summary through the status line — the TUI half of `voro open`.
+    #[test]
+    fn open_key_opens_a_review_task_in_the_configured_viewer() {
+        let (mut store, ctx, project_path) = scratch_env(
+            "open",
+            Some(
+                "default = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
+                 [viewer]\ncmd = \"true\"\n",
+            ),
+        );
+        let project = store
+            .create_project("demo", project_path.to_str().unwrap())
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: project.id,
+                title: "Do the thing".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+        store.apply(task.id, Action::Start).unwrap();
+        store.apply(task.id, Action::Complete).unwrap();
+
+        let mut app = App::new(store, ctx).unwrap();
+        key(&mut app, KeyCode::Char('o'));
+
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains(&format!("opened task {}", task.id)),
+            "{:?}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// Only `review`/`running` tasks have a diff to open; anything else no-ops
+    /// with an explanation rather than silently, mirroring the dispatch keys.
+    #[test]
+    fn open_key_on_a_non_review_task_reports_and_does_not_open() {
+        let mut app = app_with(&[TaskState::Ready]);
+        key(&mut app, KeyCode::Char('o'));
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("only review or running tasks"),
+            "{:?}",
+            app.status
+        );
     }
 
     /// `D` shares the same readiness precondition as `d`.

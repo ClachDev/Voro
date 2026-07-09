@@ -54,6 +54,24 @@ propose`). For the `CLAUDE.md`/`AGENTS.md` snippet that advertises them, and a
 sample Claude Code hooks configuration that reports for a session that forgets
 to, see [`docs/agent-integration.md`](docs/agent-integration.md).
 
+## Seeing a diff
+
+Once an agent finishes and its task lands in `review`, `voro open <task-id>`
+(or the open key in the TUI, on a review or running row) opens the task's
+checkout in a viewer so you can see the diff. Like agents, the viewer is a
+command template — add an optional `[viewer]` table to `agents.toml`:
+
+```toml
+[viewer]
+cmd = "zed {path}"        # or e.g. "git difftool -d"
+```
+
+`{path}` is replaced with the project's checkout path, and the command is run
+in that directory, so a viewer that operates on the current directory needs no
+placeholder. Prefer a viewer that opens its own window (an editor or a GUI
+difftool); with no `[viewer]` configured, the open action reports what to add
+rather than failing silently.
+
 ## License
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or

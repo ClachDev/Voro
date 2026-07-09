@@ -63,6 +63,9 @@ dispatch
                                   `answer` does automatically for a
                                   previously-dispatched task, exposed to retry
                                   a continuation that failed
+  open <task-id>                  open a review/running task's checkout in the
+                                  configured [viewer] (agents.toml) to see its
+                                  diff — reports what to configure if none is set
 
 transitions
   triage <task-id> <parked|ready|reject>
@@ -104,6 +107,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         "agents" => agents_verb(&pos, ctx),
         "dispatch" => dispatch_verb(store, &pos, &flags, ctx),
         "continue" => continue_verb(store, &pos, &flags, ctx),
+        "open" => open_verb(store, &pos, ctx),
         "answer" => answer_verb(store, &pos, &flags, ctx),
         "import" => import_verb(store, &pos, &flags),
         "triage" | "start" | "ask" | "done" | "accept" | "reject" | "abort" | "park" | "unpark"
@@ -651,6 +655,15 @@ fn answer_verb(
     }
 }
 
+/// `open <task-id>` (DESIGN.md §11a): run the configured `[viewer]` command on
+/// a review/running task's checkout so its diff can be seen. Spawning lives in
+/// the dispatch module beside the other process work; `voro-core` stays
+/// process-free.
+fn open_verb(store: &mut Store, pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
+    let id = task_id(pos, 1)?;
+    dispatch::open(store, ctx, id)
+}
+
 /// Milestone C's one-way GitHub import (DESIGN.md §10): shells out to `gh
 /// issue list` in the project's path (or `--repo owner/name` if the checkout
 /// itself doesn't name the repo to import from) and captures each issue as a
@@ -987,6 +1000,18 @@ mod tests {
         assert!(shown.contains("ready"));
         ok(&mut s, &["set", "1", "--no-agent"]);
         assert!(!ok(&mut s, &["show", "1"]).contains("codex"));
+    }
+
+    #[test]
+    fn open_refuses_a_non_review_task_and_help_documents_it() {
+        // The state guard fires before any config is loaded, so a `ready` task
+        // is refused without touching the real user agents.toml `ctx()` names.
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        let e = err(&mut s, &["open", "1"]);
+        assert!(e.contains("review or running"), "{e}");
+        assert!(ok(&mut s, &["help"]).contains("open <task-id>"), "help");
     }
 
     #[test]
