@@ -4,11 +4,15 @@ A local command centre for AI-assisted development across many projects. Voro
 tracks tasks per project, weights each project by how much it matters *today*,
 and answers one question: **where should my attention go right now?**
 
-Two views drive everything: an **inbox** of tasks blocked on a human decision,
-and the single highest-priority **ready task** across all projects — with its
-body written as a prompt, ready to dispatch to a coding agent.
+A single **next-action queue** drives everything: questions, reviews, and
+proposals that need a human first, then the highest-scoring ready tasks across
+all projects — each body written as a prompt, ready to dispatch to a coding
+agent.
 
-**Status:** early development, pre-everything. Expect churn.
+**Status:** early development. The cockpit, CLI, and dispatch loop work
+end-to-end. Expect churn.
+
+![Voro TUI showing the next-action queue and running sessions](docs/images/voro-tui.png)
 
 ## Design
 
