@@ -1,7 +1,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use voro_core::{
-    Action, Blocker, Candidate, Event, LiveSession, Project, ScoreBreakdown, Store, Task,
-    TaskState, Triage, scheduler,
+    Action, AgentsConfig, Blocker, Candidate, Event, LiveSession, Project, ScoreBreakdown, Store,
+    Task, TaskState, Triage, scheduler,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +92,18 @@ pub enum Mode {
         task_id: i64,
         events: Vec<Event>,
         scroll: u16,
+    },
+    /// Dispatch-via-picker (DESIGN.md §8): agents loaded fresh from
+    /// `agents.toml` when the picker opens, never cached, since the whole
+    /// point is to catch a config that's changed since the last dispatch.
+    AgentPicker {
+        task_id: i64,
+        agents: Vec<String>,
+        /// The agent that plain dispatch (the resolved-agent key) would use —
+        /// the task's own override, else the config default — highlighted in
+        /// the list independently of cursor position.
+        resolved: Option<String>,
+        sel: usize,
     },
 }
 
@@ -418,6 +430,12 @@ impl App {
                 events,
                 scroll,
             } => self.key_history(key, task_id, events, scroll),
+            Mode::AgentPicker {
+                task_id,
+                agents,
+                resolved,
+                sel,
+            } => self.key_agent_picker(key, task_id, agents, resolved, sel),
         }
     }
 
@@ -489,6 +507,16 @@ impl App {
                 }
             }
             KeyCode::Char('h') => self.open_history(),
+            KeyCode::Char('d') => {
+                if let Some((task_id, _)) = self.ready_selected_task() {
+                    self.dispatch_task(task_id, None);
+                }
+            }
+            KeyCode::Char('D') => {
+                if let Some((task_id, agent)) = self.ready_selected_task() {
+                    self.open_agent_picker(task_id, agent);
+                }
+            }
             _ => {}
         }
     }
@@ -506,6 +534,106 @@ impl App {
                 };
             }
         }
+    }
+
+    /// The selected task's id and agent override, if there is a selection and
+    /// it is `ready` — dispatch's own precondition (DESIGN.md §8). Anything
+    /// else sets a status message and returns `None`, the same "no-op with an
+    /// explanation" the transition keybindings (`s`) use for a state with
+    /// nowhere to go, rather than silently doing nothing.
+    fn ready_selected_task(&mut self) -> Option<(i64, Option<String>)> {
+        let (id, state, agent) = {
+            let task = self.selected_task()?;
+            (task.id, task.state, task.agent.clone())
+        };
+        if state != TaskState::Ready {
+            self.status = Some(format!(
+                "task is {state} — only ready tasks can be dispatched"
+            ));
+            return None;
+        }
+        Some((id, agent))
+    }
+
+    /// Dispatch-with-resolved-agent, or the picker's chosen override — both
+    /// dispatch actions (DESIGN.md §8/§9) land here. Dispatch errors (dirty
+    /// tree, unknown agent, missing config) surface through `self.status`,
+    /// the same error style every other action already uses; they never
+    /// panic or fail silently.
+    fn dispatch_task(&mut self, task_id: i64, agent_override: Option<String>) {
+        let result = crate::dispatch::dispatch(
+            &mut self.store,
+            &self.dispatch_ctx,
+            task_id,
+            agent_override.as_deref(),
+        );
+        match result {
+            Ok(summary) => self.status = Some(summary),
+            Err(e) => self.status = Some(e),
+        }
+        let refreshed = self.refresh();
+        self.report(refreshed);
+    }
+
+    /// Open the agent picker (DESIGN.md §8): agents are loaded from
+    /// `agents.toml` right now, not cached from some earlier read, so a
+    /// config that changed since the last dispatch — the usage-cap case this
+    /// exists for — is always reflected. A load failure renders in the same
+    /// status-line error style as a failed dispatch rather than opening an
+    /// empty or stale modal.
+    fn open_agent_picker(&mut self, task_id: i64, task_agent: Option<String>) {
+        let config = match AgentsConfig::load(&self.dispatch_ctx.agents_path) {
+            Ok(config) => config,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        let agents = config.agent_names();
+        if agents.is_empty() {
+            self.status = Some("agents.toml defines no agents".into());
+            return;
+        }
+        let resolved = config.resolve(task_agent.as_deref()).ok().map(|r| r.name);
+        let sel = resolved
+            .as_ref()
+            .and_then(|name| agents.iter().position(|a| a == name))
+            .unwrap_or(0);
+        self.mode = Mode::AgentPicker {
+            task_id,
+            agents,
+            resolved,
+            sel,
+        };
+    }
+
+    fn key_agent_picker(
+        &mut self,
+        key: KeyEvent,
+        task_id: i64,
+        agents: Vec<String>,
+        resolved: Option<String>,
+        mut sel: usize,
+    ) {
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Char('j') | KeyCode::Down => {
+                sel = (sel + 1).min(agents.len().saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => sel = sel.saturating_sub(1),
+            KeyCode::Enter => {
+                let agent = agents[sel].clone();
+                self.dispatch_task(task_id, Some(agent));
+                return;
+            }
+            _ => {}
+        }
+        self.mode = Mode::AgentPicker {
+            task_id,
+            agents,
+            resolved,
+            sel,
+        };
     }
 
     fn key_weights(&mut self, key: KeyEvent, mut sel: usize) {
@@ -880,6 +1008,51 @@ mod tests {
         assert!(app.queue.is_empty());
     }
 
+    /// A scratch database, a freshly-`git init`ed clean project, and (unless
+    /// `agents_toml` is `None`, for the missing-config case) an `agents.toml`
+    /// at that content — the same scratch shape `dispatch.rs`'s and
+    /// `cli.rs`'s own tests use, duplicated here since those are private to
+    /// their modules.
+    fn scratch_env(
+        name: &str,
+        agents_toml: Option<&str>,
+    ) -> (Store, crate::dispatch::DispatchCtx, std::path::PathBuf) {
+        use std::process::{Command, Stdio};
+
+        let root = std::env::temp_dir().join(format!(
+            "voro-app-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project_path = root.join("project");
+        std::fs::create_dir_all(&project_path).unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&project_path)
+            .args(["init", "-q"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+
+        let db_path = root.join("voro.db");
+        let agents_path = root.join("agents.toml");
+        if let Some(toml) = agents_toml {
+            std::fs::write(&agents_path, toml).unwrap();
+        }
+        let store = Store::open(&db_path).unwrap();
+        let ctx = crate::dispatch::DispatchCtx {
+            db_path,
+            agents_path,
+            runtime_dir: root.join("sessions"),
+        };
+        (store, ctx, project_path)
+    }
+
     /// The TUI's answer action is the CLI's `voro answer` under a different
     /// keybinding (task #31, DESIGN.md §6): a task with prior session history
     /// gets a continuation dispatched automatically when answered here too.
@@ -1169,5 +1342,186 @@ mod tests {
         key(&mut app, KeyCode::Char('d'));
         assert_eq!(app.projects.len(), 1);
         assert!(app.status.as_deref().unwrap_or("").contains("park"));
+    }
+
+    // --- dispatch keybindings (task #28, DESIGN.md §8/§9) ---
+
+    /// `d` on a ready task dispatches it with the resolved agent — the same
+    /// mechanics `voro dispatch` uses — and reports the success summary.
+    #[test]
+    fn dispatch_key_dispatches_a_ready_task_with_the_resolved_agent() {
+        // `sleep 1 &&` keeps the stub process alive past `dispatch_task`'s own
+        // `refresh()`, whose reconcile-on-read would otherwise race an
+        // instantly-exiting stub and finalise the session as failed/ready
+        // before the assertions below run (see the answer-continuation test
+        // above for the same race).
+        let (mut store, ctx, project_path) = scratch_env(
+            "dispatch",
+            Some("default = \"stub\"\n\n[agents.stub]\ncmd = \"sleep 1 && cat {prompt_file}\"\n"),
+        );
+        let project = store
+            .create_project("demo", project_path.to_str().unwrap())
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: project.id,
+                title: "Do the thing".into(),
+                body: "Detailed prompt.".into(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+
+        let mut app = App::new(store, ctx).unwrap();
+        key(&mut app, KeyCode::Char('d'));
+
+        assert_eq!(app.store.task(task.id).unwrap().state, TaskState::Running);
+        let sessions = app.store.sessions_for(task.id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].agent, "stub");
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("dispatched task"),
+            "{:?}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// Dispatch requires `ready` (DESIGN.md §8); on anything else the key
+    /// no-ops with a status message rather than erroring deep inside dispatch
+    /// or silently doing nothing, mirroring how `s` reports a state with
+    /// nowhere to go.
+    #[test]
+    fn dispatch_key_on_a_non_ready_task_reports_and_does_not_mutate() {
+        // `Done` never appears in the cockpit queue at all, so select it on
+        // the Tasks screen instead, which lists every state.
+        let mut app = app_with(&[TaskState::Done]);
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('d'));
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("only ready tasks can be dispatched"),
+            "{:?}",
+            app.status
+        );
+    }
+
+    /// `D` opens the picker listing every agent from `agents.toml`, with the
+    /// one plain dispatch would resolve to marked regardless of cursor
+    /// position; picking a different one dispatches with that override.
+    #[test]
+    fn agent_picker_lists_agents_resolved_marked_and_dispatches_the_choice() {
+        // `sleep 1 &&` keeps the stub alive past the dispatch's own refresh,
+        // for the same reconcile-on-read race noted above.
+        let (mut store, ctx, project_path) = scratch_env(
+            "picker",
+            Some(
+                "default = \"stub\"\n\n[agents.stub]\ncmd = \"sleep 1 && cat {prompt_file}\"\n\n\
+                 [agents.special]\ncmd = \"sleep 1 && cat {prompt_file}\"\n",
+            ),
+        );
+        let project = store
+            .create_project("demo", project_path.to_str().unwrap())
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: project.id,
+                title: "Do the thing".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+
+        let mut app = App::new(store, ctx).unwrap();
+        key(&mut app, KeyCode::Char('D'));
+
+        let (agents, resolved_sel) = match &app.mode {
+            Mode::AgentPicker {
+                agents,
+                resolved,
+                sel,
+                ..
+            } => {
+                assert_eq!(agents, &vec!["special".to_string(), "stub".to_string()]);
+                assert_eq!(resolved.as_deref(), Some("stub"));
+                (agents.clone(), *sel)
+            }
+            _ => panic!("D should open the agent picker"),
+        };
+        assert_eq!(
+            agents[resolved_sel], "stub",
+            "cursor starts on the resolved agent"
+        );
+
+        // move off the resolved default onto "special" and dispatch it
+        key(&mut app, KeyCode::Char('k'));
+        key(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.store.task(task.id).unwrap().state, TaskState::Running);
+        assert_eq!(app.store.sessions_for(task.id).unwrap()[0].agent, "special");
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// A missing/invalid `agents.toml` is only discovered when the picker is
+    /// opened — it is loaded fresh each time, never cached — and surfaces
+    /// through the ordinary status-line error style instead of a stale or
+    /// empty modal.
+    #[test]
+    fn agent_picker_reports_a_config_load_failure_without_opening() {
+        let (mut store, ctx, project_path) = scratch_env("picker-missing", None);
+        let project = store
+            .create_project("demo", project_path.to_str().unwrap())
+            .unwrap();
+        store
+            .create_task(NewTask {
+                project_id: project.id,
+                title: "Do the thing".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+
+        let mut app = App::new(store, ctx).unwrap();
+        key(&mut app, KeyCode::Char('D'));
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(
+            app.status.is_some(),
+            "a missing config should report an error"
+        );
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// `D` shares the same readiness precondition as `d`.
+    #[test]
+    fn agent_picker_key_on_a_non_ready_task_reports_and_does_not_open() {
+        let mut app = app_with(&[TaskState::Done]);
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('D'));
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("only ready tasks can be dispatched"),
+            "{:?}",
+            app.status
+        );
     }
 }
