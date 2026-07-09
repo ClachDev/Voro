@@ -21,6 +21,9 @@ pub enum Error {
     #[error("cannot {action} a task in state '{from}'")]
     InvalidTransition { from: TaskState, action: String },
 
+    #[error("blocks dependency would create a cycle: {0}")]
+    DependencyCycle(String),
+
     #[error(
         "agents config not found at {}; expected a TOML file with `default = \"<name>\"` \
          and an [agents.<name>] table per agent",
