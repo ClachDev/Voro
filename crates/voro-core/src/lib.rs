@@ -11,7 +11,9 @@ pub mod scheduler;
 mod store;
 mod transition;
 
-pub use agent::{AgentTemplate, AgentsConfig, PROMPT_FILE_PLACEHOLDER, ResolvedAgent};
+pub use agent::{
+    AgentTemplate, AgentsConfig, PROMPT_FILE_PLACEHOLDER, ResolvedAgent, STARTER_CONFIG,
+};
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};
 pub use model::{

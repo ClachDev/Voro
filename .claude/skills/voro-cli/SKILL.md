@@ -15,7 +15,7 @@ to the database with raw SQL or a sqlite client.**
 From this repo: `cargo run -q -p voro -- <verb> [args]` (or `./target/debug/voro`
 after a build; `voro` if installed on PATH).
 
-Database resolution: `--db PATH` flag → `FOCUS_DB` env var → the real one at
+Database resolution: `--db PATH` flag → `VORO_DB` env var → the real one at
 `~/.local/share/voro/voro.db`. Tests and experiments must use `--db` with a
 scratch path; only deliberate task management touches the real database.
 

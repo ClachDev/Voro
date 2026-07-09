@@ -26,6 +26,25 @@ cargo test --workspace
 cargo run -p voro
 ```
 
+## Dispatching to agents
+
+Voro dispatches a task by running a shell command template per agent, read from
+`~/.config/voro/agents.toml` (see DESIGN.md §8). That file is not created for
+you — scaffold a starter with:
+
+```bash
+voro agents init      # writes ~/.config/voro/agents.toml (won't overwrite)
+voro agents list      # show configured agents; * marks the default
+voro agents path      # print where dispatch looks for the file
+```
+
+Then edit the file so each `[agents.<name>]` `cmd` matches an agent you have
+installed. `{prompt_file}` is replaced with a path to the task's prompt, and
+`default` names the agent used when a task has no `--agent` override. A
+dispatched session runs unattended, so most agents need a non-interactive
+permission flag. Once configured, `voro dispatch <task-id>` (or the dispatch
+key in the TUI) launches a headless session on a ready task.
+
 ## License
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
