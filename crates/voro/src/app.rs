@@ -58,6 +58,9 @@ pub enum Mode {
         name: String,
         path: String,
         on_path: bool,
+        /// `Some(id)` when this popup is editing an existing project (rename +
+        /// path-edit) rather than creating a new one.
+        editing: Option<i64>,
     },
     PickProject {
         sel: usize,
@@ -384,7 +387,8 @@ impl App {
                 name,
                 path,
                 on_path,
-            } => self.key_add_project(key, name, path, on_path),
+                editing,
+            } => self.key_add_project(key, name, path, on_path, editing),
             Mode::PickProject { sel } => self.key_pick_project(key, sel),
             Mode::Transition {
                 task_id,
@@ -424,6 +428,7 @@ impl App {
                     name: String::new(),
                     path: String::new(),
                     on_path: false,
+                    editing: None,
                 };
             }
             KeyCode::Char('n') => match self.projects.len() {
@@ -488,6 +493,25 @@ impl App {
                     self.report(result);
                 }
             }
+            KeyCode::Char('r') => {
+                if let Some(project) = self.projects.get(sel) {
+                    self.mode = Mode::AddProject {
+                        name: project.name.clone(),
+                        path: project.path.clone(),
+                        on_path: false,
+                        editing: Some(project.id),
+                    };
+                }
+                return;
+            }
+            KeyCode::Char('d') => {
+                if let Some(project) = self.projects.get(sel) {
+                    let id = project.id;
+                    let result = self.store.delete_project(id).and_then(|_| self.refresh());
+                    self.report(result);
+                    sel = sel.min(self.projects.len().saturating_sub(1));
+                }
+            }
             _ => {}
         }
         self.mode = Mode::Weights { sel };
@@ -499,6 +523,7 @@ impl App {
         mut name: String,
         mut path: String,
         on_path: bool,
+        editing: Option<i64>,
     ) {
         match key.code {
             KeyCode::Esc => return,
@@ -507,6 +532,7 @@ impl App {
                     name,
                     path,
                     on_path: !on_path,
+                    editing,
                 };
                 return;
             }
@@ -516,6 +542,7 @@ impl App {
                         name,
                         path,
                         on_path: true,
+                        editing,
                     };
                     return;
                 }
@@ -525,18 +552,27 @@ impl App {
                         name,
                         path,
                         on_path,
+                        editing,
                     };
                     return;
                 }
-                let result = self
-                    .store
-                    .create_project(name.trim(), path.trim())
-                    .and_then(|_| self.refresh());
+                let result = match editing {
+                    Some(id) => self
+                        .store
+                        .rename_project(id, name.trim())
+                        .and_then(|_| self.store.set_path(id, path.trim()))
+                        .and_then(|_| self.refresh()),
+                    None => self
+                        .store
+                        .create_project(name.trim(), path.trim())
+                        .and_then(|_| self.refresh()),
+                };
                 if self.report(result).is_none() {
                     self.mode = Mode::AddProject {
                         name,
                         path,
                         on_path,
+                        editing,
                     };
                 }
                 return;
@@ -561,6 +597,7 @@ impl App {
             name,
             path,
             on_path,
+            editing,
         };
     }
 
@@ -995,5 +1032,64 @@ mod tests {
 
         key(&mut app, KeyCode::Esc);
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn weights_modal_rename_prefills_and_saves() {
+        let mut app = app_with(&[]);
+        let project_id = app.projects[0].id;
+        key(&mut app, KeyCode::Char('w'));
+        assert!(matches!(app.mode, Mode::Weights { sel: 0 }));
+
+        key(&mut app, KeyCode::Char('r'));
+        match &app.mode {
+            Mode::AddProject {
+                name,
+                path,
+                editing,
+                ..
+            } => {
+                assert_eq!(name, "demo");
+                assert_eq!(path, "/tmp/demo");
+                assert_eq!(*editing, Some(project_id));
+            }
+            _ => panic!("r in weights mode should open the AddProject modal prefilled"),
+        }
+
+        for _ in 0.."demo".len() {
+            key(&mut app, KeyCode::Backspace);
+        }
+        for c in "renamed".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter); // move to the path field
+        key(&mut app, KeyCode::Enter); // save
+
+        // saving closes the modal, matching the create-project flow
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.projects[0].id, project_id);
+        assert_eq!(app.projects[0].name, "renamed");
+        assert_eq!(app.projects[0].path, "/tmp/demo");
+        // tasks reference the project by id, so renaming leaves them intact
+        assert_eq!(app.store.project(project_id).unwrap().name, "renamed");
+    }
+
+    #[test]
+    fn weights_modal_deletes_a_taskless_project() {
+        let mut app = app_with(&[]);
+        key(&mut app, KeyCode::Char('w'));
+        key(&mut app, KeyCode::Char('d'));
+        assert!(app.projects.is_empty());
+        assert!(matches!(app.mode, Mode::Weights { .. }));
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn weights_modal_delete_refuses_when_project_has_a_task() {
+        let mut app = app_with(&[TaskState::Ready]);
+        key(&mut app, KeyCode::Char('w'));
+        key(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.projects.len(), 1);
+        assert!(app.status.as_deref().unwrap_or("").contains("park"));
     }
 }
