@@ -5,15 +5,22 @@
 //! process detached — kept out of voro-core, which stays pure of process and
 //! filesystem I/O. The atomic state-plus-session writes are voro-core's
 //! `Store::record_dispatch` and `Store::record_continuation`.
+//!
+//! For agents that define a `sessions` verb (task #75), dispatch additionally
+//! captures the agent's own session reference after launch — by polling the
+//! `sessions` listing for a session started in this project since the spawn,
+//! falling back to the `backgrounded · <id>` line launchers print into the
+//! log — and records it on the session row for later attach/resume/continue.
 
 use std::fs::File;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voro_core::{
-    AgentsConfig, PROMPT_FILE_PLACEHOLDER, Session, Store, Task, TaskState, VIEWER_PATH_PLACEHOLDER,
+    AgentsConfig, PROMPT_FILE_PLACEHOLDER, SESSION_PLACEHOLDER, Session, Store, Task, TaskState,
+    VIEWER_PATH_PLACEHOLDER, parse_sessions_json,
 };
 
 /// Prepended verbatim to every dispatched prompt so the agent learns the
@@ -44,6 +51,15 @@ machine and event log.
 ---
 
 ";
+
+/// How often the session-ref capture re-polls the agent's `sessions` command
+/// while waiting for the freshly-launched session to appear in the listing.
+const REF_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Clock slack when matching a listing entry's `startedAt` against the spawn
+/// time: the agent stamps its session with its own clock, which may sit a
+/// beat behind the timestamp taken here just before the spawn.
+const SPAWN_CLOCK_SLACK_MS: i64 = 2000;
 
 /// Which of the two flows `spawn_session` is performing — they share every
 /// mechanic (agent resolution, the dirty-tree guard, prompt/log files,
@@ -108,6 +124,10 @@ pub struct DispatchCtx {
     /// Directory for prompt and log files — never inside a project checkout,
     /// so writing the prompt does not itself dirty the tree.
     pub runtime_dir: PathBuf,
+    /// How long to keep polling for a session reference after spawning an
+    /// agent that defines a `sessions` verb, before giving up (the ref stays
+    /// NULL and the summary says so). Zero means a single attempt.
+    pub ref_capture_timeout: Duration,
 }
 
 impl DispatchCtx {
@@ -122,6 +142,7 @@ impl DispatchCtx {
             db_path: db_path.to_path_buf(),
             agents_path: AgentsConfig::default_path(),
             runtime_dir,
+            ref_capture_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -137,25 +158,36 @@ pub fn dispatch(
     task_id: i64,
     agent_override: Option<&str>,
 ) -> Result<String, String> {
-    spawn_session(store, ctx, task_id, agent_override, SpawnKind::Fresh)
+    spawn_session(store, ctx, task_id, agent_override, SpawnKind::Fresh, None)
 }
 
 /// Continue a task that `answer` just moved `needs-input → running` (DESIGN.md
-/// §6): spawn a fresh session whose prompt is the task body — now carrying the
+/// §6). When the agent defines a `continue` verb and the task's last session
+/// has a captured reference, the answer is fed to *that session* headless —
+/// `new_input` (the answer text) becomes the prompt file substituted into the
+/// template alongside `{session}`. Otherwise this falls back to what it always
+/// did: spawn a fresh session whose prompt is the task body — now carrying the
 /// `## Answers` section the answer appended — so the work resumes with the
-/// answer in hand rather than being fed to a live pipe, which by the time a
-/// human answers has typically already exited. Shares every mechanic with
-/// [`dispatch`] except the required starting state and how the result is
-/// recorded: `record_continuation` asserts the task is already `running`
-/// instead of performing the `ready → running` transition itself, so this can
-/// never be used to smuggle a task into `running` outside the transition API.
+/// answer in hand. Shares every mechanic with [`dispatch`] except the required
+/// starting state and how the result is recorded: `record_continuation`
+/// asserts the task is already `running` instead of performing the `ready →
+/// running` transition itself, so this can never be used to smuggle a task
+/// into `running` outside the transition API.
 pub fn continue_dispatch(
     store: &mut Store,
     ctx: &DispatchCtx,
     task_id: i64,
     agent_override: Option<&str>,
+    new_input: Option<&str>,
 ) -> Result<String, String> {
-    spawn_session(store, ctx, task_id, agent_override, SpawnKind::Continuation)
+    spawn_session(
+        store,
+        ctx,
+        task_id,
+        agent_override,
+        SpawnKind::Continuation,
+        new_input,
+    )
 }
 
 /// Open a `review` (or `running`) task's checkout in the configured viewer so
@@ -213,12 +245,25 @@ pub fn open(store: &mut Store, ctx: &DispatchCtx, task_id: i64) -> Result<String
     ))
 }
 
+/// How the session reference on the freshly-recorded session row came to be,
+/// for the summary line.
+enum RefOutcome {
+    /// Captured from the `sessions` listing or the log, or inherited from the
+    /// prior session on a `continue`-verb continuation.
+    Captured(String),
+    /// The agent defines `sessions` but the reference never showed up.
+    NotCaptured,
+    /// The agent has no capture story; nothing was attempted.
+    NotApplicable,
+}
+
 fn spawn_session(
     store: &mut Store,
     ctx: &DispatchCtx,
     task_id: i64,
     agent_override: Option<&str>,
     kind: SpawnKind,
+    new_input: Option<&str>,
 ) -> Result<String, String> {
     let task = store.task(task_id).map_err(|e| e.to_string())?;
     let required = kind.required_state();
@@ -235,6 +280,18 @@ fn spawn_session(
     let agent = config
         .resolve(agent_override.or(task.agent.as_deref()))
         .map_err(|e| e.to_string())?;
+
+    // A continuation reuses the prior session when the agent knows how to
+    // (`continue` verb) and the session can be addressed (captured ref);
+    // otherwise it degrades to a fresh spawn of the dispatch template.
+    let continue_ref = match kind {
+        SpawnKind::Continuation if agent.continue_cmd.is_some() => store
+            .sessions_for(task_id)
+            .map_err(|e| e.to_string())?
+            .first()
+            .and_then(|s| s.session_ref.clone()),
+        _ => None,
+    };
 
     guard_clean_tree(&project.path)?;
 
@@ -254,7 +311,14 @@ fn spawn_session(
     } else {
         format!("# {}\n\n{}\n", task.title, task.body.trim_end())
     };
-    let prompt = format!("{RETURN_PATH_PREAMBLE}{body}");
+    // A continued session already carries the preamble and the task from its
+    // first prompt, so it gets only the new input (the answer); everything
+    // else gets the full preamble + body.
+    let prompt = match (&continue_ref, new_input) {
+        (Some(_), Some(input)) => format!("{input}\n"),
+        (Some(_), None) => body,
+        (None, _) => format!("{RETURN_PATH_PREAMBLE}{body}"),
+    };
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("cannot write prompt {}: {e}", prompt_path.display()))?;
 
@@ -265,9 +329,21 @@ fn spawn_session(
         .try_clone()
         .map_err(|e| format!("cannot open log {}: {e}", log_path.display()))?;
 
-    let command = agent
-        .cmd
-        .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path));
+    let command = match &continue_ref {
+        Some(session_ref) => agent
+            .continue_cmd
+            .as_deref()
+            .expect("continue_ref is only set when the verb exists")
+            .replace(SESSION_PLACEHOLDER, &shell_quote(Path::new(session_ref)))
+            .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path)),
+        None => agent
+            .dispatch
+            .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path)),
+    };
+    let spawn_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&command)
@@ -317,16 +393,141 @@ fn spawn_session(
         let _ = child.wait();
     });
 
+    let ref_outcome = match (continue_ref, &agent.sessions) {
+        // A continue-verb continuation addressed the prior session, so the
+        // new row keeps addressing it.
+        (Some(session_ref), _) => {
+            let result = store.set_session_ref(session.id, &session_ref);
+            result.map_err(|e| e.to_string())?;
+            RefOutcome::Captured(session_ref)
+        }
+        (None, Some(sessions_cmd)) => {
+            match capture_session_ref(
+                sessions_cmd,
+                &project.path,
+                spawn_ms,
+                ctx.ref_capture_timeout,
+                &log_path,
+            ) {
+                Some(session_ref) => {
+                    store
+                        .set_session_ref(session.id, &session_ref)
+                        .map_err(|e| e.to_string())?;
+                    RefOutcome::Captured(session_ref)
+                }
+                None => RefOutcome::NotCaptured,
+            }
+        }
+        (None, None) => RefOutcome::NotApplicable,
+    };
+    let ref_note = match &ref_outcome {
+        RefOutcome::Captured(session_ref) => format!(", ref {session_ref}"),
+        RefOutcome::NotCaptured => ", session ref not captured".to_string(),
+        RefOutcome::NotApplicable => String::new(),
+    };
+
     Ok(format!(
-        "{} task {} {} {} (session {}, pid {}) — log {}",
+        "{} task {} {} {} (session {}, pid {}{}) — log {}",
         kind.verb_past(),
         task.id,
         kind.preposition(),
         session.agent,
         session.id,
         pid,
+        ref_note,
         log_path.display()
     ))
+}
+
+/// Capture the agent's reference for the session just spawned: poll the
+/// agent's `sessions` listing for a session started in this project at or
+/// after the spawn, falling back to the `backgrounded · <id>` line launchers
+/// print (which lands in the log, since stdout is redirected there). `None`
+/// once the timeout passes without either source producing a reference.
+fn capture_session_ref(
+    sessions_cmd: &str,
+    project_path: &str,
+    spawn_ms: i64,
+    timeout: Duration,
+    log_path: &Path,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(session_ref) = query_new_session(sessions_cmd, project_path, spawn_ms) {
+            return Some(session_ref);
+        }
+        if let Some(session_ref) = log_backgrounded_ref(log_path) {
+            return Some(session_ref);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(REF_POLL_INTERVAL);
+    }
+}
+
+/// One poll of the `sessions` command: the newest listed session whose `cwd`
+/// is this project and whose `startedAt` is at or after the spawn (with a
+/// little slack for the agent's own clock). `None` on any failure — capture
+/// is best-effort and the caller retries until its deadline.
+fn query_new_session(sessions_cmd: &str, project_path: &str, spawn_ms: i64) -> Option<String> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(sessions_cmd)
+        .current_dir(project_path)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let entries = parse_sessions_json(&String::from_utf8_lossy(&output.stdout)).ok()?;
+    entries
+        .into_iter()
+        .filter(|e| e.cwd.as_deref() == Some(project_path))
+        .filter(|e| {
+            e.started_at_ms
+                .is_some_and(|t| t >= spawn_ms - SPAWN_CLOCK_SLACK_MS)
+        })
+        .max_by_key(|e| e.started_at_ms)
+        .map(|e| e.session_ref)
+}
+
+/// The secondary capture source: `claude --bg`-style launchers print
+/// `backgrounded · <id>` (ANSI-coloured) on stdout, which dispatch already
+/// redirects into the session log. The id is the line's last token once the
+/// colour codes are stripped.
+fn log_backgrounded_ref(log_path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(log_path).ok()?;
+    let text = strip_ansi(&text);
+    text.lines()
+        .find(|line| line.contains("backgrounded"))?
+        .split_whitespace()
+        .last()
+        .filter(|token| *token != "backgrounded" && *token != "·")
+        .map(str::to_string)
+}
+
+/// Drop ANSI escape sequences (the CSI colour codes launchers wrap their
+/// output in) so the log can be tokenised as plain text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Refuse to dispatch into a checkout with uncommitted changes (the v1 guard,
@@ -358,7 +559,7 @@ fn guard_clean_tree(path: &str) -> Result<(), String> {
 }
 
 /// Single-quote a path for safe substitution into the `sh -c` command line.
-fn shell_quote(path: &Path) -> String {
+pub(crate) fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
@@ -371,6 +572,14 @@ mod tests {
     /// `agents.toml` whose one agent is a stub command that just reads the
     /// prompt. Returns the store, the dispatch context, and the project path.
     fn fixture(cmd: &str) -> (Store, DispatchCtx, PathBuf) {
+        fixture_toml(&format!(
+            "default = \"stub\"\n\n[agents.stub]\ncmd = \"{cmd}\"\n"
+        ))
+    }
+
+    /// Like [`fixture`], but with the whole `agents.toml` supplied, for tests
+    /// exercising the session verbs.
+    fn fixture_toml(agents_toml: &str) -> (Store, DispatchCtx, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "voro-dispatch-{}-{}",
             std::process::id(),
@@ -385,17 +594,14 @@ mod tests {
 
         let db_path = root.join("voro.db");
         let agents_path = root.join("agents.toml");
-        std::fs::write(
-            &agents_path,
-            format!("default = \"stub\"\n\n[agents.stub]\ncmd = \"{cmd}\"\n"),
-        )
-        .unwrap();
+        std::fs::write(&agents_path, agents_toml).unwrap();
 
         let store = Store::open(&db_path).unwrap();
         let ctx = DispatchCtx {
             db_path,
             agents_path,
             runtime_dir: root.join("sessions"),
+            ref_capture_timeout: Duration::ZERO,
         };
         (store, ctx, project)
     }
@@ -447,6 +653,10 @@ mod tests {
         assert!(session.pid.is_some_and(|p| p > 0));
         let log = session.log_path.as_deref().unwrap();
         assert!(Path::new(log).exists(), "log file {log} should exist");
+
+        // no sessions verb, so no capture was attempted and none is reported
+        assert!(session.session_ref.is_none());
+        assert!(!summary.contains("ref"), "{summary}");
 
         // the prompt carries the task title and body
         let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
@@ -536,6 +746,207 @@ mod tests {
         let err = dispatch(&mut store, &ctx, id, None).unwrap_err();
         assert!(err.contains("ready"), "{err}");
         assert!(store.sessions_for(id).unwrap().is_empty());
+    }
+
+    // --- session-ref capture (task #75) ---
+
+    /// A canned `sessions` listing whose one entry matches the dispatched
+    /// project's cwd with a far-future start time, so the first capture poll
+    /// finds it — the stub for `claude agents --json`.
+    fn write_sessions_json(root: &Path, project: &Path, session_ref: &str) -> PathBuf {
+        let listing = root.join("sessions.json");
+        std::fs::write(
+            &listing,
+            format!(
+                "[{{\"pid\": 1, \"id\": \"short123\", \"cwd\": \"{}\", \
+                 \"startedAt\": 99999999999999, \"sessionId\": \"{session_ref}\", \
+                 \"status\": \"idle\", \"state\": \"working\"}}]",
+                project.display()
+            ),
+        )
+        .unwrap();
+        listing
+    }
+
+    #[test]
+    fn dispatch_captures_the_session_ref_from_the_sessions_listing() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file}\"\nsessions = \"cat sessions.json\"\n",
+        );
+        let root = project.parent().unwrap().to_path_buf();
+        let listing = write_sessions_json(&root, &project, "3f6c-full-uuid");
+        // the sessions command runs in the project path
+        std::fs::write(
+            &ctx.agents_path,
+            format!(
+                "default = \"stub\"\n\n[agents.stub]\n\
+                 dispatch = \"cat {{prompt_file}}\"\nsessions = \"cat '{}'\"\n",
+                listing.display()
+            ),
+        )
+        .unwrap();
+        let id = ready_task(&mut store, &project);
+
+        let summary = dispatch(&mut store, &ctx, id, None).unwrap();
+        assert!(summary.contains("ref 3f6c-full-uuid"), "{summary}");
+
+        let session = &store.sessions_for(id).unwrap()[0];
+        assert_eq!(session.session_ref.as_deref(), Some("3f6c-full-uuid"));
+    }
+
+    #[test]
+    fn capture_gives_up_gracefully_when_nothing_matches() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file}\"\nsessions = \"echo []\"\n",
+        );
+        let id = ready_task(&mut store, &project);
+
+        let summary = dispatch(&mut store, &ctx, id, None).unwrap();
+        assert!(summary.contains("session ref not captured"), "{summary}");
+        assert!(
+            store.sessions_for(id).unwrap()[0].session_ref.is_none(),
+            "the ref stays NULL when capture fails"
+        );
+        // the dispatch itself still succeeded
+        assert_eq!(store.task(id).unwrap().state, TaskState::Running);
+    }
+
+    #[test]
+    fn capture_falls_back_to_the_backgrounded_log_line() {
+        // The dispatch stub prints the ANSI-coloured `backgrounded · <id>`
+        // line a real `claude --bg` launcher prints; the sessions listing
+        // never matches (empty array), so capture must fall back to the log.
+        let (mut store, ctx, project) = fixture_toml(
+            "default = \"stub\"\n\n[agents.stub]\n\
+             dispatch = 'cat {prompt_file} >/dev/null && printf \"\\033[2mbackgrounded · \\033[1mdeadbeef\\033[0m\\n\"'\n\
+             sessions = \"echo []\"\n",
+        );
+        let id = ready_task(&mut store, &project);
+
+        // give the stub time to write the line before capture's single poll
+        let ctx = DispatchCtx {
+            ref_capture_timeout: Duration::from_secs(3),
+            ..ctx
+        };
+        let summary = dispatch(&mut store, &ctx, id, None).unwrap();
+        assert!(summary.contains("ref deadbeef"), "{summary}");
+        assert_eq!(
+            store.sessions_for(id).unwrap()[0].session_ref.as_deref(),
+            Some("deadbeef")
+        );
+    }
+
+    #[test]
+    fn strip_ansi_and_log_parsing_lift_the_backgrounded_id() {
+        assert_eq!(
+            strip_ansi("\u{1b}[38;5;245mbackgrounded · \u{1b}[1mdeadbeef\u{1b}[0m"),
+            "backgrounded · deadbeef"
+        );
+        let log = std::env::temp_dir().join(format!("voro-bg-line-{}.log", std::process::id()));
+        std::fs::write(
+            &log,
+            "warming up\n\u{1b}[2mbackgrounded · \u{1b}[1mcafe1234\u{1b}[0m\nmanage with: claude attach\n",
+        )
+        .unwrap();
+        assert_eq!(log_backgrounded_ref(&log).as_deref(), Some("cafe1234"));
+        std::fs::remove_file(&log).unwrap();
+    }
+
+    // --- continue-verb continuation (task #75) ---
+
+    /// A task dispatched and left `running`, its session's ref set as if
+    /// capture had recorded it.
+    fn dispatched_with_ref(store: &mut Store, ctx: &DispatchCtx, project: &Path) -> i64 {
+        let id = ready_task(store, project);
+        dispatch(store, ctx, id, None).unwrap();
+        let session_id = store.sessions_for(id).unwrap()[0].id;
+        store.set_session_ref(session_id, "ref-123").unwrap();
+        id
+    }
+
+    #[test]
+    fn continuation_reuses_the_session_via_the_continue_verb() {
+        let (mut store, ctx, project) = fixture_toml("placeholder — rewritten below");
+        let root = project.parent().unwrap().to_path_buf();
+        let ref_out = root.join("cont-ref.txt");
+        let prompt_out = root.join("cont-prompt.txt");
+        std::fs::write(
+            &ctx.agents_path,
+            format!(
+                "default = \"stub\"\n\n[agents.stub]\n\
+                 dispatch = \"cat {{prompt_file}}\"\n\
+                 continue = \"cp {{prompt_file}} '{}' && echo {{session}} > '{}'\"\n",
+                prompt_out.display(),
+                ref_out.display()
+            ),
+        )
+        .unwrap();
+        let id = dispatched_with_ref(&mut store, &ctx, &project);
+
+        let summary =
+            continue_dispatch(&mut store, &ctx, id, None, Some("Schema B, then.")).unwrap();
+        assert!(summary.contains("continued task"), "{summary}");
+        assert!(summary.contains("ref ref-123"), "{summary}");
+
+        // the continue template ran with the prior session's ref substituted
+        for _ in 0..50 {
+            if ref_out.exists() && prompt_out.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(&ref_out).unwrap().trim(), "ref-123");
+        // the prompt fed to the continuation is the answer, not the re-sent
+        // task body — the session already has the task
+        let prompt = std::fs::read_to_string(&prompt_out).unwrap();
+        assert_eq!(prompt.trim(), "Schema B, then.");
+        assert!(!prompt.contains("voro done"), "no preamble on a continue");
+
+        // the continuation's session row inherits the ref it addressed
+        let sessions = store.sessions_for(id).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_ref.as_deref(), Some("ref-123"));
+    }
+
+    #[test]
+    fn continuation_without_a_ref_falls_back_to_a_fresh_spawn() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file}\"\n\
+             continue = \"true {session} {prompt_file}\"\n",
+        );
+        let id = ready_task(&mut store, &project);
+        dispatch(&mut store, &ctx, id, None).unwrap();
+        // no set_session_ref: capture never happened for this agent
+
+        continue_dispatch(&mut store, &ctx, id, None, Some("B")).unwrap();
+
+        let sessions = store.sessions_for(id).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions[0].session_ref.is_none());
+        // the fresh spawn re-sends the full prompt: preamble plus task body
+        let mut prompts = prompt_files(&ctx);
+        prompts.sort();
+        let continuation_prompt = std::fs::read_to_string(prompts.last().unwrap()).unwrap();
+        assert!(continuation_prompt.contains("voro done"), "preamble");
+        assert!(continuation_prompt.contains("Do the thing"), "task body");
+    }
+
+    #[test]
+    fn continuation_without_a_continue_verb_ignores_prior_refs() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let id = dispatched_with_ref(&mut store, &ctx, &project);
+
+        continue_dispatch(&mut store, &ctx, id, None, Some("B")).unwrap();
+
+        let sessions = store.sessions_for(id).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(
+            sessions[0].session_ref.is_none(),
+            "a fresh spawn does not inherit the old session's ref"
+        );
     }
 
     /// A ready task moved into `review` through the transition machine, so

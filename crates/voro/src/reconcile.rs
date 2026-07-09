@@ -1,9 +1,20 @@
 //! The observation half of dispatch (DESIGN.md §8): closing out sessions
 //! whose backing process has already exited. `voro-core` owns the
-//! reconciliation *decision* (`Store::reconcile_session`) given pid liveness
-//! as a plain bool; this module supplies that bool — and a best-effort read
-//! of whether the log looks like a usage cap — the two inputs that need
-//! process or filesystem I/O and so stay out of voro-core.
+//! reconciliation *decision* (`Store::reconcile_session`) given liveness as a
+//! plain bool; this module supplies that bool — and a best-effort read of
+//! whether the log looks like a usage cap — the inputs that need process or
+//! filesystem I/O and so stay out of voro-core.
+//!
+//! Liveness comes from one of two sources, per agent (task #75). An agent
+//! that defines a `sessions` verb is asked directly: its listing is queried
+//! once per reconcile pass, and a session is live while its captured
+//! reference appears there not-yet-`done`. This is the only correct source
+//! for supervisor-owned launches (`claude --bg`), where the pid Voro spawned
+//! is a launcher that exits at birth — pid-checking would declare every such
+//! dispatch dead immediately, so those sessions are *never* pid-checked; if
+//! their liveness can't be determined (no ref captured, listing failed) they
+//! are left alone rather than guessed at. Agents without a `sessions` verb
+//! keep the original pid-liveness check.
 //!
 //! There is no daemon watching for a session's process to exit — the
 //! dispatching `voro` invocation may not outlive it, whether that was a
@@ -13,10 +24,12 @@
 //! dead session is finalised the next time anything looks, without ever
 //! needing a resident watcher.
 
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Stdio};
 
-use voro_core::{Result, Store};
+use voro_core::{AgentSessionEntry, AgentsConfig, Result, Store, parse_sessions_json};
 
 /// How much of a session's log tail to scan for a usage-cap signature.
 const LOG_TAIL_BYTES: u64 = 4096;
@@ -29,19 +42,60 @@ const LOG_TAIL_BYTES: u64 = 4096;
 /// cause.
 const CAP_SIGNATURES: [&str; 3] = ["usage limit", "rate limit", "quota exceeded"];
 
-/// Reconcile every session still marked live: for each whose process is no
-/// longer running, finalise it via [`Store::reconcile_session`]. Returns how
-/// many were finalised. Cheap to call on every read — with no live sessions
-/// it costs one query and nothing else.
-pub fn reconcile_live_sessions(store: &mut Store) -> Result<usize> {
+/// Reconcile every session still marked live: for each that is no longer
+/// running — by its agent's own `sessions` listing when one is configured,
+/// by pid otherwise — finalise it via [`Store::reconcile_session`]. Returns
+/// how many were finalised. Cheap to call on every read — with no live
+/// sessions it costs one query and nothing else; the agents config is only
+/// consulted when something is live.
+pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<usize> {
+    let live = store.live_sessions()?;
+    if live.is_empty() {
+        return Ok(0);
+    }
+    // A missing or invalid agents.toml degrades every session to the pid
+    // check rather than failing the read that triggered reconciliation.
+    let config = AgentsConfig::load(agents_path).ok();
+    // One listing per agent per pass, however many of its sessions are live.
+    let mut listings: HashMap<String, Option<Vec<AgentSessionEntry>>> = HashMap::new();
+
     let mut finalised = 0;
-    for session in store.live_sessions()? {
-        let Some(pid) = session.pid else {
-            // No pid was recorded for this session — liveness can't be
-            // checked, so it is left alone rather than guessed at.
-            continue;
+    for session in live {
+        let sessions_cmd = config
+            .as_ref()
+            .and_then(|c| c.agent(&session.agent))
+            .and_then(|a| a.sessions());
+        let alive = match sessions_cmd {
+            Some(cmd) => {
+                let Some(session_ref) = session.session_ref.as_deref() else {
+                    // No ref was captured — this session can't be found in
+                    // the listing, and pid-checking a supervisor-owned
+                    // launch would wrongly kill it, so it is left alone.
+                    continue;
+                };
+                let listing = listings
+                    .entry(session.agent.clone())
+                    .or_insert_with(|| run_sessions_command(cmd));
+                let Some(entries) = listing else {
+                    // The listing itself failed: liveness is unknowable
+                    // right now, so leave the session alone.
+                    continue;
+                };
+                entries
+                    .iter()
+                    .find(|e| e.matches_ref(session_ref))
+                    .is_some_and(|e| !e.is_finished())
+            }
+            None => {
+                let Some(pid) = session.pid else {
+                    // No pid was recorded for this session — liveness can't
+                    // be checked, so it is left alone rather than guessed at.
+                    continue;
+                };
+                pid_is_alive(pid)
+            }
         };
-        if pid_is_alive(pid) {
+        if alive {
             continue;
         }
         let likely_capped = session
@@ -56,6 +110,22 @@ pub fn reconcile_live_sessions(store: &mut Store) -> Result<usize> {
         }
     }
     Ok(finalised)
+}
+
+/// Run an agent's `sessions` command and parse its listing. `None` on any
+/// failure — spawn error, non-zero exit, unparseable output — which the
+/// caller treats as "liveness unknowable", never as "no sessions".
+fn run_sessions_command(cmd: &str) -> Option<Vec<AgentSessionEntry>> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_sessions_json(&String::from_utf8_lossy(&output.stdout)).ok()
 }
 
 /// Whether a process with this pid still exists, via `kill -0` — checks
@@ -97,8 +167,14 @@ fn log_tail_looks_capped(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Stdio;
+    use std::path::PathBuf;
     use voro_core::{Action, NewTask, Priority, SessionOutcome, TaskState};
+
+    /// An agents path that never exists, so every session degrades to the
+    /// pid check — the pre-verb behaviour the original tests pin.
+    fn no_config() -> PathBuf {
+        PathBuf::from("/nonexistent/agents.toml")
+    }
 
     /// A ready task started (`running`), ready to hang a session off of.
     fn running_task() -> (Store, i64) {
@@ -126,7 +202,7 @@ mod tests {
             .create_session(task_id, "claude", Some(std::process::id() as i64), None)
             .unwrap();
 
-        assert_eq!(reconcile_live_sessions(&mut s).unwrap(), 0);
+        assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 0);
         assert!(s.session(session.id).unwrap().ended_at.is_none());
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
     }
@@ -143,7 +219,7 @@ mod tests {
             .create_session(task_id, "claude", Some(dead_pid), None)
             .unwrap();
 
-        assert_eq!(reconcile_live_sessions(&mut s).unwrap(), 1);
+        assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 1);
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Ready);
         assert_eq!(
             s.session(session.id).unwrap().outcome,
@@ -172,7 +248,7 @@ mod tests {
             Some(log.to_str().unwrap()),
         )
         .unwrap();
-        reconcile_live_sessions(&mut s).unwrap();
+        reconcile_live_sessions(&mut s, &no_config()).unwrap();
 
         let sessions = s.sessions_for(task_id).unwrap();
         assert_eq!(sessions[0].outcome, Some(SessionOutcome::Capped));
@@ -184,8 +260,149 @@ mod tests {
         let (mut s, task_id) = running_task();
         let session = s.create_session(task_id, "claude", None, None).unwrap();
 
-        assert_eq!(reconcile_live_sessions(&mut s).unwrap(), 0);
+        assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 0);
         assert!(s.session(session.id).unwrap().ended_at.is_none());
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
+    }
+
+    // --- sessions-verb liveness (task #75) ---
+
+    /// An `agents.toml` whose `claude` agent lists sessions by catting a
+    /// canned JSON file, plus that file's path for the test to fill in.
+    fn sessions_fixture(name: &str, listing_json: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "voro-reconcile-verbs-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let listing = dir.join("sessions.json");
+        std::fs::write(&listing, listing_json).unwrap();
+        let agents_path = dir.join("agents.toml");
+        std::fs::write(
+            &agents_path,
+            format!(
+                "default = \"claude\"\n\n[agents.claude]\n\
+                 dispatch = \"cat {{prompt_file}}\"\nsessions = \"cat '{}'\"\n",
+                listing.display()
+            ),
+        )
+        .unwrap();
+        (agents_path, dir)
+    }
+
+    /// A session whose recorded pid is dead — the trap case: with `--bg`-style
+    /// launches the spawned pid always exits at birth. With the session still
+    /// listed live by the agent, reconciliation must trust the listing and
+    /// leave the task running, never the pid.
+    #[test]
+    fn a_listed_live_session_is_left_alone_despite_a_dead_pid() {
+        let (agents_path, dir) = sessions_fixture(
+            "alive",
+            r#"[{"id": "dead1234", "sessionId": "full-uuid-1", "cwd": "/tmp/proj",
+                "startedAt": 1, "status": "idle", "state": "working"}]"#,
+        );
+        let (mut s, task_id) = running_task();
+        let mut child = Command::new("true").stdout(Stdio::null()).spawn().unwrap();
+        let dead_pid = child.id() as i64;
+        child.wait().unwrap();
+        let session = s
+            .create_session(task_id, "claude", Some(dead_pid), None)
+            .unwrap();
+        s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert!(s.session(session.id).unwrap().ended_at.is_none());
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The session was stopped externally (`claude stop`) without any
+    /// return-path verb: it shows up `state: done` in the listing (or drops
+    /// out entirely), so the task is flagged for redispatch — even though the
+    /// live pid recorded on the session (this test's own) would have said
+    /// "alive" under the old check.
+    #[test]
+    fn a_finished_or_missing_listed_session_is_flagged_for_redispatch() {
+        for (name, listing) in [
+            (
+                "done",
+                r#"[{"sessionId": "full-uuid-1", "cwd": "/tmp/proj",
+                    "startedAt": 1, "state": "done"}]"#,
+            ),
+            ("gone", "[]"),
+        ] {
+            let (agents_path, dir) = sessions_fixture(name, listing);
+            let (mut s, task_id) = running_task();
+            let session = s
+                .create_session(task_id, "claude", Some(std::process::id() as i64), None)
+                .unwrap();
+            s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+            assert_eq!(
+                reconcile_live_sessions(&mut s, &agents_path).unwrap(),
+                1,
+                "{name}"
+            );
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Ready, "{name}");
+            assert_eq!(
+                s.session(session.id).unwrap().outcome,
+                Some(SessionOutcome::Failed),
+                "{name}"
+            );
+            assert!(s.redispatch_flag(task_id).unwrap(), "{name}");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// With a `sessions` verb configured but no captured ref, liveness is
+    /// unknowable: the session is left alone (pid-checking a supervisor-owned
+    /// launch would wrongly flag it), matching the no-pid case above.
+    #[test]
+    fn a_refless_session_of_a_sessions_agent_is_left_alone() {
+        let (agents_path, dir) = sessions_fixture("refless", "[]");
+        let (mut s, task_id) = running_task();
+        let mut child = Command::new("true").stdout(Stdio::null()).spawn().unwrap();
+        let dead_pid = child.id() as i64;
+        child.wait().unwrap();
+        let session = s
+            .create_session(task_id, "claude", Some(dead_pid), None)
+            .unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert!(s.session(session.id).unwrap().ended_at.is_none());
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failing listing command means liveness is unknowable this pass —
+    /// leave the session alone rather than guessing either way.
+    #[test]
+    fn a_failing_sessions_command_leaves_the_session_alone() {
+        let dir = std::env::temp_dir().join(format!(
+            "voro-reconcile-verbs-failcmd-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let agents_path = dir.join("agents.toml");
+        std::fs::write(
+            &agents_path,
+            "default = \"claude\"\n\n[agents.claude]\n\
+             dispatch = \"cat {prompt_file}\"\nsessions = \"false\"\n",
+        )
+        .unwrap();
+        let (mut s, task_id) = running_task();
+        let session = s.create_session(task_id, "claude", Some(1), None).unwrap();
+        s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert!(s.session(session.id).unwrap().ended_at.is_none());
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

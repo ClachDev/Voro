@@ -78,12 +78,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             editor_session(&mut app, request);
             terminal = ratatui::init();
         }
+        if let Some(request) = app.pending_attach.take() {
+            // attach/resume are full-screen interactive sessions that own the
+            // terminal until the user detaches, same treatment as $EDITOR.
+            ratatui::restore();
+            attach_session(&mut app, request);
+            terminal = ratatui::init();
+        }
         if app.should_quit {
             break Ok(());
         }
     };
     ratatui::restore();
     result
+}
+
+/// Run an agent's attach/resume command in the foreground (task #75), the
+/// terminal already restored by the caller. The command inherits stdio so the
+/// agent's own TUI takes over; on return — detach or session end — the state
+/// of the world may have moved, so refresh before redrawing.
+fn attach_session(app: &mut App, request: app::AttachRequest) {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&request.command)
+        .current_dir(&request.cwd)
+        .status();
+    app.status = Some(match status {
+        Ok(s) if s.success() => format!("returned from: {}", request.command),
+        Ok(s) => format!("'{}' exited with {s}", request.command),
+        Err(e) => format!("cannot run '{}' in {}: {e}", request.command, request.cwd),
+    });
+    if let Err(e) = app.refresh() {
+        app.status = Some(e.to_string());
+    }
 }
 
 /// Run the $EDITOR round-trip until the form parses and applies, feeding

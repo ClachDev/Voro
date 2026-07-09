@@ -2,6 +2,12 @@
 //! templates, not state, so they live in `~/.config/voro/agents.toml` rather
 //! than the database. This module only loads the file and resolves which agent
 //! a task should be dispatched with — spawning is the dispatcher's job.
+//!
+//! An agent is a set of verb templates. Only `dispatch` is required (`cmd` is
+//! accepted as an alias, so pre-verb configs load unchanged); the optional
+//! verbs — `sessions`, `attach`, `resume`, `continue` — unlock session-aware
+//! dispatch for agents that have a session layer of their own, and every one
+//! of them degrades gracefully when absent (docs/agent-integration.md).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -10,9 +16,14 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 
-/// The only substitution in a v1 agent command template. The working directory
-/// is handled by the spawner, not the template.
+/// The prompt-file substitution in `dispatch` and `continue` templates. The
+/// working directory is handled by the spawner, not the template.
 pub const PROMPT_FILE_PLACEHOLDER: &str = "{prompt_file}";
+
+/// The session-reference substitution in `attach`, `resume`, and `continue`
+/// templates: the agent-opaque reference captured at dispatch (a Claude
+/// session UUID, a Codex session id, a tmux session name).
+pub const SESSION_PLACEHOLDER: &str = "{session}";
 
 /// The substitution in the `[viewer]` command template (DESIGN.md §11a): the
 /// checkout path of the task's project. Optional — a viewer that operates on
@@ -21,30 +32,50 @@ pub const PROMPT_FILE_PLACEHOLDER: &str = "{prompt_file}";
 pub const VIEWER_PATH_PLACEHOLDER: &str = "{path}";
 
 /// A working starter config, written by `voro agents init` so a fresh install
-/// can dispatch without hand-authoring TOML. The default agent is a headless
-/// Claude Code invocation reading the task prompt from `{prompt_file}`; the
-/// commented second agent shows the shape for adding others. This must parse
-/// and pass [`AgentsConfig::parse`]'s validation — it is exercised by a test.
+/// can dispatch without hand-authoring TOML. The default agent is Claude Code
+/// launched attachably (`--bg`), with its session verbs wired; the commented
+/// second agent shows the shape for adding others. This must parse and pass
+/// [`AgentsConfig::parse`]'s validation — it is exercised by a test.
 pub const STARTER_CONFIG: &str = "\
 # Voro agent command templates (~/.config/voro/agents.toml).
 #
-# Each [agents.<name>] table is a shell command Voro runs (via `sh -c`) in a
-# task's project checkout to dispatch it to a coding agent. `{prompt_file}` is
-# replaced with the path to a file holding the task's title and body as the
-# prompt. `default` names the agent used for tasks without an --agent override.
+# Each [agents.<name>] table describes how Voro drives a coding agent, as a
+# set of shell commands run via `sh -c` in a task's project checkout. Only
+# `dispatch` is required (`cmd` is accepted as an alias): it starts a session
+# on a task, with `{prompt_file}` replaced by the path to a file holding the
+# task's title and body as the prompt. `default` names the agent used for
+# tasks without an --agent override.
 #
-# Tune the commands below for the agents you have installed. A dispatched
-# session runs unattended, so most agents need a non-interactive permission
-# flag (for Claude Code, e.g. --permission-mode acceptEdits or, to run fully
-# hands-off, --dangerously-skip-permissions).
+# The other verbs are optional, and each degrades gracefully when absent:
+#
+#   sessions  print the agent's sessions as a JSON array of objects carrying
+#             `sessionId` (or `id`), `cwd`, `startedAt` (ms epoch), `state`
+#             ('done' when finished). Used to capture a session reference at
+#             dispatch and to check session liveness instead of pid-checking.
+#   attach    open the *running* session interactively; `{session}` is
+#             replaced with the captured reference.
+#   resume    reopen a *finished* session interactively; `{session}` likewise.
+#   continue  continue a session headless with new input; takes `{session}`
+#             and `{prompt_file}` (the new input, e.g. an answer).
+#
+# A dispatched session runs unattended, so most agents need a non-interactive
+# permission flag. With `attach` configured you can jump into a live session
+# from the TUI (the a key) and answer permission prompts yourself. See
+# docs/agent-integration.md for the codex equivalents and a tmux recipe for
+# agents with no session layer of their own.
 
 default = \"claude\"
 
 [agents.claude]
-cmd = \"claude -p --permission-mode acceptEdits \\\"$(cat {prompt_file})\\\"\"
+dispatch = \"claude --bg --permission-mode acceptEdits \\\"$(cat {prompt_file})\\\"\"
+sessions = \"claude agents --json\"
+attach   = \"claude attach {session}\"
+resume   = \"claude --resume {session}\"
 
 # [agents.codex]
-# cmd = \"codex exec \\\"$(cat {prompt_file})\\\"\"
+# dispatch = \"codex exec \\\"$(cat {prompt_file})\\\"\"
+# resume   = \"codex resume {session}\"
+# continue = \"codex exec resume {session} \\\"$(cat {prompt_file})\\\"\"
 
 # An optional [viewer] command opens a review (or running) task's checkout so
 # you can see its diff — `voro open <task-id>`, or the open key in the TUI.
@@ -55,12 +86,48 @@ cmd = \"claude -p --permission-mode acceptEdits \\\"$(cat {prompt_file})\\\"\"
 # cmd = \"zed {path}\"
 ";
 
-/// A named command template from `agents.toml`. `cmd` always contains
-/// [`PROMPT_FILE_PLACEHOLDER`]; parsing rejects templates without it.
+/// A named set of verb templates from `agents.toml`. `dispatch` (or its alias
+/// `cmd`) is required and always contains [`PROMPT_FILE_PLACEHOLDER`]; the
+/// rest are optional, with their `{session}`/`{prompt_file}` placeholders
+/// validated at parse time so a bad template fails at load, not at use.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTemplate {
-    pub cmd: String,
+    dispatch: Option<String>,
+    /// Pre-verb alias for `dispatch`, so existing configs load unchanged.
+    cmd: Option<String>,
+    sessions: Option<String>,
+    attach: Option<String>,
+    resume: Option<String>,
+    #[serde(rename = "continue")]
+    continue_: Option<String>,
+}
+
+impl AgentTemplate {
+    /// The dispatch command — `dispatch`, or its legacy alias `cmd`.
+    /// Presence of exactly one is enforced at parse time.
+    pub fn dispatch(&self) -> &str {
+        self.dispatch
+            .as_deref()
+            .or(self.cmd.as_deref())
+            .expect("parse validates that dispatch or cmd is set")
+    }
+
+    pub fn sessions(&self) -> Option<&str> {
+        self.sessions.as_deref()
+    }
+
+    pub fn attach(&self) -> Option<&str> {
+        self.attach.as_deref()
+    }
+
+    pub fn resume(&self) -> Option<&str> {
+        self.resume.as_deref()
+    }
+
+    pub fn continue_cmd(&self) -> Option<&str> {
+        self.continue_.as_deref()
+    }
 }
 
 /// The `[viewer]` command template from `agents.toml` (DESIGN.md §11a): a
@@ -73,11 +140,16 @@ pub struct ViewerTemplate {
 }
 
 /// The agent a task will be dispatched with: the task's own override if it
-/// has one, otherwise the config's global default.
+/// has one, otherwise the config's global default, with every verb template
+/// resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAgent {
     pub name: String,
-    pub cmd: String,
+    pub dispatch: String,
+    pub sessions: Option<String>,
+    pub attach: Option<String>,
+    pub resume: Option<String>,
+    pub continue_cmd: Option<String>,
 }
 
 /// The parsed `agents.toml`: a global default plus named templates.
@@ -130,9 +202,44 @@ impl AgentsConfig {
             toml::from_str(text).map_err(|e| invalid(e.message().to_string()))?;
         config.path = path.to_path_buf();
         for (name, agent) in &config.agents {
-            if !agent.cmd.contains(PROMPT_FILE_PLACEHOLDER) {
+            let dispatch = match (&agent.dispatch, &agent.cmd) {
+                (Some(_), Some(_)) => {
+                    return Err(invalid(format!(
+                        "agent '{name}' sets both dispatch and cmd — cmd is an alias for \
+                         dispatch, keep one"
+                    )));
+                }
+                (Some(d), None) => d,
+                (None, Some(c)) => c,
+                (None, None) => {
+                    return Err(invalid(format!(
+                        "agent '{name}' is missing a dispatch (or cmd) template"
+                    )));
+                }
+            };
+            if !dispatch.contains(PROMPT_FILE_PLACEHOLDER) {
                 return Err(invalid(format!(
                     "agent '{name}' cmd is missing the {PROMPT_FILE_PLACEHOLDER} placeholder"
+                )));
+            }
+            for (verb, template) in [
+                ("attach", &agent.attach),
+                ("resume", &agent.resume),
+                ("continue", &agent.continue_),
+            ] {
+                if let Some(template) = template
+                    && !template.contains(SESSION_PLACEHOLDER)
+                {
+                    return Err(invalid(format!(
+                        "agent '{name}' {verb} is missing the {SESSION_PLACEHOLDER} placeholder"
+                    )));
+                }
+            }
+            if let Some(template) = &agent.continue_
+                && !template.contains(PROMPT_FILE_PLACEHOLDER)
+            {
+                return Err(invalid(format!(
+                    "agent '{name}' continue is missing the {PROMPT_FILE_PLACEHOLDER} placeholder"
                 )));
             }
         }
@@ -143,6 +250,13 @@ impl AgentsConfig {
     /// (DESIGN.md §8/§9). `agents` is a `BTreeMap`, so this is already sorted.
     pub fn agent_names(&self) -> Vec<String> {
         self.agents.keys().cloned().collect()
+    }
+
+    /// The verb templates of a named agent, if it is configured. Used where a
+    /// session already records which agent ran it — jump-in, reconciliation —
+    /// so no default/override resolution applies.
+    pub fn agent(&self, name: &str) -> Option<&AgentTemplate> {
+        self.agents.get(name)
     }
 
     /// The agent for a task: its `agent` override if set, otherwise the
@@ -161,7 +275,11 @@ impl AgentsConfig {
         })?;
         Ok(ResolvedAgent {
             name: name.to_string(),
-            cmd: agent.cmd.clone(),
+            dispatch: agent.dispatch().to_string(),
+            sessions: agent.sessions.clone(),
+            attach: agent.attach.clone(),
+            resume: agent.resume.clone(),
+            continue_cmd: agent.continue_.clone(),
         })
     }
 
@@ -178,11 +296,11 @@ impl AgentsConfig {
         &self.default
     }
 
-    /// Every agent as `(name, cmd)`, sorted by name, for `agents list`.
-    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+    /// Every agent as `(name, template)`, sorted by name, for `agents list`.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &AgentTemplate)> {
         self.agents
             .iter()
-            .map(|(name, agent)| (name.as_str(), agent.cmd.as_str()))
+            .map(|(name, agent)| (name.as_str(), agent))
     }
 
     /// Write [`STARTER_CONFIG`] to `path`, creating parent directories. Refuses
@@ -206,6 +324,61 @@ impl AgentsConfig {
             message: e.to_string(),
         })
     }
+}
+
+/// One session from an agent's `sessions` command output: a JSON array of
+/// objects, of which the fields below are read and everything else ignored.
+/// `sessionId` (falling back to `id`) is the durable reference substituted
+/// into `{session}`; `cwd` and `startedAt` (ms epoch) identify a fresh
+/// dispatch's session among its siblings; `state` is `"done"` once finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionEntry {
+    pub session_ref: String,
+    pub short_id: Option<String>,
+    pub cwd: Option<String>,
+    pub started_at_ms: Option<i64>,
+    pub state: Option<String>,
+}
+
+impl AgentSessionEntry {
+    /// Whether this entry is the session a stored reference points at —
+    /// either form of the id matches, since a log-parsed fallback capture may
+    /// have recorded the short id where the listing carries the full one.
+    pub fn matches_ref(&self, session_ref: &str) -> bool {
+        self.session_ref == session_ref || self.short_id.as_deref() == Some(session_ref)
+    }
+
+    /// A finished session: still listed, but no longer running.
+    pub fn is_finished(&self) -> bool {
+        self.state.as_deref() == Some("done")
+    }
+}
+
+/// Parse a `sessions` command's stdout. Entries without any id are skipped
+/// rather than failing the whole listing; anything that is not a JSON array
+/// is an error, so a misconfigured `sessions` verb surfaces rather than
+/// reading as "no sessions".
+pub fn parse_sessions_json(json: &str) -> Result<Vec<AgentSessionEntry>> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| Error::Invalid(format!("sessions output is not JSON: {e}")))?;
+    let array = value
+        .as_array()
+        .ok_or_else(|| Error::Invalid("sessions output is not a JSON array".into()))?;
+    let mut entries = Vec::new();
+    for item in array {
+        let get_str = |key: &str| item.get(key).and_then(|v| v.as_str()).map(str::to_string);
+        let Some(session_ref) = get_str("sessionId").or_else(|| get_str("id")) else {
+            continue;
+        };
+        entries.push(AgentSessionEntry {
+            session_ref,
+            short_id: get_str("id"),
+            cwd: get_str("cwd"),
+            started_at_ms: item.get("startedAt").and_then(|v| v.as_i64()),
+            state: get_str("state"),
+        });
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -236,7 +409,7 @@ mod tests {
         let resolved = config().resolve(None).unwrap();
         assert_eq!(resolved.name, "claude");
         assert_eq!(
-            resolved.cmd,
+            resolved.dispatch,
             "claude -p --output-format stream-json {prompt_file}"
         );
     }
@@ -245,7 +418,7 @@ mod tests {
     fn task_override_wins_over_default() {
         let resolved = config().resolve(Some("codex")).unwrap();
         assert_eq!(resolved.name, "codex");
-        assert_eq!(resolved.cmd, "codex exec {prompt_file}");
+        assert_eq!(resolved.dispatch, "codex exec {prompt_file}");
     }
 
     #[test]
@@ -311,6 +484,156 @@ mod tests {
         assert!(message.contains("/nonexistent/agents.toml"), "{message}");
     }
 
+    // --- session verbs (task #75) ---
+
+    const VERBS_CONFIG: &str = r#"
+        default = "claude"
+
+        [agents.claude]
+        dispatch = "claude --bg \"$(cat {prompt_file})\""
+        sessions = "claude agents --json"
+        attach   = "claude attach {session}"
+        resume   = "claude --resume {session}"
+
+        [agents.codex]
+        dispatch = "codex exec {prompt_file}"
+        resume   = "codex resume {session}"
+        continue = "codex exec resume {session} \"$(cat {prompt_file})\""
+    "#;
+
+    #[test]
+    fn verbs_parse_and_resolve() {
+        let config = AgentsConfig::parse(VERBS_CONFIG, Path::new("/tmp/agents.toml")).unwrap();
+        let claude = config.resolve(None).unwrap();
+        assert_eq!(claude.sessions.as_deref(), Some("claude agents --json"));
+        assert_eq!(claude.attach.as_deref(), Some("claude attach {session}"));
+        assert_eq!(claude.resume.as_deref(), Some("claude --resume {session}"));
+        assert_eq!(claude.continue_cmd, None);
+
+        let codex = config.resolve(Some("codex")).unwrap();
+        assert_eq!(codex.sessions, None);
+        assert_eq!(codex.attach, None);
+        assert_eq!(
+            codex.continue_cmd.as_deref(),
+            Some("codex exec resume {session} \"$(cat {prompt_file})\"")
+        );
+    }
+
+    #[test]
+    fn cmd_alias_behaves_as_dispatch_with_every_verb_absent() {
+        let resolved = config().resolve(None).unwrap();
+        assert_eq!(
+            resolved.dispatch,
+            "claude -p --output-format stream-json {prompt_file}"
+        );
+        assert_eq!(resolved.sessions, None);
+        assert_eq!(resolved.attach, None);
+        assert_eq!(resolved.resume, None);
+        assert_eq!(resolved.continue_cmd, None);
+    }
+
+    #[test]
+    fn both_dispatch_and_cmd_is_rejected() {
+        let text = r#"
+            default = "claude"
+
+            [agents.claude]
+            cmd = "claude -p {prompt_file}"
+            dispatch = "claude --bg {prompt_file}"
+        "#;
+        let message = AgentsConfig::parse(text, Path::new("/tmp/agents.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("alias"), "{message}");
+    }
+
+    #[test]
+    fn agent_without_dispatch_or_cmd_is_rejected() {
+        let text = r#"
+            default = "claude"
+
+            [agents.claude]
+            sessions = "claude agents --json"
+        "#;
+        let message = AgentsConfig::parse(text, Path::new("/tmp/agents.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("dispatch"), "{message}");
+    }
+
+    #[test]
+    fn attach_resume_continue_require_the_session_placeholder() {
+        for verb in ["attach", "resume", "continue"] {
+            let text = format!(
+                "default = \"a\"\n\n[agents.a]\ndispatch = \"run {{prompt_file}}\"\n\
+                 {verb} = \"reopen {{prompt_file}}\"\n"
+            );
+            let message = AgentsConfig::parse(&text, Path::new("/tmp/agents.toml"))
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("{session}"), "{verb}: {message}");
+            assert!(message.contains(verb), "{verb}: {message}");
+        }
+    }
+
+    #[test]
+    fn continue_requires_the_prompt_file_placeholder() {
+        let text = r#"
+            default = "a"
+
+            [agents.a]
+            dispatch = "run {prompt_file}"
+            continue = "reopen {session}"
+        "#;
+        let message = AgentsConfig::parse(text, Path::new("/tmp/agents.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("{prompt_file}"), "{message}");
+        assert!(message.contains("continue"), "{message}");
+    }
+
+    #[test]
+    fn agent_looks_up_templates_by_name() {
+        let config = AgentsConfig::parse(VERBS_CONFIG, Path::new("/tmp/agents.toml")).unwrap();
+        let claude = config.agent("claude").unwrap();
+        assert_eq!(claude.attach(), Some("claude attach {session}"));
+        assert_eq!(claude.sessions(), Some("claude agents --json"));
+        assert!(config.agent("gemini").is_none());
+    }
+
+    #[test]
+    fn parse_sessions_json_reads_the_listing_shape() {
+        let json = r#"[
+            {"pid": 4321, "id": "deadbeef", "cwd": "/tmp/proj", "kind": "background",
+             "startedAt": 1767950000000, "sessionId": "3f6c0e6e-1111-2222-3333-444455556666",
+             "name": "t", "status": "idle", "state": "done"},
+            {"id": "cafebabe", "cwd": "/tmp/other", "startedAt": 1767950001000},
+            {"pid": 1}
+        ]"#;
+        let entries = parse_sessions_json(json).unwrap();
+        assert_eq!(entries.len(), 2, "the id-less entry is skipped");
+        assert_eq!(
+            entries[0].session_ref,
+            "3f6c0e6e-1111-2222-3333-444455556666"
+        );
+        assert_eq!(entries[0].short_id.as_deref(), Some("deadbeef"));
+        assert_eq!(entries[0].cwd.as_deref(), Some("/tmp/proj"));
+        assert_eq!(entries[0].started_at_ms, Some(1767950000000));
+        assert!(entries[0].is_finished());
+        assert!(entries[0].matches_ref("deadbeef"), "short id matches too");
+        assert!(entries[0].matches_ref("3f6c0e6e-1111-2222-3333-444455556666"));
+
+        assert_eq!(entries[1].session_ref, "cafebabe", "id is the fallback");
+        assert!(!entries[1].is_finished(), "no state means not finished");
+    }
+
+    #[test]
+    fn parse_sessions_json_rejects_non_arrays() {
+        assert!(parse_sessions_json("{}").is_err());
+        assert!(parse_sessions_json("not json").is_err());
+        assert_eq!(parse_sessions_json("[]").unwrap(), vec![]);
+    }
+
     #[test]
     fn viewer_is_none_without_a_viewer_table() {
         assert_eq!(config().viewer(), None);
@@ -341,24 +664,27 @@ mod tests {
     fn starter_config_parses_and_resolves() {
         let config = AgentsConfig::parse(STARTER_CONFIG, Path::new("/tmp/agents.toml")).unwrap();
         assert_eq!(config.default_name(), "claude");
-        assert_eq!(config.resolve(None).unwrap().name, "claude");
         assert_eq!(config.agent_names(), vec!["claude"]);
+        let claude = config.resolve(None).unwrap();
+        assert_eq!(claude.name, "claude");
+        assert!(claude.dispatch.contains("--bg"), "{}", claude.dispatch);
+        assert!(claude.sessions.is_some());
+        assert!(claude.attach.is_some());
+        assert!(claude.resume.is_some());
     }
 
     #[test]
-    fn entries_lists_name_and_cmd() {
+    fn entries_lists_name_and_template() {
         let config = config();
         let entries: Vec<_> = config.entries().collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "claude");
         assert_eq!(
-            entries,
-            vec![
-                (
-                    "claude",
-                    "claude -p --output-format stream-json {prompt_file}"
-                ),
-                ("codex", "codex exec {prompt_file}"),
-            ]
+            entries[0].1.dispatch(),
+            "claude -p --output-format stream-json {prompt_file}"
         );
+        assert_eq!(entries[1].0, "codex");
+        assert_eq!(entries[1].1.dispatch(), "codex exec {prompt_file}");
     }
 
     #[test]

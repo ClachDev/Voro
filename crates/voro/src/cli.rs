@@ -54,14 +54,17 @@ tasks
 dispatch
   agents init                     write a starter ~/.config/voro/agents.toml
                                   (won't overwrite an existing one)
-  agents list                     list configured agents; * marks the default
+  agents list                     list configured agents and their session
+                                  verbs; * marks the default
   agents path                     print where dispatch looks for agents.toml
   dispatch <task-id> [--agent NAME]
                                   spawn a headless agent session on a ready
                                   task; --agent overrides the resolved agent
   continue <task-id> [--agent NAME]
-                                  spawn a fresh session on an already-running
-                                  task without changing its state; what
+                                  continue an already-running task without
+                                  changing its state — via the agent's
+                                  `continue` verb when its session was
+                                  captured, else a fresh session; what
                                   `answer` does automatically for a
                                   previously-dispatched task, exposed to retry
                                   a continuation that failed
@@ -95,7 +98,8 @@ transitions
 pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<String, String> {
     // Reconcile-on-read (DESIGN.md §8): before any verb consults session or
     // task state, close out sessions whose process has already exited.
-    crate::reconcile::reconcile_live_sessions(store).map_err(|e| e.to_string())?;
+    crate::reconcile::reconcile_live_sessions(store, &ctx.agents_path)
+        .map_err(|e| e.to_string())?;
 
     let (pos, flags) = split_args(args)?;
     let verb = pos.first().map(String::as_str).unwrap_or("help");
@@ -291,9 +295,23 @@ fn agents_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
             let config = AgentsConfig::load(path).map_err(|e| e.to_string())?;
             let default = config.default_name();
             let mut out = String::new();
-            for (name, cmd) in config.entries() {
+            for (name, template) in config.entries() {
                 let marker = if name == default { "* " } else { "  " };
-                writeln!(out, "{marker}{name}  {cmd}").unwrap();
+                let verbs: Vec<&str> = [
+                    ("sessions", template.sessions()),
+                    ("attach", template.attach()),
+                    ("resume", template.resume()),
+                    ("continue", template.continue_cmd()),
+                ]
+                .into_iter()
+                .filter_map(|(verb, defined)| defined.map(|_| verb))
+                .collect();
+                let suffix = if verbs.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", verbs.join(" "))
+                };
+                writeln!(out, "{marker}{name}  {}{suffix}", template.dispatch()).unwrap();
             }
             writeln!(out, "\n({} — * is the default)", path.display()).unwrap();
             Ok(out)
@@ -676,7 +694,7 @@ fn continue_verb(
     ctx: &DispatchCtx,
 ) -> Result<String, String> {
     let id = task_id(pos, 1)?;
-    dispatch::continue_dispatch(store, ctx, id, flags.get("agent").map(String::as_str))
+    dispatch::continue_dispatch(store, ctx, id, flags.get("agent").map(String::as_str), None)
 }
 
 /// `answer <task-id> TEXT [--no-dispatch]` (DESIGN.md §6): needs-input →
@@ -702,14 +720,14 @@ fn answer_verb(
         .is_empty();
 
     let task = store
-        .apply(id, Action::Answer(text))
+        .apply(id, Action::Answer(text.clone()))
         .map_err(|e| e.to_string())?;
     let out = format!("task {} -> {}", task.id, task.state);
 
     if !has_history || flags.contains_key("no-dispatch") {
         return Ok(out);
     }
-    match dispatch::continue_dispatch(store, ctx, id, None) {
+    match dispatch::continue_dispatch(store, ctx, id, None, Some(&text)) {
         Ok(summary) => Ok(format!("{out}; {summary}")),
         Err(e) => Err(format!(
             "{out}, but continuation dispatch failed: {e} — retry with 'voro continue {id}'"
@@ -853,6 +871,7 @@ mod tests {
             db_path: dir.join("voro.db"),
             agents_path: agents_path.clone(),
             runtime_dir: dir.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
         };
         let mut s = store();
         let call = |s: &mut Store, args: &[&str]| {
@@ -1257,6 +1276,7 @@ mod tests {
             db_path: db_path.clone(),
             agents_path,
             runtime_dir: root.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
         };
         ok(
             &mut store,
@@ -1329,6 +1349,7 @@ mod tests {
             db_path,
             agents_path,
             runtime_dir: root.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
         };
         (store, ctx, project)
     }
