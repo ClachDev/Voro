@@ -7,6 +7,7 @@ mod agent;
 mod error;
 mod import;
 mod model;
+mod pr;
 pub mod scheduler;
 mod store;
 mod transition;
@@ -21,6 +22,7 @@ pub use model::{
     Blocker, Dep, DepKind, Event, LiveSession, Priority, Project, Session, SessionOutcome, Task,
     TaskState,
 };
+pub use pr::{PrRef, format_review_feedback};
 pub use scheduler::{Candidate, ScoreBreakdown};
 pub use store::{NewTask, Store, TaskEdit};
 pub use transition::{Action, Triage};

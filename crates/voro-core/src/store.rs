@@ -12,6 +12,7 @@ use crate::model::{
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_rename_backlog_to_parked.sql"),
+    include_str!("../migrations/0003_track_pr.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -264,6 +265,23 @@ impl Store {
         self.task(id)
     }
 
+    /// Track (or, with `None`, untrack) a GitHub PR on a task (DESIGN.md §11c).
+    /// The URL is stored verbatim — validation and canonicalisation are the
+    /// caller's job, since only the `voro` crate knows a PR reference from any
+    /// other string — and the change is logged so the audit trail records when
+    /// a task became reviewable-by-PR. Leaves task state untouched.
+    pub fn set_pr(&mut self, id: i64, pr_url: Option<&str>) -> Result<Task> {
+        let changed = self.conn.execute(
+            "UPDATE tasks SET pr_url = ?1 WHERE id = ?2",
+            params![pr_url, id],
+        )?;
+        if changed == 0 {
+            return Err(Error::TaskNotFound(id));
+        }
+        log_event(&self.conn, id, "pr", pr_url.or(Some("cleared")))?;
+        self.task(id)
+    }
+
     // --- deps ---
 
     pub fn add_dep(&mut self, task_id: i64, depends_on: i64, kind: DepKind) -> Result<()> {
@@ -455,7 +473,7 @@ impl Store {
 }
 
 pub(crate) const TASK_COLUMNS: &str = "id, project_id, title, body, priority, state, agent, \
-                                       question, state_since, created_at, closed_at";
+                                       question, pr_url, state_since, created_at, closed_at";
 
 pub(crate) fn get_task(conn: &Connection, id: i64) -> Result<Option<Task>> {
     Ok(conn
@@ -477,9 +495,10 @@ pub(crate) fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         state: row.get(5)?,
         agent: row.get(6)?,
         question: row.get(7)?,
-        state_since: row.get(8)?,
-        created_at: row.get(9)?,
-        closed_at: row.get(10)?,
+        pr_url: row.get(8)?,
+        state_since: row.get(9)?,
+        created_at: row.get(10)?,
+        closed_at: row.get(11)?,
     })
 }
 
@@ -615,6 +634,41 @@ mod tests {
             s.rename_project(999, "x"),
             Err(Error::ProjectNotFound(999))
         ));
+    }
+
+    #[test]
+    fn set_pr_tracks_clears_and_logs() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let t = s
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "review me".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+        assert!(s.task(t.id).unwrap().pr_url.is_none());
+
+        let tracked = s
+            .set_pr(t.id, Some("https://github.com/acme/widget/pull/42"))
+            .unwrap();
+        assert_eq!(
+            tracked.pr_url.as_deref(),
+            Some("https://github.com/acme/widget/pull/42")
+        );
+        // state is untouched by tracking a PR
+        assert_eq!(tracked.state, TaskState::Ready);
+
+        let cleared = s.set_pr(t.id, None).unwrap();
+        assert!(cleared.pr_url.is_none());
+
+        let events = s.events_for(t.id).unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["created", "pr", "pr"]);
+        assert!(matches!(s.set_pr(999, None), Err(Error::TaskNotFound(999))));
     }
 
     #[test]
@@ -755,7 +809,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
     /// A project + running task to hang sessions off of.

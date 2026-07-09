@@ -256,6 +256,7 @@ mod tests {
             state: TaskState::Ready,
             agent: None,
             question: None,
+            pr_url: None,
             state_since: String::new(),
             created_at: String::new(),
             closed_at: None,

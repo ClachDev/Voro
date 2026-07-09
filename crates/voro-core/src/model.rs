@@ -259,6 +259,10 @@ pub struct Task {
     pub state: TaskState,
     pub agent: Option<String>,
     pub question: Option<String>,
+    /// The canonical URL of a GitHub PR tracked on this task (DESIGN.md §11c),
+    /// or `None`. Naming the PR's base repo, it survives forks where the
+    /// checkout's `origin` is not that repo.
+    pub pr_url: Option<String>,
     pub state_since: String,
     pub created_at: String,
     pub closed_at: Option<String>,

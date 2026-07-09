@@ -111,8 +111,20 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             frame.render_stateful_widget(list, area, &mut state);
         }
         Mode::Prompt { kind, buffer, .. } => {
-            let area = popup_area(frame, 64, 3);
-            let para = Paragraph::new(Line::from(vec![Span::raw(format!("{buffer}▏"))])).block(
+            // The buffer is usually one line, but a RejectWork prompt can be
+            // pre-filled with a PR's multi-line review comments (DESIGN.md
+            // §11c), so render every line and grow the box to fit.
+            let mut lines: Vec<Line> = buffer
+                .split('\n')
+                .map(|l| Line::from(l.to_string()))
+                .collect();
+            match lines.last_mut() {
+                Some(last) => last.spans.push(Span::raw("▏")),
+                None => lines.push(Line::from("▏")),
+            }
+            let height = (lines.len() as u16 + 2).clamp(3, 20);
+            let area = popup_area(frame, 72, height);
+            let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(format!("{} — ⏎ to submit, esc to cancel", kind.title())),
@@ -143,6 +155,9 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                     format!("question: {q}"),
                     Style::new().fg(Color::Cyan),
                 )));
+            }
+            if let Some(pr) = &t.pr_url {
+                lines.push(Line::from(pr_span(pr)));
             }
             lines.push(Line::default());
             lines.extend(t.body.lines().map(|l| Line::from(l.to_string())));
@@ -323,6 +338,15 @@ fn redispatch_span() -> Span<'static> {
     )
 }
 
+/// A tracked GitHub PR (DESIGN.md §11c) rendered for the detail pane, with the
+/// jump-to-PR key spelled out so the reviewer knows how to reach it.
+fn pr_span(url: &str) -> Span<'static> {
+    Span::styled(
+        format!("PR: {url}  (g to open)"),
+        Style::new().fg(Color::Blue),
+    )
+}
+
 /// The verb a queue row's Enter performs, from its state.
 fn action_verb(state: voro_core::TaskState) -> &'static str {
     match state {
@@ -440,6 +464,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             format!("question: {q}"),
             Style::new().fg(Color::Cyan),
         )));
+    }
+    if let Some(pr) = &task.pr_url {
+        lines.push(Line::from(pr_span(pr)));
     }
     if app.redispatch.contains(&task.id) {
         lines.push(Line::from(redispatch_span()));
@@ -576,7 +603,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 hints.push_str(enter);
             }
             hints.push_str(
-                " · n new · e edit · s state · d dispatch · D agent · o open · x score · h history · w weights · P project",
+                " · n new · e edit · s state · d dispatch · D agent · o open · g pr · x score · h history · w weights · P project",
             );
             Line::from(Span::styled(hints, Style::new().dim()))
         }
@@ -613,6 +640,7 @@ mod tests {
                 state,
                 agent: None,
                 question: None,
+                pr_url: None,
                 state_since: String::new(),
                 created_at: String::new(),
                 closed_at: None,

@@ -62,6 +62,7 @@ CREATE TABLE tasks (
                               'needs-input','review','done','rejected')),
   agent      TEXT,                        -- optional override; NULL = resolve at dispatch
   question   TEXT,                        -- set iff state = 'needs-input'
+  pr_url     TEXT,                        -- optional tracked GitHub PR (§11c); base-repo URL
   state_since TEXT NOT NULL,              -- ISO timestamp; drives the age bonus
   created_at  TEXT NOT NULL,
   closed_at   TEXT
