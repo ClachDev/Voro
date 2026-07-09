@@ -160,7 +160,7 @@ Ordering of the queue: every `needs-input`, `review`, and `proposed` task plus t
 
 Usage-cap detection is deliberately trivial: a substring match over the last few KB of the log for phrases like "usage limit". It will miss agents that word it differently, in which case the session is reported `failed` rather than `capped` — a labelling gap, not a functional one, since both outcomes flag the task for redispatch identically. A dispatched process must also be reaped once it exits, or it sits as a zombie for the life of the spawning `voro` process — and `kill -0` on a zombie still reports it alive, which would silently defeat this whole mechanism in a long-lived TUI session. Dispatch therefore hands the child to a detached reaper thread the moment the session is recorded, rather than leaving it to `Drop`.
 
-**The return path** is a small verb surface agents call from within their sessions, advertised to them via a CLAUDE.md/AGENTS.md snippet per project:
+**The return path** is a small verb surface agents call from within their sessions. Dispatch advertises it by injecting a fixed preamble at the top of every prompt it writes, ahead of the task body — the dispatcher already owns the prompt file, so prepending a known-good preamble reaches any agent runtime with no per-project install and no reliance on a CLAUDE.md/AGENTS.md snippet or a loaded skill. The preamble text lives in one place (a const in the `voro` crate) so it cannot drift; the voro-cli SKILL.md remains the richer, dev-facing version for manual runs. It documents exactly the three verbs and nothing about `voro start`, since dispatch has already performed the `ready → running` transition and exported `VORO_TASK_ID` on the agent's behalf:
 
 ```
 voro ask <task-id> --question "Schema A or B? Trade-offs: ..."   # → needs-input
@@ -192,7 +192,7 @@ Ordered by dependency and by time-to-useful, not by calendar — with agents doi
 
 **Milestone A — usable command centre.** `voro-core` (schema, state machine, scheduler, scoring) plus the TUI with manual task management: create/edit tasks, weights modal, the queue and its detail pane, mark states by hand. No dispatch yet — dispatching is copy-the-body-into-Claude-Code by hand. This is already the tool you are missing: cross-project prioritised attention. Live in it immediately; everything after this is judged against real use.
 
-**Milestone B — the loop.** Dispatch with agent resolution, the session table, the `voro ask/done/propose` verbs, CLAUDE.md snippets per project, needs-input flowing back into the queue, redispatch. The command centre now commands.
+**Milestone B — the loop.** Dispatch with agent resolution, the session table, the `voro ask/done/propose` verbs, the return-path preamble injected into every dispatched prompt, needs-input flowing back into the queue, redispatch. The command centre now commands.
 
 **Milestone C — refinement from usage.** Review UX (inline diff pane vs. open-in-Zed), triage ergonomics, GitHub issue *import* for owned repos, the human CLI surface, worktrees if parallel dispatch has become real.
 

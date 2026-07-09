@@ -14,6 +14,35 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use voro_core::{AgentsConfig, PROMPT_FILE_PLACEHOLDER, Session, Store, Task, TaskState};
 
+/// Prepended verbatim to every dispatched prompt so the agent learns the
+/// return-path verbs (DESIGN.md §8) with no per-project install and no reliance
+/// on a skill being loaded — the dispatcher already owns the prompt file, so
+/// injection is the most robust delivery. Deliberately says nothing about
+/// `voro start`: dispatch has already transitioned the task `ready → running`
+/// and exported `VORO_TASK_ID` on the agent's behalf. Kept as a single const so
+/// the injected text cannot drift; the voro-cli SKILL.md is the richer,
+/// dev-facing version covering manual runs.
+const RETURN_PATH_PREAMBLE: &str = "\
+<!-- Voro dispatch: how to report back -->
+You are an agent dispatched by Voro on the task below. Voro tracks this task in a
+local SQLite database; report progress through these CLI verbs rather than
+editing that database yourself:
+
+    voro ask \"$VORO_TASK_ID\" --question \"...\"     # blocked on a human decision (-> needs-input)
+    voro done \"$VORO_TASK_ID\" --summary \"...\"      # work finished, await review (-> review)
+    voro propose <project> \"<title>\" --body-file <path>   # file a follow-up task (-> proposed)
+
+`VORO_TASK_ID` identifies this task and is already exported for you; `propose`
+uses it as the discovered-from source when `--from` is omitted. `VORO_DB` points
+these verbs at the database this session was dispatched from — without it they
+would default to the real database at ~/.local/share/voro/voro.db — so run them
+as shown and never modify the database with raw SQL, which would bypass the state
+machine and event log.
+
+---
+
+";
+
 /// Which of the two flows `spawn_session` is performing — they share every
 /// mechanic (agent resolution, the dirty-tree guard, prompt/log files,
 /// spawning and reaping the process) and differ only in which state the task
@@ -163,11 +192,12 @@ fn spawn_session(
     let prompt_path = ctx
         .runtime_dir
         .join(format!("task-{task_id}-{stamp}.prompt.md"));
-    let prompt = if task.body.is_empty() {
+    let body = if task.body.is_empty() {
         format!("# {}\n", task.title)
     } else {
         format!("# {}\n\n{}\n", task.title, task.body.trim_end())
     };
+    let prompt = format!("{RETURN_PATH_PREAMBLE}{body}");
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("cannot write prompt {}: {e}", prompt_path.display()))?;
 
@@ -365,6 +395,28 @@ mod tests {
         let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
         assert!(prompt.contains("Do the thing"));
         assert!(prompt.contains("Detailed prompt."));
+    }
+
+    #[test]
+    fn dispatched_prompt_injects_the_return_path_preamble() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let id = ready_task(&mut store, &project);
+
+        dispatch(&mut store, &ctx, id, None).unwrap();
+
+        let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
+        // all three return-path verbs, the task-id variable, and the task body
+        assert!(prompt.contains("voro ask"), "{prompt}");
+        assert!(prompt.contains("voro done"), "{prompt}");
+        assert!(prompt.contains("voro propose"), "{prompt}");
+        assert!(prompt.contains("VORO_TASK_ID"), "{prompt}");
+        assert!(prompt.contains("Detailed prompt."), "{prompt}");
+        // the preamble is one const, dropped in ahead of the task body
+        assert!(prompt.starts_with(RETURN_PATH_PREAMBLE), "{prompt}");
+        assert!(
+            prompt.find("# Do the thing").unwrap() > prompt.find("voro done").unwrap(),
+            "the task body must follow the preamble"
+        );
     }
 
     fn prompt_files(ctx: &DispatchCtx) -> Vec<PathBuf> {
