@@ -1,6 +1,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use voro_core::{
-    Action, Blocker, Candidate, Project, ScoreBreakdown, Store, Task, TaskState, Triage, scheduler,
+    Action, Blocker, Candidate, Event, Project, ScoreBreakdown, Store, Task, TaskState, Triage,
+    scheduler,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +86,11 @@ pub enum Mode {
     },
     Detail {
         task_id: i64,
+        scroll: u16,
+    },
+    History {
+        task_id: i64,
+        events: Vec<Event>,
         scroll: u16,
     },
 }
@@ -408,6 +414,11 @@ impl App {
             } => self.key_prompt(key, task_id, kind, buffer),
             Mode::Score { .. } => {} // any key closes
             Mode::Detail { task_id, scroll } => self.key_detail(key, task_id, scroll),
+            Mode::History {
+                task_id,
+                events,
+                scroll,
+            } => self.key_history(key, task_id, events, scroll),
         }
     }
 
@@ -478,7 +489,23 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('h') => self.open_history(),
             _ => {}
+        }
+    }
+
+    /// Open the event-history popup for the current selection, wherever a
+    /// task row is selected (cockpit queue/running or the task browser).
+    fn open_history(&mut self) {
+        if let Some(task_id) = self.selected_task_id() {
+            let result = self.store.events_for(task_id);
+            if let Some(events) = self.report(result) {
+                self.mode = Mode::History {
+                    task_id,
+                    events,
+                    scroll: 0,
+                };
+            }
         }
     }
 
@@ -712,6 +739,20 @@ impl App {
             _ => {}
         }
         self.mode = Mode::Detail { task_id, scroll };
+    }
+
+    fn key_history(&mut self, key: KeyEvent, task_id: i64, events: Vec<Event>, mut scroll: u16) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => return,
+            KeyCode::Char('j') | KeyCode::Down => scroll = scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => scroll = scroll.saturating_sub(1),
+            _ => {}
+        }
+        self.mode = Mode::History {
+            task_id,
+            events,
+            scroll,
+        };
     }
 
     // --- editor application (called by main after the $EDITOR round-trip) ---
@@ -1019,6 +1060,38 @@ mod tests {
 
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
+    }
+
+    #[test]
+    fn h_opens_history_on_the_cockpit_and_the_task_browser() {
+        let mut app = app_with(&[TaskState::NeedsInput]);
+
+        key(&mut app, KeyCode::Char('h'));
+        let events = match &app.mode {
+            Mode::History {
+                task_id, events, ..
+            } => {
+                assert_eq!(*task_id, app.queue[0].task.id);
+                events.clone()
+            }
+            _ => panic!("h on a cockpit row should open the history popup"),
+        };
+        // created, then start, then ask — oldest first
+        assert_eq!(
+            events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+            vec!["created", "transition", "transition"]
+        );
+
+        key(&mut app, KeyCode::Char('j'));
+        assert!(matches!(app.mode, Mode::History { scroll: 1, .. }));
+        key(&mut app, KeyCode::Char('h'));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('h'));
+        assert!(matches!(app.mode, Mode::History { .. }));
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]
