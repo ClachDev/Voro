@@ -269,12 +269,8 @@ impl Store {
         pid: Option<i64>,
         log_path: Option<&str>,
     ) -> Result<Session> {
-        self.conn.execute(
-            "INSERT INTO sessions (task_id, agent, pid, log_path, started_at)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-            params![task_id, agent, pid, log_path],
-        )?;
-        self.session(self.conn.last_insert_rowid())
+        let id = insert_session(&self.conn, task_id, agent, pid, log_path)?;
+        self.session(id)
     }
 
     /// Close a session with its outcome, stamping `ended_at`.
@@ -388,6 +384,23 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         path: row.get(2)?,
         weight: row.get(3)?,
     })
+}
+
+/// Insert a session row, stamping `started_at`, and return its id. Shared by
+/// [`Store::create_session`] and the dispatch transaction in `transition.rs`.
+pub(crate) fn insert_session(
+    conn: &Connection,
+    task_id: i64,
+    agent: &str,
+    pid: Option<i64>,
+    log_path: Option<&str>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO sessions (task_id, agent, pid, log_path, started_at)
+         VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+        params![task_id, agent, pid, log_path],
+    )?;
+    Ok(conn.last_insert_rowid())
 }
 
 pub(crate) fn log_event(
