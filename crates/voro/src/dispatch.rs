@@ -1,8 +1,10 @@
-//! Dispatching a ready task to a headless agent session (DESIGN.md §8). This
-//! is the I/O half of dispatch — resolving the agent, guarding against a dirty
-//! checkout, writing the prompt, and spawning the process detached — kept out
-//! of voro-core, which stays pure of process and filesystem I/O. The atomic
-//! `ready → running`-plus-session write is voro-core's `Store::record_dispatch`.
+//! Dispatching a ready task to a headless agent session (DESIGN.md §8), and
+//! continuing an already-`running` one after a human answers a question
+//! (DESIGN.md §6). Both are the I/O half of dispatch — resolving the agent,
+//! guarding against a dirty checkout, writing the prompt, and spawning the
+//! process detached — kept out of voro-core, which stays pure of process and
+//! filesystem I/O. The atomic state-plus-session writes are voro-core's
+//! `Store::record_dispatch` and `Store::record_continuation`.
 
 use std::fs::File;
 use std::os::unix::process::CommandExt;
@@ -10,7 +12,59 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use voro_core::{AgentsConfig, PROMPT_FILE_PLACEHOLDER, Store, TaskState};
+use voro_core::{AgentsConfig, PROMPT_FILE_PLACEHOLDER, Session, Store, Task, TaskState};
+
+/// Which of the two flows `spawn_session` is performing — they share every
+/// mechanic (agent resolution, the dirty-tree guard, prompt/log files,
+/// spawning and reaping the process) and differ only in which state the task
+/// must already be in and which `Store` method records the result.
+#[derive(Clone, Copy)]
+enum SpawnKind {
+    /// A fresh dispatch: the task must be `ready`; recording it performs the
+    /// `ready → running` transition.
+    Fresh,
+    /// A continuation: the task must already be `running` — `answer` just put
+    /// it there — so recording it only opens a session, never changes state.
+    Continuation,
+}
+
+impl SpawnKind {
+    fn required_state(self) -> TaskState {
+        match self {
+            SpawnKind::Fresh => TaskState::Ready,
+            SpawnKind::Continuation => TaskState::Running,
+        }
+    }
+
+    /// Past tense, for both the rejection message and the success summary.
+    fn verb_past(self) -> &'static str {
+        match self {
+            SpawnKind::Fresh => "dispatched",
+            SpawnKind::Continuation => "continued",
+        }
+    }
+
+    fn preposition(self) -> &'static str {
+        match self {
+            SpawnKind::Fresh => "to",
+            SpawnKind::Continuation => "on",
+        }
+    }
+
+    fn record(
+        self,
+        store: &mut Store,
+        task_id: i64,
+        agent: &str,
+        pid: Option<i64>,
+        log_path: Option<&str>,
+    ) -> voro_core::Result<(Task, Session)> {
+        match self {
+            SpawnKind::Fresh => store.record_dispatch(task_id, agent, pid, log_path),
+            SpawnKind::Continuation => store.record_continuation(task_id, agent, pid, log_path),
+        }
+    }
+}
 
 /// Where dispatch finds its inputs and puts its artefacts. Built from the
 /// database path in `main`; constructed directly in tests.
@@ -52,10 +106,40 @@ pub fn dispatch(
     task_id: i64,
     agent_override: Option<&str>,
 ) -> Result<String, String> {
+    spawn_session(store, ctx, task_id, agent_override, SpawnKind::Fresh)
+}
+
+/// Continue a task that `answer` just moved `needs-input → running` (DESIGN.md
+/// §6): spawn a fresh session whose prompt is the task body — now carrying the
+/// `## Answers` section the answer appended — so the work resumes with the
+/// answer in hand rather than being fed to a live pipe, which by the time a
+/// human answers has typically already exited. Shares every mechanic with
+/// [`dispatch`] except the required starting state and how the result is
+/// recorded: `record_continuation` asserts the task is already `running`
+/// instead of performing the `ready → running` transition itself, so this can
+/// never be used to smuggle a task into `running` outside the transition API.
+pub fn continue_dispatch(
+    store: &mut Store,
+    ctx: &DispatchCtx,
+    task_id: i64,
+    agent_override: Option<&str>,
+) -> Result<String, String> {
+    spawn_session(store, ctx, task_id, agent_override, SpawnKind::Continuation)
+}
+
+fn spawn_session(
+    store: &mut Store,
+    ctx: &DispatchCtx,
+    task_id: i64,
+    agent_override: Option<&str>,
+    kind: SpawnKind,
+) -> Result<String, String> {
     let task = store.task(task_id).map_err(|e| e.to_string())?;
-    if task.state != TaskState::Ready {
+    let required = kind.required_state();
+    if task.state != required {
         return Err(format!(
-            "only ready tasks can be dispatched; task {task_id} is {}",
+            "only {required} tasks can be {}; task {task_id} is {}",
+            kind.verb_past(),
             task.state
         ));
     }
@@ -111,7 +195,8 @@ pub fn dispatch(
         .map_err(|e| format!("cannot spawn agent '{}': {e}", agent.name))?;
     let pid = i64::from(child.id());
 
-    let recorded = store.record_dispatch(
+    let recorded = kind.record(
+        store,
         task_id,
         &agent.name,
         Some(pid),
@@ -120,16 +205,16 @@ pub fn dispatch(
     let (task, session) = match recorded {
         Ok(pair) => pair,
         Err(e) => {
-            // An agent whose task never reached `running` must not keep
-            // working unrecorded: kill its process group (pgid = pid, set at
-            // spawn) and reap the shell before surfacing the error.
+            // An agent whose session never got recorded must not keep working
+            // unrecorded: kill its process group (pgid = pid, set at spawn)
+            // and reap the shell before surfacing the error.
             let _ = Command::new("kill")
                 .args(["-TERM", "--"])
                 .arg(format!("-{pid}"))
                 .status();
             let _ = child.wait();
             return Err(format!(
-                "recording the dispatch failed ({e}); the spawned agent (pid {pid}) was killed"
+                "recording the session failed ({e}); the spawned agent (pid {pid}) was killed"
             ));
         }
     };
@@ -146,8 +231,10 @@ pub fn dispatch(
     });
 
     Ok(format!(
-        "dispatched task {} to {} (session {}, pid {}) — log {}",
+        "{} task {} {} {} (session {}, pid {}) — log {}",
+        kind.verb_past(),
         task.id,
+        kind.preposition(),
         session.agent,
         session.id,
         pid,
