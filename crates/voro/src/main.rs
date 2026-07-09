@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod dispatch;
 mod editor;
+mod import;
 mod reconcile;
 mod ui;
 
