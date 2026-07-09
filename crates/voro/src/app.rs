@@ -423,7 +423,11 @@ impl App {
                 kind,
                 buffer,
             } => self.key_prompt(key, task_id, kind, buffer),
-            Mode::Score { .. } => {} // any key closes
+            Mode::Score {
+                task_id,
+                state,
+                breakdown,
+            } => self.key_score(key, task_id, state, breakdown),
             Mode::Detail { task_id, scroll } => self.key_detail(key, task_id, scroll),
             Mode::History {
                 task_id,
@@ -616,7 +620,7 @@ impl App {
         mut sel: usize,
     ) {
         match key.code {
-            KeyCode::Esc => return,
+            KeyCode::Esc | KeyCode::Char('D') => return,
             KeyCode::Char('j') | KeyCode::Down => {
                 sel = (sel + 1).min(agents.len().saturating_sub(1));
             }
@@ -638,7 +642,7 @@ impl App {
 
     fn key_weights(&mut self, key: KeyEvent, mut sel: usize) {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('w') => return,
+            KeyCode::Esc | KeyCode::Char('w') => return,
             KeyCode::Char('j') | KeyCode::Down => {
                 sel = (sel + 1).min(self.projects.len().saturating_sub(1));
             }
@@ -763,7 +767,7 @@ impl App {
 
     fn key_pick_project(&mut self, key: KeyEvent, mut sel: usize) {
         match key.code {
-            KeyCode::Esc => return,
+            KeyCode::Esc | KeyCode::Char('n') => return,
             KeyCode::Char('j') | KeyCode::Down => {
                 sel = (sel + 1).min(self.projects.len().saturating_sub(1));
             }
@@ -789,7 +793,7 @@ impl App {
         mut sel: usize,
     ) {
         match key.code {
-            KeyCode::Esc => return,
+            KeyCode::Esc | KeyCode::Char('s') => return,
             KeyCode::Char('j') | KeyCode::Down => {
                 sel = (sel + 1).min(actions.len().saturating_sub(1));
             }
@@ -843,9 +847,26 @@ impl App {
         };
     }
 
+    fn key_score(
+        &mut self,
+        key: KeyEvent,
+        task_id: i64,
+        state: TaskState,
+        breakdown: ScoreBreakdown,
+    ) {
+        if let KeyCode::Esc | KeyCode::Char('x') = key.code {
+            return;
+        }
+        self.mode = Mode::Score {
+            task_id,
+            state,
+            breakdown,
+        };
+    }
+
     fn key_detail(&mut self, key: KeyEvent, task_id: i64, mut scroll: u16) {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Esc => return,
             KeyCode::Char('j') | KeyCode::Down => scroll = scroll.saturating_add(1),
             KeyCode::Char('k') | KeyCode::Up => scroll = scroll.saturating_sub(1),
             KeyCode::Enter | KeyCode::Char('s') => {
@@ -870,7 +891,7 @@ impl App {
 
     fn key_history(&mut self, key: KeyEvent, task_id: i64, events: Vec<Event>, mut scroll: u16) {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => return,
+            KeyCode::Esc | KeyCode::Char('h') => return,
             KeyCode::Char('j') | KeyCode::Down => scroll = scroll.saturating_add(1),
             KeyCode::Char('k') | KeyCode::Up => scroll = scroll.saturating_sub(1),
             _ => {}

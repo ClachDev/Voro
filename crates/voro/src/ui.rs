@@ -30,17 +30,16 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 .iter()
                 .map(|p| ListItem::new(format!("{}  {}", p.weight, p.name)))
                 .collect();
-            let height = items.len() as u16 + 2;
-            let area = popup_area(frame, 44, height.max(3));
+            let area = popup_area(frame, 44, (items.len() as u16 + 3).max(4));
+            let content = popup_block(
+                frame,
+                area,
+                "Weights".to_string(),
+                "0-5 weight · r rename · d delete · esc close",
+            );
             let mut state = ListState::default().with_selected(Some(*sel));
-            let list = List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Weights — 0-5 weight, r rename/path, d delete, esc to close"),
-                )
-                .highlight_style(SELECTED);
-            frame.render_stateful_widget(list, area, &mut state);
+            let list = List::new(items).highlight_style(SELECTED);
+            frame.render_stateful_widget(list, content, &mut state);
         }
         Mode::AddProject {
             name,
@@ -48,7 +47,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             on_path,
             editing,
         } => {
-            let area = popup_area(frame, 56, 4);
+            let area = popup_area(frame, 56, 5);
             let field = |label: &str, value: &str, active: bool| {
                 let style = if active {
                     Style::new().add_modifier(Modifier::REVERSED)
@@ -61,15 +60,15 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 ])
             };
             let title = match editing {
-                Some(id) => format!("Edit project #{id} — tab to switch, ⏎ to save"),
-                None => "New project — tab to switch, ⏎ to save".to_string(),
+                Some(id) => format!("Edit project #{id}"),
+                None => "New project".to_string(),
             };
+            let content = popup_block(frame, area, title, "tab switch field · ⏎ save · esc cancel");
             let para = Paragraph::new(vec![
                 field("name", name, !*on_path),
                 field("path", path, *on_path),
-            ])
-            .block(Block::default().borders(Borders::ALL).title(title));
-            frame.render_widget(para, area);
+            ]);
+            frame.render_widget(para, content);
         }
         Mode::PickProject { sel } => {
             let items: Vec<ListItem> = app
@@ -77,17 +76,16 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 .iter()
                 .map(|p| ListItem::new(p.name.clone()))
                 .collect();
-            let height = items.len() as u16 + 2;
-            let area = popup_area(frame, 44, height.max(3));
+            let area = popup_area(frame, 44, (items.len() as u16 + 3).max(4));
+            let content = popup_block(
+                frame,
+                area,
+                "Pick project".to_string(),
+                "j/k move · ⏎ select · esc cancel",
+            );
             let mut state = ListState::default().with_selected(Some(*sel));
-            let list = List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Project for the new task"),
-                )
-                .highlight_style(SELECTED);
-            frame.render_stateful_widget(list, area, &mut state);
+            let list = List::new(items).highlight_style(SELECTED);
+            frame.render_stateful_widget(list, content, &mut state);
         }
         Mode::Transition {
             task_id,
@@ -98,26 +96,27 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 .iter()
                 .map(|a| ListItem::new(crate::app::action_label(a)))
                 .collect();
-            let height = items.len() as u16 + 2;
-            let area = popup_area(frame, 48, height.max(3));
+            let area = popup_area(frame, 48, (items.len() as u16 + 3).max(4));
+            let content = popup_block(
+                frame,
+                area,
+                format!("Transition #{task_id}"),
+                "j/k move · ⏎ select · esc close",
+            );
             let mut state = ListState::default().with_selected(Some(*sel));
-            let list = List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!("Transition #{task_id}")),
-                )
-                .highlight_style(SELECTED);
-            frame.render_stateful_widget(list, area, &mut state);
+            let list = List::new(items).highlight_style(SELECTED);
+            frame.render_stateful_widget(list, content, &mut state);
         }
         Mode::Prompt { kind, buffer, .. } => {
-            let area = popup_area(frame, 64, 3);
-            let para = Paragraph::new(Line::from(vec![Span::raw(format!("{buffer}▏"))])).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!("{} — ⏎ to submit, esc to cancel", kind.title())),
+            let area = popup_area(frame, 64, 4);
+            let content = popup_block(
+                frame,
+                area,
+                kind.title().to_string(),
+                "⏎ submit · esc cancel",
             );
-            frame.render_widget(para, area);
+            let para = Paragraph::new(Line::from(vec![Span::raw(format!("{buffer}▏"))]));
+            frame.render_widget(para, content);
         }
         Mode::Detail { task_id, scroll } => {
             let Some(row) = app.all.iter().find(|r| r.task.id == *task_id) else {
@@ -127,6 +126,12 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             let width = frame_area.width.saturating_sub(8).clamp(30, 90);
             let height = frame_area.height.saturating_sub(4).clamp(8, 40);
             let area = popup_area(frame, width, height);
+            let content = popup_block(
+                frame,
+                area,
+                format!("#{task_id}"),
+                "⏎ state · j/k scroll · esc close",
+            );
             let t = &row.task;
             let mut lines = vec![
                 Line::from(Span::styled(t.title.clone(), Style::new().bold())),
@@ -148,13 +153,8 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             lines.extend(t.body.lines().map(|l| Line::from(l.to_string())));
             let para = Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .scroll((*scroll, 0))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!("#{task_id} — ⏎ state · j/k scroll · esc close")),
-                );
-            frame.render_widget(para, area);
+                .scroll((*scroll, 0));
+            frame.render_widget(para, content);
         }
         Mode::AgentPicker {
             task_id,
@@ -172,15 +172,16 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                     }
                 })
                 .collect();
-            let height = items.len() as u16 + 2;
-            let area = popup_area(frame, 44, height.max(3));
+            let area = popup_area(frame, 44, (items.len() as u16 + 3).max(4));
+            let content = popup_block(
+                frame,
+                area,
+                format!("Dispatch #{task_id}"),
+                "j/k move · ⏎ dispatch · esc cancel",
+            );
             let mut state = ListState::default().with_selected(Some(*sel));
-            let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(format!(
-                    "Dispatch #{task_id} — pick agent, ⏎ dispatch, esc cancel"
-                )))
-                .highlight_style(SELECTED);
-            frame.render_stateful_widget(list, area, &mut state);
+            let list = List::new(items).highlight_style(SELECTED);
+            frame.render_stateful_widget(list, content, &mut state);
         }
         Mode::Score {
             task_id,
@@ -223,14 +224,9 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                     Style::new().dim(),
                 )));
             }
-            let height = lines.len() as u16 + 2;
-            let area = popup_area(frame, 44, height);
-            let para = Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!("Score of #{task_id}")),
-            );
-            frame.render_widget(para, area);
+            let area = popup_area(frame, 44, lines.len() as u16 + 3);
+            let content = popup_block(frame, area, format!("Score of #{task_id}"), "esc close");
+            frame.render_widget(Paragraph::new(lines), content);
         }
         Mode::History {
             task_id,
@@ -241,6 +237,12 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             let width = frame_area.width.saturating_sub(8).clamp(30, 100);
             let height = frame_area.height.saturating_sub(4).clamp(8, 40);
             let area = popup_area(frame, width, height);
+            let content = popup_block(
+                frame,
+                area,
+                format!("History of #{task_id}"),
+                "j/k scroll · esc close",
+            );
             let lines: Vec<Line> = if events.is_empty() {
                 vec![Line::from(Span::styled(
                     "no events yet",
@@ -260,40 +262,69 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             };
             let para = Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .scroll((*scroll, 0))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!("History of #{task_id} — j/k scroll · h/esc close")),
-                );
-            frame.render_widget(para, area);
+                .scroll((*scroll, 0));
+            frame.render_widget(para, content);
         }
     }
 }
 
 fn draw_cockpit(frame: &mut Frame, app: &App) {
-    let queue_height = (app.queue.len() as u16 + 2).clamp(3, 12);
-    // Collapsed to nothing when no session is live, so the queue and detail
-    // pane keep the space in the common case (DESIGN.md §9).
-    let running_height = if app.running.is_empty() {
-        0
-    } else {
-        (app.running.len() as u16 + 2).clamp(3, 6)
-    };
-    let [header, queue, detail, running, status] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(queue_height),
-        Constraint::Min(5),
-        Constraint::Length(running_height),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    // Regions are separated by whitespace and headed by a section label rather
+    // than a titled border, so each height is the row count itself (min 1 to
+    // keep the empty-queue hint, no border rows to add).
+    let queue_height = (app.queue.len() as u16).clamp(1, 10);
 
-    draw_header(frame, app, header);
-    draw_queue(frame, app, queue);
-    draw_detail(frame, app, detail);
-    draw_running(frame, app, running);
-    draw_status(frame, app, status);
+    if app.running.is_empty() {
+        // The running strip and its label collapse away when no session is
+        // live, so the queue and detail pane keep the space (DESIGN.md §9).
+        let [header, next_label, queue, _gap, detail, status] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(queue_height),
+            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+
+        draw_header(frame, app, header);
+        frame.render_widget(section_label("Next", app.queue.len()), next_label);
+        draw_queue(frame, app, queue);
+        draw_detail(frame, app, detail);
+        draw_status(frame, app, status);
+    } else {
+        let running_height = (app.running.len() as u16).clamp(1, 4);
+        let [
+            header,
+            next_label,
+            queue,
+            _gap1,
+            detail,
+            _gap2,
+            running_label,
+            running,
+            status,
+        ] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(queue_height),
+            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(running_height),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+
+        draw_header(frame, app, header);
+        frame.render_widget(section_label("Next", app.queue.len()), next_label);
+        draw_queue(frame, app, queue);
+        draw_detail(frame, app, detail);
+        frame.render_widget(section_label("Running", app.running.len()), running_label);
+        draw_running(frame, app, running);
+        draw_status(frame, app, status);
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -386,21 +417,16 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
     }
     let empty = items.is_empty();
     let mut state = ListState::default().with_selected(selected);
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Next"))
-        .highlight_style(SELECTED);
+    let list = List::new(items).highlight_style(SELECTED);
     frame.render_stateful_widget(list, area, &mut state);
     if empty {
-        let inner = area.inner(ratatui::layout::Margin::new(1, 1));
-        frame.render_widget(Paragraph::new("nothing to do — press n").dim(), inner);
+        frame.render_widget(Paragraph::new("nothing to do — press n").dim(), area);
     }
 }
 
 /// The body of whichever row is selected — the pane follows the selection
 /// instead of holding its own concept of "the" task.
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title("Detail");
-
     let selected = app.cockpit_rows.get(app.cockpit_sel);
     let (task, project, score) = match selected {
         Some(CockpitRow::Queue(i)) => {
@@ -411,18 +437,14 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             let r = &app.running[*i];
             match app.all.iter().find(|row| row.task.id == r.task_id) {
                 Some(row) => (&row.task, row.project.as_str(), None),
-                None => {
-                    frame.render_widget(Paragraph::new("").block(block), area);
-                    return;
-                }
+                None => return,
             }
         }
-        None => {
-            frame.render_widget(Paragraph::new("").block(block), area);
-            return;
-        }
+        None => return,
     };
 
+    // The meta line heads the pane in place of a section label, so it leads
+    // and the title follows it.
     let mut meta = vec![Span::raw(format!(
         "#{} · {} · {} · {}",
         task.id, project, task.priority, task.state
@@ -432,8 +454,8 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         meta.push(score_span(total));
     }
     let mut lines = vec![
-        Line::from(Span::styled(task.title.clone(), Style::new().bold())),
         Line::from(meta),
+        Line::from(Span::styled(task.title.clone(), Style::new().bold())),
     ];
     if let Some(q) = &task.question {
         lines.push(Line::from(Span::styled(
@@ -447,12 +469,12 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::default());
     lines.extend(task.body.lines().map(|l| Line::from(l.to_string())));
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para.block(block), area);
+    frame.render_widget(para, area);
 }
 
 /// Live sessions (DESIGN.md §9): agent, task state, and elapsed time since
-/// dispatch. Collapsed to a zero-height area by `draw_cockpit` when nothing
-/// is running, so there is nothing to draw here in the common case.
+/// dispatch. `draw_cockpit` omits this region and its label entirely when
+/// nothing is running, so it is not drawn at all in the common case.
 fn draw_running(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
@@ -478,9 +500,7 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     let mut state = ListState::default().with_selected(selected);
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Running"))
-        .highlight_style(SELECTED);
+    let list = List::new(items).highlight_style(SELECTED);
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -499,8 +519,13 @@ fn format_elapsed(secs: i64) -> String {
 }
 
 fn draw_tasks(frame: &mut Frame, app: &App) {
-    let [list_area, status] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+    let [label, list_area, status] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    frame.render_widget(section_label("All tasks", app.all.len()), label);
 
     let items: Vec<ListItem> = app
         .all
@@ -536,9 +561,7 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
     } else {
         Some(app.tasks_sel)
     });
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("All tasks"))
-        .highlight_style(SELECTED);
+    let list = List::new(items).highlight_style(SELECTED);
     frame.render_stateful_widget(list, list_area, &mut state);
     draw_status(frame, app, status);
 }
@@ -582,6 +605,34 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         }
     };
     frame.render_widget(line, area);
+}
+
+/// A section heading in the shared style — a bold title and a dim count,
+/// e.g. `Next · 4` — used in place of a titled border to separate the
+/// cockpit's regions and head the tasks list.
+fn section_label(title: &str, count: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(title.to_string(), Style::new().bold()),
+        Span::styled(format!(" · {count}"), Style::new().dim()),
+    ])
+}
+
+/// Draw a popup's bordered block with a subject-only title and a dim key-help
+/// footer on its last inner row, returning the content area above the footer.
+fn popup_block(frame: &mut Frame, area: Rect, title: String, footer: &str) -> Rect {
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [content, footer_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer.to_string(),
+            Style::new().dim(),
+        ))),
+        footer_area,
+    );
+    content
 }
 
 /// A centred popup rect, cleared of what is beneath it.
