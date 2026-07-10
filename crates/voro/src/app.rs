@@ -1,6 +1,6 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use voro_core::{
-    Action, AgentsConfig, Blocker, Candidate, Event, LiveSession, Project, ScoreBreakdown, Store,
+    Action, AgentsConfig, Blocker, Candidate, Event, Project, RunningRow, ScoreBreakdown, Store,
     Task, TaskState, Triage, scheduler,
 };
 
@@ -145,10 +145,11 @@ pub struct App {
 
     pub projects: Vec<Project>,
     pub queue: Vec<Candidate>,
-    /// Live agent sessions for the cockpit's running strip (DESIGN.md §9),
-    /// sourced from the store's session/task join rather than task state —
-    /// a task started by hand has no session to show here.
-    pub running: Vec<LiveSession>,
+    /// The cockpit's running strip (DESIGN.md §9): live agent sessions plus
+    /// every `running` task with no live session, so a task started by hand or
+    /// one whose session died before reconcile demoted it is still visible and
+    /// flagged for attention rather than hidden.
+    pub running: Vec<RunningRow>,
     pub all: Vec<TaskRow>,
     /// Ready tasks whose most recent session ended `failed` or `capped`
     /// (DESIGN.md §8) — read fresh from session history on every refresh,
@@ -263,7 +264,7 @@ impl App {
             })
             .collect();
         self.all = all;
-        self.running = self.store.live_sessions_with_tasks()?;
+        self.running = self.store.running_rows()?;
 
         self.cockpit_rows = (0..self.queue.len()).map(CockpitRow::Queue).collect();
         self.cockpit_rows
