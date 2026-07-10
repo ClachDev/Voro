@@ -8,6 +8,7 @@ use voro_core::{
 pub enum Screen {
     Cockpit,
     Tasks,
+    Projects,
 }
 
 /// One selectable row on the cockpit; indices point into the App caches.
@@ -55,9 +56,6 @@ impl PromptKind {
 
 pub enum Mode {
     Normal,
-    Weights {
-        sel: usize,
-    },
     AddProject {
         name: String,
         path: String,
@@ -159,6 +157,7 @@ pub struct App {
     pub cockpit_rows: Vec<CockpitRow>,
     pub cockpit_sel: usize,
     pub tasks_sel: usize,
+    pub projects_sel: usize,
 
     pub mode: Mode,
     pub pending_editor: Option<EditorRequest>,
@@ -198,6 +197,7 @@ impl App {
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
             tasks_sel: 0,
+            projects_sel: 0,
             mode: Mode::Normal,
             pending_editor: None,
             last_data_version: 0,
@@ -274,6 +274,7 @@ impl App {
             .cockpit_sel
             .min(self.cockpit_rows.len().saturating_sub(1));
         self.tasks_sel = self.tasks_sel.min(self.all.len().saturating_sub(1));
+        self.projects_sel = self.projects_sel.min(self.projects.len().saturating_sub(1));
         Ok(())
     }
 
@@ -284,6 +285,7 @@ impl App {
                 CockpitRow::Running(i) => Some(self.running.get(*i)?.task_id),
             },
             Screen::Tasks => Some(self.all.get(self.tasks_sel)?.task.id),
+            Screen::Projects => None,
         }
     }
 
@@ -291,6 +293,7 @@ impl App {
         let (sel, len) = match self.screen {
             Screen::Cockpit => (&mut self.cockpit_sel, self.cockpit_rows.len()),
             Screen::Tasks => (&mut self.tasks_sel, self.all.len()),
+            Screen::Projects => (&mut self.projects_sel, self.projects.len()),
         };
         if len == 0 {
             return;
@@ -298,10 +301,13 @@ impl App {
         *sel = (*sel as i64 + delta).clamp(0, len as i64 - 1) as usize;
     }
 
+    /// Tab cycles cockpit → tasks → projects → cockpit; `1`/`2`/`3` jump
+    /// directly (DESIGN.md §9).
     pub fn toggle_screen(&mut self) {
         self.screen = match self.screen {
             Screen::Cockpit => Screen::Tasks,
-            Screen::Tasks => Screen::Cockpit,
+            Screen::Tasks => Screen::Projects,
+            Screen::Projects => Screen::Cockpit,
         };
     }
 
@@ -340,6 +346,7 @@ impl App {
     /// line; None when it does nothing.
     pub fn enter_hint(&self) -> Option<&'static str> {
         match self.screen {
+            Screen::Projects => None,
             Screen::Tasks => self.all.get(self.tasks_sel).map(|_| "⏎ view"),
             Screen::Cockpit => match self.cockpit_rows.get(self.cockpit_sel)? {
                 CockpitRow::Queue(i) => match self.queue.get(*i)?.task.state {
@@ -406,7 +413,6 @@ impl App {
         let mode = std::mem::replace(&mut self.mode, Mode::Normal);
         match mode {
             Mode::Normal => self.key_normal(key),
-            Mode::Weights { sel } => self.key_weights(key, sel),
             Mode::AddProject {
                 name,
                 path,
@@ -441,33 +447,57 @@ impl App {
     }
 
     fn key_normal(&mut self, key: KeyEvent) {
+        // Navigation shared by every screen: quit, screen switching (tab
+        // cycles, `1`/`2`/`3` jump), and moving the selection.
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Tab => self.toggle_screen(),
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+                return;
+            }
+            KeyCode::Tab => {
+                self.toggle_screen();
+                return;
+            }
+            KeyCode::Char('1') => {
+                self.screen = Screen::Cockpit;
+                return;
+            }
+            KeyCode::Char('2') => {
+                self.screen = Screen::Tasks;
+                return;
+            }
+            KeyCode::Char('3') => {
+                self.screen = Screen::Projects;
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.move_selection(1);
+                return;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.move_selection(-1);
+                return;
+            }
+            _ => {}
+        }
+        // The projects screen owns weight/admin (DESIGN.md §9); its keys
+        // (`0`–`5`, `r`, `a`, `d`) are local and reinterpret keys that mean
+        // other things on the task-oriented screens.
+        if self.screen == Screen::Projects {
+            self.key_projects(key);
+            return;
+        }
+        match key.code {
             KeyCode::Char('r') => {
                 let result = self.refresh();
                 self.report(result);
             }
             KeyCode::Enter => self.activate_selection(),
-            KeyCode::Char('w') => {
-                if self.projects.is_empty() {
-                    self.status = Some("no projects yet — press P to add one".into());
-                } else {
-                    self.mode = Mode::Weights { sel: 0 };
-                }
-            }
-            KeyCode::Char('P') => {
-                self.mode = Mode::AddProject {
-                    name: String::new(),
-                    path: String::new(),
-                    on_path: false,
-                    editing: None,
-                };
-            }
             KeyCode::Char('n') => match self.projects.len() {
-                0 => self.status = Some("no projects yet — press P to add one".into()),
+                0 => {
+                    self.status =
+                        Some("no projects yet — add one on the projects screen (3)".into())
+                }
                 1 => {
                     self.pending_editor = Some(EditorRequest::Create {
                         project_id: self.projects[0].id,
@@ -707,15 +737,16 @@ impl App {
         };
     }
 
-    fn key_weights(&mut self, key: KeyEvent, mut sel: usize) {
+    /// The projects screen's local keys (DESIGN.md §9). `0`–`5` sets the
+    /// selected project's weight immediately — the every-morning action, one
+    /// keystroke per project; `r` opens the AddProject form pre-filled to
+    /// rename/re-path, `a` opens it blank to add a project, `d` deletes behind
+    /// the store's own guard (only projects with no tasks). Movement and
+    /// screen switching are handled by `key_normal` before it delegates here.
+    fn key_projects(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('w') => return,
-            KeyCode::Char('j') | KeyCode::Down => {
-                sel = (sel + 1).min(self.projects.len().saturating_sub(1));
-            }
-            KeyCode::Char('k') | KeyCode::Up => sel = sel.saturating_sub(1),
             KeyCode::Char(c @ '0'..='5') => {
-                if let Some(project) = self.projects.get(sel) {
+                if let Some(project) = self.projects.get(self.projects_sel) {
                     let id = project.id;
                     let result = self
                         .store
@@ -725,7 +756,7 @@ impl App {
                 }
             }
             KeyCode::Char('r') => {
-                if let Some(project) = self.projects.get(sel) {
+                if let Some(project) = self.projects.get(self.projects_sel) {
                     self.mode = Mode::AddProject {
                         name: project.name.clone(),
                         path: project.path.clone(),
@@ -733,19 +764,26 @@ impl App {
                         editing: Some(project.id),
                     };
                 }
-                return;
+            }
+            KeyCode::Char('a') => {
+                self.mode = Mode::AddProject {
+                    name: String::new(),
+                    path: String::new(),
+                    on_path: false,
+                    editing: None,
+                };
             }
             KeyCode::Char('d') => {
-                if let Some(project) = self.projects.get(sel) {
+                if let Some(project) = self.projects.get(self.projects_sel) {
                     let id = project.id;
                     let result = self.store.delete_project(id).and_then(|_| self.refresh());
                     self.report(result);
-                    sel = sel.min(self.projects.len().saturating_sub(1));
+                    self.projects_sel =
+                        self.projects_sel.min(self.projects.len().saturating_sub(1));
                 }
             }
             _ => {}
         }
-        self.mode = Mode::Weights { sel };
     }
 
     fn key_add_project(
@@ -1357,12 +1395,51 @@ mod tests {
         assert!(matches!(app.mode, Mode::Normal));
     }
 
+    // --- projects screen (task, DESIGN.md §9) ---
+
+    /// Tab cycles cockpit → tasks → projects → cockpit, and `1`/`2`/`3` jump
+    /// to a screen directly regardless of where the cursor is.
     #[test]
-    fn weights_modal_rename_prefills_and_saves() {
+    fn tab_and_digits_move_between_the_three_screens() {
+        let mut app = app_with(&[]);
+        assert_eq!(app.screen, Screen::Cockpit);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.screen, Screen::Tasks);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.screen, Screen::Projects);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.screen, Screen::Cockpit);
+
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.screen, Screen::Projects);
+        key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.screen, Screen::Cockpit);
+        key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.screen, Screen::Tasks);
+    }
+
+    /// The morning ritual: `0`–`5` on the projects screen sets the selected
+    /// project's weight through the store in a single keystroke.
+    #[test]
+    fn digit_on_projects_screen_sets_weight_through_the_store() {
         let mut app = app_with(&[]);
         let project_id = app.projects[0].id;
-        key(&mut app, KeyCode::Char('w'));
-        assert!(matches!(app.mode, Mode::Weights { sel: 0 }));
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.screen, Screen::Projects);
+
+        key(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.projects[0].weight, 5);
+        assert_eq!(app.store.project(project_id).unwrap().weight, 5);
+
+        key(&mut app, KeyCode::Char('0'));
+        assert_eq!(app.store.project(project_id).unwrap().weight, 0);
+    }
+
+    #[test]
+    fn projects_screen_rename_prefills_and_saves() {
+        let mut app = app_with(&[]);
+        let project_id = app.projects[0].id;
+        key(&mut app, KeyCode::Char('3'));
 
         key(&mut app, KeyCode::Char('r'));
         match &app.mode {
@@ -1376,7 +1453,7 @@ mod tests {
                 assert_eq!(path, "/tmp/demo");
                 assert_eq!(*editing, Some(project_id));
             }
-            _ => panic!("r in weights mode should open the AddProject modal prefilled"),
+            _ => panic!("r on the projects screen should open the AddProject modal prefilled"),
         }
 
         for _ in 0.."demo".len() {
@@ -1386,31 +1463,61 @@ mod tests {
             key(&mut app, KeyCode::Char(c));
         }
         key(&mut app, KeyCode::Enter); // move to the path field
+        for _ in 0.."/tmp/demo".len() {
+            key(&mut app, KeyCode::Backspace);
+        }
+        for c in "/tmp/moved".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
         key(&mut app, KeyCode::Enter); // save
 
-        // saving closes the modal, matching the create-project flow
+        // saving closes the form, matching the create-project flow
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(app.projects[0].id, project_id);
         assert_eq!(app.projects[0].name, "renamed");
-        assert_eq!(app.projects[0].path, "/tmp/demo");
+        // the same form re-paths in one save
+        assert_eq!(app.projects[0].path, "/tmp/moved");
         // tasks reference the project by id, so renaming leaves them intact
-        assert_eq!(app.store.project(project_id).unwrap().name, "renamed");
+        let stored = app.store.project(project_id).unwrap();
+        assert_eq!(stored.name, "renamed");
+        assert_eq!(stored.path, "/tmp/moved");
+    }
+
+    /// `a` opens a blank AddProject form to add a new project.
+    #[test]
+    fn projects_screen_add_opens_a_blank_form() {
+        let mut app = app_with(&[]);
+        key(&mut app, KeyCode::Char('3'));
+        key(&mut app, KeyCode::Char('a'));
+        match &app.mode {
+            Mode::AddProject {
+                name,
+                path,
+                editing,
+                ..
+            } => {
+                assert!(name.is_empty());
+                assert!(path.is_empty());
+                assert_eq!(*editing, None);
+            }
+            _ => panic!("a on the projects screen should open a blank AddProject form"),
+        }
     }
 
     #[test]
-    fn weights_modal_deletes_a_taskless_project() {
+    fn projects_screen_deletes_a_taskless_project() {
         let mut app = app_with(&[]);
-        key(&mut app, KeyCode::Char('w'));
+        key(&mut app, KeyCode::Char('3'));
         key(&mut app, KeyCode::Char('d'));
         assert!(app.projects.is_empty());
-        assert!(matches!(app.mode, Mode::Weights { .. }));
+        assert_eq!(app.screen, Screen::Projects);
         assert!(app.status.is_none());
     }
 
     #[test]
-    fn weights_modal_delete_refuses_when_project_has_a_task() {
+    fn projects_screen_delete_refuses_when_project_has_a_task() {
         let mut app = app_with(&[TaskState::Ready]);
-        key(&mut app, KeyCode::Char('w'));
+        key(&mut app, KeyCode::Char('3'));
         key(&mut app, KeyCode::Char('d'));
         assert_eq!(app.projects.len(), 1);
         assert!(app.status.as_deref().unwrap_or("").contains("park"));
