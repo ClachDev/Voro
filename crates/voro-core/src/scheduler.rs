@@ -68,7 +68,7 @@ pub struct Candidate {
 /// How many `ready` tasks the queue offers: enough autonomy to choose
 /// around the top one, few enough that the queue stays an answer rather
 /// than a todo list — the browser holds the rest.
-pub const QUEUE_READY_ROWS: usize = 3;
+pub const QUEUE_READY_ROWS: usize = 5;
 
 /// The next-action queue (§1): every `needs-input`, `review`, and
 /// `proposed` task plus the top `QUEUE_READY_ROWS` ready tasks, in one list
