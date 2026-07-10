@@ -183,6 +183,8 @@ The return path depends on the agent remembering to call it, and for the one age
 
 Dispatch runs in the project's path with a dirty-tree guard in v1; per-dispatch worktrees are deferred until parallel dispatch within one project is actually wanted (§11).
 
+The subprocesses Voro launches that are *not* dispatches — the viewer open (§11a) and the attach/resume round-trip (§11a) — do not each earn a session row and its per-session log, but their failures are just as easily swallowed: a detached viewer's output would otherwise go to `/dev/null`, and an attach failure is painted over the instant the TUI reinitialises. They share one append-only `launches.log` beside the per-session logs, recording each launch's command, cwd, and exit status. A failing attach additionally holds its own error output on screen until a keypress before the TUI redraws over it. Single rolling file, no rotation — the same single-operator argument as the per-session logs above.
+
 ## 9. Cockpit
 
 The TUI is built first and is the primary interface throughout. Ratatui, three regions: the **queue** (top), a **detail** pane showing the full body of whichever row is selected (middle), and a **running** strip showing live sessions, their agents, and their states (bottom).
