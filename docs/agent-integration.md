@@ -69,7 +69,7 @@ through optional verbs on their `[agents.<name>]` table, next to the required
 
 ```toml
 [agents.claude]
-dispatch = "claude --bg --permission-mode bypassPermissions \"$(cat {prompt_file})\""
+dispatch = "claude --bg --name \"voro-{task_id}\" --permission-mode bypassPermissions \"$(cat {prompt_file})\""
 sessions = "claude agents --json"
 attach   = "claude attach {session}"
 resume   = "claude --resume {session}"
@@ -80,6 +80,11 @@ resume   = "codex resume {session}"
 continue = "codex exec resume {session} \"$(cat {prompt_file})\""
 ```
 
+- `dispatch` may also carry `{task_id}`, replaced with the task's numeric id.
+  It is optional — a template that omits it dispatches unchanged — and is used
+  above to name the session `voro-<id>` (via Claude's `--name` flag) so it is
+  identifiable in `claude agents` and the `/resume` picker. Agents with no
+  session-naming flag simply leave it out.
 - `sessions` prints the agent's sessions as a JSON array; Voro reads
   `sessionId` (or `id`), `cwd`, `startedAt` (ms epoch), and `state` (`"done"`
   once finished) from each object and ignores the rest.

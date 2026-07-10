@@ -19,8 +19,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voro_core::{
-    AgentsConfig, PROMPT_FILE_PLACEHOLDER, SESSION_PLACEHOLDER, Session, Store, Task, TaskState,
-    VIEWER_PATH_PLACEHOLDER, parse_sessions_json,
+    AgentsConfig, PROMPT_FILE_PLACEHOLDER, SESSION_PLACEHOLDER, Session, Store,
+    TASK_ID_PLACEHOLDER, Task, TaskState, VIEWER_PATH_PLACEHOLDER, parse_sessions_json,
 };
 
 /// Rendered per dispatch and prepended verbatim to every prompt so the agent
@@ -376,7 +376,8 @@ fn spawn_session(
             .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path)),
         None => agent
             .dispatch
-            .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path)),
+            .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path))
+            .replace(TASK_ID_PLACEHOLDER, &task_id.to_string()),
     };
     let spawn_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -782,6 +783,39 @@ mod tests {
             prompt.contains("voro done") && prompt.contains("--branch feat/parser"),
             "{prompt}"
         );
+    }
+
+    #[test]
+    fn dispatch_substitutes_the_task_id_into_the_command() {
+        // the stub command writes {task_id} to a marker file, so a successful
+        // run proves the placeholder reached the spawned command line
+        let (mut store, ctx, project) = fixture("cat {prompt_file} && echo {task_id} > marker.txt");
+        let id = ready_task(&mut store, &project);
+
+        dispatch(&mut store, &ctx, id, None).unwrap();
+
+        let marker = project.join("marker.txt");
+        for _ in 0..50 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            id.to_string()
+        );
+    }
+
+    #[test]
+    fn dispatch_without_the_task_id_placeholder_is_unchanged() {
+        // a template that never mentions {task_id} dispatches exactly as before
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let id = ready_task(&mut store, &project);
+
+        let summary = dispatch(&mut store, &ctx, id, None).unwrap();
+        assert!(summary.contains("dispatched task"), "{summary}");
+        assert_eq!(store.task(id).unwrap().state, TaskState::Running);
     }
 
     fn prompt_files(ctx: &DispatchCtx) -> Vec<PathBuf> {
