@@ -15,6 +15,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0003_track_pr.sql"),
     include_str!("../migrations/0004_add_session_ref.sql"),
     include_str!("../migrations/0005_add_branch.sql"),
+    include_str!("../migrations/0006_one_open_session_per_task.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -491,34 +492,29 @@ impl Store {
         ))
     }
 
-    /// Rows for the cockpit's running strip (DESIGN.md §9): every live session
-    /// joined with its task (newest first), followed by every `running` task
-    /// that has no live session. The latter is a task nothing is actively
-    /// driving — started by hand, or a task whose session ended without
-    /// reporting (reconcile finalises the session but leaves the task running,
-    /// §8) — surfaced because it is in the wrong state and needs a human's
-    /// attention; its `session_id`/`agent` are `NULL` and its elapsed time is
-    /// measured from when it entered `running` rather than from a session
-    /// start. Elapsed time is computed against the database's clock so the TUI
-    /// only formats it.
+    /// Rows for the cockpit's running strip (DESIGN.md §9): every `running`
+    /// task, joined with its open session if it has one. The strip filters on
+    /// task *state*, not on "has an open session" — a `review` or `needs-input`
+    /// task keeps its session open behind the scenes (for feedback/answer
+    /// continuation, §8) but belongs to the queue, not the strip, so those
+    /// never appear here even though their session row is still open. A task
+    /// nothing is actively driving — started by hand, or one whose session
+    /// ended without reporting (reconcile leaves it `running`, §8) — has no
+    /// open session, so its `session_id`/`agent` are `NULL` and its elapsed
+    /// time is measured from when it entered `running`. The one-open-session
+    /// invariant (§8) makes the join at most one row per task, so a task
+    /// appears exactly once. Elapsed time is computed against the database's
+    /// clock so the TUI only formats it.
     pub fn running_rows(&self) -> Result<Vec<RunningRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.id AS session_id, s.task_id, t.title, t.state, s.agent, s.started_at,
-                    CAST(strftime('%s', 'now') - strftime('%s', s.started_at) AS INTEGER),
-                    0 AS orphan
-             FROM sessions s JOIN tasks t ON t.id = s.task_id
-             WHERE s.ended_at IS NULL
-             UNION ALL
-             SELECT NULL, t.id, t.title, t.state, NULL, t.state_since,
-                    CAST(strftime('%s', 'now') - strftime('%s', t.state_since) AS INTEGER),
-                    1 AS orphan
+            "SELECT s.id AS session_id, t.id, t.title, t.state, s.agent,
+                    COALESCE(s.started_at, t.state_since) AS since,
+                    CAST(strftime('%s', 'now')
+                         - strftime('%s', COALESCE(s.started_at, t.state_since)) AS INTEGER)
              FROM tasks t
+             LEFT JOIN sessions s ON s.task_id = t.id AND s.ended_at IS NULL
              WHERE t.state = 'running'
-               AND NOT EXISTS (
-                   SELECT 1 FROM sessions s
-                   WHERE s.task_id = t.id AND s.ended_at IS NULL
-               )
-             ORDER BY orphan ASC, session_id DESC, task_id DESC",
+             ORDER BY (s.id IS NULL), s.id DESC, t.id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(RunningRow {
@@ -598,21 +594,6 @@ pub(crate) fn get_session(conn: &Connection, id: i64) -> Result<Option<Session>>
         .optional()?)
 }
 
-/// The id of a task's most recent session — the one that last put it in
-/// `running`, matching the newest-first ordering of [`Store::sessions_for`].
-/// `None` when the task has no sessions. Used by reconciliation to tell a
-/// task's live session apart from an older, superseded one.
-pub(crate) fn latest_session_id(conn: &Connection, task_id: i64) -> Result<Option<i64>> {
-    Ok(conn
-        .query_row(
-            "SELECT MAX(id) FROM sessions WHERE task_id = ?1",
-            [task_id],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten())
-}
-
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
         id: row.get(0)?,
@@ -637,7 +618,11 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 }
 
 /// Insert a session row, stamping `started_at`, and return its id. Shared by
-/// [`Store::create_session`] and the dispatch transaction in `transition.rs`.
+/// [`Store::create_session`] and the dispatch/continuation transactions in
+/// `transition.rs`. Enforces the one-open-session invariant (DESIGN.md §8):
+/// opening a new session first closes any predecessor still open for the same
+/// task (stamped `aborted` — it was superseded), so a task never carries two
+/// open rows at once. The partial unique index is the schema-level backstop.
 pub(crate) fn insert_session(
     conn: &Connection,
     task_id: i64,
@@ -645,12 +630,31 @@ pub(crate) fn insert_session(
     pid: Option<i64>,
     log_path: Option<&str>,
 ) -> Result<i64> {
+    close_open_session(conn, task_id, SessionOutcome::Aborted)?;
     conn.execute(
         "INSERT INTO sessions (task_id, agent, pid, log_path, started_at)
          VALUES (?1, ?2, ?3, ?4, datetime('now'))",
         params![task_id, agent, pid, log_path],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Close a task's currently-open session, if it has one, stamping `ended_at`
+/// and `outcome`. The one-open-session invariant (DESIGN.md §8) means this
+/// touches at most one row. Used both to supersede a predecessor when a new
+/// session opens and to close the session on a terminal transition
+/// (accept/abandon/abort) in `transition.rs`, all within the caller's
+/// transaction. Returns the number of rows closed (0 if none was open).
+pub(crate) fn close_open_session(
+    conn: &Connection,
+    task_id: i64,
+    outcome: SessionOutcome,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE sessions SET ended_at = datetime('now'), outcome = ?1
+         WHERE task_id = ?2 AND ended_at IS NULL",
+        params![outcome, task_id],
+    )?)
 }
 
 /// Stamp `ended_at` and record `outcome` on a session, returning the number
@@ -970,6 +974,58 @@ mod tests {
         assert_eq!(refs, 0);
     }
 
+    /// Migration 0006 must dedupe a task that already carries several open
+    /// sessions (the duplicate-rows bug) — keeping the newest open and closing
+    /// the rest — before it can create the one-open-session index, and the
+    /// index must then reject any further second open row.
+    #[test]
+    fn migration_0006_dedupes_open_sessions_and_enforces_the_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        // apply 0001..=0005, i.e. everything before the invariant migration
+        for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
+            .unwrap();
+        conn.execute("INSERT INTO projects (name, path) VALUES ('p', '/tmp')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (project_id, title, state, state_since, created_at)
+             VALUES (1, 'run me', 'running', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        // three open sessions on the one task — the exact duplicate state
+        for _ in 0..3 {
+            conn.execute(
+                "INSERT INTO sessions (task_id, agent, started_at) VALUES (1, 'a', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = Store::from_connection(conn).unwrap();
+        // only the newest open session survives; the rest are closed `aborted`
+        let open: Vec<i64> = store
+            .sessions_for(1)
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.ended_at.is_none())
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(open, vec![3]);
+        assert_eq!(
+            store.session(1).unwrap().outcome,
+            Some(SessionOutcome::Aborted)
+        );
+        // and the index now forbids a second open row
+        let second = store.conn.execute(
+            "INSERT INTO sessions (task_id, agent, started_at) VALUES (1, 'b', datetime('now'))",
+            [],
+        );
+        assert!(second.is_err());
+    }
+
     /// A project + running task to hang sessions off of.
     fn task_fixture(s: &mut Store) -> i64 {
         s.conn
@@ -1235,6 +1291,63 @@ mod tests {
         assert_eq!(rows[0].task_id, live_task);
         assert_eq!(rows[1].session_id, None);
         assert_eq!(rows[1].task_id, orphan_task);
+    }
+
+    /// The strip filters on task state: a task that has left `running` —
+    /// review, done, rejected — never renders, even a `review` task whose
+    /// session is deliberately still open (DESIGN.md §8/§9).
+    #[test]
+    fn running_rows_exclude_tasks_that_left_running() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let new = |title: &str| NewTask {
+            project_id: p.id,
+            title: title.into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state: TaskState::Ready,
+            agent: None,
+        };
+
+        // review keeps its session open, yet must not appear in the strip
+        let review = s.create_task(new("review")).unwrap().id;
+        s.record_dispatch(review, "claude", Some(1), None).unwrap();
+        s.apply(review, Action::Complete(None)).unwrap();
+        assert!(s.sessions_for(review).unwrap()[0].ended_at.is_none());
+
+        // done and rejected have their sessions closed by the transition
+        let done = s.create_task(new("done")).unwrap().id;
+        s.record_dispatch(done, "claude", Some(2), None).unwrap();
+        s.apply(done, Action::Complete(None)).unwrap();
+        s.apply(done, Action::Accept).unwrap();
+
+        let rejected = s.create_task(new("rejected")).unwrap().id;
+        s.record_dispatch(rejected, "claude", Some(3), None)
+            .unwrap();
+        s.apply(rejected, Action::Abort).unwrap();
+        s.apply(rejected, Action::Abandon).unwrap();
+
+        // one genuinely running task remains
+        let running = s.create_task(new("running")).unwrap().id;
+        s.record_dispatch(running, "claude", Some(4), None).unwrap();
+
+        let rows = s.running_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_id, running);
+    }
+
+    /// The direct session-25/#79 reproduction: a `done` task left carrying an
+    /// open session (a lingering listing entry could otherwise keep it "alive")
+    /// must stay out of the strip purely on its state.
+    #[test]
+    fn running_rows_ignore_a_stale_open_session_on_a_closed_task() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+        s.create_session(task_id, "claude", Some(1), None).unwrap();
+        s.conn
+            .execute("UPDATE tasks SET state = 'done' WHERE id = ?1", [task_id])
+            .unwrap();
+        assert!(s.running_rows().unwrap().is_empty());
     }
 
     #[test]
