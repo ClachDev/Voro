@@ -37,9 +37,9 @@ Voro dispatches a task by running a shell command template per agent, read from
 you — scaffold a starter with:
 
 ```bash
-voro agents init      # writes ~/.config/voro/agents.toml (won't overwrite)
-voro agents list      # show configured agents; * marks the default
-voro agents path      # print where dispatch looks for the file
+voro agent init       # writes ~/.config/voro/agents.toml (won't overwrite)
+voro agent list       # show configured agents; * marks the default
+voro agent path       # print where dispatch looks for the file
 ```
 
 Then edit the file so each `[agents.<name>]` `cmd` matches an agent you have

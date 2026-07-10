@@ -38,7 +38,7 @@ pub const SESSION_PLACEHOLDER: &str = "{session}";
 /// command is run in the project's path regardless.
 pub const VIEWER_PATH_PLACEHOLDER: &str = "{path}";
 
-/// A working starter config, written by `voro agents init` so a fresh install
+/// A working starter config, written by `voro agent init` so a fresh install
 /// can dispatch without hand-authoring TOML. The default agent is Claude Code
 /// launched attachably (`--bg`), with its session verbs wired; the commented
 /// second agent shows the shape for adding others. This must parse and pass
@@ -309,12 +309,12 @@ impl AgentsConfig {
     }
 
     /// The name of the agent used when a task has no override, for the CLI's
-    /// `agents list` to flag it.
+    /// `agent list` to flag it.
     pub fn default_name(&self) -> &str {
         &self.default
     }
 
-    /// Every agent as `(name, template)`, sorted by name, for `agents list`.
+    /// Every agent as `(name, template)`, sorted by name, for `agent list`.
     pub fn entries(&self) -> impl Iterator<Item = (&str, &AgentTemplate)> {
         self.agents
             .iter()
@@ -323,7 +323,7 @@ impl AgentsConfig {
 
     /// Write [`STARTER_CONFIG`] to `path`, creating parent directories. Refuses
     /// to overwrite an existing file so a hand-tuned config is never clobbered
-    /// — `agents init` is a one-time bootstrap, not a reset.
+    /// — `agent init` is a one-time bootstrap, not a reset.
     pub fn write_starter(path: &Path) -> Result<()> {
         if path.exists() {
             return Err(Error::Invalid(format!(
