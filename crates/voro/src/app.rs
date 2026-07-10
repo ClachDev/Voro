@@ -85,18 +85,8 @@ pub enum Mode {
         task_id: i64,
         buffer: String,
     },
-    Score {
-        task_id: i64,
-        state: TaskState,
-        breakdown: ScoreBreakdown,
-    },
     Detail {
         task_id: i64,
-        scroll: u16,
-    },
-    History {
-        task_id: i64,
-        events: Vec<Event>,
         scroll: u16,
     },
     /// Dispatch-via-picker (DESIGN.md §8): agents loaded fresh from
@@ -180,6 +170,12 @@ pub struct App {
     pub projects_sel: usize,
 
     pub mode: Mode,
+    /// Whether the detail views fold the score decomposition (DESIGN.md §7) and
+    /// the event history in — toggled by `x` and `h`. Held per app-state rather
+    /// than per task so the choice persists as the selection moves, and shared
+    /// by the cockpit detail pane and the tasks-screen Detail popup.
+    pub show_score: bool,
+    pub show_history: bool,
     pub pending_editor: Option<EditorRequest>,
     pub pending_attach: Option<AttachRequest>,
 
@@ -220,6 +216,8 @@ impl App {
             tasks_sel: 0,
             projects_sel: 0,
             mode: Mode::Normal,
+            show_score: false,
+            show_history: false,
             pending_editor: None,
             pending_attach: None,
             last_data_version: 0,
@@ -458,13 +456,7 @@ impl App {
                 buffer,
             } => self.key_prompt(key, task_id, kind, buffer),
             Mode::LinkPr { task_id, buffer } => self.key_link_pr(key, task_id, buffer),
-            Mode::Score { .. } => {} // any key closes
             Mode::Detail { task_id, scroll } => self.key_detail(key, task_id, scroll),
-            Mode::History {
-                task_id,
-                events,
-                scroll,
-            } => self.key_history(key, task_id, events, scroll),
             Mode::AgentPicker {
                 task_id,
                 agents,
@@ -552,20 +544,16 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('x') => {
-                if let Some(task) = self.selected_task() {
-                    let (id, state) = (task.id, task.state);
-                    let result = self.store.explain(id);
-                    if let Some(breakdown) = self.report(result) {
-                        self.mode = Mode::Score {
-                            task_id: id,
-                            state,
-                            breakdown,
-                        };
-                    }
-                }
+            // The score and history sections live in the detail pane on the
+            // cockpit and in the Detail popup on the tasks screen; on the
+            // cockpit `x`/`h` fold them into the pane in place, while on the
+            // tasks screen they are local to the popup (see `key_detail`).
+            KeyCode::Char('x') if self.screen == Screen::Cockpit => {
+                self.show_score = !self.show_score;
             }
-            KeyCode::Char('h') => self.open_history(),
+            KeyCode::Char('h') if self.screen == Screen::Cockpit => {
+                self.show_history = !self.show_history;
+            }
             KeyCode::Char('d') => {
                 if let Some((task_id, _)) = self.ready_selected_task() {
                     self.dispatch_task(task_id, None);
@@ -663,19 +651,17 @@ impl App {
         });
     }
 
-    /// Open the event-history popup for the current selection, wherever a
-    /// task row is selected (cockpit queue/running or the task browser).
-    fn open_history(&mut self) {
-        if let Some(task_id) = self.selected_task_id() {
-            let result = self.store.events_for(task_id);
-            if let Some(events) = self.report(result) {
-                self.mode = Mode::History {
-                    task_id,
-                    events,
-                    scroll: 0,
-                };
-            }
-        }
+    /// The score decomposition (DESIGN.md §7) for a task, for the detail
+    /// views' `x` toggle. A failed lookup yields `None` so the section is
+    /// simply omitted rather than surfacing an error mid-render.
+    pub fn score_breakdown(&self, task_id: i64) -> Option<ScoreBreakdown> {
+        self.store.explain(task_id).ok()
+    }
+
+    /// A task's event history, oldest first, for the detail views' `h` toggle.
+    /// A read error yields an empty history for the same reason.
+    pub fn task_events(&self, task_id: i64) -> Vec<Event> {
+        self.store.events_for(task_id).unwrap_or_default()
     }
 
     /// The selected task's id and agent override, if there is a selection and
@@ -1118,6 +1104,10 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => return,
             KeyCode::Char('j') | KeyCode::Down => scroll = scroll.saturating_add(1),
             KeyCode::Char('k') | KeyCode::Up => scroll = scroll.saturating_sub(1),
+            // Fold the score and history sections into the popup in place; the
+            // toggles are shared with the cockpit detail pane.
+            KeyCode::Char('x') => self.show_score = !self.show_score,
+            KeyCode::Char('h') => self.show_history = !self.show_history,
             KeyCode::Enter | KeyCode::Char('s') => {
                 if let Some(task) = self.all.iter().map(|r| &r.task).find(|t| t.id == task_id) {
                     let actions = Store::legal_actions(task.state);
@@ -1155,20 +1145,6 @@ impl App {
             }
             Err(e) => self.status = Some(e.to_string()),
         }
-    }
-
-    fn key_history(&mut self, key: KeyEvent, task_id: i64, events: Vec<Event>, mut scroll: u16) {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => return,
-            KeyCode::Char('j') | KeyCode::Down => scroll = scroll.saturating_add(1),
-            KeyCode::Char('k') | KeyCode::Up => scroll = scroll.saturating_sub(1),
-            _ => {}
-        }
-        self.mode = Mode::History {
-            task_id,
-            events,
-            scroll,
-        };
     }
 
     // --- editor application (called by main after the $EDITOR round-trip) ---
@@ -1525,36 +1501,72 @@ mod tests {
         assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
     }
 
+    /// `x` and `h` fold the score and history sections into the cockpit detail
+    /// pane in place — they flip per-app-state flags, not popups, and stay in
+    /// Normal mode so the pane keeps following the selection.
     #[test]
-    fn h_opens_history_on_the_cockpit_and_the_task_browser() {
+    fn x_and_h_toggle_the_cockpit_detail_sections() {
         let mut app = app_with(&[TaskState::NeedsInput]);
+        assert!(!app.show_score && !app.show_history);
 
+        key(&mut app, KeyCode::Char('x'));
+        assert!(app.show_score);
+        assert!(matches!(app.mode, Mode::Normal));
         key(&mut app, KeyCode::Char('h'));
-        let events = match &app.mode {
-            Mode::History {
-                task_id, events, ..
-            } => {
-                assert_eq!(*task_id, app.queue[0].task.id);
-                events.clone()
-            }
-            _ => panic!("h on a cockpit row should open the history popup"),
-        };
+        assert!(app.show_history);
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // the same keys close the sections again
+        key(&mut app, KeyCode::Char('x'));
+        key(&mut app, KeyCode::Char('h'));
+        assert!(!app.show_score && !app.show_history);
+    }
+
+    /// The event history the `h` toggle draws comes straight from the store,
+    /// oldest first — the data the retired popup used to load for itself.
+    #[test]
+    fn task_events_reads_history_oldest_first() {
+        let app = app_with(&[TaskState::NeedsInput]);
+        let events = app.task_events(app.queue[0].task.id);
         // created, then start, then ask — oldest first
         assert_eq!(
             events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
             vec!["created", "transition", "transition"]
         );
+    }
 
-        key(&mut app, KeyCode::Char('j'));
-        assert!(matches!(app.mode, Mode::History { scroll: 1, .. }));
-        key(&mut app, KeyCode::Char('h'));
-        assert!(matches!(app.mode, Mode::Normal));
-
+    /// On the tasks screen the sections live inside the Detail popup: `x`/`h`
+    /// on the list itself do nothing, but inside the popup they toggle the same
+    /// shared flags without closing it, and the choice persists back out to the
+    /// cockpit.
+    #[test]
+    fn tasks_screen_toggles_score_and_history_inside_the_detail_popup() {
+        let mut app = app_with(&[TaskState::Ready]);
         app.toggle_screen();
+        assert_eq!(app.screen, Screen::Tasks);
+
+        // inert on the list — the sections are a popup concern here
+        key(&mut app, KeyCode::Char('x'));
         key(&mut app, KeyCode::Char('h'));
-        assert!(matches!(app.mode, Mode::History { .. }));
+        assert!(!app.show_score && !app.show_history);
+
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Detail { .. }));
+        key(&mut app, KeyCode::Char('x'));
+        assert!(app.show_score);
+        assert!(
+            matches!(app.mode, Mode::Detail { .. }),
+            "toggling score keeps the detail popup open"
+        );
+        key(&mut app, KeyCode::Char('h'));
+        assert!(app.show_history);
+        assert!(matches!(app.mode, Mode::Detail { .. }));
+
+        // the flags outlive the popup and the screen switch
         key(&mut app, KeyCode::Esc);
-        assert!(matches!(app.mode, Mode::Normal));
+        key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.screen, Screen::Cockpit);
+        assert!(app.show_score && app.show_history);
     }
 
     #[test]
