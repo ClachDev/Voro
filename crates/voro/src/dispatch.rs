@@ -23,30 +23,33 @@ use voro_core::{
     VIEWER_PATH_PLACEHOLDER, parse_sessions_json,
 };
 
-/// Prepended verbatim to every dispatched prompt so the agent learns the
-/// return-path verbs (DESIGN.md §8) with no per-project install and no reliance
-/// on a skill being loaded — the dispatcher already owns the prompt file, so
-/// injection is the most robust delivery. Deliberately says nothing about
-/// `voro start`: dispatch has already transitioned the task `ready → running`
-/// and exported `VORO_TASK_ID` on the agent's behalf. Kept as a single const so
-/// the injected text cannot drift; the voro-cli SKILL.md is the richer,
-/// dev-facing version covering manual runs.
-const RETURN_PATH_PREAMBLE: &str = "\
+/// Rendered per dispatch and prepended verbatim to every prompt so the agent
+/// learns the return-path verbs (DESIGN.md §8) with no per-project install and no
+/// reliance on a skill being loaded — the dispatcher already owns the prompt
+/// file, so injection is the most robust delivery. The `{task_id}` and `{db}`
+/// placeholders are filled by [`render_preamble`] so every verb names its task
+/// and database literally, rather than relying on inherited `VORO_TASK_ID`/
+/// `VORO_DB` env vars — those do not survive a launcher that hands the real
+/// session to a supervisor daemon (e.g. `claude --bg`), the exact launch style
+/// the starter config ships. Deliberately says nothing about `voro start`:
+/// dispatch has already transitioned the task `ready → running`. Kept as a
+/// single template so the injected text cannot drift; the voro-cli SKILL.md is
+/// the richer, dev-facing version covering manual runs.
+const RETURN_PATH_PREAMBLE_TEMPLATE: &str = "\
 <!-- Voro dispatch: how to report back -->
-You are an agent dispatched by Voro on the task below. Voro tracks this task in a
+You are an agent dispatched by Voro on task {task_id}. Voro tracks this task in a
 local SQLite database; report progress through these CLI verbs rather than
 editing that database yourself:
 
-    voro ask \"$VORO_TASK_ID\" --question \"...\"     # blocked on a human decision (-> needs-input)
-    voro done \"$VORO_TASK_ID\" --summary \"...\"      # work finished, await review (-> review)
-    voro propose <project> \"<title>\" --body-file <path>   # file a follow-up task (-> proposed)
+    voro ask {task_id}{db} --question \"...\"     # blocked on a human decision (-> needs-input)
+    voro done {task_id}{db} --summary \"...\"      # work finished, await review (-> review)
+    voro propose <project> \"<title>\"{db} --body-file <path>   # file a follow-up task (-> proposed)
 
-`VORO_TASK_ID` identifies this task and is already exported for you; `propose`
-uses it as the discovered-from source when `--from` is omitted. `VORO_DB` points
-these verbs at the database this session was dispatched from — without it they
-would default to the real database at ~/.local/share/voro/voro.db — so run them
-as shown and never modify the database with raw SQL, which would bypass the state
-machine and event log.
+Run these commands exactly as shown: they name task {task_id} explicitly, so they
+work from anywhere without any environment variable being set. `propose` uses
+task {task_id} as the discovered-from source when `--from` is omitted. Never
+modify the database with raw SQL, which would bypass the state machine and event
+log.
 
 ---
 
@@ -60,6 +63,23 @@ const REF_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// time: the agent stamps its session with its own clock, which may sit a
 /// beat behind the timestamp taken here just before the spawn.
 const SPAWN_CLOCK_SLACK_MS: i64 = 2000;
+
+/// Fill [`RETURN_PATH_PREAMBLE_TEMPLATE`] for a concrete dispatch: substitute the
+/// literal task id into every verb, and add a `--db <path>` flag to each verb
+/// only when the dispatching database is not the default one the verbs resolve to
+/// on their own. Putting both values in the visible command is what makes the
+/// return path robust under launch styles that drop the spawned process's
+/// environment.
+fn render_preamble(task_id: i64, db_path: &Path) -> String {
+    let db_flag = if db_path == Store::default_db_path() {
+        String::new()
+    } else {
+        format!(" --db {}", shell_quote(db_path))
+    };
+    RETURN_PATH_PREAMBLE_TEMPLATE
+        .replace("{task_id}", &task_id.to_string())
+        .replace("{db}", &db_flag)
+}
 
 /// Which of the two flows `spawn_session` is performing — they share every
 /// mechanic (agent resolution, the dirty-tree guard, prompt/log files,
@@ -317,7 +337,7 @@ fn spawn_session(
     let prompt = match (&continue_ref, new_input) {
         (Some(_), Some(input)) => format!("{input}\n"),
         (Some(_), None) => body,
-        (None, _) => format!("{RETURN_PATH_PREAMBLE}{body}"),
+        (None, _) => format!("{}{body}", render_preamble(task_id, &ctx.db_path)),
     };
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("cannot write prompt {}: {e}", prompt_path.display()))?;
@@ -672,18 +692,45 @@ mod tests {
         dispatch(&mut store, &ctx, id, None).unwrap();
 
         let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
-        // all three return-path verbs, the task-id variable, and the task body
-        assert!(prompt.contains("voro ask"), "{prompt}");
-        assert!(prompt.contains("voro done"), "{prompt}");
+        // all three return-path verbs name the literal task id, no env var
+        assert!(prompt.contains(&format!("voro ask {id}")), "{prompt}");
+        assert!(prompt.contains(&format!("voro done {id}")), "{prompt}");
         assert!(prompt.contains("voro propose"), "{prompt}");
-        assert!(prompt.contains("VORO_TASK_ID"), "{prompt}");
+        assert!(!prompt.contains("VORO_TASK_ID"), "{prompt}");
         assert!(prompt.contains("Detailed prompt."), "{prompt}");
-        // the preamble is one const, dropped in ahead of the task body
-        assert!(prompt.starts_with(RETURN_PATH_PREAMBLE), "{prompt}");
+        // the rendered preamble is dropped in ahead of the task body
+        assert!(
+            prompt.starts_with(&render_preamble(id, &ctx.db_path)),
+            "{prompt}"
+        );
         assert!(
             prompt.find("# Do the thing").unwrap() > prompt.find("voro done").unwrap(),
             "the task body must follow the preamble"
         );
+    }
+
+    #[test]
+    fn preamble_renders_a_db_flag_only_for_a_non_default_database() {
+        // a scratch (non-default) db renders --db on every verb, shell-quoted
+        let db = PathBuf::from("/tmp/scratch/voro.db");
+        let rendered = render_preamble(62, &db);
+        assert!(
+            rendered.contains("voro ask 62 --db '/tmp/scratch/voro.db'"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("voro done 62 --db '/tmp/scratch/voro.db'"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("voro propose <project> \"<title>\" --db '/tmp/scratch/voro.db'"),
+            "{rendered}"
+        );
+
+        // the default db is what the verbs resolve to unaided, so no flag
+        let default = render_preamble(62, &Store::default_db_path());
+        assert!(default.contains("voro ask 62 --question"), "{default}");
+        assert!(!default.contains("--db"), "{default}");
     }
 
     fn prompt_files(ctx: &DispatchCtx) -> Vec<PathBuf> {
