@@ -257,6 +257,7 @@ mod tests {
             agent: None,
             question: None,
             pr_url: None,
+            branch: None,
             state_since: String::new(),
             created_at: String::new(),
             closed_at: None,

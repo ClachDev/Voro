@@ -142,6 +142,9 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             if let Some(pr) = &t.pr_url {
                 lines.push(Line::from(pr_span(pr)));
             }
+            if let Some(branch) = &t.branch {
+                lines.push(Line::from(branch_span(branch)));
+            }
             lines.push(Line::default());
             lines.extend(t.body.lines().map(|l| Line::from(l.to_string())));
             let para = Paragraph::new(lines)
@@ -330,6 +333,12 @@ fn pr_span(url: &str) -> Span<'static> {
     )
 }
 
+/// The task's git branch (task #81) rendered for the detail pane — the intended
+/// name dispatch injects, or the name the agent reported it worked on.
+fn branch_span(branch: &str) -> Span<'static> {
+    Span::styled(format!("branch: {branch}"), Style::new().fg(Color::Green))
+}
+
 /// The verb a queue row's Enter performs, from its state.
 fn action_verb(state: voro_core::TaskState) -> &'static str {
     match state {
@@ -450,6 +459,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(pr) = &task.pr_url {
         lines.push(Line::from(pr_span(pr)));
+    }
+    if let Some(branch) = &task.branch {
+        lines.push(Line::from(branch_span(branch)));
     }
     if app.redispatch.contains(&task.id) {
         lines.push(Line::from(redispatch_span()));
@@ -689,6 +701,7 @@ mod tests {
                 agent: None,
                 question: None,
                 pr_url: None,
+                branch: None,
                 state_since: String::new(),
                 created_at: String::new(),
                 closed_at: None,

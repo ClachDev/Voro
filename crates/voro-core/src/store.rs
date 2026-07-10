@@ -14,6 +14,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0002_rename_backlog_to_parked.sql"),
     include_str!("../migrations/0003_track_pr.sql"),
     include_str!("../migrations/0004_add_session_ref.sql"),
+    include_str!("../migrations/0005_add_branch.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -283,6 +284,24 @@ impl Store {
         self.task(id)
     }
 
+    /// Record (or, with `None`, clear) the git branch a task's work lives on
+    /// (task #81) — the intended name a human sets for dispatch to inject, or
+    /// the name an agent reports back through `voro done --branch`. The value
+    /// is stored verbatim; Voro never runs git, so it neither validates the
+    /// name nor touches the checkout. The change is logged, and task state is
+    /// left untouched.
+    pub fn set_branch(&mut self, id: i64, branch: Option<&str>) -> Result<Task> {
+        let changed = self.conn.execute(
+            "UPDATE tasks SET branch = ?1 WHERE id = ?2",
+            params![branch, id],
+        )?;
+        if changed == 0 {
+            return Err(Error::TaskNotFound(id));
+        }
+        log_event(&self.conn, id, "branch", branch.or(Some("cleared")))?;
+        self.task(id)
+    }
+
     // --- deps ---
 
     pub fn add_dep(&mut self, task_id: i64, depends_on: i64, kind: DepKind) -> Result<()> {
@@ -505,7 +524,8 @@ impl Store {
 }
 
 pub(crate) const TASK_COLUMNS: &str = "id, project_id, title, body, priority, state, agent, \
-                                       question, pr_url, state_since, created_at, closed_at";
+                                       question, pr_url, branch, state_since, created_at, \
+                                       closed_at";
 
 pub(crate) fn get_task(conn: &Connection, id: i64) -> Result<Option<Task>> {
     Ok(conn
@@ -528,9 +548,10 @@ pub(crate) fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         agent: row.get(6)?,
         question: row.get(7)?,
         pr_url: row.get(8)?,
-        state_since: row.get(9)?,
-        created_at: row.get(10)?,
-        closed_at: row.get(11)?,
+        branch: row.get(9)?,
+        state_since: row.get(10)?,
+        created_at: row.get(11)?,
+        closed_at: row.get(12)?,
     })
 }
 
@@ -702,6 +723,43 @@ mod tests {
         let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
         assert_eq!(kinds, vec!["created", "pr", "pr"]);
         assert!(matches!(s.set_pr(999, None), Err(Error::TaskNotFound(999))));
+    }
+
+    #[test]
+    fn set_branch_records_clears_and_logs() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let t = s
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "branch me".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+        assert!(s.task(t.id).unwrap().branch.is_none());
+
+        let named = s.set_branch(t.id, Some("feat/parser")).unwrap();
+        assert_eq!(named.branch.as_deref(), Some("feat/parser"));
+        // recording a branch never touches task state
+        assert_eq!(named.state, TaskState::Ready);
+
+        // reporting a different branch overwrites the intended one
+        let renamed = s.set_branch(t.id, Some("feat/parser-v2")).unwrap();
+        assert_eq!(renamed.branch.as_deref(), Some("feat/parser-v2"));
+
+        let cleared = s.set_branch(t.id, None).unwrap();
+        assert!(cleared.branch.is_none());
+
+        let events = s.events_for(t.id).unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["created", "branch", "branch", "branch"]);
+        assert!(matches!(
+            s.set_branch(999, None),
+            Err(Error::TaskNotFound(999))
+        ));
     }
 
     #[test]

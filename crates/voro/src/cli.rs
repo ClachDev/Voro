@@ -38,8 +38,11 @@ tasks
                                   $VORO_TASK_ID) links it discovered-from
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
       [--body TEXT | --body-file PATH] [--blocks IDS] [--pr URL | --no-pr]
+      [--branch NAME | --no-branch]
                                   --pr tracks a GitHub PR (URL or owner/repo#N)
-                                  for review; --no-pr clears it
+                                  for review; --no-pr clears it. --branch sets
+                                  the git branch dispatch injects into the
+                                  prompt; --no-branch clears it
   show <task-id>                  full task: body, deps, events
   list [--state STATE] [--project P]
   inbox                           the next-action queue: questions, reviews,
@@ -83,8 +86,11 @@ transitions
                                   been dispatched, also starts a continuation
                                   session with the answer in the prompt body
                                   (--no-dispatch skips that)
-  done <task-id> [--summary TEXT] running → review; --summary is the agent's
-                                  completion note, kept as a summary event
+  done <task-id> [--summary TEXT] [--branch NAME]
+                                  running → review; --summary is the agent's
+                                  completion note, kept as a summary event;
+                                  --branch records the git branch the work
+                                  landed on (agent return path)
   accept <task-id>                review → done
   reject <task-id> [TEXT] [--from-pr]
                                   review → running; TEXT is the feedback, or
@@ -122,10 +128,12 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         "open" => open_verb(store, &pos, ctx),
         "pr" => pr_verb(store, &pos),
         "reject" => reject_verb(store, &pos, &flags),
+        "done" => done_verb(store, &pos, &flags),
         "answer" => answer_verb(store, &pos, &flags, ctx),
         "import" => import_verb(store, &pos, &flags),
-        "triage" | "start" | "ask" | "done" | "accept" | "abort" | "park" | "unpark"
-        | "abandon" => transition_verb(store, verb, &pos, &flags),
+        "triage" | "start" | "ask" | "accept" | "abort" | "park" | "unpark" | "abandon" => {
+            transition_verb(store, verb, &pos, &flags)
+        }
         other => Err(format!("unknown verb '{other}' — try 'voro help'")),
     }
 }
@@ -144,6 +152,9 @@ fn split_args(args: Vec<String>) -> Result<(Vec<String>, HashMap<String, String>
             }
             Some("no-pr") => {
                 flags.insert("no-pr".to_string(), String::new());
+            }
+            Some("no-branch") => {
+                flags.insert("no-branch".to_string(), String::new());
             }
             Some("from-pr") => {
                 flags.insert("from-pr".to_string(), String::new());
@@ -464,6 +475,14 @@ fn set_verb(
         }
         (false, None) => task,
     };
+    let task = match (flags.contains_key("no-branch"), flags.get("branch")) {
+        (true, Some(_)) => return Err("--branch and --no-branch are mutually exclusive".into()),
+        (true, None) => store.set_branch(id, None).map_err(|e| e.to_string())?,
+        (false, Some(name)) => store
+            .set_branch(id, Some(name.trim()))
+            .map_err(|e| e.to_string())?,
+        (false, None) => task,
+    };
     Ok(format!("task {} updated ({})", task.id, task.state))
 }
 
@@ -500,6 +519,33 @@ fn reject_verb(
     Ok(format!("task {} -> {}", task.id, task.state))
 }
 
+/// `done <task-id> [--summary TEXT] [--branch NAME]` (DESIGN.md §6/§8): running
+/// → review. `--summary` is the agent's completion note, kept as a summary
+/// event by the transition. `--branch` is the belt-and-braces half of task
+/// #81's branch tracking — the branch the agent reports its work landed on,
+/// recorded on the task (overwriting any intended name dispatch injected) so
+/// the task correlates with its branch and PR. The completion transition is
+/// applied first, so a task that is not `running` is refused before any branch
+/// is recorded. Voro never runs git; it only stores the reported name.
+fn done_verb(
+    store: &mut Store,
+    pos: &[String],
+    flags: &HashMap<String, String>,
+) -> Result<String, String> {
+    let id = task_id(pos, 1)?;
+    let task = store
+        .apply(id, Action::Complete(flags.get("summary").cloned()))
+        .map_err(|e| e.to_string())?;
+    let mut out = format!("task {} -> {}", task.id, task.state);
+    if let Some(name) = flags.get("branch") {
+        store
+            .set_branch(id, Some(name.trim()))
+            .map_err(|e| e.to_string())?;
+        write!(out, " (branch {})", name.trim()).unwrap();
+    }
+    Ok(out)
+}
+
 fn show_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     let id = task_id(pos, 1)?;
     let task = store.task(id).map_err(|e| e.to_string())?;
@@ -520,6 +566,9 @@ fn show_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     }
     if let Some(pr) = &task.pr_url {
         writeln!(out, "pr: {pr}").unwrap();
+    }
+    if let Some(branch) = &task.branch {
+        writeln!(out, "branch: {branch}").unwrap();
     }
     if store.redispatch_flag(id).map_err(|e| e.to_string())? {
         writeln!(out, "flagged for redispatch").unwrap();
@@ -798,7 +847,6 @@ fn transition_verb(
             };
             Action::Ask(question)
         }
-        "done" => Action::Complete(flags.get("summary").cloned()),
         "accept" => Action::Accept,
         "abort" => Action::Abort,
         "park" => Action::Park,
@@ -1169,6 +1217,74 @@ mod tests {
         let out = ok(&mut s, &["reject", "1", "tests missing"]);
         assert!(out.contains("-> running"), "{out}");
         assert!(ok(&mut s, &["show", "1"]).contains("tests missing"));
+    }
+
+    // --- branch tracking (task #81, DESIGN.md §5/§8) ---
+
+    #[test]
+    fn set_tracks_and_clears_a_branch() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+
+        ok(&mut s, &["set", "1", "--branch", "feat/parser"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("branch: feat/parser"));
+
+        ok(&mut s, &["set", "1", "--no-branch"]);
+        assert!(!ok(&mut s, &["show", "1"]).contains("branch:"));
+    }
+
+    #[test]
+    fn set_branch_and_no_branch_are_mutually_exclusive() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        let e = err(&mut s, &["set", "1", "--branch", "x", "--no-branch"]);
+        assert!(e.contains("mutually exclusive"), "{e}");
+    }
+
+    #[test]
+    fn done_records_the_reported_branch_and_reaches_review() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+
+        let out = ok(&mut s, &["done", "1", "--branch", "feat/parser"]);
+        assert!(out.contains("-> review"), "{out}");
+        assert!(out.contains("branch feat/parser"), "{out}");
+        assert!(ok(&mut s, &["show", "1"]).contains("branch: feat/parser"));
+    }
+
+    #[test]
+    fn done_without_a_branch_still_reviews() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        let out = ok(&mut s, &["done", "1"]);
+        assert!(out.contains("-> review"), "{out}");
+        assert!(!ok(&mut s, &["show", "1"]).contains("branch:"));
+    }
+
+    /// `done --branch` on a non-running task is refused by the transition
+    /// before any branch is recorded.
+    #[test]
+    fn done_branch_on_a_non_running_task_records_nothing() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        let e = err(&mut s, &["done", "1", "--branch", "feat/parser"]);
+        assert!(e.contains("cannot"), "{e}");
+        assert!(!ok(&mut s, &["show", "1"]).contains("branch:"));
+    }
+
+    #[test]
+    fn help_documents_branch_tracking() {
+        let mut s = store();
+        let out = ok(&mut s, &["help"]);
+        assert!(out.contains("--branch NAME"), "{out}");
+        assert!(out.contains("--no-branch"), "{out}");
     }
 
     #[test]

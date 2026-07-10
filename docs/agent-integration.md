@@ -41,11 +41,14 @@ You were dispatched by Voro on task $VORO_TASK_ID. When you reach one of these
 points, run the matching command — Voro surfaces it in the operator's queue:
 
     voro ask "$VORO_TASK_ID" --question "Schema A or B? Trade-offs: ..."
-    voro done "$VORO_TASK_ID"
+    voro done "$VORO_TASK_ID" --branch "$(git rev-parse --abbrev-ref HEAD)"
     voro propose <project> "Follow-up title" --body-file plan.md
 
 - `ask` when you are blocked on a human decision and cannot proceed.
-- `done` when the work is complete and ready for review.
+- `done` when the work is complete and ready for review; `--branch` reports the
+  git branch your work landed on so the task correlates with its PR (omit it if
+  you did not work on a branch). If the task named an intended branch, you were
+  told which one in the dispatch preamble — create or check it out yourself.
 - `propose` to record follow-up work you noticed; it links back to this task.
 
 `VORO_TASK_ID` and `VORO_DB` are already in your environment — do not set them.
@@ -169,7 +172,7 @@ The hooks that matter here, and what each can honestly do:
 
 | Hook | Fires when | Fallback | Value it adds |
 |---|---|---|---|
-| `SessionEnd` | the session terminates normally | `voro done` if the task is still `running` | upgrades a forgotten `done` from a `failed`-flagged reconcile to a real `review` — the operator sees the diff instead of a redispatch |
+| `SessionEnd` | the session terminates normally | `voro done --branch <current branch>` if the task is still `running` | upgrades a forgotten `done` from a `failed`-flagged reconcile to a real `review` — the operator sees the diff instead of a redispatch — and records the branch the work landed on (task #81) |
 | `Notification` | Claude needs permission, or has idled waiting for input | `voro ask` with the notification message | the *only* signal for a session that is alive but stuck: its process is still running, so the pid-liveness reconciler never fires for it |
 | `Stop` | the main agent finishes responding | same as `SessionEnd` | an earlier anchor for the same completion case; redundant with `SessionEnd` and optional |
 
@@ -220,9 +223,10 @@ Two things make this safe to leave installed:
 - **Swallow the exit code.** A rejected transition exits non-zero; `|| true`
   keeps Claude Code from surfacing it to the operator as a failed hook.
 
-The `SessionEnd` fallback needs no payload, so it can live inline. The
-`Notification` fallback reads the hook's JSON from stdin to lift out the message,
-which is fiddly to inline; give it a small wrapper script on your `PATH` instead.
+Both fallbacks get a small wrapper script on your `PATH`. The `SessionEnd`
+fallback needs to read the checkout's current branch (guarding an empty or
+detached HEAD so it never records a blank name), and the `Notification` fallback
+reads the hook's JSON from stdin to lift out the message — both fiddly to inline.
 
 `.claude/settings.json`:
 
@@ -232,10 +236,7 @@ which is fiddly to inline; give it a small wrapper script on your `PATH` instead
     "SessionEnd": [
       {
         "hooks": [
-          {
-            "type": "command",
-            "command": "test -n \"$VORO_TASK_ID\" && voro done \"$VORO_TASK_ID\" >/dev/null 2>&1 || true"
-          }
+          { "type": "command", "command": "voro-done-hook" }
         ]
       }
     ],
@@ -248,6 +249,21 @@ which is fiddly to inline; give it a small wrapper script on your `PATH` instead
     ]
   }
 }
+```
+
+`voro-done-hook` (make it executable, put it on `PATH`):
+
+```sh
+#!/bin/sh
+# Claude Code SessionEnd hook -> voro done, for a forgotten completion.
+[ -n "$VORO_TASK_ID" ] || exit 0           # inert outside a dispatched session
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+[ "$branch" = HEAD ] && branch=            # detached HEAD: no branch to report
+if [ -n "$branch" ]; then
+  voro done "$VORO_TASK_ID" --branch "$branch" >/dev/null 2>&1 || true
+else
+  voro done "$VORO_TASK_ID" >/dev/null 2>&1 || true
+fi
 ```
 
 `voro-notify-hook` (make it executable, put it on `PATH`):
@@ -273,8 +289,9 @@ The transition-rejection guarantee the double-transition safety rests on is
 verified in code (`voro-core`'s `full_transition_matrix` test, plus reading the
 `apply` path: an illegal transition returns before any write and never commits).
 The verb-to-state mapping and the `VORO_TASK_ID`/`VORO_DB` export are verified
-against the dispatch and CLI source (DESIGN.md §8; `voro done` takes no
-`--summary` in the current CLI, unlike §8's illustrative example).
+against the dispatch and CLI source (DESIGN.md §8; `voro done` takes an optional
+`--branch NAME` but no `--summary` in the current CLI, unlike §8's illustrative
+example).
 
 Not yet verified against a live Claude Code session is the *firing* of the hooks
 themselves — that `SessionEnd`, `Notification`, and `Stop` fire with the payloads

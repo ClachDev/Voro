@@ -263,6 +263,11 @@ pub struct Task {
     /// or `None`. Naming the PR's base repo, it survives forks where the
     /// checkout's `origin` is not that repo.
     pub pr_url: Option<String>,
+    /// The git branch this task's work lives on (task #81), or `None`. Holds
+    /// the *intended* name dispatch injects into the agent's prompt, later
+    /// overwritten by the branch the agent *reports*. Voro never runs git; it
+    /// only passes this name into the prompt and records what comes back.
+    pub branch: Option<String>,
     pub state_since: String,
     pub created_at: String,
     pub closed_at: Option<String>,
