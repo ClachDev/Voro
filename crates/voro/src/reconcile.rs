@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_pid_finalises_the_session_and_drops_the_task_to_ready() {
+    fn a_dead_pid_finalises_the_session_and_leaves_the_task_running() {
         let (mut s, task_id) = running_task();
         // spawn and reap a child so its pid is guaranteed to no longer exist
         let mut child = Command::new("true").stdout(Stdio::null()).spawn().unwrap();
@@ -219,13 +219,15 @@ mod tests {
             .create_session(task_id, "claude", Some(dead_pid), None)
             .unwrap();
 
+        // the session is finalised, but the task is not auto-requeued
+        // (DESIGN.md §8): it stays running, surfaced as an orphaned running row.
         assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 1);
-        assert_eq!(s.task(task_id).unwrap().state, TaskState::Ready);
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
         assert_eq!(
             s.session(session.id).unwrap().outcome,
             Some(SessionOutcome::Failed)
         );
-        assert!(s.redispatch_flag(task_id).unwrap());
+        assert!(!s.redispatch_flag(task_id).unwrap());
     }
 
     #[test]
@@ -318,13 +320,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The session was stopped externally (`claude stop`) without any
-    /// return-path verb: it shows up `state: done` in the listing (or drops
-    /// out entirely), so the task is flagged for redispatch — even though the
-    /// live pid recorded on the session (this test's own) would have said
-    /// "alive" under the old check.
+    /// The session left its agent's listing without any return-path verb: it
+    /// shows up `state: done` (or drops out entirely). The reconciler finalises
+    /// the session but must *not* auto-requeue the task — a vanished session is
+    /// indistinguishable from a completion whose `voro done` has not landed yet
+    /// (DESIGN.md §8), so the task is left running for the human to handle.
     #[test]
-    fn a_finished_or_missing_listed_session_is_flagged_for_redispatch() {
+    fn a_finished_or_missing_listed_session_is_left_running() {
         for (name, listing) in [
             (
                 "done",
@@ -345,13 +347,13 @@ mod tests {
                 1,
                 "{name}"
             );
-            assert_eq!(s.task(task_id).unwrap().state, TaskState::Ready, "{name}");
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Running, "{name}");
             assert_eq!(
                 s.session(session.id).unwrap().outcome,
                 Some(SessionOutcome::Failed),
                 "{name}"
             );
-            assert!(s.redispatch_flag(task_id).unwrap(), "{name}");
+            assert!(!s.redispatch_flag(task_id).unwrap(), "{name}");
 
             let _ = std::fs::remove_dir_all(&dir);
         }

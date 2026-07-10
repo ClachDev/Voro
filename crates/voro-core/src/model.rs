@@ -324,8 +324,9 @@ pub struct Session {
 /// A row of the cockpit's running strip (DESIGN.md §9): every live session
 /// joined with its task, plus every `running` task that has *no* live session
 /// — the latter is a task nothing is actively driving (started by hand, or a
-/// session that died before the reconciler demoted it), surfaced here because
-/// it is in the wrong state and needs attention. `session_id`/`agent` are
+/// task whose session ended without reporting, which reconcile leaves running
+/// rather than re-queuing, §8), surfaced here because it is in the wrong state
+/// and needs a human's attention. `session_id`/`agent` are
 /// `None` for that session-less case. `elapsed_secs` is computed in SQL
 /// against the database's clock — a live session's age, or how long a
 /// session-less task has sat in `running` — so the TUI only has to format it.

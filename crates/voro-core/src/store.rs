@@ -456,14 +456,26 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Whether `task_id`'s most recent session ended `failed` or `capped` —
-    /// the redispatch flag (DESIGN.md §8). Derived from session history on
-    /// every read rather than stored on the task, per the queue/task browser
-    /// rendering it rather than owning it. Only ever true for a task that is
-    /// currently `ready`: that is the only way a task with a failed/capped
-    /// last session can be sitting still, since a fresh dispatch opens a new
-    /// session ahead of any later failure.
+    /// Whether `task_id` is a `ready` task whose most recent session ended
+    /// `failed` or `capped` — the redispatch flag (DESIGN.md §8). Derived from
+    /// session history on every read rather than stored on the task, per the
+    /// queue/task browser rendering it rather than owning it. Gated on `ready`
+    /// on purpose: the flag means "re-dispatchable, and its last run died", so
+    /// a still-`running` task whose session ended without reporting is *not*
+    /// flagged here — reconcile now leaves such a task running (§8), and it is
+    /// surfaced as an orphaned running row (§9) instead. Once a human aborts
+    /// that orphan back to `ready`, the flag reappears against the same
+    /// session history and redispatch becomes available.
     pub fn redispatch_flag(&self, task_id: i64) -> Result<bool> {
+        let state: Option<TaskState> = self
+            .conn
+            .query_row("SELECT state FROM tasks WHERE id = ?1", [task_id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if state != Some(TaskState::Ready) {
+            return Ok(false);
+        }
         let outcome: Option<SessionOutcome> = self
             .conn
             .query_row(
@@ -482,8 +494,9 @@ impl Store {
     /// Rows for the cockpit's running strip (DESIGN.md §9): every live session
     /// joined with its task (newest first), followed by every `running` task
     /// that has no live session. The latter is a task nothing is actively
-    /// driving — started by hand, or a session that died before the reconciler
-    /// demoted it — surfaced because it is in the wrong state and needs
+    /// driving — started by hand, or a task whose session ended without
+    /// reporting (reconcile finalises the session but leaves the task running,
+    /// §8) — surfaced because it is in the wrong state and needs a human's
     /// attention; its `session_id`/`agent` are `NULL` and its elapsed time is
     /// measured from when it entered `running` rather than from a session
     /// start. Elapsed time is computed against the database's clock so the TUI
@@ -1165,9 +1178,9 @@ mod tests {
     }
 
     /// A task can be `running` with no live session — started by hand, or a
-    /// session that died before the reconciler demoted it. The running strip
-    /// must still surface it (DESIGN.md §9), with no session id or agent and
-    /// elapsed measured from when it entered `running`.
+    /// task whose session ended without reporting (reconcile leaves it running,
+    /// §8). The running strip must still surface it (DESIGN.md §9), with no
+    /// session id or agent and elapsed measured from when it entered `running`.
     #[test]
     fn running_rows_include_running_task_without_live_session() {
         let mut s = Store::open_in_memory().unwrap();
