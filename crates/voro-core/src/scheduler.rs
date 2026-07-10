@@ -63,6 +63,12 @@ pub struct Candidate {
     pub task: Task,
     pub project_name: String,
     pub score: ScoreBreakdown,
+    /// Whether a `ready` task's most recent session ended `failed`/`capped`
+    /// — the redispatch flag (§8), read from session history by the store.
+    /// It exempts the task from the ready-row cap in [`queue`] so a failed
+    /// dispatch cannot silently drop out of the cockpit. Only populated for
+    /// `ready` tasks; `false` everywhere else.
+    pub flagged: bool,
 }
 
 /// How many `ready` tasks the queue offers: enough autonomy to choose
@@ -71,21 +77,29 @@ pub struct Candidate {
 pub const QUEUE_READY_ROWS: usize = 5;
 
 /// The next-action queue (§1): every `needs-input`, `review`, and
-/// `proposed` task plus the top `QUEUE_READY_ROWS` ready tasks, in one list
-/// ordered purely by score. Each row is an action — answer, review, triage,
-/// or start; the human picks from the top, the score does not dictate.
+/// `proposed` task plus the top `QUEUE_READY_ROWS` ready tasks — and any
+/// flagged-for-redispatch ready task beyond that cap — in one list ordered
+/// purely by score. Each row is an action — answer, review, triage, or
+/// start; the human picks from the top, the score does not dictate. A
+/// flagged task is a failed dispatch, exactly the attention the queue exists
+/// to surface, so it is never truncated away regardless of its score (§8).
 pub fn queue(candidates: &[Candidate]) -> Vec<&Candidate> {
     let mut ready: Vec<&Candidate> = candidates
         .iter()
         .filter(|c| c.task.state == TaskState::Ready)
         .collect();
     ready.sort_by(|a, b| rank(a, b));
-    ready.truncate(QUEUE_READY_ROWS);
+    let mut kept: Vec<&Candidate> = ready.iter().take(QUEUE_READY_ROWS).copied().collect();
+    for c in ready.iter().skip(QUEUE_READY_ROWS) {
+        if c.flagged {
+            kept.push(c);
+        }
+    }
 
     let mut items: Vec<&Candidate> = candidates
         .iter()
         .filter(|c| c.task.state != TaskState::Ready)
-        .chain(ready)
+        .chain(kept)
         .collect();
     items.sort_by(|a, b| rank(a, b));
     items
@@ -146,9 +160,19 @@ impl Store {
                 task,
                 project_name,
                 score,
+                flagged: false,
             })
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut candidates: Vec<Candidate> = rows.collect::<rusqlite::Result<_>>()?;
+        // The redispatch flag only steers the ready-row cap (§8), so it is
+        // read from session history for ready tasks alone — the one state it
+        // can meaningfully sit still in.
+        for c in &mut candidates {
+            if c.task.state == TaskState::Ready {
+                c.flagged = self.redispatch_flag(c.task.id)?;
+            }
+        }
+        Ok(candidates)
     }
 
     /// Score decomposition for any single task, whatever its state — the
@@ -277,6 +301,18 @@ mod tests {
         s.apply(id, crate::Action::Complete).unwrap();
     }
 
+    /// Drive a ready task through a dispatch that dies: a session opened and
+    /// closed `failed`, then `running → ready` — leaving it `ready` with its
+    /// most recent session failed, which is exactly the redispatch flag.
+    fn flag_for_redispatch(s: &mut Store, id: i64) {
+        s.apply(id, crate::Action::Start).unwrap();
+        let session = s.create_session(id, "claude", Some(1), None).unwrap();
+        s.end_session(session.id, crate::model::SessionOutcome::Failed)
+            .unwrap();
+        s.apply(id, crate::Action::Abort).unwrap();
+        assert!(s.redispatch_flag(id).unwrap());
+    }
+
     fn add_proposed(s: &mut Store, project_id: i64, title: &str, priority: Priority) -> i64 {
         s.create_task(NewTask {
             project_id,
@@ -349,6 +385,33 @@ mod tests {
         let ids: Vec<i64> = queued.iter().map(|c| c.task.id).collect();
         assert_eq!(ids, keep);
         assert!(!ids.contains(&dropped));
+    }
+
+    #[test]
+    fn a_flagged_ready_task_survives_the_ready_row_cap() {
+        let mut s = setup();
+        let p = add_project(&mut s, "p", 3);
+        // The cap's worth of higher-scoring ready tasks fills every start row.
+        let top: Vec<i64> = (0..QUEUE_READY_ROWS)
+            .map(|i| add_task(&mut s, p, &format!("top {i}"), Priority::P1))
+            .collect();
+        // Two lower-priority tasks sit below the cap; one had its dispatch fail.
+        let unflagged = add_task(&mut s, p, "unflagged overflow", Priority::P3);
+        let flagged = add_task(&mut s, p, "flagged overflow", Priority::P3);
+        flag_for_redispatch(&mut s, flagged);
+
+        let candidates = s.candidates().unwrap();
+        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
+
+        // the flagged task rides along despite scoring below the cap …
+        assert!(ids.contains(&flagged));
+        // … while an equally-ranked unflagged task beyond the cap stays out …
+        assert!(!ids.contains(&unflagged));
+        // … and none of the top rows are displaced to make room.
+        for id in &top {
+            assert!(ids.contains(id));
+        }
+        assert_eq!(ids.len(), QUEUE_READY_ROWS + 1);
     }
 
     #[test]
