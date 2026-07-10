@@ -770,7 +770,7 @@ mod tests {
             }
             Review => {
                 let id = task_in_state(s, project_id, Running);
-                s.apply(id, Action::Complete).unwrap();
+                s.apply(id, Action::Complete(None)).unwrap();
                 id
             }
             Done => {
@@ -1175,7 +1175,7 @@ mod tests {
         let open = s.create_task(new("open", TaskState::Ready)).unwrap();
         let closed = s.create_task(new("closed", TaskState::Ready)).unwrap();
         s.apply(closed.id, Action::Start).unwrap();
-        s.apply(closed.id, Action::Complete).unwrap();
+        s.apply(closed.id, Action::Complete(None)).unwrap();
         s.apply(closed.id, Action::Accept).unwrap();
         let sibling = s.create_task(new("sibling", TaskState::Ready)).unwrap();
         let waiting = s.create_task(new("waiting", TaskState::Ready)).unwrap();
