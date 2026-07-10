@@ -316,17 +316,21 @@ pub struct Session {
     pub outcome: Option<SessionOutcome>,
 }
 
-/// A live session joined with the task it is running, for the cockpit's
-/// running strip (DESIGN.md §9) — what's live, on what task, and for how
-/// long. `elapsed_secs` is computed in SQL against the database's clock so
-/// the TUI only has to format it.
+/// A row of the cockpit's running strip (DESIGN.md §9): every live session
+/// joined with its task, plus every `running` task that has *no* live session
+/// — the latter is a task nothing is actively driving (started by hand, or a
+/// session that died before the reconciler demoted it), surfaced here because
+/// it is in the wrong state and needs attention. `session_id`/`agent` are
+/// `None` for that session-less case. `elapsed_secs` is computed in SQL
+/// against the database's clock — a live session's age, or how long a
+/// session-less task has sat in `running` — so the TUI only has to format it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveSession {
-    pub session_id: i64,
+pub struct RunningRow {
+    pub session_id: Option<i64>,
     pub task_id: i64,
     pub task_title: String,
     pub task_state: TaskState,
-    pub agent: String,
+    pub agent: Option<String>,
     pub started_at: String,
     pub elapsed_secs: i64,
 }

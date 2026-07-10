@@ -20,7 +20,7 @@ pub use agent::{
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};
 pub use model::{
-    Blocker, Dep, DepKind, Event, LiveSession, Priority, Project, Session, SessionOutcome, Task,
+    Blocker, Dep, DepKind, Event, Priority, Project, RunningRow, Session, SessionOutcome, Task,
     TaskState,
 };
 pub use pr::{PrRef, format_review_feedback};
