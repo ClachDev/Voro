@@ -160,11 +160,9 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             let para = Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .scroll((*scroll, 0))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!("#{task_id} — ⏎ state · j/k scroll · esc close")),
-                );
+                .block(Block::default().borders(Borders::ALL).title(format!(
+                    "#{task_id} — ⏎ state · 0-3 priority · j/k scroll · esc close"
+                )));
             frame.render_widget(para, area);
         }
         Mode::AgentPicker {
