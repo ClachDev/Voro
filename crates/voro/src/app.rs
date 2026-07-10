@@ -1896,7 +1896,16 @@ mod tests {
                 sel,
                 ..
             } => {
-                assert_eq!(agents, &vec!["special".to_string(), "stub".to_string()]);
+                // the built-in claude/codex layer in alongside the user agents
+                assert_eq!(
+                    agents,
+                    &vec![
+                        "claude".to_string(),
+                        "codex".to_string(),
+                        "special".to_string(),
+                        "stub".to_string(),
+                    ]
+                );
                 assert_eq!(resolved.as_deref(), Some("stub"));
                 (agents.clone(), *sel)
             }
@@ -1917,13 +1926,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }
 
-    /// A missing/invalid `agents.toml` is only discovered when the picker is
+    /// An invalid `agents.toml` is only discovered when the picker is
     /// opened — it is loaded fresh each time, never cached — and surfaces
     /// through the ordinary status-line error style instead of a stale or
-    /// empty modal.
+    /// empty modal. (A *missing* file is no longer a failure: the built-ins
+    /// load, so the picker opens on them.)
     #[test]
     fn agent_picker_reports_a_config_load_failure_without_opening() {
-        let (mut store, ctx, project_path) = scratch_env("picker-missing", None);
+        // an agent whose dispatch drops the {prompt_file} placeholder fails
+        // validation, so the whole config fails to load
+        let (mut store, ctx, project_path) = scratch_env(
+            "picker-invalid",
+            Some("[agents.bad]\ncmd = \"run with no placeholder\"\n"),
+        );
         let project = store
             .create_project("demo", project_path.to_str().unwrap())
             .unwrap();

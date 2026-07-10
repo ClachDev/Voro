@@ -13,9 +13,9 @@ mod store;
 mod transition;
 
 pub use agent::{
-    AgentSessionEntry, AgentTemplate, AgentsConfig, PROMPT_FILE_PLACEHOLDER, ResolvedAgent,
-    SESSION_PLACEHOLDER, STARTER_CONFIG, TASK_ID_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER,
-    ViewerTemplate, parse_sessions_json,
+    AgentSessionEntry, AgentTemplate, AgentsConfig, PROMPT_FILE_PLACEHOLDER, Provenance,
+    ResolvedAgent, SESSION_PLACEHOLDER, STARTER_CONFIG, TASK_ID_PLACEHOLDER,
+    VIEWER_PATH_PLACEHOLDER, ViewerTemplate, parse_sessions_json,
 };
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};

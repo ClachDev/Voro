@@ -192,8 +192,10 @@ mod tests {
     use std::path::PathBuf;
     use voro_core::{Action, NewTask, Priority, SessionOutcome, TaskState};
 
-    /// An agents path that never exists, so every session degrades to the
-    /// pid check — the pre-verb behaviour the original tests pin.
+    /// An agents path that never exists. It loads the built-ins (a missing
+    /// file is no longer an error), so a session under a verb-less agent name
+    /// like `manual` still degrades to the pid check — the built-in `claude`
+    /// and `codex` carry a `sessions` verb and take the listing path instead.
     fn no_config() -> PathBuf {
         PathBuf::from("/nonexistent/agents.toml")
     }
@@ -237,8 +239,9 @@ mod tests {
         let dead_pid = child.id() as i64;
         child.wait().unwrap();
 
+        // a verb-less agent so liveness falls to the pid check
         let session = s
-            .create_session(task_id, "claude", Some(dead_pid), None)
+            .create_session(task_id, "manual", Some(dead_pid), None)
             .unwrap();
 
         // the session is finalised, but the task is not auto-requeued
@@ -267,7 +270,7 @@ mod tests {
 
         s.create_session(
             task_id,
-            "claude",
+            "manual",
             Some(dead_pid),
             Some(log.to_str().unwrap()),
         )

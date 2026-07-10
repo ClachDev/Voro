@@ -55,10 +55,11 @@ tasks
                                   --repo overrides the checkout's own remote
 
 dispatch
-  agent init                      write a starter ~/.config/voro/agents.toml
-                                  (won't overwrite an existing one)
-  agent list                      list configured agents and their session
-                                  verbs; * marks the default
+  agent init                      write an optional agents.toml skeleton for
+                                  extending/overriding the built-ins (won't
+                                  overwrite an existing one)
+  agent list                      list effective agents (built-in + user)
+                                  with provenance; * marks the default
   agent path                      print where dispatch looks for agents.toml
   dispatch <task-id> [--agent NAME]
                                   spawn a headless agent session on a ready
@@ -321,8 +322,8 @@ fn agent_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
         "init" => {
             AgentsConfig::write_starter(path).map_err(|e| e.to_string())?;
             Ok(format!(
-                "wrote starter agents config to {} — edit it to match your installed agents, \
-                 then `voro dispatch <task-id>`",
+                "wrote an agents skeleton to {} — optional, since the built-in claude/codex \
+                 agents already dispatch; edit it only to add or override agents",
                 path.display()
             ))
         }
@@ -330,8 +331,12 @@ fn agent_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
             let config = AgentsConfig::load(path).map_err(|e| e.to_string())?;
             let default = config.default_name();
             let mut out = String::new();
-            for (name, template) in config.entries() {
-                let marker = if name == default { "* " } else { "  " };
+            for (name, template, provenance) in config.entries() {
+                let marker = if Some(name) == default.as_deref() {
+                    "* "
+                } else {
+                    "  "
+                };
                 let verbs: Vec<&str> = [
                     ("sessions", template.sessions()),
                     ("attach", template.attach()),
@@ -346,9 +351,33 @@ fn agent_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
                 } else {
                     format!("  [{}]", verbs.join(" "))
                 };
-                writeln!(out, "{marker}{name}  {}{suffix}", template.dispatch()).unwrap();
+                writeln!(
+                    out,
+                    "{marker}{name}  {}{suffix}  ({})",
+                    template.dispatch(),
+                    provenance.label()
+                )
+                .unwrap();
+                let missing = config.override_missing_verbs(name);
+                if !missing.is_empty() {
+                    writeln!(
+                        out,
+                        "    ! overrides the built-in {name} but drops: {} — those verbs no \
+                         longer work; copy them from the built-in if you want them",
+                        missing.join(", ")
+                    )
+                    .unwrap();
+                }
             }
-            writeln!(out, "\n({} — * is the default)", path.display()).unwrap();
+            match default {
+                Some(_) => writeln!(out, "\n({} — * is the default)", path.display()).unwrap(),
+                None => writeln!(
+                    out,
+                    "\n({} — no default agent resolved; install claude/codex or set `default`)",
+                    path.display()
+                )
+                .unwrap(),
+            }
             Ok(out)
         }
         "path" => Ok(path.display().to_string()),
@@ -1033,17 +1062,21 @@ mod tests {
             run(s, args.iter().map(|x| x.to_string()).collect(), &ctx)
         };
 
-        // no config yet: dispatch-facing verbs report the missing file and
-        // point at `agent init`
-        let e = call(&mut s, &["agent", "list"]).unwrap_err();
-        assert!(e.contains("agent init"), "{e}");
+        // no config yet: the built-in agents already list, with provenance
+        let listed = call(&mut s, &["agent", "list"]).unwrap();
+        assert!(listed.contains("claude"), "{listed}");
+        assert!(listed.contains("codex"), "{listed}");
+        assert!(listed.contains("built-in"), "{listed}");
 
+        // init writes an optional skeleton
         let out = call(&mut s, &["agent", "init"]).unwrap();
         assert!(out.contains(&agents_path.display().to_string()), "{out}");
         assert!(agents_path.exists());
 
+        // the skeleton adds nothing, so the built-ins still list
         let listed = call(&mut s, &["agent", "list"]).unwrap();
-        assert!(listed.contains("* claude"), "{listed}");
+        assert!(listed.contains("claude"), "{listed}");
+        assert!(listed.contains("built-in"), "{listed}");
 
         // a second init refuses rather than clobbering
         let e = call(&mut s, &["agent", "init"]).unwrap_err();

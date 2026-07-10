@@ -32,22 +32,27 @@ cargo run -p voro
 
 ## Dispatching to agents
 
-Voro dispatches a task by running a shell command template per agent, read from
-`~/.config/voro/agents.toml` (see DESIGN.md §8). That file is not created for
-you — scaffold a starter with:
+Voro dispatches a task by running a shell command template per agent. It ships
+with built-in `claude` and `codex` agents (see DESIGN.md §8), so with one of
+those on your `PATH` a fresh install dispatches with no configuration at all:
+`voro dispatch <task-id>` (or the dispatch key in the TUI) launches a headless
+session on a ready task, and `default` resolves to the first built-in found on
+`PATH`.
+
+To extend or override the built-ins, layer a `~/.config/voro/agents.toml` on
+top:
 
 ```bash
-voro agent init       # writes ~/.config/voro/agents.toml (won't overwrite)
-voro agent list       # show configured agents; * marks the default
+voro agent list       # effective agents (built-in + user) with provenance; * marks the default
+voro agent init       # optional: write an agents.toml skeleton (won't overwrite)
 voro agent path       # print where dispatch looks for the file
 ```
 
-Then edit the file so each `[agents.<name>]` `cmd` matches an agent you have
-installed. `{prompt_file}` is replaced with a path to the task's prompt, and
-`default` names the agent used when a task has no `--agent` override. A
-dispatched session runs unattended, so most agents need a non-interactive
-permission flag. Once configured, `voro dispatch <task-id>` (or the dispatch
-key in the TUI) launches a headless session on a ready task.
+Each `[agents.<name>]` table adds an agent or, when named `claude`/`codex`,
+replaces that built-in wholesale (so copy every verb you still want).
+`{prompt_file}` is replaced with a path to the task's prompt, and `default`
+names the agent used when a task has no `--agent` override. A dispatched session
+runs unattended, so most agents need a non-interactive permission flag.
 
 A dispatched agent reports back through the return-path verbs (`voro ask/done/
 propose`). For the `CLAUDE.md`/`AGENTS.md` snippet that advertises them, and a
