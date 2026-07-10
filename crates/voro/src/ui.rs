@@ -114,6 +114,16 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             );
             frame.render_widget(para, area);
         }
+        Mode::LinkPr { buffer, .. } => {
+            let area = popup_area(frame, 72, 3);
+            let line = Line::from(vec![Span::raw(buffer.as_str()), Span::raw("▏")]);
+            let para = Paragraph::new(line).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Link PR (URL or owner/repo#n) — ⏎ to submit, esc to cancel"),
+            );
+            frame.render_widget(para, area);
+        }
         Mode::Detail { task_id, scroll } => {
             let Some(row) = app.all.iter().find(|r| r.task.id == *task_id) else {
                 return;
