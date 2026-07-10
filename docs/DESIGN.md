@@ -142,7 +142,7 @@ The `state_bonus` folds task state into the priority term rather than leaving it
 
 The age bonus is a gentle anti-starvation nudge so old P2s eventually surface, capped so it can never masquerade as a priority level. It applies uniformly to every scored state — `ready`, `needs-input`, `review`, and `proposed` alike — because a week-old unanswered question is a smell worth amplifying, not just an old task. Taskwarrior's experience suggests urgency formulae accrete coefficients until nobody trusts the number; resist that — this is the one and only additive state term. Any tuning should be observable via a score-decomposition view in the TUI (and later `voro explain <task>`).
 
-Ordering of the queue: every `needs-input`, `review`, and `proposed` task plus the top three `ready` tasks, in one list sorted by score. Because the state bonus now lives in the score, state usually settles itself; the state precedence (§6) only breaks genuinely equal totals. `voro next` still answers with the single top ready task — that is what an agent asking for work should be handed, and the dispatch default.
+Ordering of the queue: every `needs-input`, `review`, and `proposed` task plus the top five `ready` tasks, in one list sorted by score. Because the state bonus now lives in the score, state usually settles itself; the state precedence (§6) only breaks genuinely equal totals. `voro next` still answers with the single top ready task — that is what an agent asking for work should be handed, and the dispatch default.
 
 ## 8. Dispatch and agent integration
 
