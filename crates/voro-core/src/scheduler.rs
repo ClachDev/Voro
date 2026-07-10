@@ -274,7 +274,7 @@ mod tests {
 
     fn to_review(s: &mut Store, id: i64) {
         s.apply(id, crate::Action::Start).unwrap();
-        s.apply(id, crate::Action::Complete).unwrap();
+        s.apply(id, crate::Action::Complete(None)).unwrap();
     }
 
     fn add_proposed(s: &mut Store, project_id: i64, title: &str, priority: Priority) -> i64 {
@@ -465,7 +465,7 @@ mod tests {
 
         // once the blocker closes it surfaces, and now outranks it
         s.apply(blocker, crate::Action::Start).unwrap();
-        s.apply(blocker, crate::Action::Complete).unwrap();
+        s.apply(blocker, crate::Action::Complete(None)).unwrap();
         s.apply(blocker, crate::Action::Accept).unwrap();
         let candidates = s.candidates().unwrap();
         assert_eq!(focus(&candidates).unwrap().task.id, blocked);

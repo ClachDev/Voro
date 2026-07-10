@@ -83,7 +83,8 @@ transitions
                                   been dispatched, also starts a continuation
                                   session with the answer in the prompt body
                                   (--no-dispatch skips that)
-  done <task-id>                  running → review
+  done <task-id> [--summary TEXT] running → review; --summary is the agent's
+                                  completion note, kept as a summary event
   accept <task-id>                review → done
   reject <task-id> [TEXT] [--from-pr]
                                   review → running; TEXT is the feedback, or
@@ -797,7 +798,7 @@ fn transition_verb(
             };
             Action::Ask(question)
         }
-        "done" => Action::Complete,
+        "done" => Action::Complete(flags.get("summary").cloned()),
         "accept" => Action::Accept,
         "abort" => Action::Abort,
         "park" => Action::Park,
@@ -1168,6 +1169,22 @@ mod tests {
         let out = ok(&mut s, &["reject", "1", "tests missing"]);
         assert!(out.contains("-> running"), "{out}");
         assert!(ok(&mut s, &["show", "1"]).contains("tests missing"));
+    }
+
+    #[test]
+    fn done_summary_surfaces_in_show() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        let out = ok(
+            &mut s,
+            &["done", "1", "--summary", "Implemented X, tests pass"],
+        );
+        assert!(out.contains("-> review"), "{out}");
+        let shown = ok(&mut s, &["show", "1"]);
+        assert!(shown.contains("summary"), "{shown}");
+        assert!(shown.contains("Implemented X, tests pass"), "{shown}");
     }
 
     #[test]

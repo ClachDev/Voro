@@ -32,8 +32,9 @@ pub enum Action {
     Ask(String),
     /// needs-input → running; the answer is appended to the body and logged
     Answer(String),
-    /// running → review
-    Complete,
+    /// running → review; the optional string is the agent's completion summary,
+    /// logged as a `summary` event so review starts from it
+    Complete(Option<String>),
     /// review → done
     Accept,
     /// review → running; the string is the feedback, appended to the body
@@ -55,7 +56,7 @@ impl Action {
             Action::Start => "start",
             Action::Ask(_) => "ask",
             Action::Answer(_) => "answer",
-            Action::Complete => "complete",
+            Action::Complete(_) => "complete",
             Action::Accept => "accept",
             Action::RejectWork(_) => "reject work on",
             Action::Abort => "abort",
@@ -82,7 +83,11 @@ impl Store {
             ],
             Parked => vec![Action::Unpark, Action::Abandon],
             Ready => vec![Action::Start, Action::Park, Action::Abandon],
-            Running => vec![Action::Ask(String::new()), Action::Complete, Action::Abort],
+            Running => vec![
+                Action::Ask(String::new()),
+                Action::Complete(None),
+                Action::Abort,
+            ],
             NeedsInput => vec![Action::Answer(String::new()), Action::Abandon],
             Review => vec![
                 Action::Accept,
@@ -266,7 +271,7 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         (Ready, Action::Start) => Running,
         (Running, Action::Ask(_)) => NeedsInput,
         (NeedsInput, Action::Answer(_)) => Running,
-        (Running, Action::Complete) => Review,
+        (Running, Action::Complete(_)) => Review,
         (Review, Action::Accept) => Done,
         (Review, Action::RejectWork(_)) => Running,
         (Running, Action::Abort) => Ready,
@@ -319,6 +324,9 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         Action::RejectWork(f) => {
             append_section(tx, task_id, "Feedback", f.trim())?;
             log_event(tx, task_id, "feedback", Some(f.trim()))?;
+        }
+        Action::Complete(Some(s)) if !s.trim().is_empty() => {
+            log_event(tx, task_id, "summary", Some(s.trim()))?;
         }
         _ => {}
     }
@@ -515,7 +523,7 @@ mod tests {
             }
             Review => {
                 let id = task_in_state(s, project_id, Running);
-                s.apply(id, Action::Complete).unwrap();
+                s.apply(id, Action::Complete(None)).unwrap();
                 id
             }
             Done => {
@@ -539,7 +547,7 @@ mod tests {
             Action::Start,
             Action::Ask("q?".into()),
             Action::Answer("a.".into()),
-            Action::Complete,
+            Action::Complete(None),
             Action::Accept,
             Action::RejectWork("redo".into()),
             Action::Abort,
@@ -561,7 +569,7 @@ mod tests {
             (Ready, Action::Park) => Some(Parked),
             (Parked, Action::Unpark) => Some(Ready),
             (Running, Action::Ask(_)) => Some(NeedsInput),
-            (Running, Action::Complete) => Some(Review),
+            (Running, Action::Complete(_)) => Some(Review),
             (Running, Action::Abort) => Some(Ready),
             (NeedsInput, Action::Answer(_)) => Some(Running),
             (Review, Action::Accept) => Some(Done),
@@ -680,7 +688,7 @@ mod tests {
         assert_eq!(task.body.matches("## Answers").count(), 1);
         assert!(task.body.contains("- covering"));
 
-        s.apply(id, Action::Complete).unwrap();
+        s.apply(id, Action::Complete(None)).unwrap();
         let task = s
             .apply(id, Action::RejectWork("tests missing".into()))
             .unwrap();
@@ -693,6 +701,50 @@ mod tests {
                 .filter(|e| e.kind == "answer")
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn complete_summary_is_logged_as_an_event() {
+        let (mut s, p) = store_with_project();
+        let id = task_in_state(&mut s, p, TaskState::Running);
+        s.apply(
+            id,
+            Action::Complete(Some("Implemented X, tests pass".into())),
+        )
+        .unwrap();
+        let summaries: Vec<_> = s
+            .events_for(id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "summary")
+            .collect();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].detail.as_deref(),
+            Some("Implemented X, tests pass")
+        );
+    }
+
+    #[test]
+    fn complete_without_summary_logs_no_summary_event() {
+        let (mut s, p) = store_with_project();
+        let id = task_in_state(&mut s, p, TaskState::Running);
+        s.apply(id, Action::Complete(None)).unwrap();
+        let blank = task_in_state(&mut s, p, TaskState::Running);
+        s.apply(blank, Action::Complete(Some("   ".into())))
+            .unwrap();
+        assert!(
+            s.events_for(id)
+                .unwrap()
+                .iter()
+                .all(|e| e.kind != "summary")
+        );
+        assert!(
+            s.events_for(blank)
+                .unwrap()
+                .iter()
+                .all(|e| e.kind != "summary")
         );
     }
 
@@ -772,7 +824,7 @@ mod tests {
 
         // ...and closing that blocker brings it straight back.
         s.apply(blocker, Action::Start).unwrap();
-        s.apply(blocker, Action::Complete).unwrap();
+        s.apply(blocker, Action::Complete(None)).unwrap();
         s.apply(blocker, Action::Accept).unwrap();
         assert_eq!(s.task(task).unwrap().state, TaskState::Ready);
     }
@@ -791,7 +843,7 @@ mod tests {
 
         // closing the blocker auto-promotes it exactly like any parked task
         s.apply(blocker, Action::Start).unwrap();
-        s.apply(blocker, Action::Complete).unwrap();
+        s.apply(blocker, Action::Complete(None)).unwrap();
         s.apply(blocker, Action::Accept).unwrap();
         assert_eq!(s.task(task).unwrap().state, TaskState::Ready);
     }
@@ -1026,7 +1078,7 @@ mod tests {
         fn a_task_the_agent_already_completed_is_left_alone() {
             let (mut s, p) = store_with_project();
             let (task_id, session_id) = dispatch(&mut s, p);
-            s.apply(task_id, Action::Complete).unwrap();
+            s.apply(task_id, Action::Complete(None)).unwrap();
 
             let (session, task) = s
                 .reconcile_session(session_id, false, false)
