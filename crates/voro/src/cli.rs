@@ -86,8 +86,11 @@ transitions
                                   been dispatched, also starts a continuation
                                   session with the answer in the prompt body
                                   (--no-dispatch skips that)
-  done <task-id> [--branch NAME]  running → review; --branch records the git
-                                  branch the work landed on (agent return path)
+  done <task-id> [--summary TEXT] [--branch NAME]
+                                  running → review; --summary is the agent's
+                                  completion note, kept as a summary event;
+                                  --branch records the git branch the work
+                                  landed on (agent return path)
   accept <task-id>                review → done
   reject <task-id> [TEXT] [--from-pr]
                                   review → running; TEXT is the feedback, or
@@ -516,13 +519,14 @@ fn reject_verb(
     Ok(format!("task {} -> {}", task.id, task.state))
 }
 
-/// `done <task-id> [--branch NAME]` (DESIGN.md §6/§8): running → review, and
-/// the belt-and-braces half of task #81's branch tracking — an agent reports
-/// the branch its work landed on with `--branch`, which is recorded on the task
-/// (overwriting any intended name dispatch injected) so the task correlates
-/// with its branch and PR. The completion transition is applied first, so a
-/// task that is not `running` is refused before any branch is recorded. Voro
-/// never runs git; it only stores the reported name.
+/// `done <task-id> [--summary TEXT] [--branch NAME]` (DESIGN.md §6/§8): running
+/// → review. `--summary` is the agent's completion note, kept as a summary
+/// event by the transition. `--branch` is the belt-and-braces half of task
+/// #81's branch tracking — the branch the agent reports its work landed on,
+/// recorded on the task (overwriting any intended name dispatch injected) so
+/// the task correlates with its branch and PR. The completion transition is
+/// applied first, so a task that is not `running` is refused before any branch
+/// is recorded. Voro never runs git; it only stores the reported name.
 fn done_verb(
     store: &mut Store,
     pos: &[String],
@@ -530,7 +534,7 @@ fn done_verb(
 ) -> Result<String, String> {
     let id = task_id(pos, 1)?;
     let task = store
-        .apply(id, Action::Complete)
+        .apply(id, Action::Complete(flags.get("summary").cloned()))
         .map_err(|e| e.to_string())?;
     let mut out = format!("task {} -> {}", task.id, task.state);
     if let Some(name) = flags.get("branch") {
@@ -1281,6 +1285,22 @@ mod tests {
         let out = ok(&mut s, &["help"]);
         assert!(out.contains("--branch NAME"), "{out}");
         assert!(out.contains("--no-branch"), "{out}");
+    }
+
+    #[test]
+    fn done_summary_surfaces_in_show() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        let out = ok(
+            &mut s,
+            &["done", "1", "--summary", "Implemented X, tests pass"],
+        );
+        assert!(out.contains("-> review"), "{out}");
+        let shown = ok(&mut s, &["show", "1"]);
+        assert!(shown.contains("summary"), "{shown}");
+        assert!(shown.contains("Implemented X, tests pass"), "{shown}");
     }
 
     #[test]

@@ -69,7 +69,7 @@ through optional verbs on their `[agents.<name>]` table, next to the required
 
 ```toml
 [agents.claude]
-dispatch = "claude --bg --permission-mode acceptEdits \"$(cat {prompt_file})\""
+dispatch = "claude --bg --permission-mode bypassPermissions \"$(cat {prompt_file})\""
 sessions = "claude agents --json"
 attach   = "claude attach {session}"
 resume   = "claude --resume {session}"
@@ -88,6 +88,15 @@ continue = "codex exec resume {session} \"$(cat {prompt_file})\""
 - `resume` reopens a *finished* session interactively.
 - `continue` feeds a session new input headless — `{prompt_file}` holds the
   input (an answer), `{session}` addresses the session.
+
+The dispatch template above runs Claude in `bypassPermissions` mode on purpose:
+a dispatched session is unattended, so anything that stops to ask — and
+`acceptEdits` still asks before every bash command, a cargo build or a git
+commit — strands the whole task waiting on a human. Dispatch already refuses a
+dirty tree and the agent's work lands as a reviewable diff, so the vetting
+happens at review rather than per-command. If you would rather approve each
+command as it runs, set `--permission-mode acceptEdits` and use `attach` to
+jump into the live session and answer its prompts yourself.
 
 Three behaviours hang off these verbs.
 

@@ -762,7 +762,7 @@ mod tests {
         let open = store.create_task(new("open blocker")).unwrap();
         let closed = store.create_task(new("closed blocker")).unwrap();
         store.apply(closed.id, Action::Start).unwrap();
-        store.apply(closed.id, Action::Complete).unwrap();
+        store.apply(closed.id, Action::Complete(None)).unwrap();
         store.apply(closed.id, Action::Accept).unwrap();
         let waiting = store.create_task(new("waiting")).unwrap();
         store
@@ -816,7 +816,7 @@ mod tests {
         let closed = store.create_task(new("closed", TaskState::Ready)).unwrap();
         store
             .apply(closed.id, voro_core::Action::Start)
-            .and_then(|_| store.apply(closed.id, voro_core::Action::Complete))
+            .and_then(|_| store.apply(closed.id, voro_core::Action::Complete(None)))
             .and_then(|_| store.apply(closed.id, voro_core::Action::Accept))
             .unwrap();
 

@@ -132,7 +132,7 @@ pub fn action_label(action: &Action) -> &'static str {
         Action::Start => "start → running",
         Action::Ask(_) => "ask a question → needs-input",
         Action::Answer(_) => "answer the question → running",
-        Action::Complete => "complete → review",
+        Action::Complete(_) => "complete → review",
         Action::Accept => "accept → done",
         Action::RejectWork(_) => "reject with feedback → running",
         Action::Abort => "abort → ready",
@@ -1180,11 +1180,11 @@ mod tests {
                 }
                 TaskState::Review => {
                     store.apply(task.id, Action::Start).unwrap();
-                    store.apply(task.id, Action::Complete).unwrap();
+                    store.apply(task.id, Action::Complete(None)).unwrap();
                 }
                 TaskState::Done => {
                     store.apply(task.id, Action::Start).unwrap();
-                    store.apply(task.id, Action::Complete).unwrap();
+                    store.apply(task.id, Action::Complete(None)).unwrap();
                     store.apply(task.id, Action::Accept).unwrap();
                 }
                 other => panic!("fixture does not build {other} tasks"),
@@ -1850,7 +1850,7 @@ mod tests {
     #[test]
     fn attach_key_uses_resume_for_a_review_task() {
         let (mut store, ctx, task_id, project_path) = jump_in_env();
-        store.apply(task_id, Action::Complete).unwrap();
+        store.apply(task_id, Action::Complete(None)).unwrap();
 
         let mut app = App::new(store, ctx).unwrap();
         app.toggle_screen();
@@ -1955,7 +1955,7 @@ mod tests {
             })
             .unwrap();
         store.apply(task.id, Action::Start).unwrap();
-        store.apply(task.id, Action::Complete).unwrap();
+        store.apply(task.id, Action::Complete(None)).unwrap();
 
         let mut app = App::new(store, ctx).unwrap();
         key(&mut app, KeyCode::Char('o'));

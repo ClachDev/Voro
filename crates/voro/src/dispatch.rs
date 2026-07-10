@@ -1052,7 +1052,7 @@ mod tests {
     fn review_task(store: &mut Store, project_path: &Path) -> i64 {
         let id = ready_task(store, project_path);
         store.apply(id, voro_core::Action::Start).unwrap();
-        store.apply(id, voro_core::Action::Complete).unwrap();
+        store.apply(id, voro_core::Action::Complete(None)).unwrap();
         id
     }
 
