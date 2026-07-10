@@ -165,8 +165,8 @@ pub struct App {
     pub queue: Vec<Candidate>,
     /// The cockpit's running strip (DESIGN.md §9): live agent sessions plus
     /// every `running` task with no live session, so a task started by hand or
-    /// one whose session died before reconcile demoted it is still visible and
-    /// flagged for attention rather than hidden.
+    /// one whose session ended without reporting (reconcile leaves it running,
+    /// §8) is still visible and flagged for attention rather than hidden.
     pub running: Vec<RunningRow>,
     pub all: Vec<TaskRow>,
     /// Ready tasks whose most recent session ended `failed` or `capped`
@@ -1943,8 +1943,9 @@ mod tests {
 
     /// Without a captured ref there is nothing to substitute into the verb;
     /// the key explains instead of queuing a broken command. The fixture's
-    /// verb-less stub agent also exercises the pid-reconcile path dropping
-    /// the dead session's task to ready-flagged, whose jump-in is `resume`.
+    /// verb-less stub agent also exercises the pid-reconcile path: the dead
+    /// session is finalised but the task is left running (DESIGN.md §8),
+    /// surfaced as an orphaned running row whose jump-in is `attach`.
     #[test]
     fn attach_key_without_a_captured_ref_reports_and_does_nothing() {
         let (mut store, ctx, project_path) = scratch_env(
@@ -1975,8 +1976,17 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let mut app = App::new(store, ctx).unwrap();
-        assert_eq!(app.store.task(task.id).unwrap().state, TaskState::Ready);
-        assert!(app.redispatch.contains(&task.id), "flagged for redispatch");
+        assert_eq!(app.store.task(task.id).unwrap().state, TaskState::Running);
+        // the dead session's task is left running and surfaced as an orphan
+        // (no live session) in the running strip, not auto-flagged for redispatch
+        assert!(!app.redispatch.contains(&task.id));
+        assert!(
+            app.running
+                .iter()
+                .any(|r| r.task_id == task.id && r.session_id.is_none()),
+            "orphaned running row expected: {:?}",
+            app.running
+        );
         app.toggle_screen();
         key(&mut app, KeyCode::Char('a'));
 

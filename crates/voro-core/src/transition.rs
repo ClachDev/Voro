@@ -164,11 +164,16 @@ impl Store {
     /// - the session already ended: also a no-op, so a caller looping over
     ///   `live_sessions` repeatedly can't double-finalise one.
     /// - the task is still `running` and this is its most recent session: the
-    ///   agent's process died without calling `done` or `ask`. The session
-    ///   outcome is `capped` if `likely_capped`, else `failed`, and the task
-    ///   drops `running → ready` flagged for redispatch (via the same
-    ///   transition `Abort` uses, tagged with a distinct `reconcile` event so
-    ///   the log tells an automatic reconciliation apart from a human abort).
+    ///   agent's process ended without calling `done` or `ask`. The session
+    ///   outcome is recorded (`capped` if `likely_capped`, else `failed`) but
+    ///   the task is **left `running`** — it is not auto-demoted or re-queued
+    ///   (DESIGN.md §8). A session vanishing from its agent's listing (or a
+    ///   dead pid) is indistinguishable from a normal completion whose
+    ///   return-path call has not landed yet, so silently bouncing the task to
+    ///   `ready` fired on healthy completions as often as on real deaths. It
+    ///   instead surfaces as an orphaned `running` row (§9) — logged with a
+    ///   distinct `reconcile` event — for the human to redispatch, complete,
+    ///   or abort explicitly.
     /// - the task is `running` but an *older* session is the one that exited —
     ///   it was aborted and redispatched (#41), and a newer session now owns
     ///   the running state. Its outcome is backfilled (`failed`/`capped`) but
@@ -210,13 +215,12 @@ impl Store {
 
         let is_current_session = latest_session_id(&tx, task.id)? == Some(session_id);
         if task.state == TaskState::Running && is_current_session {
-            apply_action(&tx, task.id, Action::Abort)?;
             log_event(
                 &tx,
                 task.id,
                 "reconcile",
                 Some(&format!(
-                    "session {session_id} exited ({outcome}); flagged for redispatch"
+                    "session {session_id} ended without reporting ({outcome}); left running for review"
                 )),
             )?;
         }
@@ -1015,7 +1019,7 @@ mod tests {
         }
 
         #[test]
-        fn dead_pid_on_a_running_task_fails_and_drops_to_ready() {
+        fn dead_pid_on_a_running_task_fails_but_leaves_it_running() {
             let (mut s, p) = store_with_project();
             let (task_id, session_id) = dispatch(&mut s, p);
 
@@ -1025,24 +1029,26 @@ mod tests {
                 .unwrap();
             assert_eq!(session.outcome, Some(SessionOutcome::Failed));
             assert!(session.ended_at.is_some());
-            assert_eq!(task.state, TaskState::Ready);
-            assert!(s.redispatch_flag(task_id).unwrap());
+            // policy (DESIGN.md §8): no auto-requeue — the task stays running,
+            // surfaced as an orphaned running row for explicit handling.
+            assert_eq!(task.state, TaskState::Running);
+            // a still-running task is not redispatch-flagged; the flag is for
+            // a ready task, and only reappears once a human aborts this orphan.
+            assert!(!s.redispatch_flag(task_id).unwrap());
 
             let events = s.events_for(task_id).unwrap();
-            assert_eq!(events.last().unwrap().kind, "reconcile");
+            let last = events.last().unwrap();
+            assert_eq!(last.kind, "reconcile");
+            let detail = last.detail.as_deref().unwrap();
+            assert!(detail.contains("without reporting"), "{detail}");
+            assert!(detail.contains("failed"), "{detail}");
+            // no running -> ready transition was logged
             assert!(
                 events
-                    .last()
-                    .unwrap()
-                    .detail
-                    .as_deref()
-                    .unwrap()
-                    .contains("failed")
+                    .iter()
+                    .all(|e| e.detail.as_deref() != Some("running -> ready")),
+                "an automatic transition was logged: {events:?}"
             );
-            // the transition itself reads exactly like Abort's
-            let transition = events.iter().rev().nth(1).unwrap();
-            assert_eq!(transition.kind, "transition");
-            assert_eq!(transition.detail.as_deref(), Some("running -> ready"));
         }
 
         #[test]
@@ -1055,7 +1061,25 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(session.outcome, Some(SessionOutcome::Capped));
-            assert_eq!(task.state, TaskState::Ready);
+            // the task is left running here too — a cap is redispatched by an
+            // explicit human action, not automatically (DESIGN.md §8).
+            assert_eq!(task.state, TaskState::Running);
+            assert!(!s.redispatch_flag(task_id).unwrap());
+        }
+
+        #[test]
+        fn aborting_a_reconciled_orphan_reveals_the_redispatch_flag() {
+            // the explicit path: reconcile leaves a dead session's task
+            // running, and only when the human aborts it back to `ready` does
+            // the redispatch flag surface against the failed session history.
+            let (mut s, p) = store_with_project();
+            let (task_id, session_id) = dispatch(&mut s, p);
+            s.reconcile_session(session_id, false, false).unwrap();
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
+            assert!(!s.redispatch_flag(task_id).unwrap());
+
+            s.apply(task_id, Action::Abort).unwrap();
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Ready);
             assert!(s.redispatch_flag(task_id).unwrap());
         }
 

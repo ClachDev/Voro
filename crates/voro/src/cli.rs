@@ -1366,10 +1366,11 @@ mod tests {
 
     /// End to end (DESIGN.md §8): a task really dispatched, whose agent
     /// process really exits without calling `voro done`/`ask`, is finalised
-    /// and flagged for redispatch purely by a later CLI verb reading state —
-    /// no code here ever calls the reconciliation function directly.
+    /// purely by a later CLI verb reading state — no code here ever calls the
+    /// reconciliation function directly. The task is left `running` (not
+    /// auto-requeued), recording a `reconcile` event that the history surfaces.
     #[test]
-    fn a_dead_dispatched_session_surfaces_the_redispatch_flag_on_read() {
+    fn a_dead_dispatched_session_is_finalised_and_left_running_on_read() {
         use std::process::{Command, Stdio};
 
         let root = std::env::temp_dir().join(format!(
@@ -1428,14 +1429,21 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         // a plain read-only verb — not a direct call to the reconciler —
-        // must notice the dead process and finalise it
-        let out = run(&mut store, vec!["inbox".to_string()], &dispatch_ctx).unwrap();
-        assert!(out.contains("[redispatch]"), "{out}");
-        assert_eq!(store.task(1).unwrap().state, TaskState::Ready);
-        assert!(store.redispatch_flag(1).unwrap());
-
-        let shown = ok(&mut store, &["show", "1"]);
-        assert!(shown.contains("flagged for redispatch"), "{shown}");
+        // must notice the dead process and finalise the session, while leaving
+        // the task running (no auto-requeue)
+        let out = run(
+            &mut store,
+            vec!["show".to_string(), "1".to_string()],
+            &dispatch_ctx,
+        )
+        .unwrap();
+        assert_eq!(store.task(1).unwrap().state, TaskState::Running);
+        assert!(!store.redispatch_flag(1).unwrap());
+        // a running task is not in the queue, and carries no redispatch flag
+        assert!(!out.contains("flagged for redispatch"), "{out}");
+        // but the reconcile is recorded in the task's history
+        assert!(out.contains("reconcile"), "{out}");
+        assert!(out.contains("without reporting"), "{out}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1498,8 +1506,9 @@ mod tests {
     /// A ready task in `store`, dispatched and then asked a question, all
     /// through direct `voro-core` calls rather than `run()` — reaching
     /// `needs-input` this way sidesteps `run()`'s reconcile-on-read, which
-    /// would otherwise race the stub agent's near-instant exit and flag the
-    /// still-`running` task for redispatch before `ask` ever lands.
+    /// would otherwise race the stub agent's near-instant exit and finalise the
+    /// dispatch session before `ask` lands, leaving the test unable to control
+    /// its session history.
     fn dispatched_and_asked(
         store: &mut Store,
         ctx: &DispatchCtx,
