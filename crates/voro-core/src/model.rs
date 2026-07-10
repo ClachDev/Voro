@@ -305,6 +305,11 @@ pub struct Session {
     pub task_id: i64,
     pub agent: String,
     pub pid: Option<i64>,
+    /// The agent's own reference for this session (a Claude session UUID, a
+    /// Codex session id, a tmux session name), captured after launch and
+    /// substituted into the agent's attach/resume/continue verb templates.
+    /// `None` when the agent has no capture story or capture failed.
+    pub session_ref: Option<String>,
     pub log_path: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,

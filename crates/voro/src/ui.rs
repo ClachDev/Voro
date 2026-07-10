@@ -648,7 +648,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                         hints.push_str(enter);
                     }
                     hints.push_str(
-                        " · n new · e edit · s state · d dispatch · D agent · o open · g pr · x score · h history",
+                        " · n new · e edit · s state · d dispatch · D agent · a attach · o open · g pr · x score · h history",
                     );
                     hints
                 }

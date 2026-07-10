@@ -112,6 +112,18 @@ pub enum EditorRequest {
     Edit { task_id: i64 },
 }
 
+/// A request for main() to suspend the terminal and run an agent's
+/// `attach`/`resume` command in the foreground (task #75) — like the editor,
+/// these are full-screen interactive programs that own the terminal until
+/// the user detaches or the session ends.
+#[derive(Debug, Clone)]
+pub struct AttachRequest {
+    /// The verb template with `{session}` already substituted.
+    pub command: String,
+    /// The project checkout to run it in.
+    pub cwd: String,
+}
+
 pub fn action_label(action: &Action) -> &'static str {
     match action {
         Action::Triage(Triage::Parked) => "triage → parked",
@@ -161,6 +173,7 @@ pub struct App {
 
     pub mode: Mode,
     pub pending_editor: Option<EditorRequest>,
+    pub pending_attach: Option<AttachRequest>,
 
     /// Last `PRAGMA data_version` seen, used to detect commits from other
     /// processes and refresh without reacting to our own mutations.
@@ -200,6 +213,7 @@ impl App {
             projects_sel: 0,
             mode: Mode::Normal,
             pending_editor: None,
+            pending_attach: None,
             last_data_version: 0,
         };
         app.refresh()?;
@@ -225,7 +239,7 @@ impl App {
         // Reconcile-on-read (DESIGN.md §8): finalise any session whose
         // process has already exited before anything below reads state that
         // depends on it.
-        crate::reconcile::reconcile_live_sessions(&mut self.store)?;
+        crate::reconcile::reconcile_live_sessions(&mut self.store, &self.dispatch_ctx.agents_path)?;
 
         self.projects = self.store.projects()?;
         let candidates = self.store.candidates()?;
@@ -383,7 +397,11 @@ impl App {
     /// consistent. A task that was only ever started by hand has no session
     /// history and the transition stands alone.
     fn apply_and_refresh(&mut self, task_id: i64, action: Action) {
-        let has_history = matches!(action, Action::Answer(_))
+        let answer_text = match &action {
+            Action::Answer(text) => Some(text.clone()),
+            _ => None,
+        };
+        let has_history = answer_text.is_some()
             && self
                 .store
                 .sessions_for(task_id)
@@ -396,6 +414,7 @@ impl App {
                     &self.dispatch_ctx,
                     task_id,
                     None,
+                    answer_text.as_deref(),
                 ) {
                     Ok(summary) => self.status = Some(summary),
                     Err(e) => self.status = Some(format!("answered, but continuation failed: {e}")),
@@ -550,8 +569,89 @@ impl App {
             }
             KeyCode::Char('o') => self.open_selected_in_viewer(),
             KeyCode::Char('g') => self.open_selected_pr(),
+            KeyCode::Char('a') => self.jump_into_session(),
             _ => {}
         }
+    }
+
+    /// Jump into the selected task's agent session (task #75): `attach` for a
+    /// running task, `resume` for a review or redispatch-flagged one. The
+    /// actual run happens in main() via `pending_attach`, with the TUI torn
+    /// down around it — attach/resume are full-screen interactive. Every
+    /// missing piece (state, session, captured ref, verb) reports through the
+    /// status line, the same "no-op with an explanation" style the dispatch
+    /// keys use.
+    fn jump_into_session(&mut self) {
+        let (task_id, state, project_id) = match self.selected_task() {
+            Some(task) => (task.id, task.state, task.project_id),
+            None => return,
+        };
+        let attach = match state {
+            TaskState::Running => true,
+            TaskState::Review => false,
+            TaskState::Ready if self.redispatch.contains(&task_id) => false,
+            _ => {
+                self.status = Some(format!(
+                    "task is {state} — jump-in works on running, review, or \
+                     redispatch-flagged tasks"
+                ));
+                return;
+            }
+        };
+        let sessions = match self.store.sessions_for(task_id) {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        let Some(session) = sessions.first() else {
+            self.status = Some(format!(
+                "task {task_id} has no recorded session to jump into"
+            ));
+            return;
+        };
+        let Some(session_ref) = session.session_ref.clone() else {
+            self.status = Some(format!(
+                "no session reference was captured for session {} — nothing to {}",
+                session.id,
+                if attach { "attach to" } else { "resume" }
+            ));
+            return;
+        };
+        let config = match AgentsConfig::load(&self.dispatch_ctx.agents_path) {
+            Ok(config) => config,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        let verb_name = if attach { "attach" } else { "resume" };
+        let template = config
+            .agent(&session.agent)
+            .and_then(|a| if attach { a.attach() } else { a.resume() });
+        let Some(template) = template else {
+            self.status = Some(format!(
+                "agent '{}' defines no {verb_name} template in {}",
+                session.agent,
+                self.dispatch_ctx.agents_path.display()
+            ));
+            return;
+        };
+        let project = match self.store.project(project_id) {
+            Ok(project) => project,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        self.pending_attach = Some(AttachRequest {
+            command: template.replace(
+                voro_core::SESSION_PLACEHOLDER,
+                &crate::dispatch::shell_quote(std::path::Path::new(&session_ref)),
+            ),
+            cwd: project.path,
+        });
     }
 
     /// Open the event-history popup for the current selection, wherever a
@@ -1159,6 +1259,7 @@ mod tests {
             db_path,
             agents_path,
             runtime_dir: root.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
         };
         (store, ctx, project_path)
     }
@@ -1208,6 +1309,7 @@ mod tests {
             db_path: db_path.clone(),
             agents_path,
             runtime_dir: root.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
         };
         let project = store
             .create_project("demo", project_path.to_str().unwrap())
@@ -1684,6 +1786,146 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    // --- jump-in keybinding (task #75) ---
+
+    /// A project with one dispatched task whose agent defines the session
+    /// verbs, its session's ref recorded, and a canned `sessions` listing
+    /// that keeps reconciliation believing the session is live.
+    fn jump_in_env() -> (Store, crate::dispatch::DispatchCtx, i64, std::path::PathBuf) {
+        let (mut store, ctx, project_path) = scratch_env("jumpin", None);
+        let listing = project_path.parent().unwrap().join("listing.json");
+        std::fs::write(&listing, r#"[{"sessionId": "ref-1", "state": "working"}]"#).unwrap();
+        std::fs::write(
+            &ctx.agents_path,
+            format!(
+                "default = \"stub\"\n\n[agents.stub]\n\
+                 dispatch = \"cat {{prompt_file}}\"\n\
+                 sessions = \"cat '{}'\"\n\
+                 attach = \"agent attach {{session}}\"\n\
+                 resume = \"agent resume {{session}}\"\n",
+                listing.display()
+            ),
+        )
+        .unwrap();
+        let project = store
+            .create_project("demo", project_path.to_str().unwrap())
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: project.id,
+                title: "Do the thing".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+        crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
+        let session_id = store.sessions_for(task.id).unwrap()[0].id;
+        store.set_session_ref(session_id, "ref-1").unwrap();
+        (store, ctx, task.id, project_path)
+    }
+
+    /// `a` on a running task queues the agent's `attach` command — ref
+    /// substituted, project path as cwd — for main() to run with the TUI
+    /// suspended.
+    #[test]
+    fn attach_key_prepares_the_attach_command_for_a_running_task() {
+        let (store, ctx, _task_id, project_path) = jump_in_env();
+        let mut app = App::new(store, ctx).unwrap();
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('a'));
+
+        let request = app.pending_attach.clone().expect("an attach request");
+        assert_eq!(request.command, "agent attach 'ref-1'");
+        assert_eq!(request.cwd, project_path.to_str().unwrap());
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// `a` on a review task uses `resume` — the session is finished; the
+    /// point is reopening it, not attaching to a live one.
+    #[test]
+    fn attach_key_uses_resume_for_a_review_task() {
+        let (mut store, ctx, task_id, project_path) = jump_in_env();
+        store.apply(task_id, Action::Complete).unwrap();
+
+        let mut app = App::new(store, ctx).unwrap();
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('a'));
+
+        let request = app.pending_attach.clone().expect("a resume request");
+        assert_eq!(request.command, "agent resume 'ref-1'");
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// Without a captured ref there is nothing to substitute into the verb;
+    /// the key explains instead of queuing a broken command. The fixture's
+    /// verb-less stub agent also exercises the pid-reconcile path dropping
+    /// the dead session's task to ready-flagged, whose jump-in is `resume`.
+    #[test]
+    fn attach_key_without_a_captured_ref_reports_and_does_nothing() {
+        let (mut store, ctx, project_path) = scratch_env(
+            "jumpin-noref",
+            Some(
+                "default = \"stub\"\n\n[agents.stub]\n\
+                 dispatch = \"cat {prompt_file}\"\n\
+                 attach = \"agent attach {session}\"\n\
+                 resume = \"agent resume {session}\"\n",
+            ),
+        );
+        let project = store
+            .create_project("demo", project_path.to_str().unwrap())
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: project.id,
+                title: "Do the thing".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+        crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
+        // the stub exits immediately; wait for it so App::new's
+        // reconcile-on-read reliably finds the pid dead
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let mut app = App::new(store, ctx).unwrap();
+        assert_eq!(app.store.task(task.id).unwrap().state, TaskState::Ready);
+        assert!(app.redispatch.contains(&task.id), "flagged for redispatch");
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('a'));
+
+        assert!(app.pending_attach.is_none());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("no session reference"),
+            "{:?}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// States with no session to jump into no-op with an explanation.
+    #[test]
+    fn attach_key_on_an_unflagged_ready_task_reports_the_states_that_work() {
+        let mut app = app_with(&[TaskState::Ready]);
+        key(&mut app, KeyCode::Char('a'));
+
+        assert!(app.pending_attach.is_none());
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("jump-in"),
+            "{:?}",
+            app.status
+        );
     }
 
     // --- open-in-viewer keybinding (task #24, DESIGN.md §11a) ---

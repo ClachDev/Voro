@@ -44,6 +44,92 @@ the queue); `done` moves it `running → review`; `propose` files a `proposed`
 task discovered-from this one. That is the whole surface — see DESIGN.md §8 for
 why it is deliberately this small.
 
+## Session verbs: attachable dispatch
+
+Background-only dispatch loses a lot against just running the agent
+interactively: no live view, no way to jump in and steer, no way to reopen the
+session afterwards. Agents that ship their own session layer close that gap
+through optional verbs on their `[agents.<name>]` table, next to the required
+`dispatch` (`cmd` is accepted as an alias, so older configs load unchanged):
+
+```toml
+[agents.claude]
+dispatch = "claude --bg --permission-mode acceptEdits \"$(cat {prompt_file})\""
+sessions = "claude agents --json"
+attach   = "claude attach {session}"
+resume   = "claude --resume {session}"
+
+[agents.codex]
+dispatch = "codex exec \"$(cat {prompt_file})\""
+resume   = "codex resume {session}"
+continue = "codex exec resume {session} \"$(cat {prompt_file})\""
+```
+
+- `sessions` prints the agent's sessions as a JSON array; Voro reads
+  `sessionId` (or `id`), `cwd`, `startedAt` (ms epoch), and `state` (`"done"`
+  once finished) from each object and ignores the rest.
+- `attach` opens the *running* session interactively; `{session}` is replaced
+  with the reference Voro captured at dispatch.
+- `resume` reopens a *finished* session interactively.
+- `continue` feeds a session new input headless — `{prompt_file}` holds the
+  input (an answer), `{session}` addresses the session.
+
+Three behaviours hang off these verbs.
+
+**Session-ref capture.** Launchers like `claude --bg` ignore any caller-chosen
+session id, so the reference has to be captured after the fact: dispatch polls
+the `sessions` listing for a session whose `cwd` is the project and whose
+`startedAt` is at or after the spawn, falling back to the ANSI-coloured
+`backgrounded · <id>` line the launcher prints (it lands in the session log).
+The captured ref is stored on the session row (`session_ref`) and printed in
+the dispatch summary; if nothing shows up within a few seconds the ref stays
+NULL and the summary says so.
+
+**Liveness without pids.** A `--bg`-style launch is owned by a supervisor: the
+pid Voro spawned exits as soon as the launcher returns, so pid-checking would
+declare the dispatch dead at birth. For agents with a `sessions` verb, the
+reconciler therefore never pid-checks — a session is live while its ref
+appears in the listing not-yet-`done`; a session that drops out of the listing
+or finishes there without having called `voro done`/`ask` is flagged for
+redispatch, exactly as pid-death is for plain agents. When liveness is
+unknowable (no ref captured, listing failed) the session is left alone rather
+than guessed at.
+
+**Jump-in.** In the TUI, `a` on a running task runs the agent's `attach`
+command in the project checkout with the TUI suspended — the real session,
+full control, including answering permission prompts (which also means the
+`--allowedTools` allowlist in a dispatch template can shrink once attach is
+wired). Detaching returns to Voro. On a review or redispatch-flagged task the
+same key runs `resume`, reopening the finished session with its history.
+`answer` prefers the `continue` verb when it exists and the session has a ref
+— the answer alone goes to the *same* session, context intact — and otherwise
+falls back to spawning a fresh session re-sent the whole task body.
+
+Every verb degrades gracefully when absent: no `attach`/`resume` disables the
+jump-in key for that agent, no `sessions` keeps pid-liveness reconciliation,
+no `continue` keeps fresh-spawn continuation. An agent defining only
+`dispatch`/`cmd` behaves exactly as before the verbs existed.
+
+### tmux as a universal fallback
+
+An agent with no session layer of its own can still be attachable by running
+under tmux. Dispatch runs with `VORO_TASK_ID` exported, so the template can
+name the tmux session deterministically, and `tmux list-sessions -F` can be
+dressed up as a `sessions` listing (session name as the ref, `jq -s` to build
+the array):
+
+```toml
+[agents.myagent]
+dispatch = "tmux new-session -d -s \"voro-$VORO_TASK_ID\" \"myagent run $(cat {prompt_file})\""
+sessions = "tmux list-sessions -F '{\"sessionId\":\"#{session_name}\",\"cwd\":\"#{session_path}\",\"startedAt\":#{session_created}000,\"state\":\"working\"}' 2>/dev/null | jq -s ."
+attach   = "tmux attach -t {session}"
+```
+
+A tmux session vanishes from `list-sessions` when its command exits, which is
+exactly the drop-out the reconciler treats as finished-without-reporting.
+There is no honest `resume`/`continue` for a dead tmux session, so leave those
+verbs off and let redispatch handle it.
+
 ## Hooks as a fallback
 
 The return path depends on the agent remembering to call it. A session that does

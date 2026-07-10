@@ -13,6 +13,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_rename_backlog_to_parked.sql"),
     include_str!("../migrations/0003_track_pr.sql"),
+    include_str!("../migrations/0004_add_session_ref.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -369,6 +370,20 @@ impl Store {
         self.session(id)
     }
 
+    /// Record the agent's own reference for a session (task #75), captured
+    /// after launch — the row necessarily exists before the reference does,
+    /// so this is an update rather than a `create_session` parameter.
+    pub fn set_session_ref(&mut self, id: i64, session_ref: &str) -> Result<Session> {
+        let changed = self.conn.execute(
+            "UPDATE sessions SET session_ref = ?1 WHERE id = ?2",
+            params![session_ref, id],
+        )?;
+        if changed == 0 {
+            return Err(Error::SessionNotFound(id));
+        }
+        self.session(id)
+    }
+
     /// Close a session with its outcome, stamping `ended_at`.
     pub fn end_session(&mut self, id: i64, outcome: SessionOutcome) -> Result<Session> {
         if set_session_outcome(&self.conn, id, outcome)? == 0 {
@@ -520,7 +535,7 @@ pub(crate) fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
 }
 
 pub(crate) const SESSION_COLUMNS: &str =
-    "id, task_id, agent, pid, log_path, started_at, ended_at, outcome";
+    "id, task_id, agent, pid, session_ref, log_path, started_at, ended_at, outcome";
 
 pub(crate) fn get_session(conn: &Connection, id: i64) -> Result<Option<Session>> {
     Ok(conn
@@ -553,10 +568,11 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         task_id: row.get(1)?,
         agent: row.get(2)?,
         pid: row.get(3)?,
-        log_path: row.get(4)?,
-        started_at: row.get(5)?,
-        ended_at: row.get(6)?,
-        outcome: row.get(7)?,
+        session_ref: row.get(4)?,
+        log_path: row.get(5)?,
+        started_at: row.get(6)?,
+        ended_at: row.get(7)?,
+        outcome: row.get(8)?,
     })
 }
 
@@ -827,6 +843,12 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
+        // 0004 gave the sessions table its session_ref column
+        let refs: i64 = store
+            .conn
+            .query_row("SELECT COUNT(session_ref) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(refs, 0);
     }
 
     /// A project + running task to hang sessions off of.
@@ -921,7 +943,30 @@ mod tests {
         let task_id = task_fixture(&mut s);
         let opened = s.create_session(task_id, "codex", None, None).unwrap();
         assert!(opened.pid.is_none());
+        assert!(opened.session_ref.is_none());
         assert!(opened.log_path.is_none());
+    }
+
+    #[test]
+    fn set_session_ref_records_and_rejects_unknown_ids() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+        let opened = s.create_session(task_id, "claude", None, None).unwrap();
+        assert!(opened.session_ref.is_none());
+
+        let updated = s
+            .set_session_ref(opened.id, "3f6c0e6e-1111-2222-3333-444455556666")
+            .unwrap();
+        assert_eq!(
+            updated.session_ref.as_deref(),
+            Some("3f6c0e6e-1111-2222-3333-444455556666")
+        );
+        assert_eq!(s.session(opened.id).unwrap(), updated);
+
+        assert!(matches!(
+            s.set_session_ref(999, "x"),
+            Err(Error::SessionNotFound(999))
+        ));
     }
 
     #[test]
