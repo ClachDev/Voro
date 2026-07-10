@@ -15,12 +15,24 @@ rather than the agent's discipline.
 
 ## The return path
 
+Dispatch injects a preamble at the top of every prompt it writes (DESIGN.md §8)
+that names the verbs with the task's literal id already substituted in — so a
+dispatched agent needs none of the setup in this section. This file is for the
+*other* way an agent can reach the verbs: an operator-pasted snippet and Claude
+Code hooks, both of which read the task and database from the environment rather
+than from a rendered command.
+
 Dispatch runs the agent in the project checkout with two environment variables
 set (DESIGN.md §8): `VORO_TASK_ID`, the task being worked, and `VORO_DB`, the
-database that dispatched it. Every return-path verb reads them, so the agent
-addresses the right task in the right store without being told either. Advertise
-the verbs to the agent by pasting this into the project's `CLAUDE.md` (or
-`AGENTS.md`):
+database that dispatched it. A verb that reads them addresses the right task in
+the right store without being told either. Note the injected preamble does *not*
+rely on this — it renders the id and `--db <path>` into the commands directly,
+precisely because some launch styles (notably `claude --bg`, which hands the
+session to a supervisor daemon) do not propagate the spawned process's
+environment to the session. The snippet and hooks below are best-effort under
+those launch styles for the same reason; the injected preamble is the reliable
+path. Advertise the verbs to the agent by pasting this into the project's
+`CLAUDE.md` (or `AGENTS.md`):
 
 ```markdown
 ## Reporting back to Voro
