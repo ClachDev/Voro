@@ -49,11 +49,21 @@ Run these commands exactly as shown: they name task {task_id} explicitly, so the
 work from anywhere without any environment variable being set. `propose` uses
 task {task_id} as the discovered-from source when `--from` is omitted. Never
 modify the database with raw SQL, which would bypass the state machine and event
-log.
+log.{branch}
 
 ---
 
 ";
+
+/// The branch paragraph [`render_preamble`] substitutes for `{branch}` when the
+/// task carries an intended git branch (task #81): the agent is told to create
+/// or check it out itself — Voro runs no git — and to confirm the branch its
+/// work landed on. `{name}` is filled with the branch name and `{task_id}`/`{db}`
+/// so the reported-name verb is copy-pasteable.
+const BRANCH_INSTRUCTION_TEMPLATE: &str = "\n\n\
+This task is assigned the git branch `{name}`. Create or check it out yourself
+before making changes — Voro runs no git — and confirm the branch your work
+landed on with `voro done {task_id}{db} --branch {name}`.";
 
 /// How often the session-ref capture re-polls the agent's `sessions` command
 /// while waiting for the freshly-launched session to appear in the listing.
@@ -70,13 +80,18 @@ const SPAWN_CLOCK_SLACK_MS: i64 = 2000;
 /// on their own. Putting both values in the visible command is what makes the
 /// return path robust under launch styles that drop the spawned process's
 /// environment.
-fn render_preamble(task_id: i64, db_path: &Path) -> String {
+fn render_preamble(task_id: i64, db_path: &Path, branch: Option<&str>) -> String {
     let db_flag = if db_path == Store::default_db_path() {
         String::new()
     } else {
         format!(" --db {}", shell_quote(db_path))
     };
+    let branch_block = match branch {
+        Some(name) => BRANCH_INSTRUCTION_TEMPLATE.replace("{name}", name),
+        None => String::new(),
+    };
     RETURN_PATH_PREAMBLE_TEMPLATE
+        .replace("{branch}", &branch_block)
         .replace("{task_id}", &task_id.to_string())
         .replace("{db}", &db_flag)
 }
@@ -337,7 +352,10 @@ fn spawn_session(
     let prompt = match (&continue_ref, new_input) {
         (Some(_), Some(input)) => format!("{input}\n"),
         (Some(_), None) => body,
-        (None, _) => format!("{}{body}", render_preamble(task_id, &ctx.db_path)),
+        (None, _) => format!(
+            "{}{body}",
+            render_preamble(task_id, &ctx.db_path, task.branch.as_deref())
+        ),
     };
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("cannot write prompt {}: {e}", prompt_path.display()))?;
@@ -700,7 +718,7 @@ mod tests {
         assert!(prompt.contains("Detailed prompt."), "{prompt}");
         // the rendered preamble is dropped in ahead of the task body
         assert!(
-            prompt.starts_with(&render_preamble(id, &ctx.db_path)),
+            prompt.starts_with(&render_preamble(id, &ctx.db_path, None)),
             "{prompt}"
         );
         assert!(
@@ -713,7 +731,7 @@ mod tests {
     fn preamble_renders_a_db_flag_only_for_a_non_default_database() {
         // a scratch (non-default) db renders --db on every verb, shell-quoted
         let db = PathBuf::from("/tmp/scratch/voro.db");
-        let rendered = render_preamble(62, &db);
+        let rendered = render_preamble(62, &db, None);
         assert!(
             rendered.contains("voro ask 62 --db '/tmp/scratch/voro.db'"),
             "{rendered}"
@@ -728,9 +746,42 @@ mod tests {
         );
 
         // the default db is what the verbs resolve to unaided, so no flag
-        let default = render_preamble(62, &Store::default_db_path());
+        let default = render_preamble(62, &Store::default_db_path(), None);
         assert!(default.contains("voro ask 62 --question"), "{default}");
         assert!(!default.contains("--db"), "{default}");
+    }
+
+    #[test]
+    fn preamble_injects_the_intended_branch_only_when_one_is_set() {
+        // no branch: nothing about branches leaks into the preamble
+        let plain = render_preamble(62, &Store::default_db_path(), None);
+        assert!(!plain.contains("branch"), "{plain}");
+
+        // with a branch: the agent is told to use it and how to report back,
+        // with the reported-name verb naming the literal task id and branch
+        let branched = render_preamble(62, &Store::default_db_path(), Some("feat/parser"));
+        assert!(branched.contains("git branch `feat/parser`"), "{branched}");
+        assert!(branched.contains("Voro runs no git"), "{branched}");
+        assert!(
+            branched.contains("voro done 62 --branch feat/parser"),
+            "{branched}"
+        );
+    }
+
+    #[test]
+    fn dispatched_prompt_injects_the_intended_branch() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let id = ready_task(&mut store, &project);
+        store.set_branch(id, Some("feat/parser")).unwrap();
+
+        dispatch(&mut store, &ctx, id, None).unwrap();
+
+        let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
+        assert!(prompt.contains("git branch `feat/parser`"), "{prompt}");
+        assert!(
+            prompt.contains("voro done") && prompt.contains("--branch feat/parser"),
+            "{prompt}"
+        );
     }
 
     fn prompt_files(ctx: &DispatchCtx) -> Vec<PathBuf> {

@@ -36,6 +36,7 @@ voro explain <id>       # score decomposition (weight × priority + age bonus)
 ```
 voro add <project> <title> --body-file plan.md [--priority 0-3] [--blocks 3,7]
 voro set <id> [--title T] [--priority N] [--body-file F] [--blocks IDS]
+              [--branch NAME]        # intended git branch dispatch injects
 voro project add <name> <path>
 voro weight <project> <0-5>          # 0 parks/hides the project
 ```
@@ -56,7 +57,8 @@ when its last blocker closes.
 voro start <id>                      # ready → running (claim the task)
 voro ask <id> --question "A or B?"   # running → needs-input (blocked on human)
 voro answer <id> TEXT                # needs-input → running
-voro done <id>                       # running → review (work finished, await human)
+voro done <id> [--branch NAME]       # running → review; --branch records the
+                                     #   git branch your work landed on
 voro abort <id>                      # running → ready (backing out)
 ```
 
