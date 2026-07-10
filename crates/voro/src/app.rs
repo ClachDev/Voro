@@ -229,6 +229,14 @@ impl App {
         Ok(app)
     }
 
+    /// Where main() records the outcome of an attach/resume round-trip — the
+    /// same rolling launch log a viewer open writes to (DESIGN.md §11a), so a
+    /// failing attach leaves a breadcrumb even though the TUI paints back over
+    /// its output.
+    pub fn launch_log_path(&self) -> std::path::PathBuf {
+        self.dispatch_ctx.launch_log_path()
+    }
+
     /// Refresh if another process has committed since the last check. Cheap
     /// enough to call every poll tick; `PRAGMA data_version` ignores our own
     /// writes, so this fires only on genuinely external changes.

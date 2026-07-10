@@ -97,19 +97,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// terminal already restored by the caller. The command inherits stdio so the
 /// agent's own TUI takes over; on return — detach or session end — the state
 /// of the world may have moved, so refresh before redrawing.
+///
+/// A non-zero exit (e.g. `claude attach <id>` printing `No job matching …`)
+/// used to be painted over the instant the TUI reinitialised, leaving only a
+/// terse status line. So on failure the outcome is left on screen — below
+/// whatever the subprocess printed — until a key is pressed, and every
+/// round-trip is appended to the launch log so even a swallowed failure is
+/// recoverable.
 fn attach_session(app: &mut App, request: app::AttachRequest) {
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(&request.command)
         .current_dir(&request.cwd)
         .status();
-    app.status = Some(match status {
+
+    let succeeded = matches!(&status, Ok(s) if s.success());
+    let message = match &status {
         Ok(s) if s.success() => format!("returned from: {}", request.command),
         Ok(s) => format!("'{}' exited with {s}", request.command),
         Err(e) => format!("cannot run '{}' in {}: {e}", request.command, request.cwd),
-    });
+    };
+
+    let log_line = match &status {
+        Ok(s) => format!(
+            "attach: {} (cwd {}) exited with {s}",
+            request.command, request.cwd
+        ),
+        Err(e) => format!(
+            "attach: {} (cwd {}) could not be run: {e}",
+            request.command, request.cwd
+        ),
+    };
+    dispatch::append_launch_log(&app.launch_log_path(), &log_line);
+
+    // On failure keep the subprocess's own error output readable: print the
+    // outcome beneath it and hold until a keypress, rather than reinitialising
+    // the TUI straight over the top of it.
+    if !succeeded {
+        println!("\n{message}");
+        println!("(press any key to return to voro)");
+        wait_for_keypress();
+    }
+
+    app.status = Some(message);
     if let Err(e) = app.refresh() {
         app.status = Some(e.to_string());
+    }
+}
+
+/// Block until the next key press, used to hold a failed attach's output on
+/// screen. Raw mode is toggled on just for the read so a single key suffices
+/// (no Enter); any read error simply returns rather than trapping the user.
+fn wait_for_keypress() {
+    use ratatui::crossterm::terminal;
+    let raw = terminal::enable_raw_mode().is_ok();
+    loop {
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    if raw {
+        let _ = terminal::disable_raw_mode();
     }
 }
 

@@ -12,7 +12,8 @@
 //! falling back to the `backgrounded · <id>` line launchers print into the
 //! log — and records it on the session row for later attach/resume/continue.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -180,6 +181,34 @@ impl DispatchCtx {
             ref_capture_timeout: Duration::from_secs(5),
         }
     }
+
+    /// The rolling log for subprocess launches that are *not* dispatches —
+    /// viewer opens and attach/resume round-trips. Dispatch and continuation
+    /// each own a per-session log (`log_path`); these one-off launches share a
+    /// single append-only file beside those session logs so a failure that
+    /// would otherwise be painted over by the TUI leaves a breadcrumb. Single
+    /// file, no rotation — the same single-operator argument as session logs
+    /// (DESIGN.md §8).
+    pub fn launch_log_path(&self) -> PathBuf {
+        self.runtime_dir.join("launches.log")
+    }
+}
+
+/// Append a timestamped line to the launch log, best-effort — a launch must
+/// not fail because its breadcrumb could not be written. Creates the parent
+/// directory and opens in append mode so concurrent writers (a viewer's own
+/// redirected stdout/stderr and this record line) interleave cleanly.
+pub(crate) fn append_launch_log(path: &Path, line: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(file, "[{ts}] {line}");
+    }
 }
 
 /// Dispatch a ready task to a headless agent session, returning a summary line.
@@ -256,13 +285,34 @@ pub fn open(store: &mut Store, ctx: &DispatchCtx, task_id: i64) -> Result<String
         VIEWER_PATH_PLACEHOLDER,
         &shell_quote(Path::new(&project.path)),
     );
+
+    // A detached viewer's output was previously discarded to `/dev/null`, so a
+    // failing viewer command was completely silent. Redirect it to the shared
+    // launch log instead, and record the exit status there when the reap thread
+    // collects it, so a silent failure has a breadcrumb.
+    std::fs::create_dir_all(&ctx.runtime_dir)
+        .map_err(|e| format!("cannot create {}: {e}", ctx.runtime_dir.display()))?;
+    let launch_log = ctx.launch_log_path();
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&launch_log)
+        .map_err(|e| format!("cannot open launch log {}: {e}", launch_log.display()))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| format!("cannot open launch log {}: {e}", launch_log.display()))?;
+    append_launch_log(
+        &launch_log,
+        &format!("viewer: {command} (cwd {})", project.path),
+    );
+
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&command)
         .current_dir(&project.path)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
         .process_group(0)
         .spawn()
         .map_err(|e| format!("cannot spawn viewer in {}: {e}", project.path))?;
@@ -270,13 +320,22 @@ pub fn open(store: &mut Store, ctx: &DispatchCtx, task_id: i64) -> Result<String
 
     // Nothing waits on the viewer — like dispatch, reap it in a detached thread
     // so an exited child never lingers as a zombie in a long-lived TUI session.
+    // The reap records the exit status so a viewer that failed after spawning is
+    // findable in the log, not just one that failed to spawn.
+    let reap_log = launch_log.clone();
+    let reap_command = command.clone();
     std::thread::spawn(move || {
-        let _ = child.wait();
+        let line = match child.wait() {
+            Ok(status) => format!("viewer: {reap_command} exited with {status}"),
+            Err(e) => format!("viewer: {reap_command} could not be waited on: {e}"),
+        };
+        append_launch_log(&reap_log, &line);
     });
 
     Ok(format!(
-        "opened task {task_id} in {} (pid {pid})",
-        project.name
+        "opened task {task_id} in {} (pid {pid}) — launch log {}",
+        project.name,
+        launch_log.display()
     ))
 }
 
@@ -1114,6 +1173,40 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(marker.exists(), "the viewer should have run in the project");
+    }
+
+    #[test]
+    fn open_records_a_failing_viewers_exit_status_in_the_launch_log() {
+        // a [viewer] whose command exits non-zero after spawning: the failure
+        // is silent on the (null-less) detached child, so it must be findable
+        // in the launch log, and the summary must say where that log is.
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        std::fs::write(
+            &ctx.agents_path,
+            "default = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
+             [viewer]\ncmd = \"exit 3\"\n",
+        )
+        .unwrap();
+        let id = review_task(&mut store, &project);
+
+        let summary = open(&mut store, &ctx, id).unwrap();
+        let launch_log = ctx.launch_log_path();
+        assert!(
+            summary.contains(&launch_log.display().to_string()),
+            "{summary}"
+        );
+
+        // the reap thread records the exit status asynchronously
+        let mut contents = String::new();
+        for _ in 0..50 {
+            contents = std::fs::read_to_string(&launch_log).unwrap_or_default();
+            if contents.contains("exited with") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(contents.contains("viewer:"), "{contents}");
+        assert!(contents.contains("exit status: 3"), "{contents}");
     }
 
     #[test]
