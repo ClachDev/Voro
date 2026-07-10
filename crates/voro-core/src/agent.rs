@@ -67,20 +67,23 @@ pub const STARTER_CONFIG: &str = "\
 #   continue  continue a session headless with new input; takes `{session}`
 #             and `{prompt_file}` (the new input, e.g. an answer).
 #
-# A dispatched session runs unattended, so the default drives Claude in
-# `bypassPermissions` mode: it never stops to ask, which is what lets a queue
-# of tasks run start to finish without a human — `acceptEdits` still prompts
-# for every bash command (a cargo build, a git commit) and blocks the session.
-# Dispatch already guards a clean tree, and the work lands as a reviewable
-# diff. To vet each command instead, switch to `--permission-mode acceptEdits`
-# and use `attach` (the a key) to jump into a live session and answer its
-# prompts. See docs/agent-integration.md for the codex equivalents and a tmux
-# recipe for agents with no session layer of their own.
+# A dispatched session runs unattended, so the default drives Claude in `auto`
+# mode: it auto-approves the actions it judges safe (edits, builds, commits) and
+# only pauses on genuinely risky ones, keeping a queue moving without a human
+# while still guarding the dangerous cases. When it does pause, the session parks
+# until you `attach` (the a key) and answer — so a task can stall mid-run rather
+# than fail at launch. `bypassPermissions` never pauses at all, but needs a
+# one-time disclaimer accepted (`claude --dangerously-skip-permissions`) before
+# `--bg` will start; `acceptEdits` auto-accepts edits yet still blocks on every
+# bash command (a cargo build, a git commit). Dispatch already guards a clean
+# tree and the work lands as a reviewable diff. See docs/agent-integration.md for
+# the codex equivalents and a tmux recipe for agents with no session layer of
+# their own.
 
 default = \"claude\"
 
 [agents.claude]
-dispatch = \"claude --bg --name \\\"voro-{task_id}\\\" --permission-mode bypassPermissions \\\"$(cat {prompt_file})\\\"\"
+dispatch = \"claude --bg --name \\\"voro-{task_id}\\\" --permission-mode auto \\\"$(cat {prompt_file})\\\"\"
 sessions = \"claude agents --json\"
 attach   = \"claude attach {session}\"
 resume   = \"claude --resume {session}\"

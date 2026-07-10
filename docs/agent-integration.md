@@ -69,7 +69,7 @@ through optional verbs on their `[agents.<name>]` table, next to the required
 
 ```toml
 [agents.claude]
-dispatch = "claude --bg --name \"voro-{task_id}\" --permission-mode bypassPermissions \"$(cat {prompt_file})\""
+dispatch = "claude --bg --name \"voro-{task_id}\" --permission-mode auto \"$(cat {prompt_file})\""
 sessions = "claude agents --json"
 attach   = "claude attach {session}"
 resume   = "claude --resume {session}"
@@ -94,14 +94,19 @@ continue = "codex exec resume {session} \"$(cat {prompt_file})\""
 - `continue` feeds a session new input headless — `{prompt_file}` holds the
   input (an answer), `{session}` addresses the session.
 
-The dispatch template above runs Claude in `bypassPermissions` mode on purpose:
-a dispatched session is unattended, so anything that stops to ask — and
-`acceptEdits` still asks before every bash command, a cargo build or a git
-commit — strands the whole task waiting on a human. Dispatch already refuses a
-dirty tree and the agent's work lands as a reviewable diff, so the vetting
-happens at review rather than per-command. If you would rather approve each
-command as it runs, set `--permission-mode acceptEdits` and use `attach` to
-jump into the live session and answer its prompts yourself.
+The dispatch template above runs Claude in `auto` mode: a dispatched session is
+unattended, and `auto` auto-approves the actions it judges safe — edits, a cargo
+build, a git commit — while still pausing on genuinely risky ones, so the queue
+keeps moving without a human but the dangerous cases are still guarded. When it
+does pause, the session parks until you `attach` and answer, so a task can stall
+mid-run rather than sail through unchecked. Dispatch already refuses a dirty tree
+and the agent's work lands as a reviewable diff, so most vetting happens at
+review rather than per-command. Two alternatives trade differently:
+`bypassPermissions` never pauses at all — nothing strands the task — but requires
+accepting a one-time disclaimer (`claude --dangerously-skip-permissions`) before
+`--bg` will start; `acceptEdits` auto-accepts edits yet still blocks on every
+bash command. Set whichever `--permission-mode` matches how much you want to
+approve by hand, and use `attach` to answer prompts in a live session.
 
 Three behaviours hang off these verbs.
 
