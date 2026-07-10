@@ -1,7 +1,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use voro_core::{
-    Action, AgentsConfig, Blocker, Candidate, Event, PrRef, Project, RunningRow, ScoreBreakdown,
-    Store, Task, TaskState, Triage, scheduler,
+    Action, AgentsConfig, Blocker, Candidate, Event, PrRef, Priority, Project, RunningRow,
+    ScoreBreakdown, Store, Task, TaskState, Triage, scheduler,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1133,9 +1133,28 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char(c @ '0'..='3') => {
+                if let Ok(priority) = Priority::from_int((c as u8 - b'0') as i64) {
+                    self.set_priority(task_id, priority);
+                }
+            }
             _ => {}
         }
         self.mode = Mode::Detail { task_id, scroll };
+    }
+
+    /// Re-prioritise the viewed task in place (task #88), the review-time fast
+    /// path that skips the edit form. Routes through `voro-core` so the change
+    /// is logged, then refreshes to re-score and re-sort.
+    fn set_priority(&mut self, task_id: i64, priority: Priority) {
+        match self.store.set_priority(task_id, priority) {
+            Ok(_) => {
+                self.status = Some(format!("priority set to {priority}"));
+                let result = self.refresh();
+                self.report(result);
+            }
+            Err(e) => self.status = Some(e.to_string()),
+        }
     }
 
     fn key_history(&mut self, key: KeyEvent, task_id: i64, events: Vec<Event>, mut scroll: u16) {

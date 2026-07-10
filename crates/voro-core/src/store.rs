@@ -267,6 +267,23 @@ impl Store {
         self.task(id)
     }
 
+    /// Re-prioritise a task in isolation (DESIGN.md §7), the fast path used when
+    /// the operator realises mid-review that a task's priority is wrong. Unlike
+    /// `update_task` this touches only `priority`, and it logs the change so the
+    /// audit trail records when a task was re-prioritised. Task state is left
+    /// untouched; scoring picks up the new priority on the next refresh.
+    pub fn set_priority(&mut self, id: i64, priority: Priority) -> Result<Task> {
+        let changed = self.conn.execute(
+            "UPDATE tasks SET priority = ?1 WHERE id = ?2",
+            params![priority, id],
+        )?;
+        if changed == 0 {
+            return Err(Error::TaskNotFound(id));
+        }
+        log_event(&self.conn, id, "priority", Some(&priority.to_string()))?;
+        self.task(id)
+    }
+
     /// Track (or, with `None`, untrack) a GitHub PR on a task (DESIGN.md §11c).
     /// The URL is stored verbatim — validation and canonicalisation are the
     /// caller's job, since only the `voro` crate knows a PR reference from any
@@ -723,6 +740,37 @@ mod tests {
         let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
         assert_eq!(kinds, vec!["created", "pr", "pr"]);
         assert!(matches!(s.set_pr(999, None), Err(Error::TaskNotFound(999))));
+    }
+
+    #[test]
+    fn set_priority_updates_leaves_state_and_logs() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let t = s
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "reprioritise me".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+
+        let raised = s.set_priority(t.id, Priority::P0).unwrap();
+        assert_eq!(raised.priority, Priority::P0);
+        // priority is changed in isolation; state is untouched
+        assert_eq!(raised.state, TaskState::Ready);
+
+        let events = s.events_for(t.id).unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(last.kind, "priority");
+        assert_eq!(last.detail.as_deref(), Some("P0"));
+
+        assert!(matches!(
+            s.set_priority(999, Priority::P1),
+            Err(Error::TaskNotFound(999))
+        ));
     }
 
     #[test]
