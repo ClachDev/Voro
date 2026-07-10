@@ -640,36 +640,75 @@ fn draw_projects(frame: &mut Frame, app: &App) {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let line = match &app.status {
-        Some(msg) => Line::from(Span::styled(msg.clone(), Style::new().fg(Color::Red))),
-        None => {
-            let hints = match app.screen {
-                Screen::Projects => {
-                    "q quit · tab screen · j/k move · 0-5 weight · r rename · a add · d delete"
-                        .to_string()
-                }
-                Screen::Cockpit | Screen::Tasks => {
-                    let mut hints = String::from("q quit · tab screen · j/k move");
-                    if let Some(enter) = app.enter_hint() {
-                        hints.push_str(" · ");
-                        hints.push_str(enter);
-                    }
-                    hints.push_str(
-                        " · n new · e edit · s state · d dispatch · D agent · a attach · o open · g pr",
-                    );
-                    // The score/history toggles fold into the cockpit detail
-                    // pane in place; on the tasks screen they live inside the
-                    // Detail popup and are advertised in its footer instead.
-                    if app.screen == Screen::Cockpit {
-                        hints.push_str(" · x score · h history");
-                    }
-                    hints
-                }
-            };
-            Line::from(Span::styled(hints, Style::new().dim()))
+    // A red status message overrides the key line, as before.
+    if let Some(msg) = &app.status {
+        let line = Line::from(Span::styled(msg.clone(), Style::new().fg(Color::Red)));
+        frame.render_widget(line, area);
+        return;
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (key, label)) in key_hints(app).into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::new().dim()));
         }
-    };
-    frame.render_widget(line, area);
+        spans.push(Span::styled(key, Style::new().bold()));
+        spans.push(Span::styled(format!(" {label}"), Style::new().dim()));
+    }
+    frame.render_widget(Line::from(spans), area);
+}
+
+/// The contextual per-screen key line (ui-redesign §2): the actions that apply
+/// on the current screen and selection, as key/label pairs the caller renders
+/// key-bold, label-dim. It lists actions, not navigation — `j`/`k` and the
+/// arrows are omitted, and `r` refresh stays bound but unadvertised — while `q`
+/// and `tab` are always present. On the cockpit the dispatch keys and the
+/// score/history toggles only apply to a selected task, so they drop out when
+/// nothing is selected.
+fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    // `enter_hint` yields "⏎ <verb>"; split the glyph from the verb so the
+    // glyph renders as the bold key and the verb as the dim label.
+    let enter = app
+        .enter_hint()
+        .and_then(|h| h.split_once(' '))
+        .map(|(_, verb)| ("⏎", verb));
+    match app.screen {
+        Screen::Cockpit => {
+            let mut pairs: Vec<(&'static str, &'static str)> = Vec::new();
+            pairs.extend(enter);
+            if app.selected_task_id().is_some() {
+                pairs.push(("d", "dispatch"));
+                pairs.push(("D", "agent"));
+            }
+            pairs.push(("s", "state"));
+            if app.selected_task_id().is_some() {
+                pairs.push(("x", "score"));
+                pairs.push(("h", "history"));
+            }
+            pairs.push(("n", "new"));
+            pairs.push(("e", "edit"));
+            pairs.push(("tab", "tasks"));
+            pairs.push(("q", "quit"));
+            pairs
+        }
+        Screen::Tasks => {
+            let mut pairs: Vec<(&'static str, &'static str)> = Vec::new();
+            pairs.extend(enter);
+            pairs.push(("s", "state"));
+            pairs.push(("n", "new"));
+            pairs.push(("e", "edit"));
+            pairs.push(("tab", "projects"));
+            pairs.push(("q", "quit"));
+            pairs
+        }
+        Screen::Projects => vec![
+            ("0-5", "weight"),
+            ("r", "rename"),
+            ("a", "add"),
+            ("d", "delete"),
+            ("tab", "cockpit"),
+            ("q", "quit"),
+        ],
+    }
 }
 
 /// A centred popup rect, cleared of what is beneath it.
@@ -956,6 +995,53 @@ mod tests {
             rendered.contains("History") && rendered.contains("created"),
             "history should fold into the Detail popup: {rendered}"
         );
+    }
+
+    /// The cockpit key line only advertises the score/history toggles and the
+    /// dispatch keys while a task is selected — with an empty queue there is
+    /// nothing for them to act on, so they drop out.
+    #[test]
+    fn cockpit_key_line_drops_score_and_history_without_a_selection() {
+        use crate::app::App;
+        use voro_core::{NewTask, Store};
+
+        let ctx = || {
+            crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new("/nonexistent/voro.db"))
+        };
+
+        let empty = App::new(Store::open_in_memory().unwrap(), ctx()).unwrap();
+        assert_eq!(empty.screen, Screen::Cockpit);
+        assert!(empty.selected_task_id().is_none());
+        let labels: Vec<&str> = key_hints(&empty).iter().map(|(_, l)| *l).collect();
+        for dropped in ["score", "history", "dispatch", "agent"] {
+            assert!(
+                !labels.contains(&dropped),
+                "empty cockpit should not advertise {dropped}: {labels:?}"
+            );
+        }
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store.set_weight(p.id, 3).unwrap();
+        store
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "a task".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+        let selected = App::new(store, ctx()).unwrap();
+        assert!(selected.selected_task_id().is_some());
+        let labels: Vec<&str> = key_hints(&selected).iter().map(|(_, l)| *l).collect();
+        for shown in ["score", "history", "dispatch", "agent"] {
+            assert!(
+                labels.contains(&shown),
+                "cockpit with a selection should advertise {shown}: {labels:?}"
+            );
+        }
     }
 
     #[test]
