@@ -58,16 +58,20 @@ pub const STARTER_CONFIG: &str = "\
 #   continue  continue a session headless with new input; takes `{session}`
 #             and `{prompt_file}` (the new input, e.g. an answer).
 #
-# A dispatched session runs unattended, so most agents need a non-interactive
-# permission flag. With `attach` configured you can jump into a live session
-# from the TUI (the a key) and answer permission prompts yourself. See
-# docs/agent-integration.md for the codex equivalents and a tmux recipe for
-# agents with no session layer of their own.
+# A dispatched session runs unattended, so the default drives Claude in
+# `bypassPermissions` mode: it never stops to ask, which is what lets a queue
+# of tasks run start to finish without a human — `acceptEdits` still prompts
+# for every bash command (a cargo build, a git commit) and blocks the session.
+# Dispatch already guards a clean tree, and the work lands as a reviewable
+# diff. To vet each command instead, switch to `--permission-mode acceptEdits`
+# and use `attach` (the a key) to jump into a live session and answer its
+# prompts. See docs/agent-integration.md for the codex equivalents and a tmux
+# recipe for agents with no session layer of their own.
 
 default = \"claude\"
 
 [agents.claude]
-dispatch = \"claude --bg --permission-mode acceptEdits \\\"$(cat {prompt_file})\\\"\"
+dispatch = \"claude --bg --permission-mode bypassPermissions \\\"$(cat {prompt_file})\\\"\"
 sessions = \"claude agents --json\"
 attach   = \"claude attach {session}\"
 resume   = \"claude --resume {session}\"
