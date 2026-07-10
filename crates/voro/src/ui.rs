@@ -17,6 +17,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
         Screen::Cockpit => draw_cockpit(frame, app),
         Screen::Tasks => draw_tasks(frame, app),
+        Screen::Projects => draw_projects(frame, app),
     }
     draw_mode(frame, app);
 }
@@ -24,24 +25,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
 fn draw_mode(frame: &mut Frame, app: &App) {
     match &app.mode {
         Mode::Normal => {}
-        Mode::Weights { sel } => {
-            let items: Vec<ListItem> = app
-                .projects
-                .iter()
-                .map(|p| ListItem::new(format!("{}  {}", p.weight, p.name)))
-                .collect();
-            let height = items.len() as u16 + 2;
-            let area = popup_area(frame, 44, height.max(3));
-            let mut state = ListState::default().with_selected(Some(*sel));
-            let list = List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Weights — 0-5 weight, r rename/path, d delete, esc to close"),
-                )
-                .highlight_style(SELECTED);
-            frame.render_stateful_widget(list, area, &mut state);
-        }
         Mode::AddProject {
             name,
             path,
@@ -604,18 +587,72 @@ fn blocker_spans(row: &TaskRow) -> Vec<Span<'static>> {
     spans
 }
 
+/// The projects screen (DESIGN.md §9): one row per project — weight, name,
+/// path, open task count. Direct weight editing lives here (`0`–`5`), so the
+/// morning ritual is one keystroke per project. The open count is the
+/// project's non-terminal tasks, drawn from the already-loaded task list.
+fn draw_projects(frame: &mut Frame, app: &App) {
+    let [list_area, status] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+
+    let items: Vec<ListItem> = app
+        .projects
+        .iter()
+        .map(|p| {
+            let open = app
+                .all
+                .iter()
+                .filter(|r| r.task.project_id == p.id && !r.task.state.is_terminal())
+                .count();
+            let style = if p.weight == 0 {
+                Style::new().dim()
+            } else {
+                Style::new()
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!("{:>2}  {:14} {:28} {} open", p.weight, p.name, p.path, open),
+                style,
+            )))
+        })
+        .collect();
+    let empty = items.is_empty();
+    let mut state =
+        ListState::default().with_selected(if empty { None } else { Some(app.projects_sel) });
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Projects"))
+        .highlight_style(SELECTED);
+    frame.render_stateful_widget(list, list_area, &mut state);
+    if empty {
+        let inner = list_area.inner(ratatui::layout::Margin::new(1, 1));
+        frame.render_widget(
+            Paragraph::new("no projects yet — press a to add one").dim(),
+            inner,
+        );
+    }
+    draw_status(frame, app, status);
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let line = match &app.status {
         Some(msg) => Line::from(Span::styled(msg.clone(), Style::new().fg(Color::Red))),
         None => {
-            let mut hints = String::from("q quit · tab screen · j/k move");
-            if let Some(enter) = app.enter_hint() {
-                hints.push_str(" · ");
-                hints.push_str(enter);
-            }
-            hints.push_str(
-                " · n new · e edit · s state · d dispatch · D agent · o open · g pr · x score · h history · w weights · P project",
-            );
+            let hints = match app.screen {
+                Screen::Projects => {
+                    "q quit · tab screen · j/k move · 0-5 weight · r rename · a add · d delete"
+                        .to_string()
+                }
+                Screen::Cockpit | Screen::Tasks => {
+                    let mut hints = String::from("q quit · tab screen · j/k move");
+                    if let Some(enter) = app.enter_hint() {
+                        hints.push_str(" · ");
+                        hints.push_str(enter);
+                    }
+                    hints.push_str(
+                        " · n new · e edit · s state · d dispatch · D agent · o open · g pr · x score · h history",
+                    );
+                    hints
+                }
+            };
             Line::from(Span::styled(hints, Style::new().dim()))
         }
     };
@@ -739,6 +776,67 @@ mod tests {
             rendered.contains(&format!("blocked by #{}, #{}", open.id, closed.id)),
             "browser did not annotate the parked row with its blockers: {rendered}"
         );
+    }
+
+    /// End-to-end: the projects screen renders one row per project showing its
+    /// weight, name, path, and the count of its non-terminal tasks.
+    #[test]
+    fn projects_screen_renders_weight_name_path_and_open_count() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store.set_weight(p.id, 3).unwrap();
+        // one open task and one terminal task — only the open one is counted
+        let new = |title: &str, state: TaskState| NewTask {
+            project_id: p.id,
+            title: title.into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state,
+            agent: None,
+        };
+        store.create_task(new("open", TaskState::Ready)).unwrap();
+        let closed = store.create_task(new("closed", TaskState::Ready)).unwrap();
+        store
+            .apply(closed.id, voro_core::Action::Start)
+            .and_then(|_| store.apply(closed.id, voro_core::Action::Complete))
+            .and_then(|_| store.apply(closed.id, voro_core::Action::Accept))
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+        key_to_projects(&mut app);
+        assert_eq!(app.screen, Screen::Projects);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("3") && rendered.contains("voro") && rendered.contains("/tmp/voro"),
+            "projects row missing weight/name/path: {rendered}"
+        );
+        assert!(
+            rendered.contains("1 open"),
+            "projects row should count only the open task: {rendered}"
+        );
+    }
+
+    /// Drive the app onto the projects screen with the real key handler.
+    fn key_to_projects(app: &mut crate::app::App) {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        app.on_key(KeyEvent::from(KeyCode::Char('3')));
     }
 
     #[test]
