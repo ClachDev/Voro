@@ -1,7 +1,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use voro_core::{
-    Action, AgentsConfig, Blocker, Candidate, Event, Project, RunningRow, ScoreBreakdown, Store,
-    Task, TaskState, Triage, scheduler,
+    Action, AgentsConfig, Blocker, Candidate, Event, PrRef, Project, RunningRow, ScoreBreakdown,
+    Store, Task, TaskState, Triage, scheduler,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +75,14 @@ pub enum Mode {
     Prompt {
         task_id: i64,
         kind: PromptKind,
+        buffer: String,
+    },
+    /// Collecting a GitHub PR reference to track on a task (DESIGN.md §11c),
+    /// reached by pressing the jump-to-PR key on a task that has none. Unlike
+    /// `Prompt`, this feeds a store mutation (`set_pr`), not a state
+    /// transition, so it carries no `PromptKind`.
+    LinkPr {
+        task_id: i64,
         buffer: String,
     },
     Score {
@@ -449,6 +457,7 @@ impl App {
                 kind,
                 buffer,
             } => self.key_prompt(key, task_id, kind, buffer),
+            Mode::LinkPr { task_id, buffer } => self.key_link_pr(key, task_id, buffer),
             Mode::Score { .. } => {} // any key closes
             Mode::Detail { task_id, scroll } => self.key_detail(key, task_id, scroll),
             Mode::History {
@@ -731,18 +740,69 @@ impl App {
     }
 
     /// Jump to the selected task's tracked GitHub PR in a browser (DESIGN.md
-    /// §11c). A task with no PR reports through the status line — the same
-    /// "no-op with an explanation" style as the dispatch and open keys —
-    /// rather than doing nothing. Opening the PR never touches the store, so
-    /// no refresh follows.
+    /// §11c), or, when the task has none yet, open a prompt to link one rather
+    /// than pointing at a CLI command. Opening an existing PR never touches the
+    /// store, so no refresh follows; linking one goes through `key_link_pr`.
     fn open_selected_pr(&mut self) {
         let Some(id) = self.selected_task_id() else {
             return;
         };
+        let has_pr = self.store.task(id).ok().and_then(|t| t.pr_url).is_some();
+        if !has_pr {
+            self.mode = Mode::LinkPr {
+                task_id: id,
+                buffer: String::new(),
+            };
+            return;
+        }
         match crate::pr::open(&self.store, id) {
             Ok(summary) => self.status = Some(summary),
             Err(e) => self.status = Some(e),
         }
+    }
+
+    /// Drive the link-a-PR prompt (DESIGN.md §11c). Enter validates and stores
+    /// the reference; esc cancels. The buffer is one line — a PR URL or the
+    /// `owner/repo#n` shorthand — so this stays a simple line editor.
+    fn key_link_pr(&mut self, key: KeyEvent, task_id: i64, mut buffer: String) {
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Enter => {
+                self.link_pr(task_id, &buffer);
+                return;
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Char(c) => buffer.push(c),
+            _ => {}
+        }
+        self.mode = Mode::LinkPr { task_id, buffer };
+    }
+
+    /// Validate and track a PR reference on a task, then refresh so the new
+    /// link shows immediately. An unparseable reference keeps the prompt open
+    /// with the typed text intact and the parse error on the status line, so
+    /// the human can fix a typo without retyping the whole URL.
+    fn link_pr(&mut self, task_id: i64, raw: &str) {
+        let pr = match PrRef::parse(raw) {
+            Ok(pr) => pr,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                self.mode = Mode::LinkPr {
+                    task_id,
+                    buffer: raw.to_string(),
+                };
+                return;
+            }
+        };
+        if let Err(e) = self.store.set_pr(task_id, Some(&pr.url)) {
+            self.status = Some(e.to_string());
+            return;
+        }
+        self.status = Some(format!("linked {}", pr.url));
+        let result = self.refresh();
+        self.report(result);
     }
 
     /// The initial text of a transition prompt. A `RejectWork` prompt on a task
@@ -1992,21 +2052,66 @@ mod tests {
 
     // --- PR tracking (task, DESIGN.md §11c) ---
 
-    /// `g` on a task with no tracked PR reports through the status line rather
-    /// than shelling out to `gh` — a network-free no-op-with-explanation.
+    /// `g` on a task with no tracked PR opens the link-a-PR prompt rather than
+    /// shelling out to `gh` — a network-free path to set one from the TUI.
     #[test]
-    fn jump_to_pr_key_on_a_task_without_a_pr_reports() {
+    fn jump_to_pr_key_on_a_task_without_a_pr_opens_the_link_prompt() {
         let mut app = app_with(&[TaskState::Ready]);
+        let task_id = app.selected_task_id().unwrap();
         key(&mut app, KeyCode::Char('g'));
+        match app.mode {
+            Mode::LinkPr {
+                task_id: id,
+                ref buffer,
+            } => {
+                assert_eq!(id, task_id);
+                assert!(buffer.is_empty(), "buffer was {buffer:?}");
+            }
+            _ => panic!("expected the link-PR prompt, got {:?}", app.status),
+        }
+    }
+
+    /// Typing a reference and submitting tracks it (canonicalised) on the task
+    /// and closes the prompt, so the link shows without touching the CLI.
+    #[test]
+    fn link_pr_prompt_stores_a_valid_reference() {
+        let mut app = app_with(&[TaskState::Ready]);
+        let task_id = app.selected_task_id().unwrap();
+        key(&mut app, KeyCode::Char('g'));
+        for c in "acme/widget#7".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
         assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.store.task(task_id).unwrap().pr_url.as_deref(),
+            Some("https://github.com/acme/widget/pull/7")
+        );
         assert!(
-            app.status
-                .as_deref()
-                .unwrap_or("")
-                .contains("no tracked PR"),
+            app.status.as_deref().unwrap_or("").contains("linked"),
             "{:?}",
             app.status
         );
+    }
+
+    /// An unparseable reference keeps the prompt open with the typed text
+    /// intact and the parse error on the status line, so a typo is fixable
+    /// without retyping.
+    #[test]
+    fn link_pr_prompt_keeps_prompt_open_on_an_invalid_reference() {
+        let mut app = app_with(&[TaskState::Ready]);
+        let task_id = app.selected_task_id().unwrap();
+        key(&mut app, KeyCode::Char('g'));
+        for c in "not-a-pr".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+        match app.mode {
+            Mode::LinkPr { ref buffer, .. } => assert_eq!(buffer, "not-a-pr"),
+            _ => panic!("expected the prompt to stay open"),
+        }
+        assert!(app.status.is_some());
+        assert!(app.store.task(task_id).unwrap().pr_url.is_none());
     }
 
     /// Rejecting a review task with no tracked PR opens the ordinary feedback
