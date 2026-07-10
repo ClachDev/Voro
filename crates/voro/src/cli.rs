@@ -74,8 +74,11 @@ dispatch
   open <task-id>                  open a review/running task's checkout in the
                                   configured [viewer] (agents.toml) to see its
                                   diff — reports what to configure if none is set
-  pr <task-id>                    open the task's tracked GitHub PR in a browser
-                                  (jump-to-PR); set one with `set --pr`
+  pr <task-id> [--yes]            with a tracked PR, open it in a browser
+                                  (jump-to-PR); with none, push the review
+                                  task's branch and open a ready PR from its
+                                  summary, recording the URL (--yes skips the
+                                  confirm). Track an existing one with `set --pr`
 
 transitions
   triage <task-id> <parked|ready|reject>
@@ -86,11 +89,13 @@ transitions
                                   been dispatched, also starts a continuation
                                   session with the answer in the prompt body
                                   (--no-dispatch skips that)
-  done <task-id> [--summary TEXT] [--branch NAME]
-                                  running → review; --summary is the agent's
-                                  completion note, kept as a summary event;
-                                  --branch records the git branch the work
-                                  landed on (agent return path)
+  done <task-id> [--summary TEXT | --summary-file PATH] [--branch NAME]
+                                  running → review; the summary is the agent's
+                                  completion note (kept as a summary event, and
+                                  the PR body `pr` opens from) — write it as a
+                                  PR description; --branch records the git branch
+                                  the work landed on (agent return path). Warns
+                                  but succeeds when branch or summary is absent
   accept <task-id>                review → done
   reject <task-id> [TEXT] [--from-pr]
                                   review → running; TEXT is the feedback, or
@@ -126,7 +131,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         "dispatch" => dispatch_verb(store, &pos, &flags, ctx),
         "continue" => continue_verb(store, &pos, &flags, ctx),
         "open" => open_verb(store, &pos, ctx),
-        "pr" => pr_verb(store, &pos),
+        "pr" => pr_verb(store, &pos, &flags),
         "reject" => reject_verb(store, &pos, &flags, ctx),
         "done" => done_verb(store, &pos, &flags),
         "answer" => answer_verb(store, &pos, &flags, ctx),
@@ -158,6 +163,9 @@ fn split_args(args: Vec<String>) -> Result<(Vec<String>, HashMap<String, String>
             }
             Some("from-pr") => {
                 flags.insert("from-pr".to_string(), String::new());
+            }
+            Some("yes") => {
+                flags.insert("yes".to_string(), String::new());
             }
             Some("help") => pos.insert(0, "help".to_string()),
             Some(key) => {
@@ -216,6 +224,21 @@ fn parse_blocks(raw: &str) -> Result<Vec<i64>, String> {
 fn body_from(flags: &HashMap<String, String>) -> Result<Option<String>, String> {
     match (flags.get("body"), flags.get("body-file")) {
         (Some(_), Some(_)) => Err("--body and --body-file are mutually exclusive".into()),
+        (Some(text), None) => Ok(Some(text.clone())),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .map(Some)
+            .map_err(|e| format!("cannot read {path}: {e}")),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The agent's completion summary from `--summary TEXT` or `--summary-file
+/// PATH` (DESIGN.md §8), mutually exclusive — the latter lets an agent leave a
+/// PR-ready description without cramming it onto one command line. `None` when
+/// neither is given, which stays valid: not every task produces one.
+fn summary_from(flags: &HashMap<String, String>) -> Result<Option<String>, String> {
+    match (flags.get("summary"), flags.get("summary-file")) {
+        (Some(_), Some(_)) => Err("--summary and --summary-file are mutually exclusive".into()),
         (Some(text), None) => Ok(Some(text.clone())),
         (None, Some(path)) => std::fs::read_to_string(path)
             .map(Some)
@@ -486,12 +509,50 @@ fn set_verb(
     Ok(format!("task {} updated ({})", task.id, task.state))
 }
 
-/// `pr <task-id>` (DESIGN.md §11c): open the task's tracked GitHub PR in a
-/// browser — the jump-to-PR that lands on the diff and its comments. The `gh`
-/// shell-out lives in the `pr` module beside the other process work.
-fn pr_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
+/// `pr <task-id> [--yes]` (DESIGN.md §8/§11c): with a tracked PR, open it in a
+/// browser — the jump-to-PR that lands on the diff and its comments. Without
+/// one, *create* it from the review task's done-time state: assert it is
+/// PR-ready (naming any missing state, branch, or summary), confirm with the
+/// operator unless `--yes`, then push the branch and open a non-draft PR whose
+/// body is the completion summary, recording its URL. The `git`/`gh` shell-outs
+/// live in the `pr` module beside the other process work.
+fn pr_verb(
+    store: &mut Store,
+    pos: &[String],
+    flags: &HashMap<String, String>,
+) -> Result<String, String> {
     let id = task_id(pos, 1)?;
-    crate::pr::open(store, id)
+    let task = store.task(id).map_err(|e| e.to_string())?;
+    if task.pr_url.is_some() {
+        return crate::pr::open(store, id);
+    }
+    // Assert PR-ready and learn the branch before prompting, so a task missing
+    // state, branch, or summary fails naming the gap rather than at the prompt.
+    let plan = crate::pr::plan(store, id)?;
+    if !flags.contains_key("yes")
+        && !confirm(&format!("push `{}` and open a PR for #{id}?", plan.branch))?
+    {
+        return Ok(format!("cancelled — no PR opened for #{id}"));
+    }
+    crate::pr::create(store, id)
+}
+
+/// Ask a yes/no question on the terminal, defaulting to no (DESIGN.md §8): the
+/// interactive gate before `pr` pushes a branch and opens a PR. Mirrors the
+/// TUI's confirmation modal; `--yes` skips it. A non-interactive stdin (a pipe
+/// at EOF) reads as "no", so a scripted run without `--yes` declines rather
+/// than blocking.
+fn confirm(question: &str) -> Result<bool, String> {
+    use std::io::Write as _;
+    print!("{question} [y/N] ");
+    std::io::stdout()
+        .flush()
+        .map_err(|e| format!("cannot write to stdout: {e}"))?;
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("cannot read confirmation: {e}"))?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes"))
 }
 
 /// `reject <task-id> [TEXT] [--from-pr] [--no-dispatch]` (DESIGN.md §6/§8/§11c):
@@ -539,22 +600,28 @@ fn reject_verb(
     }
 }
 
-/// `done <task-id> [--summary TEXT] [--branch NAME]` (DESIGN.md §6/§8): running
-/// → review. `--summary` is the agent's completion note, kept as a summary
-/// event by the transition. `--branch` is the belt-and-braces half of task
-/// #81's branch tracking — the branch the agent reports its work landed on,
-/// recorded on the task (overwriting any intended name dispatch injected) so
-/// the task correlates with its branch and PR. The completion transition is
-/// applied first, so a task that is not `running` is refused before any branch
-/// is recorded. Voro never runs git; it only stores the reported name.
+/// `done <task-id> [--summary TEXT | --summary-file PATH] [--branch NAME]`
+/// (DESIGN.md §6/§8): running → review. The summary is the agent's completion
+/// note, kept as a summary event by the transition and read back as the PR body
+/// when `pr` opens a pull request — so it should read as a PR description
+/// (`--summary-file` lets the agent write a multi-line one without cramming a
+/// command line). `--branch` is the branch the agent reports its work landed on
+/// (task #81), recorded on the task (overwriting any intended name dispatch
+/// injected) so the task correlates with its branch and PR. The completion
+/// transition is applied first, so a task that is not `running` is refused
+/// before any branch is recorded. Voro never runs git; it only stores the
+/// reported name. A `done` that leaves the task without a branch or summary
+/// *warns* rather than failing — planning and task-generation work produces
+/// neither — so both stay optional through the whole lifecycle.
 fn done_verb(
     store: &mut Store,
     pos: &[String],
     flags: &HashMap<String, String>,
 ) -> Result<String, String> {
     let id = task_id(pos, 1)?;
+    let summary = summary_from(flags)?;
     let task = store
-        .apply(id, Action::Complete(flags.get("summary").cloned()))
+        .apply(id, Action::Complete(summary))
         .map_err(|e| e.to_string())?;
     let mut out = format!("task {} -> {}", task.id, task.state);
     if let Some(name) = flags.get("branch") {
@@ -562,6 +629,25 @@ fn done_verb(
             .set_branch(id, Some(name.trim()))
             .map_err(|e| e.to_string())?;
         write!(out, " (branch {})", name.trim()).unwrap();
+    }
+    // A PR needs both a branch and a summary; warn (never fail) about whichever
+    // is absent so the operator knows `pr` will not yet open one.
+    let has_branch = store.task(id).map_err(|e| e.to_string())?.branch.is_some();
+    let has_summary = store
+        .latest_summary(id)
+        .map_err(|e| e.to_string())?
+        .is_some();
+    let missing: Vec<&str> = [("branch", has_branch), ("summary", has_summary)]
+        .into_iter()
+        .filter_map(|(what, present)| (!present).then_some(what))
+        .collect();
+    if !missing.is_empty() {
+        write!(
+            out,
+            "\nnote: no {} recorded — `voro pr {id}` needs a branch and summary to open a PR",
+            missing.join(" or ")
+        )
+        .unwrap();
     }
     Ok(out)
 }
@@ -1330,6 +1416,142 @@ mod tests {
         assert!(out.contains("pr <task-id>"), "{out}");
         assert!(out.contains("--pr URL"), "{out}");
         assert!(out.contains("--from-pr"), "{out}");
+    }
+
+    // --- pr create from a review task's summary (DESIGN.md §8) ---
+
+    /// Walk a fresh ready task into `review` with the given branch/summary set,
+    /// through the transition machine and the branch/summary write paths.
+    fn review_task(s: &mut Store, branch: Option<&str>, summary: Option<&str>) -> i64 {
+        ok(s, &["add", "demo", "Do the thing", "--state", "ready"]);
+        let id = s.tasks().unwrap().last().unwrap().id;
+        if let Some(b) = branch {
+            ok(s, &["set", &id.to_string(), "--branch", b]);
+        }
+        ok(s, &["start", &id.to_string()]);
+        let mut done = vec!["done".to_string(), id.to_string()];
+        if let Some(text) = summary {
+            done.push("--summary".into());
+            done.push(text.into());
+        }
+        ok(s, &done.iter().map(String::as_str).collect::<Vec<_>>());
+        id
+    }
+
+    /// `pr` on a task that is not in `review` fails naming the state gap, before
+    /// touching git or `gh` — the validation runs first.
+    #[test]
+    fn pr_create_requires_the_review_state() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        let e = err(&mut s, &["pr", "1", "--yes"]);
+        assert!(e.contains("review"), "{e}");
+    }
+
+    /// `pr` on a review task with no branch fails naming the branch gap.
+    #[test]
+    fn pr_create_requires_a_branch() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        let id = review_task(&mut s, None, Some("did it"));
+        let e = err(&mut s, &["pr", &id.to_string(), "--yes"]);
+        assert!(e.contains("branch"), "{e}");
+    }
+
+    /// `pr` on a review task with a branch but no summary fails naming the
+    /// summary gap.
+    #[test]
+    fn pr_create_requires_a_summary() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        let id = review_task(&mut s, Some("feat/thing"), None);
+        let e = err(&mut s, &["pr", &id.to_string(), "--yes"]);
+        assert!(e.contains("summary"), "{e}");
+    }
+
+    #[test]
+    fn help_documents_pr_create_and_summary_file() {
+        let mut s = store();
+        let out = ok(&mut s, &["help"]);
+        assert!(out.contains("pr <task-id> [--yes]"), "{out}");
+        assert!(out.contains("--summary-file"), "{out}");
+    }
+
+    // --- done summary-file and PR-readiness warnings (DESIGN.md §8) ---
+
+    #[test]
+    fn done_summary_file_records_the_summary() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        let path = std::env::temp_dir().join(format!("voro-summary-{}.md", std::process::id()));
+        std::fs::write(&path, "## What\nDid the thing\n").unwrap();
+
+        let out = ok(
+            &mut s,
+            &["done", "1", "--summary-file", path.to_str().unwrap()],
+        );
+        assert!(out.contains("-> review"), "{out}");
+        assert!(ok(&mut s, &["show", "1"]).contains("Did the thing"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn done_summary_and_summary_file_are_mutually_exclusive() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        let e = err(
+            &mut s,
+            &["done", "1", "--summary", "x", "--summary-file", "/tmp/nope"],
+        );
+        assert!(e.contains("mutually exclusive"), "{e}");
+    }
+
+    #[test]
+    fn done_warns_when_branch_and_summary_are_missing() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        // neither recorded: warns but succeeds
+        let out = ok(&mut s, &["done", "1"]);
+        assert!(out.contains("-> review"), "{out}");
+        assert!(out.contains("note:"), "{out}");
+        assert!(out.contains("branch or summary"), "{out}");
+    }
+
+    #[test]
+    fn done_warns_only_about_the_missing_half() {
+        // summary given, no branch: the note names branch only
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        let out = ok(&mut s, &["done", "1", "--summary", "did it"]);
+        assert!(out.contains("note: no branch recorded"), "{out}");
+
+        // branch given, no summary: the note names summary only
+        ok(&mut s, &["add", "demo", "T2", "--state", "ready"]);
+        ok(&mut s, &["set", "2", "--branch", "feat/x"]);
+        ok(&mut s, &["start", "2"]);
+        let out = ok(&mut s, &["done", "2"]);
+        assert!(out.contains("note: no summary recorded"), "{out}");
+    }
+
+    #[test]
+    fn done_with_branch_and_summary_does_not_warn() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["set", "1", "--branch", "feat/x"]);
+        ok(&mut s, &["start", "1"]);
+        let out = ok(&mut s, &["done", "1", "--summary", "did it"]);
+        assert!(out.contains("-> review"), "{out}");
+        assert!(!out.contains("note:"), "{out}");
     }
 
     #[test]

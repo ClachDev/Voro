@@ -532,6 +532,25 @@ impl Store {
 
     // --- events ---
 
+    /// The most recent completion summary a task recorded (DESIGN.md §8): the
+    /// detail of its newest `summary` event, logged by `done --summary`. This
+    /// is the PR body when `pr` opens a pull request, and the presence check
+    /// `done` warns on. `None` when the task has never carried a summary — a
+    /// planning or task-generation task that produced no code, which is why the
+    /// summary stays optional through the whole lifecycle.
+    pub fn latest_summary(&self, task_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT detail FROM events WHERE task_id = ?1 AND kind = 'summary'
+                 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub fn events_for(&self, task_id: i64) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, task_id, at, kind, detail FROM events WHERE task_id = ?1 ORDER BY id",
@@ -1086,6 +1105,43 @@ mod tests {
         );
         // ids strictly increase with insertion order
         assert!(events.windows(2).all(|w| w[0].id < w[1].id));
+    }
+
+    #[test]
+    fn latest_summary_returns_the_newest_summary_event() {
+        use crate::transition::Action;
+
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let t = s
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "summary me".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+        // no summary yet
+        assert_eq!(s.latest_summary(t.id).unwrap(), None);
+
+        s.apply(t.id, Action::Start).unwrap();
+        s.apply(t.id, Action::Complete(Some("first pass".into())))
+            .unwrap();
+        assert_eq!(
+            s.latest_summary(t.id).unwrap().as_deref(),
+            Some("first pass")
+        );
+
+        // a reject-then-redo records a second summary; the newest wins
+        s.apply(t.id, Action::RejectWork("redo".into())).unwrap();
+        s.apply(t.id, Action::Complete(Some("second pass".into())))
+            .unwrap();
+        assert_eq!(
+            s.latest_summary(t.id).unwrap().as_deref(),
+            Some("second pass")
+        );
     }
 
     #[test]

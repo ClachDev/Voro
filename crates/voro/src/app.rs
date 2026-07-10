@@ -85,6 +85,16 @@ pub enum Mode {
         task_id: i64,
         buffer: String,
     },
+    /// Confirming that `pr` should push a review task's branch and open a ready
+    /// PR (DESIGN.md §8), reached by the PR key on a review task that has none.
+    /// The modal states exactly what is about to happen; confirming runs the
+    /// same `crate::pr::create` core routine the CLI calls. A tracked PR skips
+    /// this and jumps to the PR instead.
+    ConfirmPr {
+        task_id: i64,
+        branch: String,
+        title: String,
+    },
     Detail {
         task_id: i64,
         scroll: u16,
@@ -469,6 +479,11 @@ impl App {
                 buffer,
             } => self.key_prompt(key, task_id, kind, buffer),
             Mode::LinkPr { task_id, buffer } => self.key_link_pr(key, task_id, buffer),
+            Mode::ConfirmPr {
+                task_id,
+                branch,
+                title,
+            } => self.key_confirm_pr(key, task_id, branch, title),
             Mode::Detail { task_id, scroll } => self.key_detail(key, task_id, scroll),
             Mode::AgentPicker {
                 task_id,
@@ -738,25 +753,68 @@ impl App {
         }
     }
 
-    /// Jump to the selected task's tracked GitHub PR in a browser (DESIGN.md
-    /// §11c), or, when the task has none yet, open a prompt to link one rather
-    /// than pointing at a CLI command. Opening an existing PR never touches the
-    /// store, so no refresh follows; linking one goes through `key_link_pr`.
+    /// The PR key. With a tracked PR: jump to it in a browser (DESIGN.md §11c),
+    /// which never touches the store, so no refresh follows. With none: on a
+    /// `review` task, open the confirmation modal to *create* one from its
+    /// done-time summary (DESIGN.md §8) — or, if it is not yet PR-ready, report
+    /// the missing branch/summary on the status line; on any other state, fall
+    /// back to the link-an-existing-PR prompt (the TUI face of `set --pr`).
     fn open_selected_pr(&mut self) {
-        let Some(id) = self.selected_task_id() else {
+        let Some(task) = self.selected_task() else {
             return;
         };
-        let has_pr = self.store.task(id).ok().and_then(|t| t.pr_url).is_some();
-        if !has_pr {
+        let (id, state) = (task.id, task.state);
+        let has_pr = task.pr_url.is_some();
+        if has_pr {
+            match crate::pr::open(&self.store, id) {
+                Ok(summary) => self.status = Some(summary),
+                Err(e) => self.status = Some(e),
+            }
+            return;
+        }
+        if state != TaskState::Review {
             self.mode = Mode::LinkPr {
                 task_id: id,
                 buffer: String::new(),
             };
             return;
         }
-        match crate::pr::open(&self.store, id) {
-            Ok(summary) => self.status = Some(summary),
+        match crate::pr::plan(&self.store, id) {
+            Ok(plan) => {
+                self.mode = Mode::ConfirmPr {
+                    task_id: id,
+                    branch: plan.branch,
+                    title: plan.title,
+                }
+            }
             Err(e) => self.status = Some(e),
+        }
+    }
+
+    /// Drive the create-PR confirmation modal (DESIGN.md §8). Enter (or `y`)
+    /// runs the same `crate::pr::create` routine the CLI's `pr` calls — push
+    /// the branch, open a ready PR, record the URL — then refreshes so the row
+    /// flips to "PR open"; esc (or `n`) cancels without touching anything.
+    fn key_confirm_pr(&mut self, key: KeyEvent, task_id: i64, branch: String, title: String) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                match crate::pr::create(&mut self.store, task_id) {
+                    Ok(summary) => self.status = Some(summary),
+                    Err(e) => self.status = Some(e),
+                }
+                let result = self.refresh();
+                self.report(result);
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.status = Some(format!("cancelled — no PR opened for #{task_id}"));
+            }
+            _ => {
+                self.mode = Mode::ConfirmPr {
+                    task_id,
+                    branch,
+                    title,
+                };
+            }
         }
     }
 

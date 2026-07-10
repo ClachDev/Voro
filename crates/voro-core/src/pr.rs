@@ -7,6 +7,7 @@
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+use crate::model::{Task, TaskState};
 
 /// A parsed reference to a GitHub pull request. The base repo is recorded
 /// explicitly (`owner`/`repo`/`host`) rather than inferred from a checkout's
@@ -200,6 +201,60 @@ pub fn format_review_feedback(
     Ok(body)
 }
 
+/// Everything the forge needs to open a PR for a review task (DESIGN.md §8):
+/// the branch to push and the title and body of the pull request. Assembled by
+/// [`plan_pr`] once the task is proven PR-ready, so the process-facing create
+/// routine in the `voro` crate never has to re-derive or re-validate it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrPlan {
+    pub branch: String,
+    pub title: String,
+    pub body: String,
+}
+
+/// Validate that a task can have a PR opened from its done-time state, and if
+/// so assemble the [`PrPlan`] (DESIGN.md §8). A PR is created from a `review`
+/// task that carries both a branch (the work to push) and a completion summary
+/// (the PR body, kept as a `summary` event — the caller supplies the latest).
+/// Each gap fails naming exactly what is missing — state, branch, or summary —
+/// so `pr` can tell the operator what to fix. Pure of I/O, so the forge seam in
+/// the `voro` crate is the only part that touches git or `gh`.
+pub fn plan_pr(task: &Task, latest_summary: Option<&str>) -> Result<PrPlan> {
+    if task.state != TaskState::Review {
+        return Err(Error::Invalid(format!(
+            "only a review task can have a PR opened from its summary; task {} is {}",
+            task.id, task.state
+        )));
+    }
+    let branch = task
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| {
+            Error::Invalid(format!(
+                "task {} has no branch to push — record one with `voro done --branch` or \
+                 `voro set --branch`",
+                task.id
+            ))
+        })?;
+    let body = latest_summary
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::Invalid(format!(
+                "task {} has no completion summary for the PR body — record one with \
+                 `voro done --summary`",
+                task.id
+            ))
+        })?;
+    Ok(PrPlan {
+        branch: branch.to_string(),
+        title: task.title.clone(),
+        body: body.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +353,79 @@ mod tests {
     fn rejects_malformed_json() {
         assert!(format_review_feedback(&pr(), "not json", "[]").is_err());
         assert!(format_review_feedback(&pr(), "[]", "not json").is_err());
+    }
+
+    // --- plan_pr (DESIGN.md §8: opening a PR from a review task's summary) ---
+
+    use crate::model::Priority;
+
+    fn task(state: TaskState, branch: Option<&str>) -> Task {
+        Task {
+            id: 82,
+            project_id: 1,
+            title: "Extend pr to create the PR".into(),
+            body: String::new(),
+            priority: Priority::P1,
+            state,
+            agent: None,
+            question: None,
+            pr_url: None,
+            branch: branch.map(str::to_string),
+            state_since: "2026-07-10 00:00:00".into(),
+            created_at: "2026-07-10 00:00:00".into(),
+            closed_at: None,
+        }
+    }
+
+    #[test]
+    fn plans_a_pr_from_a_review_task_with_branch_and_summary() {
+        let plan = plan_pr(
+            &task(TaskState::Review, Some("feat/pr")),
+            Some("Did the thing"),
+        )
+        .unwrap();
+        assert_eq!(plan.branch, "feat/pr");
+        assert_eq!(plan.title, "Extend pr to create the PR");
+        assert_eq!(plan.body, "Did the thing");
+    }
+
+    #[test]
+    fn plan_requires_the_review_state() {
+        for state in [
+            TaskState::Ready,
+            TaskState::Running,
+            TaskState::NeedsInput,
+            TaskState::Done,
+        ] {
+            let err = plan_pr(&task(state, Some("feat/pr")), Some("summary"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("review"), "{state}: {err}");
+        }
+    }
+
+    #[test]
+    fn plan_names_a_missing_branch() {
+        let err = plan_pr(&task(TaskState::Review, None), Some("summary"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("branch"), "{err}");
+        // a blank branch is treated as absent
+        let err = plan_pr(&task(TaskState::Review, Some("   ")), Some("summary"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("branch"), "{err}");
+    }
+
+    #[test]
+    fn plan_names_a_missing_summary() {
+        let err = plan_pr(&task(TaskState::Review, Some("feat/pr")), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("summary"), "{err}");
+        let err = plan_pr(&task(TaskState::Review, Some("feat/pr")), Some("  "))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("summary"), "{err}");
     }
 }
