@@ -20,6 +20,13 @@ use crate::error::{Error, Result};
 /// working directory is handled by the spawner, not the template.
 pub const PROMPT_FILE_PLACEHOLDER: &str = "{prompt_file}";
 
+/// The task-id substitution in the `dispatch` template: the numeric id of the
+/// task being dispatched. Unlike [`PROMPT_FILE_PLACEHOLDER`] it is optional —
+/// a template that omits it dispatches unchanged — so agents with a
+/// session-naming flag can tie the session back to its task (e.g.
+/// `--name "voro-{task_id}"`) while agents without one need no change.
+pub const TASK_ID_PLACEHOLDER: &str = "{task_id}";
+
 /// The session-reference substitution in `attach`, `resume`, and `continue`
 /// templates: the agent-opaque reference captured at dispatch (a Claude
 /// session UUID, a Codex session id, a tmux session name).
@@ -43,7 +50,9 @@ pub const STARTER_CONFIG: &str = "\
 # set of shell commands run via `sh -c` in a task's project checkout. Only
 # `dispatch` is required (`cmd` is accepted as an alias): it starts a session
 # on a task, with `{prompt_file}` replaced by the path to a file holding the
-# task's title and body as the prompt. `default` names the agent used for
+# task's title and body as the prompt, and the optional `{task_id}` replaced
+# by the task's numeric id — the default names the session `voro-<id>` with it
+# so the session ties back to its task. `default` names the agent used for
 # tasks without an --agent override.
 #
 # The other verbs are optional, and each degrades gracefully when absent:
@@ -71,7 +80,7 @@ pub const STARTER_CONFIG: &str = "\
 default = \"claude\"
 
 [agents.claude]
-dispatch = \"claude --bg --permission-mode bypassPermissions \\\"$(cat {prompt_file})\\\"\"
+dispatch = \"claude --bg --name \\\"voro-{task_id}\\\" --permission-mode bypassPermissions \\\"$(cat {prompt_file})\\\"\"
 sessions = \"claude agents --json\"
 attach   = \"claude attach {session}\"
 resume   = \"claude --resume {session}\"
@@ -91,9 +100,11 @@ resume   = \"claude --resume {session}\"
 ";
 
 /// A named set of verb templates from `agents.toml`. `dispatch` (or its alias
-/// `cmd`) is required and always contains [`PROMPT_FILE_PLACEHOLDER`]; the
-/// rest are optional, with their `{session}`/`{prompt_file}` placeholders
-/// validated at parse time so a bad template fails at load, not at use.
+/// `cmd`) is required and always contains [`PROMPT_FILE_PLACEHOLDER`]; it may
+/// also carry the optional [`TASK_ID_PLACEHOLDER`] (unvalidated, since not
+/// every agent has a session-naming flag). The rest are optional, with their
+/// `{session}`/`{prompt_file}` placeholders validated at parse time so a bad
+/// template fails at load, not at use.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTemplate {
@@ -672,6 +683,12 @@ mod tests {
         let claude = config.resolve(None).unwrap();
         assert_eq!(claude.name, "claude");
         assert!(claude.dispatch.contains("--bg"), "{}", claude.dispatch);
+        // the default names the session after the task so it ties back
+        assert!(
+            claude.dispatch.contains("voro-{task_id}"),
+            "{}",
+            claude.dispatch
+        );
         assert!(claude.sessions.is_some());
         assert!(claude.attach.is_some());
         assert!(claude.resume.is_some());
