@@ -4,6 +4,8 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
+use voro_core::{Event, ScoreBreakdown, TaskState};
+
 use crate::app::{App, CockpitRow, Mode, Screen, TaskRow};
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
@@ -155,13 +157,22 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             if let Some(branch) = &t.branch {
                 lines.push(Line::from(branch_span(branch)));
             }
+            if app.show_score
+                && let Some(b) = app.score_breakdown(*task_id)
+            {
+                lines.extend(score_lines(&b));
+            }
             lines.push(Line::default());
             lines.extend(t.body.lines().map(|l| Line::from(l.to_string())));
+            if app.show_history {
+                lines.push(Line::default());
+                lines.extend(history_lines(&app.task_events(*task_id)));
+            }
             let para = Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .scroll((*scroll, 0))
                 .block(Block::default().borders(Borders::ALL).title(format!(
-                    "#{task_id} — ⏎ state · 0-3 priority · j/k scroll · esc close"
+                    "#{task_id} — ⏎ state · 0-3 priority · x score · h history · j/k scroll · esc close"
                 )));
             frame.render_widget(para, area);
         }
@@ -191,93 +202,60 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 .highlight_style(SELECTED);
             frame.render_stateful_widget(list, area, &mut state);
         }
-        Mode::Score {
-            task_id,
-            state,
-            breakdown,
-        } => {
-            let b = breakdown;
-            let mut lines = vec![
-                Line::from(format!("weight          {:>6}", b.weight)),
-                Line::from(format!(
-                    "priority        {:>6}  (value {})",
-                    b.priority.to_string(),
-                    b.priority_value
-                )),
-                Line::from(format!(
-                    "state           {:>6}  (bonus +{})",
-                    b.state.to_string(),
-                    b.state_bonus
-                )),
-                Line::from(format!("base w×(p+s)    {:>6.1}", b.base)),
-                Line::from(format!("age             {:>6.1} days", b.age_days)),
-                Line::from(format!(
-                    "age bonus       {:>6.2}  (0.1/day, cap 2)",
-                    b.age_bonus
-                )),
-                Line::from(Span::styled(
-                    format!("total           {:>6.2}", b.total),
-                    Style::new().bold().fg(Color::Yellow),
-                )),
-            ];
-            if !matches!(
-                state,
-                voro_core::TaskState::Ready
-                    | voro_core::TaskState::NeedsInput
-                    | voro_core::TaskState::Review
-                    | voro_core::TaskState::Proposed
-            ) {
-                lines.push(Line::from(Span::styled(
-                    format!("({state} tasks are not scheduled)"),
-                    Style::new().dim(),
-                )));
-            }
-            let height = lines.len() as u16 + 2;
-            let area = popup_area(frame, 44, height);
-            let para = Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!("Score of #{task_id}")),
-            );
-            frame.render_widget(para, area);
-        }
-        Mode::History {
-            task_id,
-            events,
-            scroll,
-        } => {
-            let frame_area = frame.area();
-            let width = frame_area.width.saturating_sub(8).clamp(30, 100);
-            let height = frame_area.height.saturating_sub(4).clamp(8, 40);
-            let area = popup_area(frame, width, height);
-            let lines: Vec<Line> = if events.is_empty() {
-                vec![Line::from(Span::styled(
-                    "no events yet",
-                    Style::new().dim(),
-                ))]
-            } else {
-                events
-                    .iter()
-                    .map(|e| {
-                        Line::from(vec![
-                            Span::styled(format!("{:<19} ", e.at), Style::new().dim()),
-                            Span::styled(format!("{:<10} ", e.kind), Style::new().bold()),
-                            Span::raw(e.detail.clone().unwrap_or_default()),
-                        ])
-                    })
-                    .collect()
-            };
-            let para = Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((*scroll, 0))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!("History of #{task_id} — j/k scroll · h/esc close")),
-                );
-            frame.render_widget(para, area);
-        }
     }
+}
+
+/// The inline score decomposition (DESIGN.md §7) that `x` folds into a detail
+/// view: one dim line breaking the total down, plus the "not scheduled" note
+/// where the task's state keeps it out of the queue. Shared by the cockpit
+/// detail pane and the tasks-screen Detail popup so both read identically.
+fn score_lines(b: &ScoreBreakdown) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "weight {} · {} (value {}) · {} (+{}) · base w×(p+s) {:.1} · age {:.1}d (+{:.2})",
+            b.weight,
+            b.priority,
+            b.priority_value,
+            b.state,
+            b.state_bonus,
+            b.base,
+            b.age_days,
+            b.age_bonus
+        ),
+        Style::new().dim(),
+    ))];
+    if !matches!(
+        b.state,
+        TaskState::Ready | TaskState::NeedsInput | TaskState::Review | TaskState::Proposed
+    ) {
+        lines.push(Line::from(Span::styled(
+            format!("({} tasks are not scheduled)", b.state),
+            Style::new().dim(),
+        )));
+    }
+    lines
+}
+
+/// The event-history section that `h` folds into a detail view: a bold
+/// "History" header over one line per event — timestamp dim, kind bold, detail
+/// plain, oldest first — matching the line format the popup used before.
+fn history_lines(events: &[Event]) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled("History", Style::new().bold()))];
+    if events.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no events yet",
+            Style::new().dim(),
+        )));
+    } else {
+        lines.extend(events.iter().map(|e| {
+            Line::from(vec![
+                Span::styled(format!("{:<19} ", e.at), Style::new().dim()),
+                Span::styled(format!("{:<10} ", e.kind), Style::new().bold()),
+                Span::raw(e.detail.clone().unwrap_or_default()),
+            ])
+        }));
+    }
+    lines
 }
 
 fn draw_cockpit(frame: &mut Frame, app: &App) {
@@ -474,8 +452,17 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     if app.redispatch.contains(&task.id) {
         lines.push(Line::from(redispatch_span()));
     }
+    if app.show_score
+        && let Some(b) = app.score_breakdown(task.id)
+    {
+        lines.extend(score_lines(&b));
+    }
     lines.push(Line::default());
     lines.extend(task.body.lines().map(|l| Line::from(l.to_string())));
+    if app.show_history {
+        lines.push(Line::default());
+        lines.extend(history_lines(&app.task_events(task.id)));
+    }
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para.block(block), area);
 }
@@ -668,8 +655,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                         hints.push_str(enter);
                     }
                     hints.push_str(
-                        " · n new · e edit · s state · d dispatch · D agent · a attach · o open · g pr · x score · h history",
+                        " · n new · e edit · s state · d dispatch · D agent · a attach · o open · g pr",
                     );
+                    // The score/history toggles fold into the cockpit detail
+                    // pane in place; on the tasks screen they live inside the
+                    // Detail popup and are advertised in its footer instead.
+                    if app.screen == Screen::Cockpit {
+                        hints.push_str(" · x score · h history");
+                    }
                     hints
                 }
             };
@@ -858,6 +851,111 @@ mod tests {
     fn key_to_projects(app: &mut crate::app::App) {
         use ratatui::crossterm::event::{KeyCode, KeyEvent};
         app.on_key(KeyEvent::from(KeyCode::Char('3')));
+    }
+
+    /// End-to-end: with the score and history toggles on, the cockpit detail
+    /// pane renders the inline decomposition line and the history section for
+    /// the selected task, rather than opening a popup.
+    #[test]
+    fn cockpit_detail_folds_in_score_and_history_when_toggled() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        use voro_core::{NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store.set_weight(p.id, 3).unwrap();
+        store
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "a task".into(),
+                body: "body".into(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        app.on_key(KeyEvent::from(KeyCode::Char('h')));
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("base w×(p+s)"),
+            "score decomposition should fold into the detail pane: {rendered}"
+        );
+        assert!(
+            rendered.contains("History") && rendered.contains("created"),
+            "history should fold into the detail pane: {rendered}"
+        );
+    }
+
+    /// End-to-end: on the tasks screen the same sections fold into the Detail
+    /// popup — `x`/`h` inside the popup drive the same shared flags — so score
+    /// and history render inline on this screen too, never as separate popups.
+    #[test]
+    fn tasks_detail_popup_folds_in_score_and_history_when_toggled() {
+        use crate::app::{App, Mode};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        use voro_core::{NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store.set_weight(p.id, 3).unwrap();
+        store
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "a task".into(),
+                body: "body".into(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+        app.on_key(KeyEvent::from(KeyCode::Char('2'))); // tasks screen
+        app.on_key(KeyEvent::from(KeyCode::Enter)); // open the Detail popup
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        app.on_key(KeyEvent::from(KeyCode::Char('h')));
+        assert!(matches!(app.mode, Mode::Detail { .. }));
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("base w×(p+s)"),
+            "score decomposition should fold into the Detail popup: {rendered}"
+        );
+        assert!(
+            rendered.contains("History") && rendered.contains("created"),
+            "history should fold into the Detail popup: {rendered}"
+        );
     }
 
     #[test]
