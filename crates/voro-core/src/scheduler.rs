@@ -65,29 +65,22 @@ pub struct Candidate {
     pub score: ScoreBreakdown,
 }
 
-/// How many `ready` tasks the queue offers: enough autonomy to choose
-/// around the top one, few enough that the queue stays an answer rather
-/// than a todo list — the browser holds the rest.
-pub const QUEUE_READY_ROWS: usize = 5;
+/// How many rows the queue offers: enough to keep the autonomy to pick around
+/// the top item, few enough that the queue stays an answer rather than the
+/// whole backlog — the browser holds the rest. A single cap across every
+/// state, since each row is one next action competing on the same score (§7).
+pub const QUEUE_MAX_ROWS: usize = 10;
 
-/// The next-action queue (§1): every `needs-input`, `review`, and
-/// `proposed` task plus the top `QUEUE_READY_ROWS` ready tasks, in one list
-/// ordered purely by score. Each row is an action — answer, review, triage,
-/// or start; the human picks from the top, the score does not dictate.
+/// The next-action queue (§1): the `QUEUE_MAX_ROWS` highest-scoring tasks
+/// across every actionable state, in one list ordered by score. Each row is an
+/// action — answer, review, triage, or start; the human picks from the top,
+/// the score does not dictate. The cap is uniform: `needs-input`, `review`,
+/// `proposed`, and `ready` all compete for the same slots on score alone, so a
+/// low-scoring row of any state can fall below the cut (§7).
 pub fn queue(candidates: &[Candidate]) -> Vec<&Candidate> {
-    let mut ready: Vec<&Candidate> = candidates
-        .iter()
-        .filter(|c| c.task.state == TaskState::Ready)
-        .collect();
-    ready.sort_by(|a, b| rank(a, b));
-    ready.truncate(QUEUE_READY_ROWS);
-
-    let mut items: Vec<&Candidate> = candidates
-        .iter()
-        .filter(|c| c.task.state != TaskState::Ready)
-        .chain(ready)
-        .collect();
+    let mut items: Vec<&Candidate> = candidates.iter().collect();
     items.sort_by(|a, b| rank(a, b));
+    items.truncate(QUEUE_MAX_ROWS);
     items
 }
 
@@ -336,19 +329,49 @@ mod tests {
     }
 
     #[test]
-    fn queue_offers_only_the_top_ready_rows() {
+    fn queue_caps_at_the_highest_scoring_rows() {
+        // More candidates than the cap: the queue keeps the QUEUE_MAX_ROWS
+        // highest-scoring and drops the rest, regardless of state.
         let mut s = setup();
         let p = add_project(&mut s, "p", 3);
-        let keep: Vec<i64> = (0..QUEUE_READY_ROWS)
-            .map(|i| add_task(&mut s, p, &format!("keep {i}"), Priority::P1))
+        let tasks: Vec<i64> = (0..QUEUE_MAX_ROWS + 4)
+            .map(|i| {
+                let id = add_task(&mut s, p, &format!("t{i}"), Priority::P2);
+                // older tasks score higher via the age bonus, so ordering is
+                // deterministic: index 0 oldest, last youngest.
+                set_age_days(&mut s, id, (QUEUE_MAX_ROWS + 4 - i) as f64);
+                id
+            })
             .collect();
-        let dropped = add_task(&mut s, p, "dropped", Priority::P3);
 
         let candidates = s.candidates().unwrap();
-        let queued = queue(&candidates);
-        let ids: Vec<i64> = queued.iter().map(|c| c.task.id).collect();
-        assert_eq!(ids, keep);
-        assert!(!ids.contains(&dropped));
+        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
+        assert_eq!(ids.len(), QUEUE_MAX_ROWS);
+        assert_eq!(ids, tasks[..QUEUE_MAX_ROWS]);
+    }
+
+    #[test]
+    fn the_cap_drops_a_low_scoring_attention_item_regardless_of_state() {
+        // The cap is uniform across state: a low-scoring question can fall
+        // below it just like a ready task, once enough higher-scoring work
+        // exists. Ten P0 ready tasks in a heavy project (score 40) fill the cap
+        // and push a lone P3 question in a light project (1×(1+4) = 5) off.
+        let mut s = setup();
+        let heavy = add_project(&mut s, "heavy", 5);
+        let light = add_project(&mut s, "light", 1);
+        let loud: Vec<i64> = (0..QUEUE_MAX_ROWS)
+            .map(|i| add_task(&mut s, heavy, &format!("loud {i}"), Priority::P0))
+            .collect();
+        let quiet_question = add_task(&mut s, light, "quiet question", Priority::P3);
+        to_needs_input(&mut s, quiet_question);
+
+        let candidates = s.candidates().unwrap();
+        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
+        assert_eq!(ids.len(), QUEUE_MAX_ROWS);
+        assert!(!ids.contains(&quiet_question));
+        for id in &loud {
+            assert!(ids.contains(id));
+        }
     }
 
     #[test]
