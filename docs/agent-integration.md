@@ -303,11 +303,29 @@ verified in code (`voro-core`'s `full_transition_matrix` test, plus reading the
 `apply` path: an illegal transition returns before any write and never commits).
 The verb-to-state mapping and the `VORO_TASK_ID`/`VORO_DB` export are verified
 against the dispatch and CLI source (DESIGN.md §8; `voro done` takes an optional
-`--branch NAME` but no `--summary` in the current CLI, unlike §8's illustrative
-example).
+`--summary TEXT` and `--branch NAME`).
 
-Not yet verified against a live Claude Code session is the *firing* of the hooks
-themselves — that `SessionEnd`, `Notification`, and `Stop` fire with the payloads
-and environment assumed here. Confirm that once against a real dispatched session
-before relying on the fallback, and adjust the event names or the `message`
-extraction if Claude Code's hook contract has moved.
+The *firing* of the hooks is verified against a live Claude Code session
+(v2.1.206): the sample configuration above, installed in a scratch project with a
+scratch `--db`, driving a real session under a dispatched task's environment. The
+event names and the `message` extraction match Claude Code's current hook
+contract, and no correction to the snippet was needed.
+
+`SessionEnd` fires when the session ends (`hook_event_name` `"SessionEnd"`,
+`reason` `"other"` on a normal `-p` exit), and its `voro-done-hook` upgrades a
+still-`running` task to `review` while recording the current branch — the
+forgotten completion is caught. `Notification` fires the moment a live session
+stalls on a permission prompt, with `hook_event_name` `"Notification"` and
+`message` `"Claude needs your permission"` (alongside a `notification_type`
+`"permission_prompt"` the hook ignores); the `voro-notify-hook`'s `jq -r '.message
+// empty'` lifts that string and `voro ask` records it while the process is still
+alive and waiting — the one path the pid-liveness reconciler cannot cover. That
+Notification is an interactive-session signal, though: a headless `claude -p` run
+auto-denies a permission-gated tool and exits rather than stalling, so the
+Notification fallback only earns its keep under an attachable launch (`claude
+--bg`, the dispatch template's default). `Stop` fires too (`hook_event_name`
+`"Stop"`, `stop_hook_active` `false`), confirming the optional earlier anchor is
+there. Finally the `VORO_TASK_ID` guard holds: with the variable unset, an
+ordinary session's hooks exit before invoking `voro` at all, leaving a canary
+`running` task untouched. Re-confirm against a live session if Claude Code's hook
+contract moves.
