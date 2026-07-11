@@ -492,6 +492,41 @@ impl Store {
         ))
     }
 
+    /// Whether `task_id` is a `review` task carrying a *partial* completion
+    /// report — exactly one of its branch and its summary is present (DESIGN.md
+    /// §8). A PR needs both (`pr` errors without either), so a review task with
+    /// one but not the other is a report a dispatched agent left half-finished:
+    /// it called `done` with `--branch` but no `--summary`, or the reverse, or
+    /// the `SessionEnd` fallback recorded a branch with no summary. That is the
+    /// "incomplete done report" anomaly the operator must see rather than
+    /// discover at `pr` time. A review task with *neither* is deliberately not
+    /// flagged — a planning or task-generation task legitimately produces no
+    /// branch and no summary — and one with *both* is a complete report. Gated
+    /// on `review` because that is the only state where a PR is opened; derived
+    /// fresh from task and event state on every read, like [`redispatch_flag`],
+    /// rather than stored on the task.
+    ///
+    /// [`redispatch_flag`]: Store::redispatch_flag
+    pub fn incomplete_report_flag(&self, task_id: i64) -> Result<bool> {
+        let row: Option<(TaskState, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT state, branch FROM tasks WHERE id = ?1",
+                [task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((state, branch)) = row else {
+            return Ok(false);
+        };
+        if state != TaskState::Review {
+            return Ok(false);
+        }
+        let has_branch = branch.is_some();
+        let has_summary = self.latest_summary(task_id)?.is_some();
+        Ok(has_branch != has_summary)
+    }
+
     /// Rows for the cockpit's running strip (DESIGN.md §9): every `running`
     /// task, joined with its open session if it has one. The strip filters on
     /// task *state*, not on "has an open session" — a `review` or `needs-input`
@@ -1142,6 +1177,91 @@ mod tests {
             s.latest_summary(t.id).unwrap().as_deref(),
             Some("second pass")
         );
+    }
+
+    #[test]
+    fn incomplete_report_flag_marks_a_review_task_missing_one_half() {
+        use crate::transition::Action;
+
+        // Helper: a fresh task carried to `review` with the given branch/summary.
+        fn reviewed(branch: Option<&str>, summary: Option<&str>) -> (Store, i64) {
+            let mut s = Store::open_in_memory().unwrap();
+            let p = s.create_project("voro", "/tmp/voro").unwrap();
+            let t = s
+                .create_task(NewTask {
+                    project_id: p.id,
+                    title: "report me".into(),
+                    body: String::new(),
+                    priority: Priority::P2,
+                    state: TaskState::Ready,
+                    agent: None,
+                })
+                .unwrap();
+            s.apply(t.id, Action::Start).unwrap();
+            s.apply(t.id, Action::Complete(summary.map(str::to_string)))
+                .unwrap();
+            if let Some(name) = branch {
+                s.set_branch(t.id, Some(name)).unwrap();
+            }
+            (s, t.id)
+        }
+
+        // Branch but no summary — the classic forgotten-summary flake and the
+        // shape the SessionEnd fallback leaves behind.
+        let (s, id) = reviewed(Some("feat/x"), None);
+        assert!(s.incomplete_report_flag(id).unwrap());
+
+        // Summary but no branch — the reverse flake.
+        let (s, id) = reviewed(None, Some("did the thing"));
+        assert!(s.incomplete_report_flag(id).unwrap());
+
+        // Both present — a complete report, not an anomaly.
+        let (s, id) = reviewed(Some("feat/x"), Some("did the thing"));
+        assert!(!s.incomplete_report_flag(id).unwrap());
+
+        // Neither present — a legitimate no-artifact (e.g. planning) task.
+        let (s, id) = reviewed(None, None);
+        assert!(!s.incomplete_report_flag(id).unwrap());
+    }
+
+    #[test]
+    fn incomplete_report_flag_is_gated_on_review() {
+        use crate::transition::Action;
+
+        // A partial report only counts once the task is in `review`: a running
+        // task with an intended branch and no summary yet is mid-flight, not a
+        // finished-but-incomplete report.
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let t = s
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "in flight".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+        s.set_branch(t.id, Some("feat/x")).unwrap();
+        assert!(!s.incomplete_report_flag(t.id).unwrap(), "ready");
+
+        s.apply(t.id, Action::Start).unwrap();
+        assert!(!s.incomplete_report_flag(t.id).unwrap(), "running");
+
+        // Only on reaching review does the missing summary become an anomaly.
+        s.apply(t.id, Action::Complete(None)).unwrap();
+        assert!(s.incomplete_report_flag(t.id).unwrap(), "review");
+
+        // Accepting past review clears it — no PR is opened from `done`.
+        s.apply(t.id, Action::Accept).unwrap();
+        assert!(!s.incomplete_report_flag(t.id).unwrap(), "done");
+    }
+
+    #[test]
+    fn incomplete_report_flag_is_false_for_a_missing_task() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(!s.incomplete_report_flag(999).unwrap());
     }
 
     #[test]

@@ -338,6 +338,18 @@ fn redispatch_span() -> Span<'static> {
     )
 }
 
+/// The incomplete-report flag (DESIGN.md §8): a `review` task carrying only one
+/// of a branch and a summary — the half-finished done report a dispatched
+/// session left behind, which `pr` cannot open. Yellow to match the running
+/// strip's "no live session" warning, since both are anomalies needing the
+/// operator rather than the magenta redispatch *action*.
+fn incomplete_report_span() -> Span<'static> {
+    Span::styled(
+        "  [incomplete report]",
+        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )
+}
+
 /// A tracked GitHub PR (DESIGN.md §11c) rendered for the detail pane, with the
 /// jump-to-PR key spelled out so the reviewer knows how to reach it.
 fn pr_span(url: &str) -> Span<'static> {
@@ -423,7 +435,11 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
                 if app.redispatch.contains(&c.task.id) {
                     spans.push(redispatch_span());
                 }
-                if let Some(substate) = review_substate_span(&c.task) {
+                if app.incomplete_report.contains(&c.task.id) {
+                    // Replaces the optimistic "next: pr" — a PR cannot be opened
+                    // from a half-finished report, so name the gap instead.
+                    spans.push(incomplete_report_span());
+                } else if let Some(substate) = review_substate_span(&c.task) {
                     spans.push(substate);
                 }
                 ListItem::new(Line::from(spans))
@@ -494,6 +510,10 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(pr) = &task.pr_url {
         lines.push(Line::from(pr_span(pr)));
+    } else if app.incomplete_report.contains(&task.id) {
+        // A review task missing a branch or summary: `pr` would fail, so say
+        // what is needed rather than the optimistic "next: pr".
+        lines.push(Line::from(incomplete_report_span()));
     } else if task.state == TaskState::Review {
         lines.push(Line::from(Span::styled(
             "next: pr  (g opens one from the summary)",
@@ -609,7 +629,9 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
             if app.redispatch.contains(&r.task.id) {
                 spans.push(redispatch_span());
             }
-            if let Some(substate) = review_substate_span(&r.task) {
+            if app.incomplete_report.contains(&r.task.id) {
+                spans.push(incomplete_report_span());
+            } else if let Some(substate) = review_substate_span(&r.task) {
                 spans.push(substate);
             }
             spans.extend(blocker_spans(r));

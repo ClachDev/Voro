@@ -174,6 +174,10 @@ pub struct App {
     /// (DESIGN.md §8) — read fresh from session history on every refresh,
     /// never stored on the task itself.
     pub redispatch: std::collections::HashSet<i64>,
+    /// Review tasks carrying only one of a branch and a summary (DESIGN.md §8):
+    /// the half-finished done report a dispatched session left behind, which a
+    /// PR cannot be opened from. Re-derived per refresh like `redispatch`.
+    pub incomplete_report: std::collections::HashSet<i64>,
 
     pub cockpit_rows: Vec<CockpitRow>,
     pub cockpit_sel: usize,
@@ -222,6 +226,7 @@ impl App {
             running: Vec::new(),
             all: Vec::new(),
             redispatch: std::collections::HashSet::new(),
+            incomplete_report: std::collections::HashSet::new(),
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
             tasks_sel: 0,
@@ -298,6 +303,16 @@ impl App {
             .filter_map(|r| {
                 self.store
                     .redispatch_flag(r.task.id)
+                    .ok()?
+                    .then_some(r.task.id)
+            })
+            .collect();
+        self.incomplete_report = all
+            .iter()
+            .filter(|r| r.task.state == TaskState::Review)
+            .filter_map(|r| {
+                self.store
+                    .incomplete_report_flag(r.task.id)
                     .ok()?
                     .then_some(r.task.id)
             })
