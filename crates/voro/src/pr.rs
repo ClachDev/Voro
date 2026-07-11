@@ -8,7 +8,7 @@
 
 use std::process::{Command, Stdio};
 
-use voro_core::{PrPlan, PrRef, Store, format_review_feedback, plan_pr};
+use voro_core::{PrPlan, PrRef, Project, ReviewMedium, Store, format_review_feedback, plan_pr};
 
 /// Resolve a task's tracked PR, erroring with a fix-it hint when none is set.
 fn tracked_pr(store: &Store, task_id: i64) -> Result<PrRef, String> {
@@ -88,21 +88,46 @@ pub fn create(store: &mut Store, task_id: i64) -> Result<String, String> {
     Ok(format!("opened {} for task {task_id}", pr.url))
 }
 
+/// Resolve a project's review medium (DESIGN.md §8): the single "show me this
+/// task's diff" action `pr` performs. The decision itself is
+/// `ReviewAction::resolve` in `voro-core`; this seam only supplies the one
+/// input core cannot compute — whether the checkout is a GitHub repo `gh` can
+/// address — and only when the action is `auto`, so pinned media never pay for
+/// the probe.
+pub fn resolve_medium(project: &Project) -> ReviewMedium {
+    let on_github = project.review_action.needs_probe() && is_github_repo(&project.path);
+    project.review_action.resolve(on_github)
+}
+
+/// The probe behind the `auto` review action: whether `gh` can address the
+/// checkout as a GitHub repository. A missing or unauthenticated `gh` reads
+/// as "not GitHub" — the viewer is then the only workable medium — while the
+/// explicit `pr` action still reports the failure via [`ensure_github_repo`].
+fn is_github_repo(project_path: &str) -> bool {
+    Command::new("gh")
+        .args(["repo", "view", "--json", "nameWithOwner"])
+        .current_dir(project_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// The forge-specific half of [`create`] (DESIGN.md §8), kept behind one seam:
 /// push the branch and open a ready PR against the repo's default branch,
 /// returning the PR URL. This is the only part that knows about GitHub. A
 /// project whose checkout is not a GitHub repo gets a clear error pointing at
-/// `voro open` — the local diff viewer (#65), which is the natural home for the
-/// non-GitHub review medium if the two verbs later merge (DESIGN.md §8/§11).
+/// the viewer medium — the other half of the folded review action (§8/§11a).
 fn open_pr_on_github(project_path: &str, plan: &PrPlan) -> Result<String, String> {
     ensure_github_repo(project_path)?;
     push_branch(project_path, &plan.branch)?;
     gh_pr_create(project_path, plan)
 }
 
-/// Refuse a non-GitHub checkout before pushing anything, pointing at the local
-/// diff viewer instead — the seam where `open`'s behaviour for these projects
-/// belongs (DESIGN.md §8).
+/// Refuse a non-GitHub checkout before pushing anything, pointing at the
+/// viewer medium instead — reached when a project's review action is pinned
+/// to `pr` (or resolves there) but the checkout cannot take one (DESIGN.md §8).
 fn ensure_github_repo(project_path: &str) -> Result<(), String> {
     let output = Command::new("gh")
         .args(["repo", "view", "--json", "nameWithOwner"])
@@ -115,7 +140,8 @@ fn ensure_github_repo(project_path: &str) -> Result<(), String> {
     }
     Err(format!(
         "{project_path} is not a GitHub repository, so `pr` cannot open a pull request there; \
-         use `voro open <task-id>` to see its diff in the configured viewer instead"
+         use `voro open <task-id>` to see its diff in a viewer, or point the project at one \
+         with `voro project action <project> viewer`"
     ))
 }
 

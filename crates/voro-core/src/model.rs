@@ -244,12 +244,111 @@ impl ToSql for SessionOutcome {
     }
 }
 
+/// A project's review medium (DESIGN.md §8/§11a): which of the two media the
+/// unified `pr` action uses to get a review task's diff in front of the
+/// operator. Stored on the project (`projects.review_action`), since the
+/// medium is a property of where the project's code review happens, not of
+/// any task.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ReviewAction {
+    /// Resolve at use: GitHub when the checkout is a GitHub repo, otherwise
+    /// the configured viewer. Stored as NULL — the unconfigured default.
+    #[default]
+    Auto,
+    /// Always the GitHub PR flow (jump to the tracked PR, or push and create).
+    Pr,
+    /// Always a local viewer from `voro.toml`: the named `[viewers.<name>]`
+    /// when one is given, otherwise the default viewer.
+    Viewer(Option<String>),
+}
+
+impl ReviewAction {
+    /// Parse the stored/CLI form: `auto`, `pr`, `viewer`, or `viewer:<name>`.
+    pub fn parse(s: &str) -> Result<ReviewAction> {
+        match s {
+            "auto" => Ok(ReviewAction::Auto),
+            "pr" => Ok(ReviewAction::Pr),
+            "viewer" => Ok(ReviewAction::Viewer(None)),
+            other => match other.strip_prefix("viewer:") {
+                Some(name) if !name.trim().is_empty() => {
+                    Ok(ReviewAction::Viewer(Some(name.trim().to_string())))
+                }
+                _ => Err(Error::Invalid(format!(
+                    "unknown review action '{s}' — expected auto, pr, viewer, or viewer:<name>"
+                ))),
+            },
+        }
+    }
+
+    /// Resolve the medium once the checkout's GitHub-ness is known. Pure —
+    /// probing whether the checkout actually is a GitHub repo is process I/O
+    /// and lives in the `voro` crate; only `Auto` consults the probe's answer.
+    pub fn resolve(&self, on_github: bool) -> ReviewMedium {
+        match self {
+            ReviewAction::Auto if on_github => ReviewMedium::GithubPr,
+            ReviewAction::Auto => ReviewMedium::Viewer(None),
+            ReviewAction::Pr => ReviewMedium::GithubPr,
+            ReviewAction::Viewer(name) => ReviewMedium::Viewer(name.clone()),
+        }
+    }
+
+    /// Whether resolving this action needs the GitHub probe at all, so
+    /// callers can skip the `gh` shell-out when the medium is pinned.
+    pub fn needs_probe(&self) -> bool {
+        matches!(self, ReviewAction::Auto)
+    }
+}
+
+impl fmt::Display for ReviewAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReviewAction::Auto => f.pad("auto"),
+            ReviewAction::Pr => f.pad("pr"),
+            ReviewAction::Viewer(None) => f.pad("viewer"),
+            ReviewAction::Viewer(Some(name)) => f.pad(&format!("viewer:{name}")),
+        }
+    }
+}
+
+impl FromSql for ReviewAction {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Null => Ok(ReviewAction::Auto),
+            _ => ReviewAction::parse(value.as_str()?).map_err(|e| FromSqlError::Other(Box::new(e))),
+        }
+    }
+}
+
+impl ToSql for ReviewAction {
+    /// `Auto` writes NULL — absence of configuration — so the column stays
+    /// empty until the operator pins a medium.
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        match self {
+            ReviewAction::Auto => Ok(rusqlite::types::Null.into()),
+            other => Ok(other.to_string().into()),
+        }
+    }
+}
+
+/// The concrete medium a [`ReviewAction`] resolves to: the single "show me
+/// this task's diff" action, per project (DESIGN.md §8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewMedium {
+    /// Jump to / create the GitHub PR.
+    GithubPr,
+    /// Run a `voro.toml` viewer on the checkout; `Some` names a
+    /// `[viewers.<name>]` entry, `None` is the default viewer.
+    Viewer(Option<String>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub id: i64,
     pub name: String,
     pub path: String,
     pub weight: i64,
+    /// How `pr` shows this project's review diffs (DESIGN.md §8/§11a).
+    pub review_action: ReviewAction,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -385,5 +484,40 @@ mod tests {
     fn priority_display_honors_width() {
         assert_eq!(format!("{:>6}", Priority::P0), "    P0");
         assert_eq!(format!("{:>6}", Priority::P2), "    P2");
+    }
+
+    #[test]
+    fn review_action_parses_and_displays_every_form() {
+        for (text, action) in [
+            ("auto", ReviewAction::Auto),
+            ("pr", ReviewAction::Pr),
+            ("viewer", ReviewAction::Viewer(None)),
+            ("viewer:zed", ReviewAction::Viewer(Some("zed".into()))),
+        ] {
+            assert_eq!(ReviewAction::parse(text).unwrap(), action, "{text}");
+            assert_eq!(action.to_string(), text);
+        }
+        assert!(ReviewAction::parse("github").is_err());
+        assert!(ReviewAction::parse("viewer:").is_err());
+        assert!(ReviewAction::parse("viewer:  ").is_err());
+    }
+
+    #[test]
+    fn review_action_resolves_the_medium() {
+        // auto is the only form that consults the GitHub probe
+        assert_eq!(ReviewAction::Auto.resolve(true), ReviewMedium::GithubPr);
+        assert_eq!(
+            ReviewAction::Auto.resolve(false),
+            ReviewMedium::Viewer(None)
+        );
+        assert!(ReviewAction::Auto.needs_probe());
+
+        assert_eq!(ReviewAction::Pr.resolve(false), ReviewMedium::GithubPr);
+        assert!(!ReviewAction::Pr.needs_probe());
+        assert_eq!(
+            ReviewAction::Viewer(Some("zed".into())).resolve(true),
+            ReviewMedium::Viewer(Some("zed".into()))
+        );
+        assert!(!ReviewAction::Viewer(None).needs_probe());
     }
 }

@@ -20,7 +20,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voro_core::{
-    AgentsConfig, PROMPT_FILE_PLACEHOLDER, SESSION_PLACEHOLDER, Session, Store,
+    AgentsConfig, PROMPT_FILE_PLACEHOLDER, ReviewAction, SESSION_PLACEHOLDER, Session, Store,
     TASK_ID_PLACEHOLDER, Task, TaskState, VIEWER_PATH_PLACEHOLDER, parse_sessions_json,
 };
 
@@ -289,15 +289,22 @@ pub fn continue_dispatch(
     )
 }
 
-/// Open a `review` (or `running`) task's checkout in the configured viewer so
-/// its diff can be seen (DESIGN.md §11a). The `[viewer]` command from
-/// `voro.toml` is run detached in the project's path — a shell-out baseline
-/// that reuses the command-template model rather than hard-coding an editor.
-/// With no viewer configured, the caller gets back what to add rather than a
-/// silent no-op; opening never touches task state, so no clean-tree guard and
-/// no `Store` mutation are involved (the diff being reviewed is often the
-/// uncommitted work itself).
-pub fn open(store: &mut Store, ctx: &DispatchCtx, task_id: i64) -> Result<String, String> {
+/// Open a `review` (or `running`) task's checkout in a viewer so its diff can
+/// be seen (DESIGN.md §11a): the viewer medium of the per-project review
+/// action (§8). The viewer command from `voro.toml` is run detached in the
+/// project's path — a shell-out baseline that reuses the command-template
+/// model rather than hard-coding an editor. `viewer_override` names a
+/// `[viewers.<name>]` entry; `None` falls back to the viewer the project's
+/// review action picks, or the config's default. With no viewer configured,
+/// the caller gets back what to add rather than a silent no-op; opening never
+/// touches task state, so no clean-tree guard and no `Store` mutation are
+/// involved (the diff being reviewed is often the uncommitted work itself).
+pub fn open(
+    store: &mut Store,
+    ctx: &DispatchCtx,
+    task_id: i64,
+    viewer_override: Option<&str>,
+) -> Result<String, String> {
     let task = store.task(task_id).map_err(|e| e.to_string())?;
     if !matches!(task.state, TaskState::Review | TaskState::Running) {
         return Err(format!(
@@ -307,14 +314,19 @@ pub fn open(store: &mut Store, ctx: &DispatchCtx, task_id: i64) -> Result<String
     }
     let project = store.project(task.project_id).map_err(|e| e.to_string())?;
 
+    // The project's review action may pin a named viewer even when this open
+    // was invoked directly (`voro open`, the TUI's o key) rather than through
+    // the resolved `pr` action.
+    let project_viewer = match &project.review_action {
+        ReviewAction::Viewer(Some(name)) => Some(name.clone()),
+        _ => None,
+    };
+    let viewer_name = viewer_override.map(str::to_string).or(project_viewer);
+
     let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
-    let viewer = config.viewer().ok_or_else(|| {
-        format!(
-            "no viewer configured; add a [viewer] table to {} with a cmd such as \
-             'zed {{path}}' or 'git difftool -d' to see a task's diff",
-            ctx.agents_path.display()
-        )
-    })?;
+    let viewer = config
+        .viewer_cmd(viewer_name.as_deref())
+        .map_err(|e| e.to_string())?;
 
     let command = viewer.replace(
         VIEWER_PATH_PLACEHOLDER,
@@ -1243,7 +1255,7 @@ mod tests {
         .unwrap();
         let id = review_task(&mut store, &project);
 
-        let summary = open(&mut store, &ctx, id).unwrap();
+        let summary = open(&mut store, &ctx, id, None).unwrap();
         assert!(summary.contains(&format!("opened task {id}")), "{summary}");
 
         // the viewer is spawned detached, so wait briefly for it to run
@@ -1271,7 +1283,7 @@ mod tests {
         .unwrap();
         let id = review_task(&mut store, &project);
 
-        let summary = open(&mut store, &ctx, id).unwrap();
+        let summary = open(&mut store, &ctx, id, None).unwrap();
         let launch_log = ctx.launch_log_path();
         assert!(
             summary.contains(&launch_log.display().to_string()),
@@ -1293,12 +1305,12 @@ mod tests {
 
     #[test]
     fn open_without_a_viewer_reports_what_to_configure() {
-        // the fixture's voro.toml has no [viewer] table
+        // the fixture's voro.toml defines no viewer at all
         let (mut store, ctx, project) = fixture("cat {prompt_file}");
         let id = review_task(&mut store, &project);
 
-        let err = open(&mut store, &ctx, id).unwrap_err();
-        assert!(err.contains("[viewer]"), "{err}");
+        let err = open(&mut store, &ctx, id, None).unwrap_err();
+        assert!(err.contains("[viewers.<name>]"), "{err}");
         assert!(err.contains(ctx.agents_path.to_str().unwrap()), "{err}");
     }
 
@@ -1307,8 +1319,76 @@ mod tests {
         let (mut store, ctx, project) = fixture("cat {prompt_file}");
         let id = ready_task(&mut store, &project); // still ready
 
-        let err = open(&mut store, &ctx, id).unwrap_err();
+        let err = open(&mut store, &ctx, id, None).unwrap_err();
         assert!(err.contains("review or running"), "{err}");
+    }
+
+    /// The two named-viewer selection paths (DESIGN.md §8/§11a): an explicit
+    /// override picks its `[viewers.<name>]` entry over the default, and with
+    /// no override the project's `viewer:<name>` review action picks one.
+    #[test]
+    fn open_picks_the_named_viewer_from_override_or_project_action() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        std::fs::write(
+            &ctx.agents_path,
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
+             [viewer]\ncmd = \"touch {path}/default.marker\"\n\n\
+             [viewers.special]\ncmd = \"touch {path}/special.marker\"\n",
+        )
+        .unwrap();
+        let id = review_task(&mut store, &project);
+
+        open(&mut store, &ctx, id, Some("special")).unwrap();
+        let marker = project.join("special.marker");
+        for _ in 0..50 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "the override must pick [viewers.special]");
+        std::fs::remove_file(&marker).unwrap();
+
+        let project_id = store.task(id).unwrap().project_id;
+        store
+            .set_review_action(
+                project_id,
+                &voro_core::ReviewAction::Viewer(Some("special".into())),
+            )
+            .unwrap();
+        open(&mut store, &ctx, id, None).unwrap();
+        for _ in 0..50 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            marker.exists(),
+            "the project's viewer:special action must pick [viewers.special]"
+        );
+        assert!(
+            !project.join("default.marker").exists(),
+            "the default [viewer] must not have run"
+        );
+    }
+
+    /// An unknown viewer name errors naming the known ones rather than
+    /// silently falling back to the default.
+    #[test]
+    fn open_reports_an_unknown_viewer_name() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        std::fs::write(
+            &ctx.agents_path,
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
+             [viewers.zed]\ncmd = \"true\"\n",
+        )
+        .unwrap();
+        let id = review_task(&mut store, &project);
+
+        let err = open(&mut store, &ctx, id, Some("emacs")).unwrap_err();
+        assert!(err.contains("emacs"), "{err}");
+        assert!(err.contains("zed"), "{err}");
     }
 
     #[test]

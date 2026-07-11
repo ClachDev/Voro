@@ -13,9 +13,10 @@
 //! Config is layered: the built-ins ship with the binary and so upgrade with
 //! it, then `voro.toml` is merged on top. A user file may add new agents,
 //! replace a built-in wholesale (whole-agent override, not per-verb), and set
-//! `default_agent`/`[viewer]`. A missing file is not an error — the built-ins
-//! alone are a working config — so a fresh install with `claude` on PATH can
-//! dispatch without authoring any TOML.
+//! `default_agent` and the viewers (`[viewers.<name>]` tables plus
+//! `default_viewer`, or the single anonymous `[viewer]`). A missing file is
+//! not an error — the built-ins alone are a working config — so a fresh
+//! install with `claude` on PATH can dispatch without authoring any TOML.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -41,7 +42,7 @@ pub const TASK_ID_PLACEHOLDER: &str = "{task_id}";
 /// session UUID, a Codex session id, a tmux session name).
 pub const SESSION_PLACEHOLDER: &str = "{session}";
 
-/// The substitution in the `[viewer]` command template (DESIGN.md §11a): the
+/// The substitution in a viewer command template (DESIGN.md §11a): the
 /// checkout path of the task's project. Optional — a viewer that operates on
 /// the current directory (`git difftool -d`) needs no placeholder, since the
 /// command is run in the project's path regardless.
@@ -114,7 +115,12 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #     built-ins are reproduced below, commented out, ready to copy.
 #   * set `default_agent` — used for tasks with no --agent override. When unset,
 #     Voro picks the first built-in found on PATH (claude, then codex).
-#   * set a [viewer] — how `voro open <task-id>` shows a task's diff.
+#   * set up viewers — [viewers.<name>] tables define how a task's diff is
+#     shown locally when `voro pr`/`voro open` resolve to the viewer medium
+#     (DESIGN.md §8). `default_viewer` names the one used when a project does
+#     not pick a viewer itself (`voro project action <p> viewer:<name>`); a
+#     single anonymous [viewer] table is the older, still-valid spelling of
+#     the default.
 "#;
 
 /// The full skeleton `voro agent init` writes: the header, then the built-ins
@@ -148,8 +154,11 @@ fn starter_config() -> String {
          # default_agent = \"claude\"\n#\n\
          # [agents.mine]\n\
          # dispatch = \"my-agent run {prompt_file}\"\n#\n\
-         # [viewer]\n\
-         # cmd = \"zed {path}\"\n",
+         # default_viewer = \"zed\"\n#\n\
+         # [viewers.zed]\n\
+         # cmd = \"zed {path}\"\n#\n\
+         # [viewers.difftool]\n\
+         # cmd = \"git difftool -d\"\n",
     );
     out
 }
@@ -200,9 +209,12 @@ impl AgentTemplate {
     }
 }
 
-/// The `[viewer]` command template from `voro.toml` (DESIGN.md §11a): a
-/// shell command run in a task's checkout to open its diff. Unlike an agent
-/// template, `{path}` is optional, so nothing is validated at parse time.
+/// A viewer command template from `voro.toml` (DESIGN.md §11a): a shell
+/// command run in a task's checkout to open its diff. Defined as a named
+/// `[viewers.<name>]` table — so a project's review action can pick one by
+/// name — or as the anonymous `[viewer]` table, the single-viewer form that
+/// predates names and stays valid as a default. Unlike an agent template,
+/// `{path}` is optional, so nothing is validated at parse time.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewerTemplate {
@@ -246,6 +258,10 @@ struct RawConfig {
     agents: BTreeMap<String, AgentTemplate>,
     #[serde(default)]
     viewer: Option<ViewerTemplate>,
+    #[serde(default)]
+    viewers: BTreeMap<String, ViewerTemplate>,
+    #[serde(default)]
+    default_viewer: Option<String>,
 }
 
 /// Validate one agent's verb templates, factored out so the built-ins and the
@@ -325,7 +341,7 @@ pub struct ResolvedAgent {
 }
 
 /// The effective agent config: the built-in agents with any `voro.toml`
-/// merged on top, plus the user's `default_agent`/`[viewer]`. Each agent
+/// merged on top, plus the user's `default_agent` and viewers. Each agent
 /// carries its [`Provenance`] so `agent list` can show where it came from.
 #[derive(Debug, Clone)]
 pub struct AgentsConfig {
@@ -333,7 +349,14 @@ pub struct AgentsConfig {
     default: Option<String>,
     agents: BTreeMap<String, AgentTemplate>,
     provenance: BTreeMap<String, Provenance>,
+    /// The anonymous `[viewer]` table — the pre-names single viewer, still
+    /// honoured as a default when no `default_viewer` is set.
     viewer: Option<ViewerTemplate>,
+    /// The named `[viewers.<name>]` tables a project's review action can
+    /// pick from (DESIGN.md §8/§11a).
+    viewers: BTreeMap<String, ViewerTemplate>,
+    /// The user-set `default_viewer`, naming a `[viewers.*]` entry.
+    default_viewer: Option<String>,
     path: PathBuf,
 }
 
@@ -386,6 +409,8 @@ impl AgentsConfig {
             agents,
             provenance,
             viewer: None,
+            viewers: BTreeMap::new(),
+            default_viewer: None,
             path: path.to_path_buf(),
         }
     }
@@ -421,6 +446,8 @@ impl AgentsConfig {
             agents,
             provenance,
             viewer: raw.viewer,
+            viewers: raw.viewers,
+            default_viewer: raw.default_viewer,
             path: path.to_path_buf(),
         })
     }
@@ -492,11 +519,75 @@ impl AgentsConfig {
         })
     }
 
-    /// The `[viewer]` command template, if one is configured (DESIGN.md §11a).
-    /// `None` when the config has no `[viewer]` table, which the open-in-viewer
-    /// action turns into "add a `[viewer]` entry" rather than a silent no-op.
-    pub fn viewer(&self) -> Option<&str> {
-        self.viewer.as_ref().map(|v| v.cmd.as_str())
+    /// The names of the `[viewers.*]` tables, sorted, for the TUI's
+    /// review-action picker and `viewer list`.
+    pub fn viewer_names(&self) -> Vec<String> {
+        self.viewers.keys().cloned().collect()
+    }
+
+    /// The name of the viewer used when nothing picks one by name, for
+    /// `viewer list` to flag it: the user's `default_viewer` when set
+    /// (honoured even if it names a missing viewer, so [`viewer_cmd`]
+    /// (Self::viewer_cmd) reports the mismatch), else the sole `[viewers.*]`
+    /// entry when there is exactly one. The anonymous `[viewer]` table has no
+    /// name, so it yields `None` here even though it resolves.
+    pub fn default_viewer_name(&self) -> Option<String> {
+        if self.default_viewer.is_some() {
+            return self.default_viewer.clone();
+        }
+        if self.viewer.is_none() && self.viewers.len() == 1 {
+            return self.viewers.keys().next().cloned();
+        }
+        None
+    }
+
+    /// Resolve a viewer command (DESIGN.md §11a): the named `[viewers.<name>]`
+    /// when a name is given — a project's `viewer:<name>` review action —
+    /// otherwise the default: `default_viewer` when set, else the anonymous
+    /// `[viewer]` table, else the sole `[viewers.*]` entry when there is
+    /// exactly one. Errors carry what to configure, so the open-in-viewer
+    /// action reports a fix rather than a silent no-op.
+    pub fn viewer_cmd(&self, name: Option<&str>) -> Result<&str> {
+        let invalid = |message: String| Error::AgentConfigInvalid {
+            path: self.path.clone(),
+            message,
+        };
+        let named =
+            |name: &str| {
+                self.viewers.get(name).map(|v| v.cmd.as_str()).ok_or_else(|| {
+                let known = if self.viewers.is_empty() {
+                    "none are defined".to_string()
+                } else {
+                    format!("defined viewers: {}", self.viewer_names().join(", "))
+                };
+                invalid(format!(
+                    "no viewer named '{name}' — {known}; add a [viewers.{name}] table with a \
+                     cmd such as 'zed {{path}}' or 'git difftool -d'"
+                ))
+            })
+            };
+        match name {
+            Some(name) => named(name),
+            None => match &self.default_viewer {
+                Some(default) => named(default),
+                None => self
+                    .viewer
+                    .as_ref()
+                    .map(|v| v.cmd.as_str())
+                    .or_else(|| match self.viewers.len() {
+                        1 => self.viewers.values().next().map(|v| v.cmd.as_str()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        invalid(
+                            "no viewer configured; add a [viewers.<name>] table with a cmd \
+                             such as 'zed {path}' or 'git difftool -d' to see a task's diff \
+                             (set `default_viewer` when defining several)"
+                                .to_string(),
+                        )
+                    }),
+            },
+        }
     }
 
     /// The name of the agent used when a task has no override, for the CLI's
@@ -976,12 +1067,17 @@ mod tests {
     }
 
     #[test]
-    fn viewer_is_none_without_a_viewer_table() {
-        assert_eq!(config().viewer(), None);
+    fn viewer_resolution_errors_with_guidance_when_nothing_is_configured() {
+        let message = config().viewer_cmd(None).unwrap_err().to_string();
+        assert!(message.contains("no viewer configured"), "{message}");
+        assert!(message.contains("[viewers.<name>]"), "{message}");
+        assert!(message.contains("/tmp/voro.toml"), "{message}");
+        assert!(config().viewer_names().is_empty());
+        assert_eq!(config().default_viewer_name(), None);
     }
 
     #[test]
-    fn viewer_is_read_from_the_viewer_table() {
+    fn the_anonymous_viewer_table_is_the_default_viewer() {
         let text = r#"
             default_agent = "claude"
 
@@ -992,7 +1088,70 @@ mod tests {
             cmd = "zed {path}"
         "#;
         let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
-        assert_eq!(config.viewer(), Some("zed {path}"));
+        assert_eq!(config.viewer_cmd(None).unwrap(), "zed {path}");
+    }
+
+    #[test]
+    fn named_viewers_resolve_by_name_and_default_viewer_picks_among_them() {
+        let text = r#"
+            default_viewer = "zed"
+
+            [viewers.zed]
+            cmd = "zed {path}"
+
+            [viewers.difftool]
+            cmd = "git difftool -d"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        assert_eq!(config.viewer_names(), vec!["difftool", "zed"]);
+        assert_eq!(
+            config.viewer_cmd(Some("difftool")).unwrap(),
+            "git difftool -d"
+        );
+        assert_eq!(config.viewer_cmd(None).unwrap(), "zed {path}");
+        assert_eq!(config.default_viewer_name().as_deref(), Some("zed"));
+    }
+
+    #[test]
+    fn a_sole_named_viewer_is_the_default_without_being_named() {
+        let text = r#"
+            [viewers.zed]
+            cmd = "zed {path}"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        assert_eq!(config.viewer_cmd(None).unwrap(), "zed {path}");
+        assert_eq!(config.default_viewer_name().as_deref(), Some("zed"));
+    }
+
+    #[test]
+    fn several_named_viewers_without_a_default_error_with_guidance() {
+        let text = r#"
+            [viewers.zed]
+            cmd = "zed {path}"
+
+            [viewers.difftool]
+            cmd = "git difftool -d"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        let message = config.viewer_cmd(None).unwrap_err().to_string();
+        assert!(message.contains("default_viewer"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_viewer_name_errors_listing_the_known_ones() {
+        let text = r#"
+            [viewers.zed]
+            cmd = "zed {path}"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        let message = config.viewer_cmd(Some("emacs")).unwrap_err().to_string();
+        assert!(message.contains("emacs"), "{message}");
+        assert!(message.contains("zed"), "{message}");
+        // a default_viewer naming a missing table reports the same way
+        let text = r#"default_viewer = "gone""#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        let message = config.viewer_cmd(None).unwrap_err().to_string();
+        assert!(message.contains("gone"), "{message}");
     }
 
     #[test]
@@ -1003,7 +1162,8 @@ mod tests {
         let config = AgentsConfig::parse(&starter_config(), Path::new("/tmp/voro.toml")).unwrap();
         assert_eq!(config.agent_names(), vec!["claude", "codex"]);
         assert_eq!(config.provenance("claude"), Some(Provenance::BuiltIn));
-        assert_eq!(config.viewer(), None);
+        assert!(config.viewer_names().is_empty());
+        assert!(config.viewer_cmd(None).is_err());
         // the built-in claude still carries the #75 session verbs
         let claude = config.agent("claude").unwrap();
         assert!(claude.dispatch().contains("--bg"), "{}", claude.dispatch());

@@ -5,8 +5,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    Blocker, Dep, DepKind, DepRef, Event, Priority, Project, RunningRow, Session, SessionOutcome,
-    Task, TaskState,
+    Blocker, Dep, DepKind, DepRef, Event, Priority, Project, ReviewAction, RunningRow, Session,
+    SessionOutcome, Task, TaskState,
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -18,6 +18,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0006_one_open_session_per_task.sql"),
     include_str!("../migrations/0007_add_human.sql"),
     include_str!("../migrations/0008_add_stalled_state.sql"),
+    include_str!("../migrations/0009_add_review_action.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -140,7 +141,7 @@ impl Store {
     pub fn project(&self, id: i64) -> Result<Project> {
         self.conn
             .query_row(
-                "SELECT id, name, path, weight FROM projects WHERE id = ?1",
+                "SELECT id, name, path, weight, review_action FROM projects WHERE id = ?1",
                 [id],
                 project_from_row,
             )
@@ -151,7 +152,7 @@ impl Store {
     pub fn projects(&self) -> Result<Vec<Project>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, path, weight FROM projects ORDER BY name")?;
+            .prepare("SELECT id, name, path, weight, review_action FROM projects ORDER BY name")?;
         let rows = stmt.query_map([], project_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -168,6 +169,19 @@ impl Store {
             return Err(Error::ProjectNotFound(project_id));
         }
         Ok(())
+    }
+
+    /// Set how `pr` shows this project's review diffs (DESIGN.md §8/§11a).
+    /// `Auto` stores NULL — the medium goes back to being resolved at use.
+    pub fn set_review_action(&mut self, project_id: i64, action: &ReviewAction) -> Result<Project> {
+        let changed = self.conn.execute(
+            "UPDATE projects SET review_action = ?1 WHERE id = ?2",
+            params![action, project_id],
+        )?;
+        if changed == 0 {
+            return Err(Error::ProjectNotFound(project_id));
+        }
+        self.project(project_id)
     }
 
     /// Tasks reference a project by id, not name, so renaming is a pure
@@ -765,6 +779,7 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         name: row.get(1)?,
         path: row.get(2)?,
         weight: row.get(3)?,
+        review_action: row.get(4)?,
     })
 }
 
@@ -865,6 +880,38 @@ mod tests {
         let reloaded = s.task(task.id).unwrap();
         assert_eq!(reloaded.project_id, p.id);
         assert_eq!(s.project(reloaded.project_id).unwrap().name, "new-name");
+    }
+
+    #[test]
+    fn review_action_defaults_to_auto_and_round_trips() {
+        use crate::model::ReviewAction;
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("proj", "/tmp/proj").unwrap();
+        assert_eq!(p.review_action, ReviewAction::Auto);
+
+        let action = ReviewAction::Viewer(Some("zed".into()));
+        let updated = s.set_review_action(p.id, &action).unwrap();
+        assert_eq!(updated.review_action, action);
+        assert_eq!(s.project(p.id).unwrap().review_action, action);
+        assert_eq!(s.projects().unwrap()[0].review_action, action);
+
+        // Auto writes NULL, so the column reads back empty
+        s.set_review_action(p.id, &ReviewAction::Auto).unwrap();
+        assert_eq!(s.project(p.id).unwrap().review_action, ReviewAction::Auto);
+        let raw: Option<String> = s
+            .conn
+            .query_row(
+                "SELECT review_action FROM projects WHERE id = ?1",
+                [p.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, None);
+
+        assert!(matches!(
+            s.set_review_action(999, &ReviewAction::Pr),
+            Err(Error::ProjectNotFound(999))
+        ));
     }
 
     #[test]
