@@ -3,7 +3,7 @@
 This is the glue that lives *between* Voro and a coding agent, for the one agent
 that has richer integration hooks than "run a shell command": Claude Code. None
 of it is required — dispatch works for any agent through a command template,
-built-in or from `agents.toml` (DESIGN.md §8) — and none of it lives in
+built-in or from `voro.toml` (DESIGN.md §8) — and none of it lives in
 `voro-core` or the dispatch path. It is per-agent configuration you drop into a
 project.
 
@@ -70,10 +70,12 @@ through optional verbs on their `[agents.<name>]` table, next to the required
 
 The `claude` and `codex` definitions below **ship built-in** — Voro compiles
 them in (DESIGN.md §5), so you get exactly these without writing any
-`agents.toml`, and a binary upgrade updates them. They are reproduced here to
-explain the verbs and to show what you would copy into an `agents.toml` table
+`voro.toml`, and a binary upgrade updates them. They are reproduced here to
+explain the verbs and to show what you would copy into a `voro.toml` table
 to *override* one (a user table replaces a built-in wholesale, so keep every
-verb you still want) or to model a new agent of your own on:
+verb you still want) or to model a new agent of your own on. `voro agent init`
+writes the same built-ins into a fresh `voro.toml`, commented out and ready to
+copy:
 
 ```toml
 [agents.claude]

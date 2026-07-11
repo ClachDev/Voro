@@ -909,7 +909,7 @@ impl App {
         };
         let agents = config.agent_names();
         if agents.is_empty() {
-            self.status = Some("agents.toml defines no agents".into());
+            self.status = Some("no agents are configured".into());
             return;
         }
         let resolved = config.resolve(task_agent.as_deref()).ok().map(|r| r.name);

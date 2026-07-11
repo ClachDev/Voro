@@ -32,7 +32,7 @@ pub enum Error {
 
     #[error(
         "no default agent: none of the built-in agents ({probed}) were found on PATH; \
-         install one, or set `default` in {} to a configured agent",
+         install one, or set `default_agent` in {} to a configured agent",
         path.display()
     )]
     NoDefaultAgent { probed: String, path: PathBuf },

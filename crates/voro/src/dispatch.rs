@@ -157,7 +157,8 @@ pub struct DispatchCtx {
     /// The active database, exported to the session as `VORO_DB` so the
     /// agent's return-path verbs write back to the same store.
     pub db_path: PathBuf,
-    /// `agents.toml` location.
+    /// The resolved config-file location (`voro.toml`, or a legacy
+    /// `agents.toml` if that is what exists).
     pub agents_path: PathBuf,
     /// Directory for prompt and log files — never inside a project checkout,
     /// so writing the prompt does not itself dirty the tree.
@@ -169,8 +170,9 @@ pub struct DispatchCtx {
 }
 
 impl DispatchCtx {
-    /// The real environment: `agents.toml` at its config default, and a
-    /// `sessions/` directory beside the database for prompts and logs.
+    /// The real environment: the config file at its resolved default
+    /// location, and a `sessions/` directory beside the database for prompts
+    /// and logs.
     pub fn from_db_path(db_path: &Path) -> DispatchCtx {
         let runtime_dir = db_path
             .parent()

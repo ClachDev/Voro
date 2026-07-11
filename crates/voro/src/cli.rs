@@ -55,12 +55,12 @@ tasks
                                   --repo overrides the checkout's own remote
 
 dispatch
-  agent init                      write an optional agents.toml skeleton for
+  agent init                      write an optional voro.toml skeleton for
                                   extending/overriding the built-ins (won't
                                   overwrite an existing one)
   agent list                      list effective agents (built-in + user)
                                   with provenance; * marks the default
-  agent path                      print where dispatch looks for agents.toml
+  agent path                      print where dispatch looks for voro.toml
   dispatch <task-id> [--agent NAME]
                                   spawn a headless agent session on a ready
                                   task; --agent overrides the resolved agent
@@ -73,7 +73,7 @@ dispatch
                                   previously-dispatched task, exposed to retry
                                   a continuation that failed
   open <task-id>                  open a review/running task's checkout in the
-                                  configured [viewer] (agents.toml) to see its
+                                  configured [viewer] (voro.toml) to see its
                                   diff — reports what to configure if none is set
   pr <task-id> [--yes]            with a tracked PR, open it in a browser
                                   (jump-to-PR); with none, push the review
@@ -312,9 +312,9 @@ fn project_verb(
     }
 }
 
-/// Manage the `agents.toml` that dispatch resolves against — the config that
+/// Manage the `voro.toml` that dispatch resolves against — the config that
 /// lives outside the database (DESIGN.md §8), so this verb takes no `store`.
-/// `init` scaffolds a starter file, `list` shows what is configured, and
+/// `init` scaffolds a starter file, `list` shows the effective agents, and
 /// `path` prints where dispatch looks for it.
 fn agent_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
     let path = &ctx.agents_path;
@@ -322,8 +322,9 @@ fn agent_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
         "init" => {
             AgentsConfig::write_starter(path).map_err(|e| e.to_string())?;
             Ok(format!(
-                "wrote an agents skeleton to {} — optional, since the built-in claude/codex \
-                 agents already dispatch; edit it only to add or override agents",
+                "wrote a config skeleton to {} — optional, since the built-in claude/codex \
+                 agents already dispatch; edit it to add or override agents, or set options \
+                 like `default_agent` and `[viewer]`",
                 path.display()
             ))
         }
@@ -373,10 +374,19 @@ fn agent_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
                 Some(_) => writeln!(out, "\n({} — * is the default)", path.display()).unwrap(),
                 None => writeln!(
                     out,
-                    "\n({} — no default agent resolved; install claude/codex or set `default`)",
+                    "\n({} — no default agent resolved; install claude/codex or set \
+                     `default_agent`)",
                     path.display()
                 )
                 .unwrap(),
+            }
+            if AgentsConfig::is_legacy_path(path) {
+                writeln!(
+                    out,
+                    "note: loaded from the legacy agents.toml — rename it to voro.toml \
+                     (same directory) to silence this."
+                )
+                .unwrap();
             }
             Ok(out)
         }
@@ -1050,7 +1060,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let agents_path = dir.join("voro/agents.toml");
+        let agents_path = dir.join("voro/voro.toml");
         let ctx = DispatchCtx {
             db_path: dir.join("voro.db"),
             agents_path: agents_path.clone(),
