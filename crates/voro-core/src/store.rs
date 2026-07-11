@@ -378,6 +378,35 @@ impl Store {
         self.task(id)
     }
 
+    /// Set or replace a task's completion summary outside `done` (DESIGN.md
+    /// §8): append a `summary` event, which [`latest_summary`] naturally
+    /// supersedes with — the PR body, the detail view, and the
+    /// incomplete-report flag all read the newest event, so every consumer
+    /// picks up the replacement on its next read and the append-only log keeps
+    /// the older account. This is how a stale PR body gets amended and how a
+    /// `review` task flagged `[incomplete report]` gets its missing summary
+    /// without a `reject` → re-`done` round trip. Allowed only on a `running`
+    /// task (a resumed agent recording its account before `done`) or a
+    /// `review` task (fixing the report after it); it never touches
+    /// `tasks.state`, so it composes with the transition API rather than
+    /// bypassing it.
+    ///
+    /// [`latest_summary`]: Store::latest_summary
+    pub fn set_summary(&mut self, id: i64, summary: &str) -> Result<Task> {
+        if summary.trim().is_empty() {
+            return Err(Error::Invalid("a summary is required".into()));
+        }
+        let task = self.task(id)?;
+        if !matches!(task.state, TaskState::Running | TaskState::Review) {
+            return Err(Error::Invalid(format!(
+                "a summary can only be set on a running or review task; task {} is {}",
+                id, task.state
+            )));
+        }
+        log_event(&self.conn, id, "summary", Some(summary.trim()))?;
+        self.task(id)
+    }
+
     // --- deps ---
 
     pub fn add_dep(&mut self, task_id: i64, depends_on: i64, kind: DepKind) -> Result<()> {
@@ -589,11 +618,14 @@ impl Store {
     // --- events ---
 
     /// The most recent completion summary a task recorded (DESIGN.md §8): the
-    /// detail of its newest `summary` event, logged by `done --summary`. This
+    /// detail of its newest `summary` event, logged by `done --summary` or
+    /// amended in place by `set --summary` ([`set_summary`]). This
     /// is the PR body when `pr` opens a pull request, and the presence check
     /// `done` warns on. `None` when the task has never carried a summary — a
     /// planning or task-generation task that produced no code, which is why the
     /// summary stays optional through the whole lifecycle.
+    ///
+    /// [`set_summary`]: Store::set_summary
     pub fn latest_summary(&self, task_id: i64) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -1061,6 +1093,110 @@ mod tests {
             .conn
             .execute("UPDATE tasks SET human = 2 WHERE id = 1", []);
         assert!(junk.is_err(), "the CHECK must reject values outside 0/1");
+    }
+
+    #[test]
+    fn set_summary_appends_a_superseding_summary_event() {
+        use crate::transition::Action;
+
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let t = s
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "summarise me".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+            })
+            .unwrap();
+
+        // a running task may record its account before `done`
+        s.apply(t.id, Action::Start).unwrap();
+        let updated = s.set_summary(t.id, "  early account  ").unwrap();
+        assert_eq!(updated.state, TaskState::Running);
+        assert_eq!(
+            s.latest_summary(t.id).unwrap().as_deref(),
+            Some("early account")
+        );
+
+        // in review, a new summary supersedes the done-time one
+        s.apply(t.id, Action::Complete(Some("done-time".into())))
+            .unwrap();
+        let updated = s.set_summary(t.id, "amended for the PR body").unwrap();
+        assert_eq!(updated.state, TaskState::Review);
+        assert_eq!(
+            s.latest_summary(t.id).unwrap().as_deref(),
+            Some("amended for the PR body")
+        );
+
+        // every account stays on the append-only log
+        let events = s.events_for(t.id).unwrap();
+        let summaries = events.iter().filter(|e| e.kind == "summary").count();
+        assert_eq!(summaries, 3);
+    }
+
+    #[test]
+    fn set_summary_clears_the_incomplete_report_flag() {
+        use crate::transition::Action;
+
+        // The SessionEnd-fallback shape: review with a branch and no summary.
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let t = s
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "half a report".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+            })
+            .unwrap();
+        s.apply(t.id, Action::Start).unwrap();
+        s.apply(t.id, Action::Complete(None)).unwrap();
+        s.set_branch(t.id, Some("feat/x")).unwrap();
+        assert!(s.incomplete_report_flag(t.id).unwrap());
+
+        s.set_summary(t.id, "the missing half").unwrap();
+        assert!(!s.incomplete_report_flag(t.id).unwrap());
+    }
+
+    #[test]
+    fn set_summary_is_refused_outside_running_and_review() {
+        use crate::transition::Action;
+
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let t = s
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "not yet".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+            })
+            .unwrap();
+        let err = s.set_summary(t.id, "too early").unwrap_err();
+        assert!(err.to_string().contains("ready"), "{err}");
+
+        s.apply(t.id, Action::Start).unwrap();
+        s.apply(t.id, Action::Complete(None)).unwrap();
+        s.apply(t.id, Action::Accept).unwrap();
+        let err = s.set_summary(t.id, "too late").unwrap_err();
+        assert!(err.to_string().contains("done"), "{err}");
+
+        // and never with nothing to record, nor for a missing task
+        assert!(s.set_summary(t.id, "   ").is_err());
+        assert!(matches!(
+            s.set_summary(999, "x"),
+            Err(Error::TaskNotFound(999))
+        ));
     }
 
     #[test]
