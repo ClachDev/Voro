@@ -95,6 +95,16 @@ pub enum Mode {
         branch: String,
         title: String,
     },
+    /// Confirming that a just-closed task's dispatch worktree should be torn
+    /// down (DESIGN.md §8), reached when `accept`/`abandon` land on a task whose
+    /// branch has a matching worktree. The transition has already committed; the
+    /// plan states exactly what will be removed and why the branch is safe to
+    /// delete, and confirming runs the same `crate::worktree` teardown the CLI
+    /// calls. Declining leaves the worktree in place.
+    ConfirmCleanup {
+        task_id: i64,
+        plan: crate::worktree::Cleanup,
+    },
     Detail {
         task_id: i64,
         scroll: u16,
@@ -484,6 +494,7 @@ impl App {
                 branch,
                 title,
             } => self.key_confirm_pr(key, task_id, branch, title),
+            Mode::ConfirmCleanup { task_id, plan } => self.key_confirm_cleanup(key, task_id, plan),
             Mode::Detail { task_id, scroll } => self.key_detail(key, task_id, scroll),
             Mode::AgentPicker {
                 task_id,
@@ -818,6 +829,57 @@ impl App {
         }
     }
 
+    /// Apply a terminal transition (`Accept`/`Abandon`) and, if the closed task
+    /// owns a dispatch worktree, open the confirmation modal to tear it down
+    /// (DESIGN.md §8). The transition commits and refreshes first — cleanup is a
+    /// follow-on the operator confirms, and the transition stands whether they
+    /// go through with it or not. A task with no branch, or a branch with no
+    /// worktree, plans to nothing and closes exactly as before.
+    fn apply_and_clean_up(&mut self, task_id: i64, action: Action) {
+        let result = self.store.apply(task_id, action);
+        let Some(task) = self.report(result) else {
+            return;
+        };
+        let refreshed = self.refresh();
+        self.report(refreshed);
+        let project = match self.store.project(task.project_id) {
+            Ok(project) => project,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        match crate::worktree::Cleanup::plan(&task, &project.path) {
+            Ok(Some(plan)) => self.mode = Mode::ConfirmCleanup { task_id, plan },
+            Ok(None) => {}
+            Err(e) => self.status = Some(e),
+        }
+    }
+
+    /// Drive the worktree-teardown confirmation modal (DESIGN.md §8). Enter (or
+    /// `y`) runs the same `crate::worktree` teardown the CLI's `accept`/`abandon`
+    /// call — remove the worktree, delete the branch when it is safe — then
+    /// refreshes; esc (or `n`) leaves the worktree in place. Either way the
+    /// transition that opened this modal already stands.
+    fn key_confirm_cleanup(&mut self, key: KeyEvent, task_id: i64, plan: crate::worktree::Cleanup) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.status = Some(plan.execute());
+                let result = self.refresh();
+                self.report(result);
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.status = Some(format!(
+                    "worktree {} left in place — cleanup declined for #{task_id}",
+                    plan.worktree().display()
+                ));
+            }
+            _ => {
+                self.mode = Mode::ConfirmCleanup { task_id, plan };
+            }
+        }
+    }
+
     /// Drive the link-a-PR prompt (DESIGN.md §11c). Enter validates and stores
     /// the reference; esc cancels. The buffer is one line — a PR URL or the
     /// `owner/repo#n` shorthand — so this stays a simple line editor.
@@ -1136,6 +1198,9 @@ impl App {
                             kind,
                             buffer,
                         };
+                    }
+                    None if matches!(action, Action::Accept | Action::Abandon) => {
+                        self.apply_and_clean_up(task_id, action)
                     }
                     None => self.apply_and_refresh(task_id, action),
                 }
