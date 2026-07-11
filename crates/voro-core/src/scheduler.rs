@@ -162,13 +162,47 @@ impl Store {
     /// Count of untriaged tasks. Parked (weight-0) projects are hidden
     /// here too.
     pub fn proposed_count(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM tasks t JOIN projects p ON p.id = t.project_id
-             WHERE t.state = 'proposed' AND p.weight > 0",
-            [],
-            |r| r.get(0),
-        )?)
+        Ok(self.state_counts()?.proposed)
     }
+
+    /// Task counts by state for the header indicator (DESIGN.md §12), so the
+    /// triage backlog and the other queues stay felt even when a low-scoring
+    /// row falls past the queue's uniform cap (§7). Parked (weight-0) projects
+    /// are excluded, matching what the queue and browser show.
+    pub fn state_counts(&self) -> Result<StateCounts> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.state, COUNT(*) FROM tasks t JOIN projects p ON p.id = t.project_id
+             WHERE p.weight > 0 GROUP BY t.state",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, TaskState>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut counts = StateCounts::default();
+        for row in rows {
+            let (state, n) = row?;
+            match state {
+                TaskState::Proposed => counts.proposed = n,
+                TaskState::Ready => counts.ready = n,
+                TaskState::Running => counts.running = n,
+                TaskState::NeedsInput => counts.needs_input = n,
+                TaskState::Review => counts.review = n,
+                TaskState::Done => counts.done = n,
+                TaskState::Parked | TaskState::Rejected => {}
+            }
+        }
+        Ok(counts)
+    }
+}
+
+/// Task counts by state, for the persistent header indicator (DESIGN.md §12).
+/// Parked and rejected tasks earn no field — the first is snoozed, the second
+/// closed — so the struct carries only the states worth a running tally.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StateCounts {
+    pub proposed: i64,
+    pub ready: i64,
+    pub running: i64,
+    pub needs_input: i64,
+    pub review: i64,
+    pub done: i64,
 }
 
 #[cfg(test)]
@@ -469,6 +503,52 @@ mod tests {
         assert_eq!(ids, vec![visible]);
         assert_eq!(focus(&candidates).unwrap().task.id, visible);
         assert_eq!(s.proposed_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn state_counts_group_by_state_and_hide_parked_projects() {
+        let mut s = setup();
+        let active = add_project(&mut s, "active", 3);
+        let parked = add_project(&mut s, "parked", 0);
+
+        add_task(&mut s, active, "r1", Priority::P2);
+        add_task(&mut s, active, "r2", Priority::P2);
+        s.create_task(NewTask {
+            project_id: active,
+            title: "idea".into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state: TaskState::Proposed,
+            agent: None,
+        })
+        .unwrap();
+        let question = add_task(&mut s, active, "blocked on me", Priority::P2);
+        to_needs_input(&mut s, question);
+        let reviewed = add_task(&mut s, active, "in review", Priority::P2);
+        s.apply(reviewed, crate::Action::Start).unwrap();
+        s.apply(reviewed, crate::Action::Complete(None)).unwrap();
+
+        // Everything in a parked (weight-0) project stays out of the tally.
+        add_task(&mut s, parked, "hidden ready", Priority::P2);
+        s.create_task(NewTask {
+            project_id: parked,
+            title: "hidden idea".into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state: TaskState::Proposed,
+            agent: None,
+        })
+        .unwrap();
+
+        let c = s.state_counts().unwrap();
+        assert_eq!(c.ready, 2);
+        assert_eq!(c.proposed, 1);
+        assert_eq!(c.needs_input, 1);
+        assert_eq!(c.review, 1);
+        assert_eq!(c.running, 0);
+        assert_eq!(c.done, 0);
+        // proposed_count is the same guard-rail number the counts expose.
+        assert_eq!(s.proposed_count().unwrap(), 1);
     }
 
     #[test]

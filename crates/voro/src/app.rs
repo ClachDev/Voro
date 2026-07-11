@@ -1,7 +1,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use voro_core::{
     Action, AgentsConfig, Blocker, Candidate, Event, PrRef, Priority, Project, RunningRow,
-    ScoreBreakdown, Store, Task, TaskState, Triage, scheduler,
+    ScoreBreakdown, StateCounts, Store, Task, TaskState, Triage, scheduler,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +169,10 @@ pub struct App {
     /// still visible. Filtered on task state, so `review`/`needs-input` tasks —
     /// whose session stays open behind the scenes — stay in the queue, not here.
     pub running: Vec<RunningRow>,
+    /// Task counts by state (DESIGN.md §12), rendered as the persistent header
+    /// indicator so the triage backlog and the other queues stay felt even
+    /// when a low-scoring row falls past the queue's uniform cap (§7).
+    pub counts: StateCounts,
     pub all: Vec<TaskRow>,
     /// Ready tasks whose most recent session ended `failed` or `capped`
     /// (DESIGN.md §8) — read fresh from session history on every refresh,
@@ -220,6 +224,7 @@ impl App {
             projects: Vec::new(),
             queue: Vec::new(),
             running: Vec::new(),
+            counts: StateCounts::default(),
             all: Vec::new(),
             redispatch: std::collections::HashSet::new(),
             cockpit_rows: Vec::new(),
@@ -304,6 +309,7 @@ impl App {
             .collect();
         self.all = all;
         self.running = self.store.running_rows()?;
+        self.counts = self.store.state_counts()?;
 
         self.cockpit_rows = (0..self.queue.len()).map(CockpitRow::Queue).collect();
         self.cockpit_rows

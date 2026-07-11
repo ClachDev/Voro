@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use voro_core::{Event, ScoreBreakdown, TaskState};
+use voro_core::{Event, ScoreBreakdown, StateCounts, TaskState};
 
 use crate::app::{App, CockpitRow, Mode, Screen, TaskRow};
 
@@ -321,7 +321,42 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         };
         spans.push(Span::styled(format!("{}:{}  ", p.name, p.weight), style));
     }
-    frame.render_widget(Line::from(spans), area);
+    // Projects stay on the left where they are edited every morning; the per-
+    // state counts sit right-aligned so they never push the weights around.
+    let counts = counts_line(&app.counts);
+    let counts_width = counts.width() as u16;
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(counts_width)]).areas(area);
+    frame.render_widget(Line::from(spans), left);
+    frame.render_widget(counts, right);
+}
+
+/// The persistent header indicator (DESIGN.md §12): a compact per-state tally
+/// so the triage backlog and the other queues stay felt independently of the
+/// queue's uniform cap (§7). Each state shows only when non-zero; the untriaged
+/// `triage` count — the guard rail §12 leans on — is highlighted, the rest dim.
+fn counts_line(counts: &StateCounts) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut push = |label: &str, n: i64, style: Style| {
+        if n == 0 {
+            return;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(format!("{label} {n}"), style));
+    };
+    let dim = Style::new().dim();
+    push(
+        "triage",
+        counts.proposed,
+        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    );
+    push("input", counts.needs_input, dim);
+    push("review", counts.review, dim);
+    push("ready", counts.ready, dim);
+    push("done", counts.done, dim);
+    Line::from(spans)
 }
 
 fn score_span(total: f64) -> Span<'static> {
@@ -1107,5 +1142,72 @@ mod tests {
             blocker_spans(&row(TaskState::Ready, vec![blocker(4, TaskState::Done)])).is_empty()
         );
         assert!(blocker_spans(&row(TaskState::Parked, vec![])).is_empty());
+    }
+
+    #[test]
+    fn header_counts_show_nonzero_states_and_omit_the_rest() {
+        let counts = voro_core::StateCounts {
+            proposed: 3,
+            ready: 5,
+            running: 2,
+            needs_input: 1,
+            review: 0,
+            done: 0,
+        };
+        let line = counts_line(&counts);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("triage 3"), "{text}");
+        assert!(text.contains("ready 5"), "{text}");
+        assert!(text.contains("input 1"), "{text}");
+        // Zero-count states never render, and `running` is not a header stat.
+        assert!(!text.contains("review"), "{text}");
+        assert!(!text.contains("done"), "{text}");
+        assert!(!text.contains("running"), "{text}");
+
+        // With no work anywhere the indicator collapses to nothing.
+        assert_eq!(counts_line(&voro_core::StateCounts::default()).width(), 0);
+    }
+
+    #[test]
+    fn header_renders_the_untriaged_count_alongside_projects() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store.set_weight(p.id, 3).unwrap();
+        let new = |title: &str, state: TaskState| NewTask {
+            project_id: p.id,
+            title: title.into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state,
+            agent: None,
+        };
+        store.create_task(new("idea", TaskState::Proposed)).unwrap();
+        store.create_task(new("go", TaskState::Ready)).unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let app = App::new(store, ctx).unwrap();
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let header = terminal.backend().buffer().content()[..80]
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(header.contains("voro"), "header missing brand: {header}");
+        assert!(
+            header.contains("triage 1"),
+            "header missing untriaged count: {header}"
+        );
+        assert!(
+            header.contains("ready 1"),
+            "header missing ready count: {header}"
+        );
     }
 }
