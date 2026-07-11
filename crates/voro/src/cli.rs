@@ -717,6 +717,16 @@ fn show_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     if store.redispatch_flag(id).map_err(|e| e.to_string())? {
         writeln!(out, "flagged for redispatch").unwrap();
     }
+    if store
+        .incomplete_report_flag(id)
+        .map_err(|e| e.to_string())?
+    {
+        writeln!(
+            out,
+            "incomplete report: needs a branch and summary before `voro pr {id}`"
+        )
+        .unwrap();
+    }
     let deps = store.deps_of(id).map_err(|e| e.to_string())?;
     for dep in &deps {
         writeln!(out, "dep: {} {}", dep.kind, dep.depends_on).unwrap();
@@ -762,9 +772,10 @@ fn list_verb(store: &mut Store, flags: &HashMap<String, String>) -> Result<Strin
             .unwrap_or("?");
         writeln!(
             out,
-            "{}{}",
+            "{}{}{}",
             task_line(&task, name),
-            redispatch_suffix(store, task.id)
+            redispatch_suffix(store, task.id),
+            incomplete_report_suffix(store, task.id)
         )
         .unwrap();
     }
@@ -786,6 +797,7 @@ fn inbox_verb(store: &mut Store) -> Result<String, String> {
             write!(out, "  — {q}").unwrap();
         }
         write!(out, "{}", redispatch_suffix(store, c.task.id)).unwrap();
+        write!(out, "{}", incomplete_report_suffix(store, c.task.id)).unwrap();
         writeln!(out).unwrap();
     }
     if out.is_empty() {
@@ -821,10 +833,11 @@ fn next_verb(store: &mut Store) -> Result<String, String> {
             let mut out = String::new();
             writeln!(
                 out,
-                "{:5.1}  {}{}",
+                "{:5.1}  {}{}{}",
                 c.score.total,
                 task_line(&c.task, &c.project_name),
-                redispatch_suffix(store, c.task.id)
+                redispatch_suffix(store, c.task.id),
+                incomplete_report_suffix(store, c.task.id)
             )
             .unwrap();
             if !c.task.body.is_empty() {
@@ -842,6 +855,20 @@ fn next_verb(store: &mut Store) -> Result<String, String> {
 fn redispatch_suffix(store: &Store, task_id: i64) -> &'static str {
     if store.redispatch_flag(task_id).unwrap_or(false) {
         "  [redispatch]"
+    } else {
+        ""
+    }
+}
+
+/// `  [incomplete report]` when a `review` task carries only one of a branch
+/// and a summary (DESIGN.md §8), else empty — the half-finished done report a
+/// dispatched session left behind, surfaced so the operator sees it rather than
+/// hitting the gap at `pr` time. Re-derived per line like [`redispatch_suffix`];
+/// the two are mutually exclusive (one is `ready`-only, the other `review`-only)
+/// so both can be appended and at most one prints.
+fn incomplete_report_suffix(store: &Store, task_id: i64) -> &'static str {
+    if store.incomplete_report_flag(task_id).unwrap_or(false) {
+        "  [incomplete report]"
     } else {
         ""
     }
@@ -1661,6 +1688,42 @@ mod tests {
         let out = ok(&mut s, &["done", "1", "--summary", "did it"]);
         assert!(out.contains("-> review"), "{out}");
         assert!(!out.contains("note:"), "{out}");
+    }
+
+    #[test]
+    fn a_partial_report_is_flagged_incomplete_in_list_and_show() {
+        // A review task with a branch but no summary — the shape a forgotten
+        // --summary (or the SessionEnd fallback) leaves — is surfaced as an
+        // anomaly the operator can act on, not left looking complete.
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["done", "1", "--branch", "feat/x"]);
+
+        assert!(ok(&mut s, &["list"]).contains("[incomplete report]"));
+        assert!(
+            ok(&mut s, &["show", "1"]).contains("incomplete report: needs a branch and summary")
+        );
+    }
+
+    #[test]
+    fn a_complete_report_is_not_flagged_incomplete() {
+        // Both halves present: a complete report, no anomaly. And a planning
+        // task with neither is likewise not flagged.
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Coding", "--state", "ready"]);
+        ok(&mut s, &["set", "1", "--branch", "feat/x"]);
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["done", "1", "--summary", "did it"]);
+        ok(&mut s, &["add", "demo", "Planning", "--state", "ready"]);
+        ok(&mut s, &["start", "2"]);
+        ok(&mut s, &["done", "2"]);
+
+        assert!(!ok(&mut s, &["list"]).contains("[incomplete report]"));
+        assert!(!ok(&mut s, &["show", "1"]).contains("incomplete report"));
+        assert!(!ok(&mut s, &["show", "2"]).contains("incomplete report"));
     }
 
     #[test]

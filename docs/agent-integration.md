@@ -42,14 +42,18 @@ You were dispatched by Voro on task $VORO_TASK_ID. When you reach one of these
 points, run the matching command — Voro surfaces it in the operator's queue:
 
     voro ask "$VORO_TASK_ID" --question "Schema A or B? Trade-offs: ..."
-    voro done "$VORO_TASK_ID" --branch "$(git rev-parse --abbrev-ref HEAD)"
+    voro done "$VORO_TASK_ID" --branch "$(git rev-parse --abbrev-ref HEAD)" --summary "Implemented X, tests pass"
     voro propose <project> "Follow-up title" --body-file plan.md
 
 - `ask` when you are blocked on a human decision and cannot proceed.
-- `done` when the work is complete and ready for review; `--branch` reports the
-  git branch your work landed on so the task correlates with its PR (omit it if
-  you did not work on a branch). If the task named an intended branch, you were
-  told which one in the dispatch preamble — create or check it out yourself.
+- `done` when the work is complete and ready for review. Record **both** flags on
+  the one call: `--branch` is the git branch your work landed on and `--summary`
+  is a PR-ready account of what changed, why, and how you verified it — `voro pr`
+  opens the pull request straight from them and needs both, and a `done` that
+  supplies only one leaves the task flagged `[incomplete report]`. Omit both only
+  for a task that produced no code (planning, triage). If the task named an
+  intended branch, you were told which one in the dispatch preamble — create or
+  check it out yourself.
 - `propose` to record follow-up work you noticed; it links back to this task.
 
 `VORO_TASK_ID` and `VORO_DB` are already in your environment — do not set them.
@@ -194,7 +198,7 @@ The hooks that matter here, and what each can honestly do:
 
 | Hook | Fires when | Fallback | Value it adds |
 |---|---|---|---|
-| `SessionEnd` | the session terminates normally | `voro done --branch <current branch>` if the task is still `running` | upgrades a forgotten `done` from a `failed` reconcile that leaves the task a stalled `running` orphan to a real `review` — the operator sees the diff instead of having to chase down an orphan — and records the branch the work landed on (task #81) |
+| `SessionEnd` | the session terminates normally | `voro done --branch <current branch> [--summary <final message>]` if the task is still `running` | upgrades a forgotten `done` from a `failed` reconcile that leaves the task a stalled `running` orphan to a real `review` — the operator sees the diff instead of having to chase down an orphan — recording the branch the work landed on (task #81) and, best-effort, the session's final assistant message as the summary so the fallback lands a complete report rather than a summary-less one (task #93) |
 | `Notification` | Claude needs permission, or has idled waiting for input | `voro ask` with the notification message | the *only* signal for a session that is alive but stuck: its process is still running, so the pid-liveness reconciler never fires for it |
 | `Stop` | the main agent finishes responding | same as `SessionEnd` | an earlier anchor for the same completion case; redundant with `SessionEnd` and optional |
 
@@ -215,6 +219,19 @@ routes the diff to the operator's eyes rather than leaving a stalled orphan to
 chase down. Prefer
 that the agent call `done` itself with a real summary; treat the hook as the net,
 not the plan.
+
+**The fallback summary is best-effort.** The hook pulls the session's final
+assistant message out of the transcript Claude Code names in the payload and
+passes it as `--summary`. When it can be read, the fallback lands a complete
+report a PR can be opened from; when it can't (no `jq`, an unreadable or
+schema-shifted transcript), the hook still records the branch and the task lands
+in `review` flagged `[incomplete report]` (DESIGN.md §8) — the operator supplies a
+real summary, or resumes the session, before `pr`. Either way the guarantee
+holds: a complete report or a visible anomaly, never a silent gap. The final
+message is a genuine account of what the agent did, not a fabricated one, so it
+is safe to become the PR body — but it is the agent's *closing remarks*, not a
+summary it wrote on purpose, so a real `done --summary` from the agent is still
+preferred.
 
 ### Double transitions are already safe
 
@@ -247,9 +264,11 @@ Two things make this safe to leave installed:
   keeps Claude Code from surfacing it to the operator as a failed hook.
 
 Both fallbacks get a small wrapper script on your `PATH`. The `SessionEnd`
-fallback needs to read the checkout's current branch (guarding an empty or
-detached HEAD so it never records a blank name), and the `Notification` fallback
-reads the hook's JSON from stdin to lift out the message — both fiddly to inline.
+fallback reads the checkout's current branch (guarding an empty or detached HEAD
+so it never records a blank name) and, best-effort, lifts the session's final
+assistant message out of the transcript the hook payload names to pass as the
+summary; the `Notification` fallback reads the hook's JSON from stdin to lift out
+the message — all fiddly to inline.
 
 `.claude/settings.json`:
 
@@ -280,13 +299,30 @@ reads the hook's JSON from stdin to lift out the message — both fiddly to inli
 #!/bin/sh
 # Claude Code SessionEnd hook -> voro done, for a forgotten completion.
 [ -n "$VORO_TASK_ID" ] || exit 0           # inert outside a dispatched session
+payload=$(cat)                             # SessionEnd JSON on stdin
+
 branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
 [ "$branch" = HEAD ] && branch=            # detached HEAD: no branch to report
-if [ -n "$branch" ]; then
-  voro done "$VORO_TASK_ID" --branch "$branch" >/dev/null 2>&1 || true
-else
-  voro done "$VORO_TASK_ID" >/dev/null 2>&1 || true
+
+# Best-effort summary: the session's final assistant message, from the
+# transcript Claude Code names in the payload. A real account of what the agent
+# did, so it is safe as a PR body. If it can't be read, the summary is omitted
+# and the task lands flagged [incomplete report] for the operator to complete.
+summary=
+if command -v jq >/dev/null 2>&1; then
+  transcript=$(printf '%s' "$payload" | jq -r '.transcript_path // empty')
+  if [ -n "$transcript" ] && [ -f "$transcript" ]; then
+    summary=$(jq -rs '
+      map(select(.type == "assistant")) | last | .message.content
+      | (if type == "array" then map(select(.type == "text") | .text) | join("\n")
+         else . end) // empty' "$transcript" 2>/dev/null)
+  fi
 fi
+
+set --                                     # build argv, omitting empty flags
+[ -n "$branch" ] && set -- "$@" --branch "$branch"
+[ -n "$summary" ] && set -- "$@" --summary "$summary"
+voro done "$VORO_TASK_ID" "$@" >/dev/null 2>&1 || true
 ```
 
 `voro-notify-hook` (make it executable, put it on `PATH`):
@@ -324,7 +360,16 @@ contract, and no correction to the snippet was needed.
 `SessionEnd` fires when the session ends (`hook_event_name` `"SessionEnd"`,
 `reason` `"other"` on a normal `-p` exit), and its `voro-done-hook` upgrades a
 still-`running` task to `review` while recording the current branch — the
-forgotten completion is caught. `Notification` fires the moment a live session
+forgotten completion is caught. The best-effort **summary** extraction added to
+that hook (task #93) — reading `transcript_path` from the payload and slurping
+the final assistant message — is *not* yet live-verified: the payload carries a
+`transcript_path` in the current contract, but the transcript's JSONL schema
+(`.type == "assistant"`, `.message.content` blocks) is assumed from Claude Code's
+format, not confirmed against a captured file, so treat the summary line as
+best-effort until re-verified. It degrades safely — an unreadable or
+schema-shifted transcript yields an empty summary and the task lands flagged
+`[incomplete report]` (DESIGN.md §8) rather than mis-recording one — so the
+guarantee does not depend on it holding. `Notification` fires the moment a live session
 stalls on a permission prompt, with `hook_event_name` `"Notification"` and
 `message` `"Claude needs your permission"` (alongside a `notification_type`
 `"permission_prompt"` the hook ignores); the `voro-notify-hook`'s `jq -r '.message
