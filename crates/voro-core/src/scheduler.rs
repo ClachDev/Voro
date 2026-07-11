@@ -65,42 +65,22 @@ pub struct Candidate {
     pub score: ScoreBreakdown,
 }
 
-/// The floor on how many `ready` rows the queue offers when startable work is
-/// all lower priority: enough autonomy to choose around the top one, few
-/// enough that the queue stays an answer rather than a todo list — the browser
-/// holds the rest. It is a floor, not a cap: every P0/P1 ready task shows on
-/// top of it (see `queue`).
-pub const QUEUE_READY_FLOOR: usize = 5;
+/// How many rows the queue offers: enough to keep the autonomy to pick around
+/// the top item, few enough that the queue stays an answer rather than the
+/// whole backlog — the browser holds the rest. A single cap across every
+/// state, since each row is one next action competing on the same score (§7).
+pub const QUEUE_MAX_ROWS: usize = 10;
 
-/// The next-action queue (§1): every `needs-input`, `review`, and `proposed`
-/// task plus a priority-driven selection of `ready` tasks, in one list ordered
-/// purely by score. Each row is an action — answer, review, triage, or start;
-/// the human picks from the top, the score does not dictate.
-///
-/// Ready selection is by priority, not a strict count (§7): every P0/P1 ready
-/// task always appears — startable work the operator has marked urgent or
-/// important is never truncated — and the highest-scoring lower-priority ready
-/// tasks fill up to `QUEUE_READY_FLOOR` total rows. Priority decides *whether*
-/// a ready row appears; score still decides *where* it sits.
+/// The next-action queue (§1): the `QUEUE_MAX_ROWS` highest-scoring tasks
+/// across every actionable state, in one list ordered by score. Each row is an
+/// action — answer, review, triage, or start; the human picks from the top,
+/// the score does not dictate. The cap is uniform: `needs-input`, `review`,
+/// `proposed`, and `ready` all compete for the same slots on score alone, so a
+/// low-scoring row of any state can fall below the cut (§7).
 pub fn queue(candidates: &[Candidate]) -> Vec<&Candidate> {
-    let mut ready: Vec<&Candidate> = candidates
-        .iter()
-        .filter(|c| c.task.state == TaskState::Ready)
-        .collect();
-    ready.sort_by(|a, b| rank(a, b));
-
-    let (mut selected, fill): (Vec<&Candidate>, Vec<&Candidate>) = ready
-        .into_iter()
-        .partition(|c| c.task.priority <= Priority::P1);
-    let room = QUEUE_READY_FLOOR.saturating_sub(selected.len());
-    selected.extend(fill.into_iter().take(room));
-
-    let mut items: Vec<&Candidate> = candidates
-        .iter()
-        .filter(|c| c.task.state != TaskState::Ready)
-        .chain(selected)
-        .collect();
+    let mut items: Vec<&Candidate> = candidates.iter().collect();
     items.sort_by(|a, b| rank(a, b));
+    items.truncate(QUEUE_MAX_ROWS);
     items
 }
 
@@ -349,70 +329,49 @@ mod tests {
     }
 
     #[test]
-    fn low_priority_ready_fills_only_up_to_the_floor() {
-        // All startable work is P2: the queue shows the highest-scoring
-        // QUEUE_READY_FLOOR of them and no more — the floor doubles as the cap
-        // when nothing is urgent or important.
+    fn queue_caps_at_the_highest_scoring_rows() {
+        // More candidates than the cap: the queue keeps the QUEUE_MAX_ROWS
+        // highest-scoring and drops the rest, regardless of state.
         let mut s = setup();
         let p = add_project(&mut s, "p", 3);
-        let tasks: Vec<i64> = (0..QUEUE_READY_FLOOR + 3)
+        let tasks: Vec<i64> = (0..QUEUE_MAX_ROWS + 4)
             .map(|i| {
                 let id = add_task(&mut s, p, &format!("t{i}"), Priority::P2);
                 // older tasks score higher via the age bonus, so ordering is
                 // deterministic: index 0 oldest, last youngest.
-                set_age_days(&mut s, id, (QUEUE_READY_FLOOR + 3 - i) as f64);
+                set_age_days(&mut s, id, (QUEUE_MAX_ROWS + 4 - i) as f64);
                 id
             })
             .collect();
 
         let candidates = s.candidates().unwrap();
         let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
-        assert_eq!(ids.len(), QUEUE_READY_FLOOR);
-        assert_eq!(ids, tasks[..QUEUE_READY_FLOOR]);
+        assert_eq!(ids.len(), QUEUE_MAX_ROWS);
+        assert_eq!(ids, tasks[..QUEUE_MAX_ROWS]);
     }
 
     #[test]
-    fn every_p0_p1_ready_task_shows_beyond_the_floor() {
-        // More P0/P1 startable work than the floor: none of it is truncated,
-        // because a strict count is exactly what priority-driven selection
-        // drops. If this floods the queue, that overflow is the signal (§7/§12).
-        let mut s = setup();
-        let p = add_project(&mut s, "p", 1);
-        let urgent: Vec<i64> = (0..QUEUE_READY_FLOOR + 2)
-            .map(|i| add_task(&mut s, p, &format!("urgent {i}"), Priority::P1))
-            .collect();
-
-        let candidates = s.candidates().unwrap();
-        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
-        assert_eq!(ids.len(), urgent.len());
-        for id in &urgent {
-            assert!(ids.contains(id));
-        }
-    }
-
-    #[test]
-    fn a_high_priority_ready_task_is_never_truncated_by_a_higher_scoring_flood() {
-        // The #74 / PR #35 case that a strict by-score cap needed an exemption
-        // for: five P2s in a weight-5 project each outscore (10) a lone P1 in a
-        // weight-1 project (4). The old count cap truncated the P1 below the
-        // line; priority-driven selection always shows it, and the P2s fill the
-        // remaining room up to the floor — so one P2 drops instead.
+    fn the_cap_drops_a_low_scoring_attention_item_regardless_of_state() {
+        // The cap is uniform across state: a low-scoring question can fall
+        // below it just like a ready task, once enough higher-scoring work
+        // exists. Ten P0 ready tasks in a heavy project (score 40) fill the cap
+        // and push a lone P3 question in a light project (1×(1+4) = 5) off.
         let mut s = setup();
         let heavy = add_project(&mut s, "heavy", 5);
         let light = add_project(&mut s, "light", 1);
-        let loud: Vec<i64> = (0..QUEUE_READY_FLOOR)
-            .map(|i| add_task(&mut s, heavy, &format!("loud {i}"), Priority::P2))
+        let loud: Vec<i64> = (0..QUEUE_MAX_ROWS)
+            .map(|i| add_task(&mut s, heavy, &format!("loud {i}"), Priority::P0))
             .collect();
-        let important = add_task(&mut s, light, "important", Priority::P1);
+        let quiet_question = add_task(&mut s, light, "quiet question", Priority::P3);
+        to_needs_input(&mut s, quiet_question);
 
         let candidates = s.candidates().unwrap();
         let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
-        assert_eq!(ids.len(), QUEUE_READY_FLOOR);
-        assert!(ids.contains(&important));
-        assert_eq!(
-            ids.iter().filter(|id| loud.contains(id)).count(),
-            QUEUE_READY_FLOOR - 1
-        );
+        assert_eq!(ids.len(), QUEUE_MAX_ROWS);
+        assert!(!ids.contains(&quiet_question));
+        for id in &loud {
+            assert!(ids.contains(id));
+        }
     }
 
     #[test]
