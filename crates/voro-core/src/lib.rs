@@ -44,6 +44,7 @@ mod tests {
             priority: Priority::P2,
             state,
             agent: None,
+            human: false,
         }
     }
 

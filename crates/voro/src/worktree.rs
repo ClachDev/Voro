@@ -293,6 +293,7 @@ mod tests {
                 priority: Priority::P1,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap()
             .id;

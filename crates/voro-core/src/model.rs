@@ -271,6 +271,12 @@ pub struct Task {
     pub state_since: String,
     pub created_at: String,
     pub closed_at: Option<String>,
+    /// Marks a task no agent can execute at all — hands-on work at real
+    /// hardware, say (DESIGN.md §3/§6). Dispatch, continuation, `ask`, and the
+    /// agent override refuse it; completion goes `running → done` directly,
+    /// since the human is both executor and acceptor. The default (`false`)
+    /// means dispatchable, with the human still free to start it by hand.
+    pub human: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
