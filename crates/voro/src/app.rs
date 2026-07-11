@@ -4,6 +4,10 @@ use voro_core::{
     ScoreBreakdown, StateCounts, Store, Task, TaskState, Triage, scheduler,
 };
 
+/// Lines `PgDn`/`PgUp` move the focus card in one press. A fixed step, since
+/// the key handler runs without the pane's geometry.
+const DETAIL_PAGE_STEP: i64 = 10;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Cockpit,
@@ -205,6 +209,15 @@ pub struct App {
     /// by the cockpit detail pane and the tasks-screen Detail popup.
     pub show_score: bool,
     pub show_history: bool,
+    /// Vertical scroll offset of the cockpit focus card (DESIGN.md §9). Task
+    /// bodies are full dispatchable prompts, so a long one overruns the pane;
+    /// `J`/`K` and `PgDn`/`PgUp` scroll it. Reset to the top whenever the
+    /// selection moves, since the pane follows the selection.
+    pub detail_scroll: u16,
+    /// The largest useful `detail_scroll` for the pane as last rendered — the
+    /// key handler has no geometry of its own, so `draw_detail` records the
+    /// overflow here for `scroll_detail` to clamp against.
+    pub detail_max_scroll: std::cell::Cell<u16>,
     pub pending_editor: Option<EditorRequest>,
     pub pending_attach: Option<AttachRequest>,
 
@@ -249,6 +262,8 @@ impl App {
             mode: Mode::Normal,
             show_score: false,
             show_history: false,
+            detail_scroll: 0,
+            detail_max_scroll: std::cell::Cell::new(0),
             pending_editor: None,
             pending_attach: None,
             last_data_version: 0,
@@ -369,6 +384,15 @@ impl App {
             return;
         }
         *sel = (*sel as i64 + delta).clamp(0, len as i64 - 1) as usize;
+        // The focus card follows the selection, so start each new body at the top.
+        self.detail_scroll = 0;
+    }
+
+    /// Scroll the cockpit focus card, clamped to the overflow `draw_detail`
+    /// last measured so `K` past the top or `J` past the bottom simply stops.
+    fn scroll_detail(&mut self, delta: i64) {
+        let max = self.detail_max_scroll.get() as i64;
+        self.detail_scroll = (self.detail_scroll as i64 + delta).clamp(0, max) as u16;
     }
 
     /// Tab cycles cockpit → tasks → projects → cockpit; `1`/`2`/`3` jump
@@ -613,6 +637,18 @@ impl App {
             }
             KeyCode::Char('h') if self.screen == Screen::Cockpit => {
                 self.show_history = !self.show_history;
+            }
+            // Scroll the focus card body (task #2). Lowercase `j`/`k` already
+            // move the row selection, so the shifted `J`/`K` and the page keys
+            // drive the pane. Clamped in `scroll_detail` against the last
+            // rendered overflow.
+            KeyCode::Char('J') if self.screen == Screen::Cockpit => self.scroll_detail(1),
+            KeyCode::Char('K') if self.screen == Screen::Cockpit => self.scroll_detail(-1),
+            KeyCode::PageDown if self.screen == Screen::Cockpit => {
+                self.scroll_detail(DETAIL_PAGE_STEP)
+            }
+            KeyCode::PageUp if self.screen == Screen::Cockpit => {
+                self.scroll_detail(-DETAIL_PAGE_STEP)
             }
             KeyCode::Char('d') => {
                 if let Some((task_id, _)) = self.ready_selected_task() {

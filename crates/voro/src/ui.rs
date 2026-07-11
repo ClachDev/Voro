@@ -593,7 +593,25 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         lines.extend(history_lines(&app.task_events(task.id)));
     }
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para.block(block), area);
+
+    // Bodies are full dispatchable prompts, so a long one overflows the pane;
+    // measure the wrapped height against the inner area to clamp the scroll and
+    // decide whether to advertise it. `line_count` wants the text width, so
+    // pass the inner width and keep the block off this measuring paragraph.
+    let inner = block.inner(area);
+    let total = para.line_count(inner.width) as u16;
+    let max_scroll = total.saturating_sub(inner.height);
+    app.detail_max_scroll.set(max_scroll);
+    let scroll = app.detail_scroll.min(max_scroll);
+
+    let block = if max_scroll > 0 {
+        block.title_bottom(
+            Line::from(format!(" {scroll}/{max_scroll} ↕ J/K PgDn/PgUp ")).right_aligned(),
+        )
+    } else {
+        block
+    };
+    frame.render_widget(para.scroll((scroll, 0)).block(block), area);
 }
 
 /// Live sessions (DESIGN.md §9): agent, task state, and elapsed time since
@@ -1075,6 +1093,86 @@ mod tests {
             rendered.contains("History") && rendered.contains("created"),
             "history should fold into the detail pane: {rendered}"
         );
+    }
+
+    /// End-to-end: a body taller than the focus card overflows, so the pane
+    /// advertises the scroll, `J` moves the view down and clamps at the bottom,
+    /// and `K` returns it to the top. Renders into a short terminal to force
+    /// the overflow, since the clamp depends on the measured geometry.
+    #[test]
+    fn cockpit_focus_card_scrolls_a_long_body() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        use voro_core::{NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let body = (0..40)
+            .map(|i| format!("row{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        store
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "a long task".into(),
+                body,
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+            })
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        let render = |app: &App, terminal: &mut Terminal<TestBackend>| -> String {
+            terminal.draw(|f| draw(f, app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        let first = render(&app, &mut terminal);
+        let max = app.detail_max_scroll.get();
+        assert!(max > 0, "the body should overflow the focus card");
+        assert!(
+            first.contains("J/K"),
+            "an overflowing pane advertises the scroll"
+        );
+        assert!(
+            first.contains("row00"),
+            "the top of the body is visible at rest"
+        );
+
+        // `J` scrolls down; the top line falls off, the indicator advances.
+        for _ in 0..max as usize + 5 {
+            app.on_key(KeyEvent::from(KeyCode::Char('J')));
+        }
+        assert_eq!(app.detail_scroll, max, "J clamps at the bottom");
+        let bottom = render(&app, &mut terminal);
+        assert!(!bottom.contains("row00"), "the top scrolled out of view");
+
+        // `K` returns to the top and stops there.
+        for _ in 0..max as usize + 5 {
+            app.on_key(KeyEvent::from(KeyCode::Char('K')));
+        }
+        assert_eq!(app.detail_scroll, 0, "K clamps at the top");
+
+        // Moving the selection resets the view to the top of the new body.
+        for _ in 0..3 {
+            app.on_key(KeyEvent::from(KeyCode::Char('J')));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(app.detail_scroll, 0, "a new selection starts at the top");
     }
 
     /// End-to-end: on the tasks screen the same sections fold into the Detail
