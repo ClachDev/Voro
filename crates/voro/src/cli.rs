@@ -742,9 +742,6 @@ fn show_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     if let Some(branch) = &task.branch {
         writeln!(out, "branch: {branch}").unwrap();
     }
-    if store.redispatch_flag(id).map_err(|e| e.to_string())? {
-        writeln!(out, "flagged for redispatch").unwrap();
-    }
     if store
         .incomplete_report_flag(id)
         .map_err(|e| e.to_string())?
@@ -800,9 +797,8 @@ fn list_verb(store: &mut Store, flags: &HashMap<String, String>) -> Result<Strin
             .unwrap_or("?");
         writeln!(
             out,
-            "{}{}{}",
+            "{}{}",
             task_line(&task, name),
-            redispatch_suffix(store, task.id),
             incomplete_report_suffix(store, task.id)
         )
         .unwrap();
@@ -824,7 +820,6 @@ fn inbox_verb(store: &mut Store) -> Result<String, String> {
         if let Some(q) = &c.task.question {
             write!(out, "  — {q}").unwrap();
         }
-        write!(out, "{}", redispatch_suffix(store, c.task.id)).unwrap();
         write!(out, "{}", incomplete_report_suffix(store, c.task.id)).unwrap();
         writeln!(out).unwrap();
     }
@@ -847,6 +842,7 @@ fn stats_verb(store: &mut Store) -> Result<String, String> {
         ("running", c.running),
         ("needs-input", c.needs_input),
         ("review", c.review),
+        ("stalled", c.stalled),
         ("done", c.done),
     ] {
         writeln!(out, "{label:<12}{n}").unwrap();
@@ -861,10 +857,9 @@ fn next_verb(store: &mut Store) -> Result<String, String> {
             let mut out = String::new();
             writeln!(
                 out,
-                "{:5.1}  {}{}{}",
+                "{:5.1}  {}{}",
                 c.score.total,
                 task_line(&c.task, &c.project_name),
-                redispatch_suffix(store, c.task.id),
                 incomplete_report_suffix(store, c.task.id)
             )
             .unwrap();
@@ -877,23 +872,10 @@ fn next_verb(store: &mut Store) -> Result<String, String> {
     }
 }
 
-/// `  [redispatch]` when the task's most recent session ended `failed` or
-/// `capped` (DESIGN.md §8), else empty — the flag lives in session history,
-/// not on the task, so every place that prints a task line re-derives it.
-fn redispatch_suffix(store: &Store, task_id: i64) -> &'static str {
-    if store.redispatch_flag(task_id).unwrap_or(false) {
-        "  [redispatch]"
-    } else {
-        ""
-    }
-}
-
 /// `  [incomplete report]` when a `review` task carries only one of a branch
 /// and a summary (DESIGN.md §8), else empty — the half-finished done report a
 /// dispatched session left behind, surfaced so the operator sees it rather than
-/// hitting the gap at `pr` time. Re-derived per line like [`redispatch_suffix`];
-/// the two are mutually exclusive (one is `ready`-only, the other `review`-only)
-/// so both can be appended and at most one prints.
+/// hitting the gap at `pr` time. Re-derived per line, never stored.
 fn incomplete_report_suffix(store: &Store, task_id: i64) -> &'static str {
     if store.incomplete_report_flag(task_id).unwrap_or(false) {
         "  [incomplete report]"
@@ -934,7 +916,7 @@ fn explain_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     writeln!(out, "total           {:>6.2}", b.total).unwrap();
     if !matches!(
         task.state,
-        TaskState::Ready | TaskState::NeedsInput | TaskState::Review
+        TaskState::Ready | TaskState::NeedsInput | TaskState::Review | TaskState::Stalled
     ) {
         writeln!(out, "({} tasks are not scheduled)", task.state).unwrap();
     }
@@ -1877,10 +1859,10 @@ mod tests {
     /// End to end (DESIGN.md §8): a task really dispatched, whose agent
     /// process really exits without calling `voro done`/`ask`, is finalised
     /// purely by a later CLI verb reading state — no code here ever calls the
-    /// reconciliation function directly. The task is left `running` (not
-    /// auto-requeued), recording a `reconcile` event that the history surfaces.
+    /// reconciliation function directly. The task lands in `stalled`,
+    /// recording a `reconcile` event that the history surfaces.
     #[test]
-    fn a_dead_dispatched_session_is_finalised_and_left_running_on_read() {
+    fn a_dead_dispatched_session_is_finalised_and_stalled_on_read() {
         use std::process::{Command, Stdio};
 
         let root = std::env::temp_dir().join(format!(
@@ -1939,19 +1921,17 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         // a plain read-only verb — not a direct call to the reconciler —
-        // must notice the dead process and finalise the session, while leaving
-        // the task running (no auto-requeue)
+        // must notice the dead process, finalise the session, and land the
+        // task in stalled (DESIGN.md §6/§8)
         let out = run(
             &mut store,
             vec!["show".to_string(), "1".to_string()],
             &dispatch_ctx,
         )
         .unwrap();
-        assert_eq!(store.task(1).unwrap().state, TaskState::Running);
-        assert!(!store.redispatch_flag(1).unwrap());
-        // a running task is not in the queue, and carries no redispatch flag
-        assert!(!out.contains("flagged for redispatch"), "{out}");
-        // but the reconcile is recorded in the task's history
+        assert_eq!(store.task(1).unwrap().state, TaskState::Stalled);
+        assert!(out.contains("#1 stalled"), "{out}");
+        // and the reconcile is recorded in the task's history
         assert!(out.contains("reconcile"), "{out}");
         assert!(out.contains("without reporting"), "{out}");
 

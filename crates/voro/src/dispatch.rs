@@ -127,8 +127,9 @@ fn render_preamble(task_id: i64, db_path: &Path, branch: Option<&str>) -> String
 /// must already be in and which `Store` method records the result.
 #[derive(Clone, Copy)]
 enum SpawnKind {
-    /// A fresh dispatch: the task must be `ready`; recording it performs the
-    /// `ready → running` transition.
+    /// A fresh dispatch: the task must be `ready` — or `stalled`, redispatch
+    /// being the whole point of that state (DESIGN.md §6/§8); recording it
+    /// performs the transition to `running`.
     Fresh,
     /// A continuation: the task must already be `running` — `answer` just put
     /// it there — so recording it only opens a session, never changes state.
@@ -136,10 +137,18 @@ enum SpawnKind {
 }
 
 impl SpawnKind {
-    fn required_state(self) -> TaskState {
+    fn accepts_state(self, state: TaskState) -> bool {
         match self {
-            SpawnKind::Fresh => TaskState::Ready,
-            SpawnKind::Continuation => TaskState::Running,
+            SpawnKind::Fresh => matches!(state, TaskState::Ready | TaskState::Stalled),
+            SpawnKind::Continuation => state == TaskState::Running,
+        }
+    }
+
+    /// The states `accepts_state` allows, for the rejection message.
+    fn accepted_states(self) -> &'static str {
+        match self {
+            SpawnKind::Fresh => "ready or stalled",
+            SpawnKind::Continuation => "running",
         }
     }
 
@@ -236,11 +245,12 @@ pub(crate) fn append_launch_log(path: &Path, line: &str) {
     }
 }
 
-/// Dispatch a ready task to a headless agent session, returning a summary line.
-/// `agent_override` is the CLI `--agent` picker flag, which outranks the task's
-/// own override (DESIGN.md §8). Every check that can fail — task readiness,
-/// agent resolution, the dirty-tree guard, writing the prompt — runs before the
-/// process is spawned, so a failed dispatch never leaves an orphan session.
+/// Dispatch a ready task — or redispatch a stalled one — to a headless agent
+/// session, returning a summary line. `agent_override` is the CLI `--agent`
+/// picker flag, which outranks the task's own override (DESIGN.md §8). Every
+/// check that can fail — task state, agent resolution, the dirty-tree guard,
+/// writing the prompt — runs before the process is spawned, so a failed
+/// dispatch never leaves an orphan session.
 pub fn dispatch(
     store: &mut Store,
     ctx: &DispatchCtx,
@@ -393,10 +403,10 @@ fn spawn_session(
              (`voro start {task_id}`, then `voro done {task_id}`)"
         ));
     }
-    let required = kind.required_state();
-    if task.state != required {
+    if !kind.accepts_state(task.state) {
         return Err(format!(
-            "only {required} tasks can be {}; task {task_id} is {}",
+            "only {} tasks can be {}; task {task_id} is {}",
+            kind.accepted_states(),
             kind.verb_past(),
             task.state
         ));
@@ -983,14 +993,32 @@ mod tests {
     }
 
     #[test]
-    fn only_ready_tasks_dispatch() {
+    fn only_ready_or_stalled_tasks_dispatch() {
         let (mut store, ctx, project) = fixture("cat {prompt_file}");
         let id = ready_task(&mut store, &project);
         store.apply(id, voro_core::Action::Park).unwrap();
 
         let err = dispatch(&mut store, &ctx, id, None).unwrap_err();
-        assert!(err.contains("ready"), "{err}");
+        assert!(err.contains("ready or stalled"), "{err}");
         assert!(store.sessions_for(id).unwrap().is_empty());
+    }
+
+    /// Redispatching a stalled task is the whole point of the state (DESIGN.md
+    /// §6/§8): dispatch's precondition accepts `stalled → running` too.
+    #[test]
+    fn a_stalled_task_redispatches() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let id = ready_task(&mut store, &project);
+
+        dispatch(&mut store, &ctx, id, None).unwrap();
+        let session = &store.sessions_for(id).unwrap()[0];
+        store.reconcile_session(session.id, false, false).unwrap();
+        assert_eq!(store.task(id).unwrap().state, TaskState::Stalled);
+
+        let summary = dispatch(&mut store, &ctx, id, None).unwrap();
+        assert!(summary.contains("dispatched task"), "{summary}");
+        assert_eq!(store.task(id).unwrap().state, TaskState::Running);
+        assert_eq!(store.sessions_for(id).unwrap().len(), 2);
     }
 
     // --- session-ref capture (task #75) ---

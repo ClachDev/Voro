@@ -27,7 +27,8 @@ pub enum Triage {
 pub enum Action {
     /// proposed → parked | ready | rejected
     Triage(Triage),
-    /// ready → running (dispatch, or the human starting by hand)
+    /// ready | stalled → running (dispatch or redispatch, or the human
+    /// starting by hand)
     Start,
     /// running → needs-input; the string is the question
     Ask(String),
@@ -42,11 +43,11 @@ pub enum Action {
     RejectWork(String),
     /// running → ready
     Abort,
-    /// ready → parked (deliberate parking)
+    /// ready | stalled → parked (deliberate parking)
     Park,
     /// parked → ready (manual unpark)
     Unpark,
-    /// parked | ready | needs-input | review → rejected
+    /// parked | ready | needs-input | review | stalled → rejected
     Abandon,
 }
 
@@ -99,6 +100,7 @@ impl Store {
                 Action::RejectWork(String::new()),
                 Action::Abandon,
             ],
+            Stalled => vec![Action::Start, Action::Park, Action::Abandon],
             Done | Rejected => vec![],
         }
     }
@@ -111,6 +113,7 @@ impl Store {
     }
 
     /// Dispatch's atomic write (DESIGN.md §8): move the task `ready → running`
+    /// (or `stalled → running` — redispatch is the whole point of that state)
     /// and open its session in one transaction, so a running task always has a
     /// session and a session always has a running task. The state change goes
     /// through the same machine as [`apply`](Store::apply); spawning the process
@@ -176,12 +179,16 @@ impl Store {
     /// - task `running`, `pid_alive`: still working, left untouched.
     /// - task `running`, process gone: it ended without calling `done`/`ask`.
     ///   The outcome is recorded (`capped` if `likely_capped`, else `failed`)
-    ///   but the task is **left `running`** (DESIGN.md §8) — a vanished session
-    ///   is indistinguishable from a completion whose return-path call has not
-    ///   landed yet, so it is surfaced as an orphaned `running` row (§9),
-    ///   logged with a distinct `reconcile` event, for the human to redispatch,
-    ///   complete, or abort explicitly. The one-open-session invariant means
-    ///   this open session is always the task's current one.
+    ///   and the task lands `running → stalled` (DESIGN.md §6/§8) — the
+    ///   attention state for a dispatch that died, which puts redispatch in
+    ///   the queue with no human abort step in between. A vanished session is
+    ///   still indistinguishable from a completion whose return-path call has
+    ///   not landed, but `stalled` makes that misfire safe where the old
+    ///   automatic `running → ready` bounce was not: a stalled task is an
+    ///   attention row, never handed out by `voro next`, and a late `done`
+    ///   is refused loudly rather than racing a fresh dispatch. A stalled
+    ///   task with an open blocker is demoted straight to `parked`, exactly
+    ///   as if it had landed `ready`.
     /// - task `needs-input`/`review`: the session stays open on purpose — it is
     ///   reused when the answer/feedback continues the work — so reconciliation
     ///   leaves it alone (`Ok(None)`) regardless of process liveness. It is
@@ -221,9 +228,11 @@ impl Store {
             // Stale: a session still open on a task that has left the active
             // path. Close it with the outcome that fits where the task landed.
             TaskState::Done => SessionOutcome::Completed,
-            TaskState::Rejected | TaskState::Ready | TaskState::Parked | TaskState::Proposed => {
-                SessionOutcome::Aborted
-            }
+            TaskState::Rejected
+            | TaskState::Ready
+            | TaskState::Parked
+            | TaskState::Proposed
+            | TaskState::Stalled => SessionOutcome::Aborted,
         };
         set_session_outcome(&tx, session_id, outcome)?;
 
@@ -233,9 +242,20 @@ impl Store {
                 task.id,
                 "reconcile",
                 Some(&format!(
-                    "session {session_id} ended without reporting ({outcome}); left running for review"
+                    "session {session_id} ended without reporting ({outcome})"
                 )),
             )?;
+            tx.execute(
+                "UPDATE tasks SET state = ?1, state_since = datetime('now') WHERE id = ?2",
+                params![TaskState::Stalled, task.id],
+            )?;
+            log_event(
+                &tx,
+                task.id,
+                "transition",
+                Some(&format!("{} -> {}", task.state, TaskState::Stalled)),
+            )?;
+            reconcile_readiness(&tx, task.id)?;
         }
         tx.commit()?;
         Ok(Some((
@@ -285,7 +305,7 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         (Proposed, Action::Triage(Triage::Parked)) => Parked,
         (Proposed, Action::Triage(Triage::Ready)) => Ready,
         (Proposed, Action::Triage(Triage::Reject)) => Rejected,
-        (Ready, Action::Start) => Running,
+        (Ready | Stalled, Action::Start) => Running,
         // A human task cannot be blocked on a decision — the executor *is* the
         // human (DESIGN.md §6). Verifying its outcome is a downstream
         // `blocks`-dependent task, not a sub-state of this one.
@@ -306,9 +326,9 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         (Review, Action::Accept) => Done,
         (Review, Action::RejectWork(_)) => Running,
         (Running, Action::Abort) => Ready,
-        (Ready, Action::Park) => Parked,
+        (Ready | Stalled, Action::Park) => Parked,
         (Parked, Action::Unpark) => Ready,
-        (Parked | Ready | NeedsInput | Review, Action::Abandon) => Rejected,
+        (Parked | Ready | NeedsInput | Review | Stalled, Action::Abandon) => Rejected,
         _ => {
             return Err(Error::InvalidTransition {
                 from: task.state,
@@ -512,7 +532,9 @@ fn reconcile_dependants(conn: &Connection, closed_id: i64) -> Result<()> {
 /// Enforce readiness against `blocks` dependencies:
 /// - `parked` with at least one blocker, all closed → promote to `ready`.
 ///   A parked task with *no* blockers is deliberately parked and stays put.
-/// - `ready` with an open blocker → demote to `parked`.
+/// - `ready` or `stalled` with an open blocker → demote to `parked`. A
+///   stalled task re-promotes to `ready`, not `stalled`, when the blocker
+///   closes — by then the stall context is stale (DESIGN.md §6).
 pub(crate) fn reconcile_readiness(conn: &Connection, task_id: i64) -> Result<()> {
     let Some(task) = get_task(conn, task_id)? else {
         return Ok(());
@@ -528,7 +550,7 @@ pub(crate) fn reconcile_readiness(conn: &Connection, task_id: i64) -> Result<()>
 
     let to = match task.state {
         TaskState::Parked if total > 0 && open == 0 => TaskState::Ready,
-        TaskState::Ready if open > 0 => TaskState::Parked,
+        TaskState::Ready | TaskState::Stalled if open > 0 => TaskState::Parked,
         _ => return Ok(()),
     };
     conn.execute(
@@ -595,6 +617,12 @@ mod tests {
                 s.apply(id, Action::Complete(None)).unwrap();
                 id
             }
+            Stalled => {
+                let id = create(s, project_id, Ready);
+                let (_, session) = s.record_dispatch(id, "claude", Some(1), None).unwrap();
+                s.reconcile_session(session.id, false, false).unwrap();
+                id
+            }
             Done => {
                 let id = task_in_state(s, project_id, Review);
                 s.apply(id, Action::Accept).unwrap();
@@ -634,8 +662,8 @@ mod tests {
             (Proposed, Action::Triage(Triage::Parked)) => Some(Parked),
             (Proposed, Action::Triage(Triage::Ready)) => Some(Ready),
             (Proposed, Action::Triage(Triage::Reject)) => Some(Rejected),
-            (Ready, Action::Start) => Some(Running),
-            (Ready, Action::Park) => Some(Parked),
+            (Ready | Stalled, Action::Start) => Some(Running),
+            (Ready | Stalled, Action::Park) => Some(Parked),
             (Parked, Action::Unpark) => Some(Ready),
             (Running, Action::Ask(_)) => Some(NeedsInput),
             (Running, Action::Complete(_)) => Some(Review),
@@ -643,7 +671,7 @@ mod tests {
             (NeedsInput, Action::Answer(_)) => Some(Running),
             (Review, Action::Accept) => Some(Done),
             (Review, Action::RejectWork(_)) => Some(Running),
-            (Parked | Ready | NeedsInput | Review, Action::Abandon) => Some(Rejected),
+            (Parked | Ready | NeedsInput | Review | Stalled, Action::Abandon) => Some(Rejected),
             _ => None,
         }
     }
@@ -1371,7 +1399,7 @@ mod tests {
         }
 
         #[test]
-        fn dead_pid_on_a_running_task_fails_but_leaves_it_running() {
+        fn dead_pid_on_a_running_task_stalls_it() {
             let (mut s, p) = store_with_project();
             let (task_id, session_id) = dispatch(&mut s, p);
 
@@ -1381,58 +1409,93 @@ mod tests {
                 .unwrap();
             assert_eq!(session.outcome, Some(SessionOutcome::Failed));
             assert!(session.ended_at.is_some());
-            // policy (DESIGN.md §8): no auto-requeue — the task stays running,
-            // surfaced as an orphaned running row for explicit handling.
-            assert_eq!(task.state, TaskState::Running);
-            // a still-running task is not redispatch-flagged; the flag is for
-            // a ready task, and only reappears once a human aborts this orphan.
-            assert!(!s.redispatch_flag(task_id).unwrap());
+            // the dispatch died under the task: running -> stalled (DESIGN.md
+            // §6/§8), the attention state that puts redispatch in the queue.
+            assert_eq!(task.state, TaskState::Stalled);
 
             let events = s.events_for(task_id).unwrap();
-            let last = events.last().unwrap();
-            assert_eq!(last.kind, "reconcile");
-            let detail = last.detail.as_deref().unwrap();
+            let transition = events.last().unwrap();
+            assert_eq!(transition.kind, "transition");
+            assert_eq!(
+                transition.detail.as_deref(),
+                Some("running -> stalled"),
+                "{events:?}"
+            );
+            let reconcile = &events[events.len() - 2];
+            assert_eq!(reconcile.kind, "reconcile");
+            let detail = reconcile.detail.as_deref().unwrap();
             assert!(detail.contains("without reporting"), "{detail}");
             assert!(detail.contains("failed"), "{detail}");
-            // no running -> ready transition was logged
-            assert!(
-                events
-                    .iter()
-                    .all(|e| e.detail.as_deref() != Some("running -> ready")),
-                "an automatic transition was logged: {events:?}"
-            );
         }
 
         #[test]
         fn dead_pid_reports_capped_when_the_caller_says_so() {
             let (mut s, p) = store_with_project();
-            let (task_id, session_id) = dispatch(&mut s, p);
+            let (_, session_id) = dispatch(&mut s, p);
 
             let (session, task) = s
                 .reconcile_session(session_id, false, true)
                 .unwrap()
                 .unwrap();
             assert_eq!(session.outcome, Some(SessionOutcome::Capped));
-            // the task is left running here too — a cap is redispatched by an
-            // explicit human action, not automatically (DESIGN.md §8).
-            assert_eq!(task.state, TaskState::Running);
-            assert!(!s.redispatch_flag(task_id).unwrap());
+            // a cap stalls the task the same way a failure does; redispatch
+            // happens from `stalled` once quota resets (DESIGN.md §6/§8).
+            assert_eq!(task.state, TaskState::Stalled);
         }
 
         #[test]
-        fn aborting_a_reconciled_orphan_reveals_the_redispatch_flag() {
-            // the explicit path: reconcile leaves a dead session's task
-            // running, and only when the human aborts it back to `ready` does
-            // the redispatch flag surface against the failed session history.
+        fn a_stalled_task_can_be_redispatched() {
+            // record_dispatch's precondition accepts stalled -> running:
+            // redispatch is the whole point of the state (DESIGN.md §8).
             let (mut s, p) = store_with_project();
             let (task_id, session_id) = dispatch(&mut s, p);
             s.reconcile_session(session_id, false, false).unwrap();
-            assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
-            assert!(!s.redispatch_flag(task_id).unwrap());
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
 
-            s.apply(task_id, Action::Abort).unwrap();
+            let (task, session) = s
+                .record_dispatch(task_id, "codex", Some(4343), Some("/var/log/s2.log"))
+                .unwrap();
+            assert_eq!(task.state, TaskState::Running);
+            assert_eq!(session.agent, "codex");
+            assert!(session.ended_at.is_none());
+        }
+
+        #[test]
+        fn a_stalled_task_with_an_open_blocker_is_parked() {
+            // Readiness reconciliation treats stalled like ready (DESIGN.md
+            // §6): a blocker opened mid-run means the stall lands in parked,
+            // never surfacing unactionable work in the queue.
+            let (mut s, p) = store_with_project();
+            let (task_id, session_id) = dispatch(&mut s, p);
+            let blocker = create(&mut s, p, TaskState::Ready);
+            s.add_dep(task_id, blocker, crate::model::DepKind::Blocks)
+                .unwrap();
+
+            let (_, task) = s
+                .reconcile_session(session_id, false, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(task.state, TaskState::Parked);
+        }
+
+        #[test]
+        fn adding_an_open_blocker_demotes_a_stalled_task() {
+            let (mut s, p) = store_with_project();
+            let (task_id, session_id) = dispatch(&mut s, p);
+            s.reconcile_session(session_id, false, false).unwrap();
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
+
+            let blocker = create(&mut s, p, TaskState::Ready);
+            s.add_dep(task_id, blocker, crate::model::DepKind::Blocks)
+                .unwrap();
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Parked);
+
+            // when the blocker closes it re-promotes to ready, not stalled —
+            // the stall context is stale by then (DESIGN.md §6).
+            s.apply(blocker, Action::Start).unwrap();
+            s.apply(blocker, Action::Complete(None)).unwrap();
+            s.apply(blocker, Action::Accept).unwrap();
             assert_eq!(s.task(task_id).unwrap().state, TaskState::Ready);
-            assert!(s.redispatch_flag(task_id).unwrap());
         }
 
         #[test]
@@ -1451,7 +1514,6 @@ mod tests {
             );
             assert!(s.session(session_id).unwrap().ended_at.is_none());
             assert_eq!(s.task(task_id).unwrap().state, TaskState::NeedsInput);
-            assert!(!s.redispatch_flag(task_id).unwrap());
         }
 
         #[test]
@@ -1469,7 +1531,6 @@ mod tests {
             );
             assert!(s.session(session_id).unwrap().ended_at.is_none());
             assert_eq!(s.task(task_id).unwrap().state, TaskState::Review);
-            assert!(!s.redispatch_flag(task_id).unwrap());
         }
 
         #[test]
@@ -1488,9 +1549,9 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+            // a manual abort lands in plain ready, never stalled — the human
+            // chose to stop the work; nothing about the dispatch died.
             assert_eq!(s.task(task_id).unwrap().state, TaskState::Ready);
-            // a manual abort must not itself read as a redispatch flag
-            assert!(!s.redispatch_flag(task_id).unwrap());
         }
 
         #[test]
@@ -1574,13 +1635,6 @@ mod tests {
                 s.reconcile_session(9999, false, false),
                 Err(Error::SessionNotFound(9999))
             ));
-        }
-
-        #[test]
-        fn redispatch_flag_is_false_with_no_sessions() {
-            let (mut s, p) = store_with_project();
-            let id = create(&mut s, p, TaskState::Ready);
-            assert!(!s.redispatch_flag(id).unwrap());
         }
     }
 

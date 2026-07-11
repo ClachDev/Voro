@@ -138,16 +138,16 @@ pid Voro spawned exits as soon as the launcher returns, so pid-checking would
 declare the dispatch dead at birth. For agents with a `sessions` verb, the
 reconciler therefore never pid-checks — a session is live while its ref
 appears in the listing not-yet-`done`; a session that drops out of the listing
-or finishes there without having called `voro done`/`ask` is flagged for
-redispatch, exactly as pid-death is for plain agents. When liveness is
-unknowable (no ref captured, listing failed) the session is left alone rather
-than guessed at.
+or finishes there without having called `voro done`/`ask` stalls its task,
+exactly as pid-death does for plain agents. When liveness is unknowable (no
+ref captured, listing failed) the session is left alone rather than guessed
+at.
 
 **Jump-in.** In the TUI, `a` on a running task runs the agent's `attach`
 command in the project checkout with the TUI suspended — the real session,
 full control, including answering permission prompts (which also means the
 `--allowedTools` allowlist in a dispatch template can shrink once attach is
-wired). Detaching returns to Voro. On a review or redispatch-flagged task the
+wired). Detaching returns to Voro. On a review or stalled task the
 same key runs `resume`, reopening the finished session with its history.
 `answer` prefers the `continue` verb when it exists and the session has a ref
 — the answer alone goes to the *same* session, context intact — and otherwise
@@ -175,19 +175,19 @@ attach   = "tmux attach -t {session}"
 
 A tmux session vanishes from `list-sessions` when its command exits, which is
 exactly the drop-out the reconciler treats as finished-without-reporting — it
-finalises the session but leaves the task `running` for the operator to handle
-(DESIGN.md §8). There is no honest `resume`/`continue` for a dead tmux session,
-so leave those verbs off and let an explicit abort/redispatch handle it.
+finalises the session and lands the task in `stalled` (DESIGN.md §8), where
+redispatch is one key away. There is no honest `resume`/`continue` for a dead
+tmux session, so leave those verbs off and let redispatch handle it.
 
 ## Hooks as a fallback
 
 The return path depends on the agent remembering to call it. A session that does
 the work and exits without calling `done` is indistinguishable, to Voro, from one
 that crashed: the pid-liveness reconciler (DESIGN.md §8) finds the process gone
-with the task still `running` and marks the session `failed`, but leaves the task
-`running` — surfaced as an orphan for the operator to redispatch, accept, or
-abort. That is the safe default, but it is manual and pessimistic — the work may
-have been finished and only the report forgotten.
+with the task still `running`, marks the session `failed`, and lands the task in
+`stalled` — the queue's redispatch state. That is the safe default, but it is
+pessimistic — the work may have been finished and only the report forgotten, and
+a stalled task is redispatched, not accepted.
 
 Claude Code fires [lifecycle hooks](https://docs.claude.com/en/docs/claude-code/hooks)
 that can close that gap by calling the verbs on the agent's behalf. Each hook
@@ -198,7 +198,7 @@ The hooks that matter here, and what each can honestly do:
 
 | Hook | Fires when | Fallback | Value it adds |
 |---|---|---|---|
-| `SessionEnd` | the session terminates normally | `voro done --branch <current branch> [--summary <final message>]` if the task is still `running` | upgrades a forgotten `done` from a `failed` reconcile that leaves the task a stalled `running` orphan to a real `review` — the operator sees the diff instead of having to chase down an orphan — recording the branch the work landed on (task #81) and, best-effort, the session's final assistant message as the summary so the fallback lands a complete report rather than a summary-less one (task #93) |
+| `SessionEnd` | the session terminates normally | `voro done --branch <current branch> [--summary <final message>]` if the task is still `running` | upgrades a forgotten `done` from a `failed` reconcile that would stall the task to a real `review` — the operator sees the diff instead of a redispatch row — recording the branch the work landed on (task #81) and, best-effort, the session's final assistant message as the summary so the fallback lands a complete report rather than a summary-less one (task #93) |
 | `Notification` | Claude needs permission, or has idled waiting for input | `voro ask` with the notification message | the *only* signal for a session that is alive but stuck: its process is still running, so the pid-liveness reconciler never fires for it |
 | `Stop` | the main agent finishes responding | same as `SessionEnd` | an earlier anchor for the same completion case; redundant with `SessionEnd` and optional |
 
@@ -208,15 +208,15 @@ Two honest limits shape this.
 `SessionEnd` entirely, and no Claude Code hook cleanly signals "this agent
 failed." So the fallback deliberately does *not* try to synthesise a `failed`
 outcome — that case stays with the pid-liveness reconciler, which already labels
-it `failed`/`capped` and leaves the task a `running` orphan for the operator to
-redispatch (DESIGN.md §8). The hooks only ever improve the *graceful* paths.
+it `failed`/`capped` and stalls the task for the operator to redispatch
+(DESIGN.md §8). The hooks only ever improve the *graceful* paths.
 
 **`SessionEnd → done` is optimistic.** It marks the task `review` on the
 assumption the work is finished, which is wrong if the agent gave up mid-task and
 merely finished talking about it. That costs little: `review` is human-gated, so
 a false completion is one rejection away from going back to `running`, and it
-routes the diff to the operator's eyes rather than leaving a stalled orphan to
-chase down. Prefer
+routes the diff to the operator's eyes rather than leaving a stalled task to
+redispatch. Prefer
 that the agent call `done` itself with a real summary; treat the hook as the net,
 not the plan.
 
@@ -246,10 +246,12 @@ rejected and leaves the task exactly as it was.
 So the hooks never need to inspect the task's current state before acting — the
 rejection is all the protection required. This composes with the reconciler for
 the same reason: whichever of the hook and the reconciler reaches the task first
-wins, and the other finds a task that has already left `running` and no-ops (the
-reconciler records the session `completed` and leaves the task alone, DESIGN.md
-§8). Wiring the hooks cannot corrupt state; the worst case is a harmless rejected
-command.
+wins. A hook's `done` moving the task to `review` makes the reconciler leave it
+alone; a reconciler that gets there first lands the task in `stalled` (DESIGN.md
+§8) and the hook's late `done` is rejected — the completion surfaces as a
+redispatch row rather than corrupted state. In practice the hook runs while the
+session's process is still alive, so it always wins that race. Wiring the hooks
+cannot corrupt state; the worst case is a harmless rejected command.
 
 ## Sample configuration
 

@@ -274,7 +274,11 @@ fn score_lines(b: &ScoreBreakdown) -> Vec<Line<'static>> {
     ))];
     if !matches!(
         b.state,
-        TaskState::Ready | TaskState::NeedsInput | TaskState::Review | TaskState::Proposed
+        TaskState::Ready
+            | TaskState::NeedsInput
+            | TaskState::Review
+            | TaskState::Stalled
+            | TaskState::Proposed
     ) {
         lines.push(Line::from(Span::styled(
             format!("({} tasks are not scheduled)", b.state),
@@ -374,6 +378,7 @@ fn counts_line(counts: &StateCounts) -> Line<'static> {
     );
     push("input", counts.needs_input, dim);
     push("review", counts.review, dim);
+    push("stalled", counts.stalled, dim);
     push("ready", counts.ready, dim);
     push("done", counts.done, dim);
     Line::from(spans)
@@ -383,21 +388,11 @@ fn score_span(total: f64) -> Span<'static> {
     Span::styled(format!("{total:5.1} "), Style::new().fg(Color::Yellow))
 }
 
-/// The redispatch flag (DESIGN.md §8): a `ready` task whose most recent
-/// session ended `failed` or `capped`, read fresh from session history
-/// rather than a stored column.
-fn redispatch_span() -> Span<'static> {
-    Span::styled(
-        "  [redispatch]",
-        Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-    )
-}
-
 /// The incomplete-report flag (DESIGN.md §8): a `review` task carrying only one
 /// of a branch and a summary — the half-finished done report a dispatched
 /// session left behind, which `pr` cannot open. Yellow to match the running
 /// strip's "no live session" warning, since both are anomalies needing the
-/// operator rather than the magenta redispatch *action*.
+/// operator.
 fn incomplete_report_span() -> Span<'static> {
     Span::styled(
         "  [incomplete report]",
@@ -438,13 +433,16 @@ fn review_substate_span(task: &voro_core::Task) -> Option<Span<'static>> {
     })
 }
 
-/// The verb a queue row's Enter performs, from its state.
+/// The verb a queue row's Enter performs, from its state. A `stalled` row's
+/// action is redispatching the dead dispatch (DESIGN.md §8) — "restart" is
+/// how that reads as one next action.
 fn action_verb(state: voro_core::TaskState) -> &'static str {
     match state {
         voro_core::TaskState::NeedsInput => "answer",
         voro_core::TaskState::Review => "review",
         voro_core::TaskState::Proposed => "triage",
         voro_core::TaskState::Ready => "start",
+        voro_core::TaskState::Stalled => "restart",
         _ => "",
     }
 }
@@ -471,7 +469,7 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
                     score,
                     Span::styled(
                         format!(
-                            "{} {:6} {} {}: {}",
+                            "{} {:7} {} {}: {}",
                             task_ref(c.task.id),
                             action_verb(c.task.state),
                             c.task.priority,
@@ -486,9 +484,6 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
                         format!("  — {q}"),
                         Style::new().fg(Color::Cyan),
                     ));
-                }
-                if app.redispatch.contains(&c.task.id) {
-                    spans.push(redispatch_span());
                 }
                 if app.incomplete_report.contains(&c.task.id) {
                     // Replaces the optimistic "next: pr" — a PR cannot be opened
@@ -577,9 +572,6 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(branch) = &task.branch {
         lines.push(Line::from(branch_span(branch)));
-    }
-    if app.redispatch.contains(&task.id) {
-        lines.push(Line::from(redispatch_span()));
     }
     if app.show_score
         && let Some(b) = app.score_breakdown(task.id)
@@ -699,9 +691,6 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
                 ),
                 style,
             )];
-            if app.redispatch.contains(&r.task.id) {
-                spans.push(redispatch_span());
-            }
             if app.incomplete_report.contains(&r.task.id) {
                 spans.push(incomplete_report_span());
             } else if let Some(substate) = review_substate_span(&r.task) {
@@ -1299,6 +1288,7 @@ mod tests {
             running: 2,
             needs_input: 1,
             review: 0,
+            stalled: 0,
             done: 0,
         };
         let line = counts_line(&counts);
@@ -1308,6 +1298,7 @@ mod tests {
         assert!(text.contains("input 1"), "{text}");
         // Zero-count states never render, and `running` is not a header stat.
         assert!(!text.contains("review"), "{text}");
+        assert!(!text.contains("stalled"), "{text}");
         assert!(!text.contains("done"), "{text}");
         assert!(!text.contains("running"), "{text}");
 

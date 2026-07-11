@@ -12,18 +12,20 @@ pub enum TaskState {
     Running,
     NeedsInput,
     Review,
+    Stalled,
     Done,
     Rejected,
 }
 
 impl TaskState {
-    pub const ALL: [TaskState; 8] = [
+    pub const ALL: [TaskState; 9] = [
         TaskState::Proposed,
         TaskState::Parked,
         TaskState::Ready,
         TaskState::Running,
         TaskState::NeedsInput,
         TaskState::Review,
+        TaskState::Stalled,
         TaskState::Done,
         TaskState::Rejected,
     ];
@@ -36,6 +38,7 @@ impl TaskState {
             TaskState::Running => "running",
             TaskState::NeedsInput => "needs-input",
             TaskState::Review => "review",
+            TaskState::Stalled => "stalled",
             TaskState::Done => "done",
             TaskState::Rejected => "rejected",
         }
@@ -330,9 +333,9 @@ pub struct Session {
 /// A row of the cockpit's running strip (DESIGN.md §9): one per `running` task,
 /// joined with its open session if it has one. The strip filters on task state,
 /// so `review`/`needs-input` tasks — whose session stays open behind the scenes
-/// (§8) — never appear; they belong to the queue. A task with no open session
-/// (started by hand, or one whose session ended without reporting, which
-/// reconcile leaves `running`, §8) still shows, with `session_id`/`agent` set
+/// (§8) — never appear; they belong to the queue, as does a `stalled` task
+/// whose dispatch died. A task with no open session (started by hand, so
+/// nothing was ever dispatched) still shows, with `session_id`/`agent` set
 /// to `None`. `elapsed_secs` is computed in SQL against the database's clock —
 /// a live session's age, or how long a session-less task has sat in `running` —
 /// so the TUI only has to format it.
