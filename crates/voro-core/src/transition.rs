@@ -290,6 +290,41 @@ impl Store {
         tx.commit()?;
         self.task(task_id)
     }
+
+    /// The reverse authoring direction of
+    /// [`set_blocks_deps`](Store::set_blocks_deps): make `blocker_id` a
+    /// blocker of each task in `dependents`. Additive and idempotent — the
+    /// blocker set belongs to each dependent, so replacing it from here would
+    /// silently detach edges other tasks authored. Each dependent's readiness
+    /// is reconciled in the same write; the returned pairs carry the
+    /// dependent's state before that reconciliation so callers can surface a
+    /// demotion.
+    pub fn block_tasks(
+        &mut self,
+        blocker_id: i64,
+        dependents: &[i64],
+    ) -> Result<Vec<(Task, TaskState)>> {
+        let tx = self.conn.transaction()?;
+        if get_task(&tx, blocker_id)?.is_none() {
+            return Err(Error::TaskNotFound(blocker_id));
+        }
+        let mut affected = Vec::with_capacity(dependents.len());
+        for dep in dependents {
+            let before = get_task(&tx, *dep)?.ok_or(Error::TaskNotFound(*dep))?.state;
+            reject_blocks_cycle(&tx, *dep, blocker_id)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO deps (task_id, depends_on, kind) VALUES (?1, ?2, 'blocks')",
+                params![dep, blocker_id],
+            )?;
+            reconcile_readiness(&tx, *dep)?;
+            affected.push((*dep, before));
+        }
+        tx.commit()?;
+        affected
+            .into_iter()
+            .map(|(id, before)| Ok((self.task(id)?, before)))
+            .collect()
+    }
 }
 
 /// The state machine proper: validate `action` against the task's current
@@ -1174,6 +1209,67 @@ mod tests {
 
         assert!(s.set_blocks_deps(task, &[task]).is_err());
         assert!(s.set_blocks_deps(task, &[9999]).is_err());
+    }
+
+    #[test]
+    fn block_tasks_demotes_ready_dependents_in_the_same_write() {
+        let (mut s, p) = store_with_project();
+        let blocker = create(&mut s, p, TaskState::Ready);
+        let ready = create(&mut s, p, TaskState::Ready);
+        let parked = create(&mut s, p, TaskState::Parked);
+
+        let affected = s.block_tasks(blocker, &[ready, parked]).unwrap();
+        let states: Vec<_> = affected
+            .iter()
+            .map(|(t, before)| (t.id, *before, t.state))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                (ready, TaskState::Ready, TaskState::Parked),
+                (parked, TaskState::Parked, TaskState::Parked),
+            ]
+        );
+
+        // closing the blocker promotes both dependents
+        s.apply(blocker, Action::Start).unwrap();
+        s.apply(blocker, Action::Complete(None)).unwrap();
+        s.apply(blocker, Action::Accept).unwrap();
+        assert_eq!(s.task(ready).unwrap().state, TaskState::Ready);
+        assert_eq!(s.task(parked).unwrap().state, TaskState::Ready);
+    }
+
+    #[test]
+    fn block_tasks_is_additive_and_idempotent() {
+        let (mut s, p) = store_with_project();
+        let existing = create(&mut s, p, TaskState::Ready);
+        let blocker = create(&mut s, p, TaskState::Ready);
+        let task = create(&mut s, p, TaskState::Ready);
+        s.set_blocks_deps(task, &[existing]).unwrap();
+
+        s.block_tasks(blocker, &[task]).unwrap();
+        s.block_tasks(blocker, &[task]).unwrap();
+        let deps = s.deps_of(task).unwrap();
+        assert_eq!(deps.len(), 2, "{deps:?}");
+    }
+
+    #[test]
+    fn block_tasks_rejects_cycles_and_unknown_tasks() {
+        let (mut s, p) = store_with_project();
+        let a = create(&mut s, p, TaskState::Ready);
+        let b = create(&mut s, p, TaskState::Ready);
+        let c = create(&mut s, p, TaskState::Ready);
+        // b waits on a, c waits on b; making c block a would close the loop
+        s.set_blocks_deps(b, &[a]).unwrap();
+        s.set_blocks_deps(c, &[b]).unwrap();
+        let err = s.block_tasks(c, &[a]).unwrap_err();
+        assert!(matches!(err, Error::DependencyCycle(_)), "{err:?}");
+
+        // self-block is the zero-hop cycle
+        assert!(s.block_tasks(a, &[a]).is_err());
+        assert!(s.block_tasks(a, &[9999]).is_err());
+        assert!(s.block_tasks(9999, &[a]).is_err());
+        assert!(s.deps_of(a).unwrap().is_empty());
     }
 
     #[test]

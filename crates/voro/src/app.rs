@@ -1342,7 +1342,7 @@ impl App {
         project_id: i64,
         form: crate::editor::TaskForm,
     ) -> voro_core::Result<()> {
-        for dep in &form.blocks {
+        for dep in &form.blocked_by {
             self.store.task(*dep)?;
         }
         let task = self.store.create_task(voro_core::NewTask {
@@ -1354,8 +1354,8 @@ impl App {
             agent: form.agent,
             human: form.human,
         })?;
-        if !form.blocks.is_empty() {
-            self.store.set_blocks_deps(task.id, &form.blocks)?;
+        if !form.blocked_by.is_empty() {
+            self.store.set_blocks_deps(task.id, &form.blocked_by)?;
         }
         self.refresh()
     }
@@ -1375,7 +1375,7 @@ impl App {
                 human: form.human,
             },
         )?;
-        self.store.set_blocks_deps(task_id, &form.blocks)?;
+        self.store.set_blocks_deps(task_id, &form.blocked_by)?;
         self.refresh()
     }
 }

@@ -16,7 +16,7 @@ pub struct TaskForm {
     pub state: Option<TaskState>,
     pub agent: Option<String>,
     pub human: bool,
-    pub blocks: Vec<i64>,
+    pub blocked_by: Vec<i64>,
     pub body: String,
 }
 
@@ -29,13 +29,13 @@ pub fn template_new() -> String {
      state: ready\n\
      agent: \n\
      human: false\n\
-     blocks: \n\
+     blocked-by: \n\
      ---\n"
         .to_string()
 }
 
-pub fn template_edit(task: &Task, blocks: &[i64]) -> String {
-    let blocks = blocks
+pub fn template_edit(task: &Task, blocked_by: &[i64]) -> String {
+    let blocked_by = blocked_by
         .iter()
         .map(|id| id.to_string())
         .collect::<Vec<_>>()
@@ -47,7 +47,7 @@ pub fn template_edit(task: &Task, blocks: &[i64]) -> String {
          priority: {}\n\
          agent: {}\n\
          human: {}\n\
-         blocks: {}\n\
+         blocked-by: {}\n\
          ---\n\
          {}",
         task.id,
@@ -55,7 +55,7 @@ pub fn template_edit(task: &Task, blocks: &[i64]) -> String {
         task.priority.as_int(),
         task.agent.as_deref().unwrap_or(""),
         task.human,
-        blocks,
+        blocked_by,
         task.body
     )
 }
@@ -84,7 +84,7 @@ pub fn parse(text: &str, allow_state: bool) -> Result<TaskForm, String> {
         state: None,
         agent: None,
         human: false,
-        blocks: Vec::new(),
+        blocked_by: Vec::new(),
         body: String::new(),
     };
     let mut saw_separator = false;
@@ -132,14 +132,20 @@ pub fn parse(text: &str, allow_state: bool) -> Result<TaskForm, String> {
                     other => return Err(format!("human must be true or false, got '{other}'")),
                 }
             }
-            "blocks" => {
+            "blocked-by" => {
                 for id in value.split([',', ' ']).filter(|s| !s.trim().is_empty()) {
-                    form.blocks.push(
+                    form.blocked_by.push(
                         id.trim()
                             .parse()
-                            .map_err(|_| format!("blocks must be task ids, got '{id}'"))?,
+                            .map_err(|_| format!("blocked-by must be task ids, got '{id}'"))?,
                     );
                 }
+            }
+            "blocks" => {
+                return Err(
+                    "the 'blocks' field is now 'blocked-by' — list the tasks this one waits on"
+                        .into(),
+                );
             }
             other => return Err(format!("unknown field '{other}'")),
         }
@@ -190,7 +196,7 @@ mod tests {
     use super::*;
 
     const VALID: &str = "title: Fix parser\npriority: 1\nstate: parked\nagent: codex\n\
-                         blocks: 3, 7\n---\nThe parser crashes on empty input.\n";
+                         blocked-by: 3, 7\n---\nThe parser crashes on empty input.\n";
 
     #[test]
     fn parses_all_fields() {
@@ -199,7 +205,7 @@ mod tests {
         assert_eq!(form.priority, Priority::P1);
         assert_eq!(form.state, Some(TaskState::Parked));
         assert_eq!(form.agent.as_deref(), Some("codex"));
-        assert_eq!(form.blocks, vec![3, 7]);
+        assert_eq!(form.blocked_by, vec![3, 7]);
         assert_eq!(form.body, "The parser crashes on empty input.");
     }
 
@@ -230,7 +236,7 @@ mod tests {
         assert_eq!(form.title, "T");
         assert!(form.state.is_none());
         assert!(form.agent.is_none());
-        assert!(form.blocks.is_empty());
+        assert!(form.blocked_by.is_empty());
     }
 
     #[test]
@@ -253,9 +259,14 @@ mod tests {
                 .contains("done")
         );
         assert!(
-            parse("title: T\nblocks: x\n---\n", true)
+            parse("title: T\nblocked-by: x\n---\n", true)
                 .unwrap_err()
                 .contains("task ids")
+        );
+        assert!(
+            parse("title: T\nblocks: 3\n---\n", true)
+                .unwrap_err()
+                .contains("blocked-by")
         );
         assert!(
             parse("title: T\nwat: 1\n---\n", true)
@@ -295,7 +306,7 @@ mod tests {
         let form = parse(&template_edit(&task, &[9]), false).unwrap();
         assert_eq!(form.title, task.title);
         assert_eq!(form.priority, task.priority);
-        assert_eq!(form.blocks, vec![9]);
+        assert_eq!(form.blocked_by, vec![9]);
         assert_eq!(form.body, task.body);
         assert!(!form.human);
 
