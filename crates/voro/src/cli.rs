@@ -48,6 +48,9 @@ tasks
   inbox                           the next-action queue: questions, reviews,
                                   proposals, top ready tasks — by score
   next                            the single highest-scoring ready task
+  stats                           task counts by state — the triage backlog
+                                  (§12) plus ready, running, needs-input,
+                                  review, done; excludes parked projects
   explain <task-id>               score decomposition
   import <project> [--repo owner/name]
                                   import open GitHub issues as proposed
@@ -130,6 +133,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         "list" => list_verb(store, &flags),
         "inbox" => inbox_verb(store),
         "next" => next_verb(store),
+        "stats" => stats_verb(store),
         "explain" => explain_verb(store, &pos),
         "agent" => agent_verb(&pos, ctx),
         "dispatch" => dispatch_verb(store, &pos, &flags, ctx),
@@ -790,6 +794,26 @@ fn inbox_verb(store: &mut Store) -> Result<String, String> {
     Ok(out)
 }
 
+/// The always-visible untriaged count (DESIGN.md §12) and its companions, as a
+/// scriptable readout: task counts by state, excluding parked projects so the
+/// numbers match the queue and header. `triage` is the untriaged-proposal
+/// guard rail; the rest give the other queues a running tally.
+fn stats_verb(store: &mut Store) -> Result<String, String> {
+    let c = store.state_counts().map_err(|e| e.to_string())?;
+    let mut out = String::new();
+    for (label, n) in [
+        ("triage", c.proposed),
+        ("ready", c.ready),
+        ("running", c.running),
+        ("needs-input", c.needs_input),
+        ("review", c.review),
+        ("done", c.done),
+    ] {
+        writeln!(out, "{label:<12}{n}").unwrap();
+    }
+    Ok(out)
+}
+
 fn next_verb(store: &mut Store) -> Result<String, String> {
     let candidates = store.candidates().map_err(|e| e.to_string())?;
     match scheduler::focus(&candidates) {
@@ -1173,6 +1197,24 @@ mod tests {
         assert!(ok(&mut s, &["inbox"]).contains("proposed P2 demo: An idea"));
         ok(&mut s, &["triage", "1", "ready"]);
         assert!(ok(&mut s, &["next"]).contains("An idea"));
+    }
+
+    #[test]
+    fn stats_reports_counts_by_state() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Idea one"]); // proposed by default
+        ok(&mut s, &["add", "demo", "Idea two"]);
+        ok(&mut s, &["add", "demo", "Ready one", "--state", "ready"]);
+        // A parked project's tasks stay out of the tally.
+        ok(&mut s, &["project", "add", "snoozed", "/tmp"]);
+        ok(&mut s, &["weight", "snoozed", "0"]);
+        ok(&mut s, &["add", "snoozed", "Hidden idea"]);
+
+        let out = ok(&mut s, &["stats"]);
+        assert!(out.contains(&format!("{:<12}{}", "triage", 2)), "{out}");
+        assert!(out.contains(&format!("{:<12}{}", "ready", 1)), "{out}");
+        assert!(out.contains(&format!("{:<12}{}", "done", 0)), "{out}");
     }
 
     #[test]

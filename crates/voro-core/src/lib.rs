@@ -24,7 +24,7 @@ pub use model::{
     TaskState,
 };
 pub use pr::{PrPlan, PrRef, format_review_feedback, plan_pr};
-pub use scheduler::{Candidate, ScoreBreakdown};
+pub use scheduler::{Candidate, ScoreBreakdown, StateCounts};
 pub use store::{NewTask, Store, TaskEdit};
 pub use transition::{Action, Triage};
 
