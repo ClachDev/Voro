@@ -55,11 +55,11 @@ tasks
                                   --repo overrides the checkout's own remote
 
 dispatch
-  agents init                     write a starter ~/.config/voro/agents.toml
+  agent init                      write a starter ~/.config/voro/agents.toml
                                   (won't overwrite an existing one)
-  agents list                     list configured agents and their session
+  agent list                      list configured agents and their session
                                   verbs; * marks the default
-  agents path                     print where dispatch looks for agents.toml
+  agent path                      print where dispatch looks for agents.toml
   dispatch <task-id> [--agent NAME]
                                   spawn a headless agent session on a ready
                                   task; --agent overrides the resolved agent
@@ -122,7 +122,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         "inbox" => inbox_verb(store),
         "next" => next_verb(store),
         "explain" => explain_verb(store, &pos),
-        "agents" => agents_verb(&pos, ctx),
+        "agent" => agent_verb(&pos, ctx),
         "dispatch" => dispatch_verb(store, &pos, &flags, ctx),
         "continue" => continue_verb(store, &pos, &flags, ctx),
         "open" => open_verb(store, &pos, ctx),
@@ -292,9 +292,9 @@ fn project_verb(
 /// lives outside the database (DESIGN.md §8), so this verb takes no `store`.
 /// `init` scaffolds a starter file, `list` shows what is configured, and
 /// `path` prints where dispatch looks for it.
-fn agents_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
+fn agent_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
     let path = &ctx.agents_path;
-    match need(pos, 1, "agents subcommand (init|list|path)")? {
+    match need(pos, 1, "agent subcommand (init|list|path)")? {
         "init" => {
             AgentsConfig::write_starter(path).map_err(|e| e.to_string())?;
             Ok(format!(
@@ -329,7 +329,7 @@ fn agents_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
             Ok(out)
         }
         "path" => Ok(path.display().to_string()),
-        other => Err(format!("unknown agents subcommand '{other}'")),
+        other => Err(format!("unknown agent subcommand '{other}'")),
     }
 }
 
@@ -906,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_init_then_list_through_the_cli() {
+    fn agent_init_then_list_through_the_cli() {
         let dir = std::env::temp_dir().join(format!(
             "voro-cli-agents-{}-{}",
             std::process::id(),
@@ -928,19 +928,19 @@ mod tests {
         };
 
         // no config yet: dispatch-facing verbs report the missing file and
-        // point at `agents init`
-        let e = call(&mut s, &["agents", "list"]).unwrap_err();
-        assert!(e.contains("agents init"), "{e}");
+        // point at `agent init`
+        let e = call(&mut s, &["agent", "list"]).unwrap_err();
+        assert!(e.contains("agent init"), "{e}");
 
-        let out = call(&mut s, &["agents", "init"]).unwrap();
+        let out = call(&mut s, &["agent", "init"]).unwrap();
         assert!(out.contains(&agents_path.display().to_string()), "{out}");
         assert!(agents_path.exists());
 
-        let listed = call(&mut s, &["agents", "list"]).unwrap();
+        let listed = call(&mut s, &["agent", "list"]).unwrap();
         assert!(listed.contains("* claude"), "{listed}");
 
         // a second init refuses rather than clobbering
-        let e = call(&mut s, &["agents", "init"]).unwrap_err();
+        let e = call(&mut s, &["agent", "init"]).unwrap_err();
         assert!(e.contains("already exists"), "{e}");
 
         std::fs::remove_dir_all(&dir).unwrap();
