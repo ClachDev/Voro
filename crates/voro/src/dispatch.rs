@@ -58,15 +58,34 @@ bypass the state machine and event log.{branch}
 
 ";
 
-/// The branch paragraph [`render_preamble`] substitutes for `{branch}` when the
-/// task carries an intended git branch (task #81): the agent is told to create
-/// or check it out itself — Voro runs no git — and to confirm the branch its
-/// work landed on. `{name}` is filled with the branch name and `{task_id}`/`{db}`
-/// so the reported-name verb is copy-pasteable.
-const BRANCH_INSTRUCTION_TEMPLATE: &str = "\n\n\
+/// The one sentence shared by both branch blocks below, so the early-registration
+/// instruction cannot drift between them (task #96): the agent registers the
+/// branch it will work on with Voro the moment it exists, letting reconcile,
+/// attach, `voro pr`, and the UI reflect the real branch while the task is still
+/// `running` — and capturing it even if the agent never reaches a clean `done`.
+/// `{name}` is the concrete branch (assigned case) or the `<name>` the agent will
+/// choose; `{task_id}`/`{db}` keep the command copy-pasteable under launch styles
+/// that drop the environment (same rationale as the return-path verbs).
+const BRANCH_REGISTER_SENTENCE: &str = "register it with `voro set {task_id}{db} --branch {name}` as you do, so Voro \
+     tracks the real branch while the task runs";
+
+/// The `{branch}` block [`render_preamble`] substitutes when the task carries an
+/// intended git branch (task #81): the agent is told the name, to create or check
+/// it out itself (Voro runs no git), to register it early via
+/// [`BRANCH_REGISTER_SENTENCE`], and to confirm the branch its work landed on at
+/// completion. `{name}` is the branch name and `{task_id}`/`{db}` keep the verbs
+/// copy-pasteable.
+const ASSIGNED_BRANCH_TEMPLATE: &str = "\n\n\
 This task is assigned the git branch `{name}`. Create or check it out yourself
-before making changes — Voro runs no git — and confirm the branch your work
-landed on with `voro done {task_id}{db} --branch {name}`.";
+before making changes — Voro runs no git — and {register}. Confirm the branch your
+work landed on with `voro done {task_id}{db} --branch {name}`.";
+
+/// The `{branch}` block when no branch is assigned: the agent picks its own name
+/// and must still register it early via [`BRANCH_REGISTER_SENTENCE`], so Voro
+/// learns the branch while the task runs rather than only at `done`.
+const UNASSIGNED_BRANCH_TEMPLATE: &str = "\n\n\
+Pick a git branch for this work, create or check it out — Voro runs no git — and
+{register}; `<name>` is the name you choose.";
 
 /// How often the session-ref capture re-polls the agent's `sessions` command
 /// while waiting for the freshly-launched session to appear in the listing.
@@ -89,9 +108,12 @@ fn render_preamble(task_id: i64, db_path: &Path, branch: Option<&str>) -> String
     } else {
         format!(" --db {}", shell_quote(db_path))
     };
+    let register = BRANCH_REGISTER_SENTENCE.replace("{name}", branch.unwrap_or("<name>"));
     let branch_block = match branch {
-        Some(name) => BRANCH_INSTRUCTION_TEMPLATE.replace("{name}", name),
-        None => String::new(),
+        Some(name) => ASSIGNED_BRANCH_TEMPLATE
+            .replace("{register}", &register)
+            .replace("{name}", name),
+        None => UNASSIGNED_BRANCH_TEMPLATE.replace("{register}", &register),
     };
     RETURN_PATH_PREAMBLE_TEMPLATE
         .replace("{branch}", &branch_block)
@@ -777,6 +799,12 @@ mod tests {
         assert!(prompt.contains(&format!("voro done {id}")), "{prompt}");
         assert!(prompt.contains("voro propose"), "{prompt}");
         assert!(!prompt.contains("VORO_TASK_ID"), "{prompt}");
+        // even with no assigned branch, the agent is told to register the branch
+        // it picks the moment it exists — `voro set` naming the literal task id,
+        // with the `<name>` placeholder it will fill in (a `--db` flag may sit
+        // between the two under a non-default store)
+        assert!(prompt.contains(&format!("voro set {id}")), "{prompt}");
+        assert!(prompt.contains("--branch <name>"), "{prompt}");
         assert!(prompt.contains("Detailed prompt."), "{prompt}");
         // the rendered preamble is dropped in ahead of the task body
         assert!(
@@ -814,19 +842,27 @@ mod tests {
     }
 
     #[test]
-    fn preamble_injects_the_intended_branch_only_when_one_is_set() {
-        // no assigned branch: the base preamble still asks for a PR-ready
-        // finish, but the branch-*assignment* block (naming a specific branch)
-        // is absent.
+    fn preamble_tells_both_cases_to_register_the_branch_early() {
+        // no assigned branch: the agent picks a name, but is still told to
+        // register it early with `voro set`, naming the literal task id. The
+        // branch-*assignment* wording (naming a specific branch) is absent, and
+        // there is no completion `voro done --branch`, since no name is known.
         let plain = render_preamble(62, &Store::default_db_path(), None);
         assert!(!plain.contains("git branch `"), "{plain}");
-        assert!(!plain.contains("--branch"), "{plain}");
+        assert!(plain.contains("voro set 62 --branch <name>"), "{plain}");
+        assert!(!plain.contains("voro done 62 --branch"), "{plain}");
+        assert!(plain.contains("Voro runs no git"), "{plain}");
 
-        // with a branch: the agent is told to use it and how to report back,
-        // with the reported-name verb naming the literal task id and branch
+        // with a branch: the agent is told to use it, to register it early with
+        // `voro set`, and how to confirm it at completion — every verb naming the
+        // literal task id and the concrete branch.
         let branched = render_preamble(62, &Store::default_db_path(), Some("feat/parser"));
         assert!(branched.contains("git branch `feat/parser`"), "{branched}");
         assert!(branched.contains("Voro runs no git"), "{branched}");
+        assert!(
+            branched.contains("voro set 62 --branch feat/parser"),
+            "{branched}"
+        );
         assert!(
             branched.contains("voro done 62 --branch feat/parser"),
             "{branched}"
@@ -843,10 +879,13 @@ mod tests {
 
         let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
         assert!(prompt.contains("git branch `feat/parser`"), "{prompt}");
-        assert!(
-            prompt.contains("voro done") && prompt.contains("--branch feat/parser"),
-            "{prompt}"
-        );
+        // the branch is both registered early (`voro set`) and confirmed at
+        // completion (`voro done`); each names the literal task id and branch,
+        // though a `--db` flag may sit between id and `--branch` under a
+        // non-default store, so the two are asserted apart
+        assert!(prompt.contains(&format!("voro set {id}")), "{prompt}");
+        assert!(prompt.contains(&format!("voro done {id}")), "{prompt}");
+        assert!(prompt.contains("--branch feat/parser"), "{prompt}");
     }
 
     #[test]
