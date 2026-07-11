@@ -11,7 +11,8 @@ use rusqlite::{Connection, params};
 use crate::error::{Error, Result};
 use crate::model::{Session, SessionOutcome, Task, TaskState};
 use crate::store::{
-    Store, get_session, get_task, insert_session, latest_session_id, log_event, set_session_outcome,
+    Store, close_open_session, get_session, get_task, insert_session, log_event,
+    set_session_outcome,
 };
 
 /// Where a `proposed` task goes at triage.
@@ -154,44 +155,43 @@ impl Store {
         Ok((self.task(task_id)?, self.session(session_id)?))
     }
 
-    /// Close out a session whose backing process is no longer running
-    /// (DESIGN.md §8, the observation half of dispatch). `pid_alive` and
-    /// `likely_capped` are supplied by the caller — voro-core stays free of
-    /// process and log I/O — so this is a pure decision over the session and
-    /// its task's current state:
+    /// Reconcile an open session against its task's state (DESIGN.md §8, the
+    /// observation half of dispatch). The session's life now follows the task,
+    /// not the agent's process listing, so reconciliation is no longer what
+    /// closes healthy sessions — the terminal transitions do that. It keeps
+    /// only the one job it is good at (detecting a crash or cap mid-`running`)
+    /// plus finalising a session left stranded on a task that has already
+    /// closed. `pid_alive` and `likely_capped` are supplied by the caller —
+    /// voro-core stays free of process and log I/O — and only matter for a
+    /// `running` task:
     ///
-    /// - `pid_alive`: nothing to do, the session is left untouched (`Ok(None)`).
-    /// - the session already ended: also a no-op, so a caller looping over
-    ///   `live_sessions` repeatedly can't double-finalise one.
-    /// - the task is still `running` and this is its most recent session: the
-    ///   agent's process ended without calling `done` or `ask`. The session
-    ///   outcome is recorded (`capped` if `likely_capped`, else `failed`) but
-    ///   the task is **left `running`** — it is not auto-demoted or re-queued
-    ///   (DESIGN.md §8). A session vanishing from its agent's listing (or a
-    ///   dead pid) is indistinguishable from a normal completion whose
-    ///   return-path call has not landed yet, so silently bouncing the task to
-    ///   `ready` fired on healthy completions as often as on real deaths. It
-    ///   instead surfaces as an orphaned `running` row (§9) — logged with a
-    ///   distinct `reconcile` event — for the human to redispatch, complete,
-    ///   or abort explicitly.
-    /// - the task is `running` but an *older* session is the one that exited —
-    ///   it was aborted and redispatched (#41), and a newer session now owns
-    ///   the running state. Its outcome is backfilled (`failed`/`capped`) but
-    ///   the task is left in `running`, so a dead predecessor can't demote a
-    ///   legitimately-running task.
-    /// - the task already left `running` on its own — `done`/`ask` landed it
-    ///   in `review`/`needs-input` before the process exited, or a human
-    ///   otherwise moved it — the session outcome reflects that instead
-    ///   (`completed`/`asked`/`aborted`) and the task is left alone.
+    /// - the session already ended: no-op (`Ok(None)`), so a caller looping
+    ///   over `live_sessions` repeatedly can't double-finalise one.
+    /// - task `running`, `pid_alive`: still working, left untouched.
+    /// - task `running`, process gone: it ended without calling `done`/`ask`.
+    ///   The outcome is recorded (`capped` if `likely_capped`, else `failed`)
+    ///   but the task is **left `running`** (DESIGN.md §8) — a vanished session
+    ///   is indistinguishable from a completion whose return-path call has not
+    ///   landed yet, so it is surfaced as an orphaned `running` row (§9),
+    ///   logged with a distinct `reconcile` event, for the human to redispatch,
+    ///   complete, or abort explicitly. The one-open-session invariant means
+    ///   this open session is always the task's current one.
+    /// - task `needs-input`/`review`: the session stays open on purpose — it is
+    ///   reused when the answer/feedback continues the work — so reconciliation
+    ///   leaves it alone (`Ok(None)`) regardless of process liveness. It is
+    ///   closed later by the next terminal transition or superseded by a
+    ///   continuation.
+    /// - task already closed (`done`/`rejected`) or otherwise off the active
+    ///   path: the session is stale — the terminal transition should have
+    ///   closed it — so it is finalised now (`completed` for `done`, else
+    ///   `aborted`) with no event. This is what heals a legacy stranded row
+    ///   (e.g. a `done` task still carrying an open session) on the next pass.
     pub fn reconcile_session(
         &mut self,
         session_id: i64,
         pid_alive: bool,
         likely_capped: bool,
     ) -> Result<Option<(Session, Task)>> {
-        if pid_alive {
-            return Ok(None);
-        }
         let tx = self.conn.transaction()?;
         let session = get_session(&tx, session_id)?.ok_or(Error::SessionNotFound(session_id))?;
         if session.ended_at.is_some() {
@@ -201,20 +201,27 @@ impl Store {
 
         let outcome = match task.state {
             TaskState::Running => {
+                if pid_alive {
+                    return Ok(None);
+                }
                 if likely_capped {
                     SessionOutcome::Capped
                 } else {
                     SessionOutcome::Failed
                 }
             }
-            TaskState::NeedsInput => SessionOutcome::Asked,
-            TaskState::Review => SessionOutcome::Completed,
-            _ => SessionOutcome::Aborted,
+            // The session is meant to stay open here; nothing to reconcile.
+            TaskState::NeedsInput | TaskState::Review => return Ok(None),
+            // Stale: a session still open on a task that has left the active
+            // path. Close it with the outcome that fits where the task landed.
+            TaskState::Done => SessionOutcome::Completed,
+            TaskState::Rejected | TaskState::Ready | TaskState::Parked | TaskState::Proposed => {
+                SessionOutcome::Aborted
+            }
         };
         set_session_outcome(&tx, session_id, outcome)?;
 
-        let is_current_session = latest_session_id(&tx, task.id)? == Some(session_id);
-        if task.state == TaskState::Running && is_current_session {
+        if task.state == TaskState::Running {
             log_event(
                 &tx,
                 task.id,
@@ -331,6 +338,22 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         }
         Action::Complete(Some(s)) if !s.trim().is_empty() => {
             log_event(tx, task_id, "summary", Some(s.trim()))?;
+        }
+        _ => {}
+    }
+
+    // The session's life follows the task (DESIGN.md §8): the terminal
+    // transitions tear down the running work, so they close the task's open
+    // session in the same transaction. `Accept` completed the work; `Abort`
+    // and `Abandon` threw it away. `Ask`/`Complete`/`Answer`/`RejectWork`
+    // deliberately leave the session open — it is reused across
+    // needs-input/review and superseded by the next continuation.
+    match &action {
+        Action::Accept => {
+            close_open_session(tx, task_id, SessionOutcome::Completed)?;
+        }
+        Action::Abort | Action::Abandon => {
+            close_open_session(tx, task_id, SessionOutcome::Aborted)?;
         }
         _ => {}
     }
@@ -982,6 +1005,116 @@ mod tests {
         }
     }
 
+    // --- session lifecycle: one open session, closed by terminal transitions ---
+
+    #[test]
+    fn terminal_transitions_close_the_open_session_with_the_right_outcome() {
+        let (mut s, p) = store_with_project();
+
+        // Accept: the session is kept open through review, then closed
+        // `completed` when the review is accepted.
+        let accepted = create(&mut s, p, TaskState::Ready);
+        let sess = s
+            .record_dispatch(accepted, "claude", Some(1), None)
+            .unwrap()
+            .1;
+        s.apply(accepted, Action::Complete(None)).unwrap();
+        assert!(
+            s.session(sess.id).unwrap().ended_at.is_none(),
+            "review keeps it open"
+        );
+        s.apply(accepted, Action::Accept).unwrap();
+        let closed = s.session(sess.id).unwrap();
+        assert_eq!(closed.outcome, Some(SessionOutcome::Completed));
+        assert!(closed.ended_at.is_some());
+
+        // Abort: running -> ready closes the session `aborted`.
+        let aborted = create(&mut s, p, TaskState::Ready);
+        let sess = s
+            .record_dispatch(aborted, "claude", Some(1), None)
+            .unwrap()
+            .1;
+        s.apply(aborted, Action::Abort).unwrap();
+        assert_eq!(
+            s.session(sess.id).unwrap().outcome,
+            Some(SessionOutcome::Aborted)
+        );
+
+        // Abandon (from review) closes the session `aborted` too.
+        let abandoned = create(&mut s, p, TaskState::Ready);
+        let sess = s
+            .record_dispatch(abandoned, "claude", Some(1), None)
+            .unwrap()
+            .1;
+        s.apply(abandoned, Action::Complete(None)).unwrap();
+        s.apply(abandoned, Action::Abandon).unwrap();
+        assert_eq!(
+            s.session(sess.id).unwrap().outcome,
+            Some(SessionOutcome::Aborted)
+        );
+    }
+
+    #[test]
+    fn a_continuation_ends_the_predecessor_open_session() {
+        let (mut s, p) = store_with_project();
+        let id = create(&mut s, p, TaskState::Ready);
+        let first = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+
+        // ask/answer leave the session open across needs-input -> running...
+        s.apply(id, Action::Ask("A or B?".into())).unwrap();
+        s.apply(id, Action::Answer("B".into())).unwrap();
+        assert!(s.session(first.id).unwrap().ended_at.is_none());
+
+        // ...then a continuation supersedes it: the predecessor is closed and
+        // the new session is the only one open (the invariant).
+        let second = s
+            .record_continuation(id, "claude", Some(2), None)
+            .unwrap()
+            .1;
+        assert!(s.session(first.id).unwrap().ended_at.is_some());
+        let open: Vec<i64> = s
+            .sessions_for(id)
+            .unwrap()
+            .into_iter()
+            .filter(|x| x.ended_at.is_none())
+            .map(|x| x.id)
+            .collect();
+        assert_eq!(open, vec![second.id]);
+    }
+
+    #[test]
+    fn rejecting_a_review_keeps_the_same_session_open_with_its_ref() {
+        // Rejecting with feedback returns the task to running with its session
+        // still open, so a continuation reuses the same agent session — the
+        // ref survives until the task actually closes (DESIGN.md §8).
+        let (mut s, p) = store_with_project();
+        let id = create(&mut s, p, TaskState::Ready);
+        let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+        s.set_session_ref(sess.id, "ref-1").unwrap();
+        s.apply(id, Action::Complete(None)).unwrap();
+        s.apply(id, Action::RejectWork("redo the tests".into()))
+            .unwrap();
+
+        let live = s.session(sess.id).unwrap();
+        assert!(live.ended_at.is_none(), "reject leaves the session open");
+        assert_eq!(live.session_ref.as_deref(), Some("ref-1"));
+        assert_eq!(s.task(id).unwrap().state, TaskState::Running);
+    }
+
+    #[test]
+    fn a_second_open_session_violates_the_unique_index() {
+        // The schema backstop: even a raw insert bypassing insert_session's
+        // supersede cannot leave two open rows on one task.
+        let (mut s, p) = store_with_project();
+        let id = create(&mut s, p, TaskState::Ready);
+        s.record_dispatch(id, "claude", Some(1), None).unwrap();
+        let second = s.conn.execute(
+            "INSERT INTO sessions (task_id, agent, started_at) VALUES (?1, 'x', datetime('now'))",
+            [id],
+        );
+        assert!(second.is_err(), "a second open session must be rejected");
+    }
+
     #[test]
     fn terminal_states_are_final() {
         let (mut s, p) = store_with_project();
@@ -1084,50 +1217,86 @@ mod tests {
         }
 
         #[test]
-        fn a_task_the_agent_already_asked_is_left_alone() {
+        fn a_needs_input_tasks_session_stays_open() {
+            // The asking session is reused when the answer continues the work,
+            // so it stays open across needs-input; reconcile leaves it alone
+            // even with a dead process (DESIGN.md §8).
             let (mut s, p) = store_with_project();
             let (task_id, session_id) = dispatch(&mut s, p);
             s.apply(task_id, Action::Ask("A or B?".into())).unwrap();
 
-            let (session, task) = s
-                .reconcile_session(session_id, false, false)
-                .unwrap()
-                .unwrap();
-            assert_eq!(session.outcome, Some(SessionOutcome::Asked));
-            assert_eq!(task.state, TaskState::NeedsInput);
+            assert!(
+                s.reconcile_session(session_id, false, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(s.session(session_id).unwrap().ended_at.is_none());
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::NeedsInput);
             assert!(!s.redispatch_flag(task_id).unwrap());
         }
 
         #[test]
-        fn a_task_the_agent_already_completed_is_left_alone() {
+        fn a_review_tasks_session_stays_open() {
+            // Review keeps the session open on purpose, so a reject-with-feedback
+            // can continue the same agent session; reconcile must not close it.
             let (mut s, p) = store_with_project();
             let (task_id, session_id) = dispatch(&mut s, p);
             s.apply(task_id, Action::Complete(None)).unwrap();
 
-            let (session, task) = s
-                .reconcile_session(session_id, false, false)
-                .unwrap()
-                .unwrap();
-            assert_eq!(session.outcome, Some(SessionOutcome::Completed));
-            assert_eq!(task.state, TaskState::Review);
+            assert!(
+                s.reconcile_session(session_id, false, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(s.session(session_id).unwrap().ended_at.is_none());
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Review);
             assert!(!s.redispatch_flag(task_id).unwrap());
         }
 
         #[test]
-        fn a_task_already_moved_off_running_some_other_way_is_marked_aborted() {
-            // e.g. a human aborted by hand before the process was noticed dead.
+        fn aborting_closes_the_session_so_reconcile_is_a_noop() {
+            // Abort now closes the session itself, in the same transaction, so
+            // by the time reconcile sees it there is nothing left to do.
             let (mut s, p) = store_with_project();
             let (task_id, session_id) = dispatch(&mut s, p);
             s.apply(task_id, Action::Abort).unwrap();
+
+            let session = s.session(session_id).unwrap();
+            assert_eq!(session.outcome, Some(SessionOutcome::Aborted));
+            assert!(session.ended_at.is_some());
+            assert!(
+                s.reconcile_session(session_id, false, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Ready);
+            // a manual abort must not itself read as a redispatch flag
+            assert!(!s.redispatch_flag(task_id).unwrap());
+        }
+
+        #[test]
+        fn a_stale_open_session_on_a_closed_task_is_finalised() {
+            // The session-25/#79 bug: a `done` task still carrying an open
+            // session because the pre-fix reconcile never closed it. The new
+            // logic finalises it on the next pass, without manual SQL. Forcing
+            // the state directly reproduces the legacy stranded row that
+            // `Accept` would otherwise have closed.
+            let (mut s, p) = store_with_project();
+            let (task_id, session_id) = dispatch(&mut s, p);
+            s.conn
+                .execute(
+                    "UPDATE tasks SET state = 'done', closed_at = datetime('now') WHERE id = ?1",
+                    [task_id],
+                )
+                .unwrap();
 
             let (session, task) = s
                 .reconcile_session(session_id, false, false)
                 .unwrap()
                 .unwrap();
-            assert_eq!(session.outcome, Some(SessionOutcome::Aborted));
-            assert_eq!(task.state, TaskState::Ready);
-            // a manual abort must not itself read as a redispatch flag
-            assert!(!s.redispatch_flag(task_id).unwrap());
+            assert!(session.ended_at.is_some());
+            assert_eq!(session.outcome, Some(SessionOutcome::Completed));
+            assert_eq!(task.state, TaskState::Done);
         }
 
         #[test]
@@ -1143,36 +1312,40 @@ mod tests {
         }
 
         #[test]
-        fn a_dead_older_session_does_not_demote_a_redispatched_task() {
-            // dispatch, abort (session stays open, #41), redispatch: the task
-            // is running behind a fresh, live session when the first session's
-            // process is finally noticed dead. Reconciling that older session
-            // must backfill only its own outcome, not knock the task back.
+        fn redispatch_supersedes_the_prior_session_keeping_one_open() {
+            // dispatch, abort, redispatch: abort now closes the first session
+            // itself, so the redispatch opens the only remaining open row. The
+            // one-open-session invariant holds, and reconciling the old
+            // already-closed session is a no-op that can't knock the task back.
             let (mut s, p) = store_with_project();
             let (task_id, older_session) = dispatch(&mut s, p);
             s.apply(task_id, Action::Abort).unwrap();
+            assert!(s.session(older_session).unwrap().ended_at.is_some());
+
             let newer_session = s
                 .record_dispatch(task_id, "claude", Some(4343), Some("/var/log/s2.log"))
                 .unwrap()
                 .1
                 .id;
 
-            let (session, task) = s
-                .reconcile_session(older_session, false, false)
+            // exactly one open session — the newer one
+            let open: Vec<i64> = s
+                .sessions_for(task_id)
                 .unwrap()
-                .unwrap();
+                .into_iter()
+                .filter(|x| x.ended_at.is_none())
+                .map(|x| x.id)
+                .collect();
+            assert_eq!(open, vec![newer_session]);
 
-            // the older session is finalised as failed...
-            assert_eq!(session.id, older_session);
-            assert_eq!(session.outcome, Some(SessionOutcome::Failed));
-            // ...but the task stays running behind the still-live newer session
-            assert_eq!(task.state, TaskState::Running);
-            assert!(!s.redispatch_flag(task_id).unwrap());
+            // reconciling the old, already-closed session does nothing
+            assert!(
+                s.reconcile_session(older_session, false, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
             assert!(s.session(newer_session).unwrap().ended_at.is_none());
-
-            // and no reconcile/transition event was logged against the task
-            let events = s.events_for(task_id).unwrap();
-            assert!(events.iter().all(|e| e.kind != "reconcile"));
         }
 
         #[test]

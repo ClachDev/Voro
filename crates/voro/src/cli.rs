@@ -127,7 +127,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         "continue" => continue_verb(store, &pos, &flags, ctx),
         "open" => open_verb(store, &pos, ctx),
         "pr" => pr_verb(store, &pos),
-        "reject" => reject_verb(store, &pos, &flags),
+        "reject" => reject_verb(store, &pos, &flags, ctx),
         "done" => done_verb(store, &pos, &flags),
         "answer" => answer_verb(store, &pos, &flags, ctx),
         "import" => import_verb(store, &pos, &flags),
@@ -494,14 +494,19 @@ fn pr_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     crate::pr::open(store, id)
 }
 
-/// `reject <task-id> [TEXT] [--from-pr]` (DESIGN.md §6/§11c): review → running
-/// with feedback. `--from-pr` pulls the tracked PR's review comments as that
-/// feedback so a GitHub review reaches the agent without retyping; any extra
-/// TEXT is appended below them. Without the flag, TEXT is the feedback as before.
+/// `reject <task-id> [TEXT] [--from-pr] [--no-dispatch]` (DESIGN.md §6/§8/§11c):
+/// review → running with feedback. `--from-pr` pulls the tracked PR's review
+/// comments as that feedback so a GitHub review reaches the agent without
+/// retyping; any extra TEXT is appended below them. Without the flag, TEXT is
+/// the feedback. Like `answer`, a task with prior session history then continues
+/// the work with the feedback in hand — and because review keeps the session
+/// open, that reuses the *same* agent session; `--no-dispatch` forces the plain
+/// transition, and a task only ever started by hand has nothing to continue.
 fn reject_verb(
     store: &mut Store,
     pos: &[String],
     flags: &HashMap<String, String>,
+    ctx: &DispatchCtx,
 ) -> Result<String, String> {
     let id = task_id(pos, 1)?;
     let feedback = if flags.contains_key("from-pr") {
@@ -513,10 +518,25 @@ fn reject_verb(
     } else {
         rest_text(pos, 2, "rejection feedback")?
     };
+    let has_history = !store
+        .sessions_for(id)
+        .map_err(|e| e.to_string())?
+        .is_empty();
+
     let task = store
-        .apply(id, Action::RejectWork(feedback))
+        .apply(id, Action::RejectWork(feedback.clone()))
         .map_err(|e| e.to_string())?;
-    Ok(format!("task {} -> {}", task.id, task.state))
+    let out = format!("task {} -> {}", task.id, task.state);
+
+    if !has_history || flags.contains_key("no-dispatch") {
+        return Ok(out);
+    }
+    match dispatch::continue_dispatch(store, ctx, id, None, Some(&feedback)) {
+        Ok(summary) => Ok(format!("{out}; {summary}")),
+        Err(e) => Err(format!(
+            "{out}, but continuation dispatch failed: {e} — retry with 'voro continue {id}'"
+        )),
+    }
 }
 
 /// `done <task-id> [--summary TEXT] [--branch NAME]` (DESIGN.md §6/§8): running

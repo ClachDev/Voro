@@ -153,10 +153,11 @@ pub struct App {
 
     pub projects: Vec<Project>,
     pub queue: Vec<Candidate>,
-    /// The cockpit's running strip (DESIGN.md §9): live agent sessions plus
-    /// every `running` task with no live session, so a task started by hand or
-    /// one whose session ended without reporting (reconcile leaves it running,
-    /// §8) is still visible and flagged for attention rather than hidden.
+    /// The cockpit's running strip (DESIGN.md §9): one row per `running` task
+    /// with its open session if any, so a task started by hand or one whose
+    /// session ended without reporting (reconcile leaves it running, §8) is
+    /// still visible. Filtered on task state, so `review`/`needs-input` tasks —
+    /// whose session stays open behind the scenes — stay in the queue, not here.
     pub running: Vec<RunningRow>,
     pub all: Vec<TaskRow>,
     /// Ready tasks whose most recent session ended `failed` or `capped`
@@ -403,19 +404,20 @@ impl App {
         self.all.iter().map(|r| &r.task).find(|t| t.id == id)
     }
 
-    /// Apply a transition and refresh. An `Answer` on a task with prior
-    /// session history additionally triggers a continuation dispatch
-    /// (DESIGN.md §6: "fed to the session" means resuming the work with the
-    /// answer in hand, not writing to a live pipe) — the same rule and the
-    /// same mechanics `voro answer` uses on the CLI, so the two stay
-    /// consistent. A task that was only ever started by hand has no session
-    /// history and the transition stands alone.
+    /// Apply a transition and refresh. An `Answer` or `RejectWork` on a task
+    /// with prior session history additionally triggers a continuation
+    /// dispatch (DESIGN.md §6/§8: "fed to the session" means resuming the work
+    /// with the answer or feedback in hand, not writing to a live pipe) — the
+    /// same rule and the same mechanics `voro answer`/`voro reject` use on the
+    /// CLI, so the two stay consistent. Because review keeps the session open,
+    /// a reject continues the *same* agent session. A task only ever started by
+    /// hand has no session history and the transition stands alone.
     fn apply_and_refresh(&mut self, task_id: i64, action: Action) {
-        let answer_text = match &action {
-            Action::Answer(text) => Some(text.clone()),
+        let continuation_input = match &action {
+            Action::Answer(text) | Action::RejectWork(text) => Some(text.clone()),
             _ => None,
         };
-        let has_history = answer_text.is_some()
+        let has_history = continuation_input.is_some()
             && self
                 .store
                 .sessions_for(task_id)
@@ -428,10 +430,13 @@ impl App {
                     &self.dispatch_ctx,
                     task_id,
                     None,
-                    answer_text.as_deref(),
+                    continuation_input.as_deref(),
                 ) {
                     Ok(summary) => self.status = Some(summary),
-                    Err(e) => self.status = Some(format!("answered, but continuation failed: {e}")),
+                    Err(e) => {
+                        self.status =
+                            Some(format!("transition applied, but continuation failed: {e}"))
+                    }
                 }
             }
             let result = self.refresh();
