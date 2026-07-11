@@ -1,6 +1,6 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use voro_core::{
-    Action, AgentsConfig, Blocker, Candidate, Event, PrRef, Priority, Project, RunningRow,
+    Action, AgentsConfig, Blocker, Candidate, DepRef, Event, PrRef, Priority, Project, RunningRow,
     ScoreBreakdown, StateCounts, Store, Task, TaskState, Triage, scheduler,
 };
 
@@ -193,6 +193,11 @@ pub struct App {
     /// the half-finished done report a dispatched session left behind, which a
     /// PR cannot be opened from. Re-derived per refresh, never stored.
     pub incomplete_report: std::collections::HashSet<i64>,
+    /// Every dependency edge, both directions, keyed by task id — what the
+    /// detail views render as `blocked by #N` / `blocks #N` (task #103).
+    /// Loaded whole per refresh so the render path never queries the store.
+    pub deps: std::collections::HashMap<i64, Vec<DepRef>>,
+    pub dependents: std::collections::HashMap<i64, Vec<DepRef>>,
 
     pub cockpit_rows: Vec<CockpitRow>,
     pub cockpit_sel: usize,
@@ -252,6 +257,8 @@ impl App {
             counts: StateCounts::default(),
             all: Vec::new(),
             incomplete_report: std::collections::HashSet::new(),
+            deps: std::collections::HashMap::new(),
+            dependents: std::collections::HashMap::new(),
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
             tasks_sel: 0,
@@ -335,6 +342,8 @@ impl App {
             })
             .collect();
         self.all = all;
+        self.deps = self.store.deps_by_task()?;
+        self.dependents = self.store.dependents_by_task()?;
         self.running = self.store.running_rows()?;
         self.counts = self.store.state_counts()?;
 

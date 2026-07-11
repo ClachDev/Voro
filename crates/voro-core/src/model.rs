@@ -304,6 +304,26 @@ impl Blocker {
     }
 }
 
+/// A dependency edge resolved for display: the task at the *other* end of the
+/// edge with its current title and state, plus the edge's kind. Which end is
+/// "other" depends on the query — the dependency for
+/// [`Store::deps_by_task`](crate::Store::deps_by_task), the dependant for
+/// [`Store::dependents_by_task`](crate::Store::dependents_by_task).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepRef {
+    pub id: i64,
+    pub title: String,
+    pub state: TaskState,
+    pub kind: DepKind,
+}
+
+impl DepRef {
+    /// The referenced task is not yet in a closed state.
+    pub fn is_open(&self) -> bool {
+        !self.state.is_terminal()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Event {
     pub id: i64,

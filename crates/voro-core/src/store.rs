@@ -5,8 +5,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    Blocker, Dep, DepKind, Event, Priority, Project, RunningRow, Session, SessionOutcome, Task,
-    TaskState,
+    Blocker, Dep, DepKind, DepRef, Event, Priority, Project, RunningRow, Session, SessionOutcome,
+    Task, TaskState,
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -432,6 +432,49 @@ impl Store {
         for row in rows {
             let (task_id, blocker) = row?;
             map.entry(task_id).or_default().push(blocker);
+        }
+        Ok(map)
+    }
+
+    /// Every dependency edge of every kind, keyed by the depending task and
+    /// resolved to the dependency's current title and state — the forward
+    /// direction a detail view renders as `blocked by #N` or `<kind> #N`.
+    /// One query feeds every pane, like [`blockers_by_task`](Store::blockers_by_task).
+    pub fn deps_by_task(&self) -> Result<HashMap<i64, Vec<DepRef>>> {
+        self.dep_refs(
+            "SELECT d.task_id, t.id, t.title, t.state, d.kind
+             FROM deps d JOIN tasks t ON t.id = d.depends_on
+             ORDER BY d.task_id, t.id",
+        )
+    }
+
+    /// The reverse edges: every dependency keyed by the task depended *on*,
+    /// resolved to the depending task — who a task blocks (or spawned), which
+    /// no forward query can answer.
+    pub fn dependents_by_task(&self) -> Result<HashMap<i64, Vec<DepRef>>> {
+        self.dep_refs(
+            "SELECT d.depends_on, t.id, t.title, t.state, d.kind
+             FROM deps d JOIN tasks t ON t.id = d.task_id
+             ORDER BY d.depends_on, t.id",
+        )
+    }
+
+    fn dep_refs(&self, sql: &str) -> Result<HashMap<i64, Vec<DepRef>>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            let key: i64 = row.get(0)?;
+            let dep = DepRef {
+                id: row.get(1)?,
+                title: row.get(2)?,
+                state: row.get(3)?,
+                kind: row.get(4)?,
+            };
+            Ok((key, dep))
+        })?;
+        let mut map: HashMap<i64, Vec<DepRef>> = HashMap::new();
+        for row in rows {
+            let (key, dep) = row?;
+            map.entry(key).or_default().push(dep);
         }
         Ok(map)
     }
@@ -1860,5 +1903,70 @@ mod tests {
 
         // Tasks without blocks deps are simply absent from the map.
         assert!(!map.contains_key(&open.id));
+    }
+
+    #[test]
+    fn dep_maps_resolve_both_directions_with_title_state_and_kind() {
+        use crate::model::{DepKind, DepRef, Priority};
+        use crate::transition::Action;
+
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let new = |title: &str| NewTask {
+            project_id: p.id,
+            title: title.into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state: TaskState::Ready,
+            agent: None,
+            human: false,
+        };
+        let blocker = s.create_task(new("blocker")).unwrap();
+        s.apply(blocker.id, Action::Start).unwrap();
+        s.apply(blocker.id, Action::Complete(None)).unwrap();
+        s.apply(blocker.id, Action::Accept).unwrap();
+        let source = s.create_task(new("source")).unwrap();
+        let task = s.create_task(new("task")).unwrap();
+        s.add_dep(task.id, blocker.id, DepKind::Blocks).unwrap();
+        s.add_dep(task.id, source.id, DepKind::DiscoveredFrom)
+            .unwrap();
+
+        // Forward: the task's own deps, every kind, resolved to the
+        // dependency's title and state.
+        let deps = s.deps_by_task().unwrap();
+        assert_eq!(
+            deps[&task.id],
+            vec![
+                DepRef {
+                    id: blocker.id,
+                    title: "blocker".into(),
+                    state: TaskState::Done,
+                    kind: DepKind::Blocks,
+                },
+                DepRef {
+                    id: source.id,
+                    title: "source".into(),
+                    state: TaskState::Ready,
+                    kind: DepKind::DiscoveredFrom,
+                },
+            ]
+        );
+        assert!(!deps[&task.id][0].is_open());
+        assert!(!deps.contains_key(&blocker.id));
+
+        // Reverse: keyed by the task depended on, resolving the dependant.
+        let dependents = s.dependents_by_task().unwrap();
+        assert_eq!(
+            dependents[&blocker.id],
+            vec![DepRef {
+                id: task.id,
+                title: "task".into(),
+                state: TaskState::Ready,
+                kind: DepKind::Blocks,
+            }]
+        );
+        assert_eq!(dependents[&source.id].len(), 1);
+        assert_eq!(dependents[&source.id][0].kind, DepKind::DiscoveredFrom);
+        assert!(!dependents.contains_key(&task.id));
     }
 }
