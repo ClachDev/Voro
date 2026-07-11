@@ -48,9 +48,11 @@ editing that database yourself:
 
 Run these commands exactly as shown: they name task {task_id} explicitly, so they
 work from anywhere without any environment variable being set. `propose` uses
-task {task_id} as the discovered-from source when `--from` is omitted. Never
-modify the database with raw SQL, which would bypass the state machine and event
-log.{branch}
+task {task_id} as the discovered-from source when `--from` is omitted. Finish
+with your work committed on a branch and a PR-ready `--summary` on `done` — what
+changed, why, and how you verified it — since `voro pr` opens the pull request
+straight from that summary. Never modify the database with raw SQL, which would
+bypass the state machine and event log.{branch}
 
 ---
 
@@ -813,9 +815,12 @@ mod tests {
 
     #[test]
     fn preamble_injects_the_intended_branch_only_when_one_is_set() {
-        // no branch: nothing about branches leaks into the preamble
+        // no assigned branch: the base preamble still asks for a PR-ready
+        // finish, but the branch-*assignment* block (naming a specific branch)
+        // is absent.
         let plain = render_preamble(62, &Store::default_db_path(), None);
-        assert!(!plain.contains("branch"), "{plain}");
+        assert!(!plain.contains("git branch `"), "{plain}");
+        assert!(!plain.contains("--branch"), "{plain}");
 
         // with a branch: the agent is told to use it and how to report back,
         // with the reported-name verb naming the literal task id and branch

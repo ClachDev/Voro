@@ -126,6 +126,34 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             );
             frame.render_widget(para, area);
         }
+        Mode::ConfirmPr {
+            task_id,
+            branch,
+            title,
+        } => {
+            let lines = vec![
+                Line::from(vec![
+                    Span::raw("push branch "),
+                    Span::styled(format!("`{branch}`"), Style::new().fg(Color::Green)),
+                ]),
+                Line::from(vec![
+                    Span::raw("create a ready PR titled "),
+                    Span::styled(format!("“{title}”"), Style::new().fg(Color::Blue)),
+                ]),
+                Line::default(),
+                Line::from(Span::styled(
+                    "⏎/y confirm · esc/n cancel",
+                    Style::new().dim(),
+                )),
+            ];
+            let area = popup_area(frame, 72, lines.len() as u16 + 2);
+            let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("Open a PR for #{task_id}?")),
+            );
+            frame.render_widget(para, area);
+        }
         Mode::Detail { task_id, scroll } => {
             let Some(row) = app.all.iter().find(|r| r.task.id == *task_id) else {
                 return;
@@ -325,6 +353,24 @@ fn branch_span(branch: &str) -> Span<'static> {
     Span::styled(format!("branch: {branch}"), Style::new().fg(Color::Green))
 }
 
+/// The review sub-state (DESIGN.md §8), read from fields rather than a new
+/// task state: a review task with no tracked PR shows "next: pr" (the PR key
+/// opens one from its summary), one with a PR shows "PR open". `None` for any
+/// task that is not in `review`.
+fn review_substate_span(task: &voro_core::Task) -> Option<Span<'static>> {
+    if task.state != voro_core::TaskState::Review {
+        return None;
+    }
+    Some(if task.pr_url.is_some() {
+        Span::styled("  PR open", Style::new().fg(Color::Blue))
+    } else {
+        Span::styled(
+            "  next: pr",
+            Style::new().fg(Color::Blue).add_modifier(Modifier::DIM),
+        )
+    })
+}
+
 /// The verb a queue row's Enter performs, from its state.
 fn action_verb(state: voro_core::TaskState) -> &'static str {
     match state {
@@ -376,6 +422,9 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 if app.redispatch.contains(&c.task.id) {
                     spans.push(redispatch_span());
+                }
+                if let Some(substate) = review_substate_span(&c.task) {
+                    spans.push(substate);
                 }
                 ListItem::new(Line::from(spans))
             }
@@ -445,6 +494,11 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(pr) = &task.pr_url {
         lines.push(Line::from(pr_span(pr)));
+    } else if task.state == TaskState::Review {
+        lines.push(Line::from(Span::styled(
+            "next: pr  (g opens one from the summary)",
+            Style::new().fg(Color::Blue),
+        )));
     }
     if let Some(branch) = &task.branch {
         lines.push(Line::from(branch_span(branch)));
@@ -554,6 +608,9 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
             )];
             if app.redispatch.contains(&r.task.id) {
                 spans.push(redispatch_span());
+            }
+            if let Some(substate) = review_substate_span(&r.task) {
+                spans.push(substate);
             }
             spans.extend(blocker_spans(r));
             ListItem::new(Line::from(spans))

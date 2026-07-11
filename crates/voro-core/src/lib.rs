@@ -23,7 +23,7 @@ pub use model::{
     Blocker, Dep, DepKind, Event, Priority, Project, RunningRow, Session, SessionOutcome, Task,
     TaskState,
 };
-pub use pr::{PrRef, format_review_feedback};
+pub use pr::{PrPlan, PrRef, format_review_feedback, plan_pr};
 pub use scheduler::{Candidate, ScoreBreakdown};
 pub use store::{NewTask, Store, TaskEdit};
 pub use transition::{Action, Triage};
