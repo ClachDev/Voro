@@ -13,8 +13,8 @@ mod store;
 mod transition;
 
 pub use agent::{
-    AgentSessionEntry, AgentTemplate, AgentsConfig, PROMPT_FILE_PLACEHOLDER, ResolvedAgent,
-    SESSION_PLACEHOLDER, STARTER_CONFIG, TASK_ID_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER,
+    AgentSessionEntry, AgentTemplate, AgentsConfig, PROMPT_FILE_PLACEHOLDER, Provenance,
+    ResolvedAgent, SESSION_PLACEHOLDER, TASK_ID_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER,
     ViewerTemplate, parse_sessions_json,
 };
 pub use error::{Error, Result};

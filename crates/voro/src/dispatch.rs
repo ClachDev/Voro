@@ -179,7 +179,7 @@ pub struct DispatchCtx {
     /// The active database, exported to the session as `VORO_DB` so the
     /// agent's return-path verbs write back to the same store.
     pub db_path: PathBuf,
-    /// `agents.toml` location.
+    /// The config-file location dispatch reads (`voro.toml`).
     pub agents_path: PathBuf,
     /// Directory for prompt and log files — never inside a project checkout,
     /// so writing the prompt does not itself dirty the tree.
@@ -191,8 +191,9 @@ pub struct DispatchCtx {
 }
 
 impl DispatchCtx {
-    /// The real environment: `agents.toml` at its config default, and a
-    /// `sessions/` directory beside the database for prompts and logs.
+    /// The real environment: the config file at its resolved default
+    /// location, and a `sessions/` directory beside the database for prompts
+    /// and logs.
     pub fn from_db_path(db_path: &Path) -> DispatchCtx {
         let runtime_dir = db_path
             .parent()
@@ -280,7 +281,7 @@ pub fn continue_dispatch(
 
 /// Open a `review` (or `running`) task's checkout in the configured viewer so
 /// its diff can be seen (DESIGN.md §11a). The `[viewer]` command from
-/// `agents.toml` is run detached in the project's path — a shell-out baseline
+/// `voro.toml` is run detached in the project's path — a shell-out baseline
 /// that reuses the command-template model rather than hard-coding an editor.
 /// With no viewer configured, the caller gets back what to add rather than a
 /// silent no-op; opening never touches task state, so no clean-tree guard and
@@ -691,15 +692,15 @@ mod tests {
     use voro_core::{NewTask, Priority};
 
     /// A scratch database, a freshly-`git init`ed clean project, and an
-    /// `agents.toml` whose one agent is a stub command that just reads the
+    /// `voro.toml` whose one agent is a stub command that just reads the
     /// prompt. Returns the store, the dispatch context, and the project path.
     fn fixture(cmd: &str) -> (Store, DispatchCtx, PathBuf) {
         fixture_toml(&format!(
-            "default = \"stub\"\n\n[agents.stub]\ncmd = \"{cmd}\"\n"
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"{cmd}\"\n"
         ))
     }
 
-    /// Like [`fixture`], but with the whole `agents.toml` supplied, for tests
+    /// Like [`fixture`], but with the whole `voro.toml` supplied, for tests
     /// exercising the session verbs.
     fn fixture_toml(agents_toml: &str) -> (Store, DispatchCtx, PathBuf) {
         let root = std::env::temp_dir().join(format!(
@@ -715,7 +716,7 @@ mod tests {
         git(&project, &["init", "-q"]);
 
         let db_path = root.join("voro.db");
-        let agents_path = root.join("agents.toml");
+        let agents_path = root.join("voro.toml");
         std::fs::write(&agents_path, agents_toml).unwrap();
 
         let store = Store::open(&db_path).unwrap();
@@ -1006,7 +1007,7 @@ mod tests {
     #[test]
     fn dispatch_captures_the_session_ref_from_the_sessions_listing() {
         let (mut store, ctx, project) = fixture_toml(
-            "default = \"stub\"\n\n[agents.stub]\n\
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
              dispatch = \"cat {prompt_file}\"\nsessions = \"cat sessions.json\"\n",
         );
         let root = project.parent().unwrap().to_path_buf();
@@ -1015,7 +1016,7 @@ mod tests {
         std::fs::write(
             &ctx.agents_path,
             format!(
-                "default = \"stub\"\n\n[agents.stub]\n\
+                "default_agent = \"stub\"\n\n[agents.stub]\n\
                  dispatch = \"cat {{prompt_file}}\"\nsessions = \"cat '{}'\"\n",
                 listing.display()
             ),
@@ -1033,7 +1034,7 @@ mod tests {
     #[test]
     fn capture_gives_up_gracefully_when_nothing_matches() {
         let (mut store, ctx, project) = fixture_toml(
-            "default = \"stub\"\n\n[agents.stub]\n\
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
              dispatch = \"cat {prompt_file}\"\nsessions = \"echo []\"\n",
         );
         let id = ready_task(&mut store, &project);
@@ -1054,7 +1055,7 @@ mod tests {
         // line a real `claude --bg` launcher prints; the sessions listing
         // never matches (empty array), so capture must fall back to the log.
         let (mut store, ctx, project) = fixture_toml(
-            "default = \"stub\"\n\n[agents.stub]\n\
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
              dispatch = 'cat {prompt_file} >/dev/null && printf \"\\033[2mbackgrounded · \\033[1mdeadbeef\\033[0m\\n\"'\n\
              sessions = \"echo []\"\n",
         );
@@ -1110,7 +1111,7 @@ mod tests {
         std::fs::write(
             &ctx.agents_path,
             format!(
-                "default = \"stub\"\n\n[agents.stub]\n\
+                "default_agent = \"stub\"\n\n[agents.stub]\n\
                  dispatch = \"cat {{prompt_file}}\"\n\
                  continue = \"cp {{prompt_file}} '{}' && echo {{session}} > '{}'\"\n",
                 prompt_out.display(),
@@ -1148,7 +1149,7 @@ mod tests {
     #[test]
     fn continuation_without_a_ref_falls_back_to_a_fresh_spawn() {
         let (mut store, ctx, project) = fixture_toml(
-            "default = \"stub\"\n\n[agents.stub]\n\
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
              dispatch = \"cat {prompt_file}\"\n\
              continue = \"true {session} {prompt_file}\"\n",
         );
@@ -1199,7 +1200,7 @@ mod tests {
         // a [viewer] whose command drops a marker at the substituted {path}
         std::fs::write(
             &ctx.agents_path,
-            "default = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
              [viewer]\ncmd = \"touch {path}/opened.marker\"\n",
         )
         .unwrap();
@@ -1227,7 +1228,7 @@ mod tests {
         let (mut store, ctx, project) = fixture("cat {prompt_file}");
         std::fs::write(
             &ctx.agents_path,
-            "default = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
              [viewer]\ncmd = \"exit 3\"\n",
         )
         .unwrap();
@@ -1255,7 +1256,7 @@ mod tests {
 
     #[test]
     fn open_without_a_viewer_reports_what_to_configure() {
-        // the fixture's agents.toml has no [viewer] table
+        // the fixture's voro.toml has no [viewer] table
         let (mut store, ctx, project) = fixture("cat {prompt_file}");
         let id = review_task(&mut store, &project);
 
@@ -1279,7 +1280,7 @@ mod tests {
         // add a second agent and set it as the task's override
         std::fs::write(
             &ctx.agents_path,
-            "default = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
              [agents.special]\ncmd = \"cat {prompt_file}\"\n",
         )
         .unwrap();

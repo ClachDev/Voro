@@ -31,11 +31,11 @@ pub enum Error {
     DependencyCycle(String),
 
     #[error(
-        "agents config not found at {}; run `voro agent init` to create a starter file, \
-         then edit it to match the agents you have installed",
-        .0.display()
+        "no default agent: none of the built-in agents ({probed}) were found on PATH; \
+         install one, or set `default_agent` in {} to a configured agent",
+        path.display()
     )]
-    AgentConfigMissing(PathBuf),
+    NoDefaultAgent { probed: String, path: PathBuf },
 
     #[error("invalid agents config at {}: {message}", path.display())]
     AgentConfigInvalid { path: PathBuf, message: String },

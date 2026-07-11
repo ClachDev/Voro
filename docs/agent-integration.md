@@ -2,9 +2,10 @@
 
 This is the glue that lives *between* Voro and a coding agent, for the one agent
 that has richer integration hooks than "run a shell command": Claude Code. None
-of it is required — dispatch works for any agent through the command template in
-`agents.toml` alone (DESIGN.md §8) — and none of it lives in `voro-core` or the
-dispatch path. It is per-agent configuration you drop into a project.
+of it is required — dispatch works for any agent through a command template,
+built-in or from `voro.toml` (DESIGN.md §8) — and none of it lives in
+`voro-core` or the dispatch path. It is per-agent configuration you drop into a
+project.
 
 Voro's boundary with an agent is task state versus session state (DESIGN.md §8):
 Voro does not watch the process, it is *told* what happened. The telling is the
@@ -65,7 +66,16 @@ Background-only dispatch loses a lot against just running the agent
 interactively: no live view, no way to jump in and steer, no way to reopen the
 session afterwards. Agents that ship their own session layer close that gap
 through optional verbs on their `[agents.<name>]` table, next to the required
-`dispatch` (`cmd` is accepted as an alias, so older configs load unchanged):
+`dispatch` (`cmd` is accepted as an alias, so older configs load unchanged).
+
+The `claude` and `codex` definitions below **ship built-in** — Voro compiles
+them in (DESIGN.md §5), so you get exactly these without writing any
+`voro.toml`, and a binary upgrade updates them. They are reproduced here to
+explain the verbs and to show what you would copy into a `voro.toml` table
+to *override* one (a user table replaces a built-in wholesale, so keep every
+verb you still want) or to model a new agent of your own on. `voro agent init`
+writes the same built-ins into a fresh `voro.toml`, commented out and ready to
+copy:
 
 ```toml
 [agents.claude]

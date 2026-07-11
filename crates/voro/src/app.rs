@@ -110,7 +110,7 @@ pub enum Mode {
         scroll: u16,
     },
     /// Dispatch-via-picker (DESIGN.md §8): agents loaded fresh from
-    /// `agents.toml` when the picker opens, never cached, since the whole
+    /// `voro.toml` when the picker opens, never cached, since the whole
     /// point is to catch a config that's changed since the last dispatch.
     AgentPicker {
         task_id: i64,
@@ -956,7 +956,7 @@ impl App {
     }
 
     /// Open the agent picker (DESIGN.md §8): agents are loaded from
-    /// `agents.toml` right now, not cached from some earlier read, so a
+    /// `voro.toml` right now, not cached from some earlier read, so a
     /// config that changed since the last dispatch — the usage-cap case this
     /// exists for — is always reflected. A load failure renders in the same
     /// status-line error style as a failed dispatch rather than opening an
@@ -971,7 +971,7 @@ impl App {
         };
         let agents = config.agent_names();
         if agents.is_empty() {
-            self.status = Some("agents.toml defines no agents".into());
+            self.status = Some("no agents are configured".into());
             return;
         }
         let resolved = config.resolve(task_agent.as_deref()).ok().map(|r| r.name);
@@ -1410,7 +1410,7 @@ mod tests {
     }
 
     /// A scratch database, a freshly-`git init`ed clean project, and (unless
-    /// `agents_toml` is `None`, for the missing-config case) an `agents.toml`
+    /// `agents_toml` is `None`, for the missing-config case) a `voro.toml`
     /// at that content — the same scratch shape `dispatch.rs`'s and
     /// `cli.rs`'s own tests use, duplicated here since those are private to
     /// their modules.
@@ -1441,7 +1441,7 @@ mod tests {
         assert!(status.success(), "git init failed");
 
         let db_path = root.join("voro.db");
-        let agents_path = root.join("agents.toml");
+        let agents_path = root.join("voro.toml");
         if let Some(toml) = agents_toml {
             std::fs::write(&agents_path, toml).unwrap();
         }
@@ -1483,7 +1483,7 @@ mod tests {
         assert!(status.success(), "git init failed");
 
         let db_path = root.join("voro.db");
-        let agents_path = root.join("agents.toml");
+        let agents_path = root.join("voro.toml");
         // The continuation this test triggers must still be alive when
         // `apply_and_refresh`'s own `self.refresh()` reconciles-on-read
         // immediately afterwards — an instantly-exiting stub (`cat`, as
@@ -1491,7 +1491,7 @@ mod tests {
         // finalised as a failed session before the assertions below run.
         std::fs::write(
             &agents_path,
-            "default = \"stub\"\n\n[agents.stub]\ncmd = \"sleep 1 && cat {prompt_file}\"\n",
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"sleep 1 && cat {prompt_file}\"\n",
         )
         .unwrap();
 
@@ -1865,7 +1865,9 @@ mod tests {
         // above for the same race).
         let (mut store, ctx, project_path) = scratch_env(
             "dispatch",
-            Some("default = \"stub\"\n\n[agents.stub]\ncmd = \"sleep 1 && cat {prompt_file}\"\n"),
+            Some(
+                "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"sleep 1 && cat {prompt_file}\"\n",
+            ),
         );
         let project = store
             .create_project("demo", project_path.to_str().unwrap())
@@ -1923,7 +1925,7 @@ mod tests {
         );
     }
 
-    /// `D` opens the picker listing every agent from `agents.toml`, with the
+    /// `D` opens the picker listing every agent from `voro.toml`, with the
     /// one plain dispatch would resolve to marked regardless of cursor
     /// position; picking a different one dispatches with that override.
     #[test]
@@ -1933,7 +1935,7 @@ mod tests {
         let (mut store, ctx, project_path) = scratch_env(
             "picker",
             Some(
-                "default = \"stub\"\n\n[agents.stub]\ncmd = \"sleep 1 && cat {prompt_file}\"\n\n\
+                "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"sleep 1 && cat {prompt_file}\"\n\n\
                  [agents.special]\ncmd = \"sleep 1 && cat {prompt_file}\"\n",
             ),
         );
@@ -1961,7 +1963,16 @@ mod tests {
                 sel,
                 ..
             } => {
-                assert_eq!(agents, &vec!["special".to_string(), "stub".to_string()]);
+                // the built-in claude/codex layer in alongside the user agents
+                assert_eq!(
+                    agents,
+                    &vec![
+                        "claude".to_string(),
+                        "codex".to_string(),
+                        "special".to_string(),
+                        "stub".to_string(),
+                    ]
+                );
                 assert_eq!(resolved.as_deref(), Some("stub"));
                 (agents.clone(), *sel)
             }
@@ -1982,13 +1993,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }
 
-    /// A missing/invalid `agents.toml` is only discovered when the picker is
+    /// An invalid `voro.toml` is only discovered when the picker is
     /// opened — it is loaded fresh each time, never cached — and surfaces
     /// through the ordinary status-line error style instead of a stale or
-    /// empty modal.
+    /// empty modal. (A *missing* file is no longer a failure: the built-ins
+    /// load, so the picker opens on them.)
     #[test]
     fn agent_picker_reports_a_config_load_failure_without_opening() {
-        let (mut store, ctx, project_path) = scratch_env("picker-missing", None);
+        // an agent whose dispatch drops the {prompt_file} placeholder fails
+        // validation, so the whole config fails to load
+        let (mut store, ctx, project_path) = scratch_env(
+            "picker-invalid",
+            Some("[agents.bad]\ncmd = \"run with no placeholder\"\n"),
+        );
         let project = store
             .create_project("demo", project_path.to_str().unwrap())
             .unwrap();
@@ -2027,7 +2044,7 @@ mod tests {
         std::fs::write(
             &ctx.agents_path,
             format!(
-                "default = \"stub\"\n\n[agents.stub]\n\
+                "default_agent = \"stub\"\n\n[agents.stub]\n\
                  dispatch = \"cat {{prompt_file}}\"\n\
                  sessions = \"cat '{}'\"\n\
                  attach = \"agent attach {{session}}\"\n\
@@ -2099,7 +2116,7 @@ mod tests {
         let (mut store, ctx, project_path) = scratch_env(
             "jumpin-noref",
             Some(
-                "default = \"stub\"\n\n[agents.stub]\n\
+                "default_agent = \"stub\"\n\n[agents.stub]\n\
                  dispatch = \"cat {prompt_file}\"\n\
                  attach = \"agent attach {session}\"\n\
                  resume = \"agent resume {session}\"\n",
@@ -2174,7 +2191,7 @@ mod tests {
         let (mut store, ctx, project_path) = scratch_env(
             "open",
             Some(
-                "default = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
+                "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
                  [viewer]\ncmd = \"true\"\n",
             ),
         );
