@@ -96,7 +96,9 @@ transitions
                                   PR description; --branch records the git branch
                                   the work landed on (agent return path). Warns
                                   but succeeds when branch or summary is absent
-  accept <task-id>                review → done
+  accept <task-id> [--yes]        review → done; then offers to remove the
+                                  task's dispatch worktree (--yes skips the
+                                  confirmation)
   reject <task-id> [TEXT] [--from-pr]
                                   review → running; TEXT is the feedback, or
                                   --from-pr pulls the tracked PR's review
@@ -104,7 +106,8 @@ transitions
   abort <task-id>                 running → ready
   park <task-id>                  ready → parked
   unpark <task-id>                parked → ready
-  abandon <task-id>               parked|ready|needs-input|review → rejected
+  abandon <task-id> [--yes]       parked|ready|needs-input|review → rejected;
+                                  then offers to remove the task's worktree
 ";
 
 pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<String, String> {
@@ -960,8 +963,37 @@ fn transition_verb(
         "abandon" => Action::Abandon,
         _ => unreachable!("guarded by run()"),
     };
+    // The task closes worktree in tow (§8): `accept`/`abandon` are the terminal
+    // transitions that own the dispatch worktree's teardown. The transition is
+    // applied first and stands regardless of what the cleanup does.
+    let closes = matches!(action, Action::Accept | Action::Abandon);
     let task = store.apply(id, action).map_err(|e| e.to_string())?;
-    Ok(format!("task {} -> {}", task.id, task.state))
+    let mut out = format!("task {} -> {}", task.id, task.state);
+    if closes && let Some(line) = clean_up_worktree(store, &task, flags.contains_key("yes"))? {
+        out.push('\n');
+        out.push_str(&line);
+    }
+    Ok(out)
+}
+
+/// Remove the worktree of a just-closed task after showing the operator exactly
+/// what will go (worktree path, branch, why the branch is judged safe) and
+/// confirming — `--yes` skips the prompt for scripting. Declining still returns
+/// `Ok`, so the transition it followed stands; `None` means there was nothing to
+/// clean (no branch, or no matching worktree). The git/`gh` work lives in the
+/// `worktree` module beside dispatch.
+fn clean_up_worktree(store: &Store, task: &Task, yes: bool) -> Result<Option<String>, String> {
+    let project = store.project(task.project_id).map_err(|e| e.to_string())?;
+    let Some(plan) = crate::worktree::Cleanup::plan(task, &project.path)? else {
+        return Ok(None);
+    };
+    if !yes && !confirm(&format!("{} — proceed?", plan.describe()))? {
+        return Ok(Some(format!(
+            "worktree {} left in place — cleanup declined",
+            plan.worktree().display()
+        )));
+    }
+    Ok(Some(plan.execute()))
 }
 
 fn task_line(task: &Task, project: &str) -> String {

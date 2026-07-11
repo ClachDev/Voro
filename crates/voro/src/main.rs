@@ -6,6 +6,7 @@ mod import;
 mod pr;
 mod reconcile;
 mod ui;
+mod worktree;
 
 use std::path::PathBuf;
 use std::time::Duration;
