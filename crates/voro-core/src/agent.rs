@@ -15,8 +15,7 @@
 //! replace a built-in wholesale (whole-agent override, not per-verb), and set
 //! `default_agent`/`[viewer]`. A missing file is not an error — the built-ins
 //! alone are a working config — so a fresh install with `claude` on PATH can
-//! dispatch without authoring any TOML. The legacy filename `agents.toml` and
-//! the `default` key are still honoured for pre-rename installs.
+//! dispatch without authoring any TOML.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -237,12 +236,11 @@ impl Provenance {
 /// The raw shape deserialized from `voro.toml` (or the built-in TOML) before
 /// layering. Every field is optional so a file that only sets `[viewer]`, only
 /// adds an agent, or is empty all parse — a missing config file is not an
-/// error under layered config. `default_agent` accepts the legacy key `default`
-/// as an alias so pre-rename files load unchanged.
+/// error under layered config.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    #[serde(default, alias = "default")]
+    #[serde(default)]
     default_agent: Option<String>,
     #[serde(default)]
     agents: BTreeMap<String, AgentTemplate>,
@@ -339,22 +337,14 @@ pub struct AgentsConfig {
     path: PathBuf,
 }
 
-/// The canonical config filename; the legacy name it superseded.
+/// The config filename under the `voro/` config directory.
 const CONFIG_FILENAME: &str = "voro.toml";
-const LEGACY_CONFIG_FILENAME: &str = "agents.toml";
 
 impl AgentsConfig {
-    /// The config path dispatch reads: `$XDG_CONFIG_HOME/voro/voro.toml`
-    /// (defaulting to `~/.config`), falling back to the legacy
-    /// `agents.toml` beside it when that exists but `voro.toml` does not, so
-    /// pre-rename installs keep loading. A fresh install resolves to
-    /// `voro.toml`, the name `agent init` writes.
+    /// The config path dispatch reads: `$XDG_CONFIG_HOME/voro/voro.toml`,
+    /// defaulting to `~/.config`. A fresh install resolves here even before
+    /// the file exists — that is the path `agent init` writes.
     pub fn default_path() -> PathBuf {
-        Self::resolve_in(&Self::config_dir())
-    }
-
-    /// The `voro/` config directory under `$XDG_CONFIG_HOME` (or `~/.config`).
-    fn config_dir() -> PathBuf {
         let config_home = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
@@ -364,28 +354,7 @@ impl AgentsConfig {
                     .unwrap_or_default();
                 home.join(".config")
             });
-        config_home.join("voro")
-    }
-
-    /// Resolve the config file within `dir`: `voro.toml` if present, else the
-    /// legacy `agents.toml` if present, else `voro.toml` (the path a fresh
-    /// `agent init` writes and dispatch reads when neither exists yet).
-    fn resolve_in(dir: &Path) -> PathBuf {
-        let primary = dir.join(CONFIG_FILENAME);
-        if primary.exists() {
-            return primary;
-        }
-        let legacy = dir.join(LEGACY_CONFIG_FILENAME);
-        if legacy.exists() {
-            return legacy;
-        }
-        primary
-    }
-
-    /// Whether `path` is the deprecated `agents.toml` name rather than the
-    /// canonical `voro.toml`, so the CLI can nudge the user to rename it.
-    pub fn is_legacy_path(path: &Path) -> bool {
-        path.file_name().and_then(|n| n.to_str()) == Some(LEGACY_CONFIG_FILENAME)
+        config_home.join("voro").join(CONFIG_FILENAME)
     }
 
     /// Load the effective config: the built-in agents, with the user file
@@ -589,8 +558,7 @@ impl AgentsConfig {
     /// Write the [`starter_config`] skeleton to `path`, creating parent
     /// directories. Refuses to overwrite an existing file so a hand-tuned
     /// config is never clobbered — `agent init` is an optional bootstrap, not
-    /// a reset. When `path` resolves to the legacy `agents.toml` (because one
-    /// exists), that same guard prevents a shadowing `voro.toml` being written.
+    /// a reset.
     pub fn write_starter(path: &Path) -> Result<()> {
         if path.exists() {
             return Err(Error::Invalid(format!(
@@ -671,7 +639,7 @@ mod tests {
     use super::*;
 
     const CONFIG: &str = r#"
-        default = "claude"
+        default_agent = "claude"
 
         [agents.claude]
         cmd = "claude -p --output-format stream-json {prompt_file}"
@@ -681,7 +649,7 @@ mod tests {
     "#;
 
     fn config() -> AgentsConfig {
-        AgentsConfig::parse(CONFIG, Path::new("/tmp/agents.toml")).unwrap()
+        AgentsConfig::parse(CONFIG, Path::new("/tmp/voro.toml")).unwrap()
     }
 
     #[test]
@@ -718,12 +686,12 @@ mod tests {
     #[test]
     fn unknown_default_errors_at_resolution() {
         let text = r#"
-            default = "gemini"
+            default_agent = "gemini"
 
             [agents.claude]
             cmd = "claude -p {prompt_file}"
         "#;
-        let config = AgentsConfig::parse(text, Path::new("/tmp/agents.toml")).unwrap();
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
         let message = config.resolve(None).unwrap_err().to_string();
         assert!(message.contains("gemini"), "{message}");
         assert!(message.contains("config default"), "{message}");
@@ -732,12 +700,12 @@ mod tests {
     #[test]
     fn cmd_without_prompt_file_placeholder_is_rejected() {
         let text = r#"
-            default = "claude"
+            default_agent = "claude"
 
             [agents.claude]
             cmd = "claude -p"
         "#;
-        let message = AgentsConfig::parse(text, Path::new("/tmp/agents.toml"))
+        let message = AgentsConfig::parse(text, Path::new("/tmp/voro.toml"))
             .unwrap_err()
             .to_string();
         assert!(message.contains("{prompt_file}"), "{message}");
@@ -746,10 +714,10 @@ mod tests {
 
     #[test]
     fn invalid_toml_names_the_file() {
-        let message = AgentsConfig::parse("default = ", Path::new("/tmp/agents.toml"))
+        let message = AgentsConfig::parse("default = ", Path::new("/tmp/voro.toml"))
             .unwrap_err()
             .to_string();
-        assert!(message.contains("/tmp/agents.toml"), "{message}");
+        assert!(message.contains("/tmp/voro.toml"), "{message}");
     }
 
     #[test]
@@ -763,9 +731,9 @@ mod tests {
 
     #[test]
     fn missing_file_loads_the_builtins() {
-        // A missing agents.toml is no longer an error: the built-ins stand
+        // A missing voro.toml is no longer an error: the built-ins stand
         // alone as a working config.
-        let config = AgentsConfig::load(Path::new("/nonexistent/agents.toml")).unwrap();
+        let config = AgentsConfig::load(Path::new("/nonexistent/voro.toml")).unwrap();
         assert_eq!(config.agent_names(), vec!["claude", "codex"]);
         assert_eq!(config.provenance("claude"), Some(Provenance::BuiltIn));
         let claude = config.agent("claude").unwrap();
@@ -782,7 +750,7 @@ mod tests {
             [agents.mycustom]
             dispatch = "mytool {prompt_file}"
         "#;
-        let config = AgentsConfig::parse(text, Path::new("/tmp/agents.toml")).unwrap();
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
         assert_eq!(config.agent_names(), vec!["claude", "codex", "mycustom"]);
         assert_eq!(config.provenance("claude"), Some(Provenance::BuiltIn));
         assert_eq!(config.provenance("codex"), Some(Provenance::BuiltIn));
@@ -799,7 +767,7 @@ mod tests {
             [agents.claude]
             cmd = "claude -p {prompt_file}"
         "#;
-        let config = AgentsConfig::parse(text, Path::new("/tmp/agents.toml")).unwrap();
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
         assert_eq!(config.provenance("claude"), Some(Provenance::UserOverride));
         let claude = config.agent("claude").unwrap();
         assert_eq!(claude.dispatch(), "claude -p {prompt_file}");
@@ -815,7 +783,7 @@ mod tests {
             [agents.claude]
             cmd = "claude -p {prompt_file}"
         "#;
-        let config = AgentsConfig::parse(text, Path::new("/tmp/agents.toml")).unwrap();
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
         let missing = config.override_missing_verbs("claude");
         assert!(missing.contains(&"sessions"), "{missing:?}");
         assert!(missing.contains(&"attach"), "{missing:?}");
@@ -827,7 +795,7 @@ mod tests {
     #[test]
     fn default_probes_path_when_the_user_sets_none() {
         // No `default`: the first built-in found on PATH wins, in fixed order.
-        let config = AgentsConfig::builtin_only(Path::new("/tmp/agents.toml"));
+        let config = AgentsConfig::builtin_only(Path::new("/tmp/voro.toml"));
         let only_codex = |name: &str| name == "codex";
         assert_eq!(
             config.resolve_with(None, &only_codex).unwrap().name,
@@ -839,7 +807,7 @@ mod tests {
 
     #[test]
     fn no_default_and_nothing_on_path_errors_with_guidance() {
-        let config = AgentsConfig::builtin_only(Path::new("/tmp/agents.toml"));
+        let config = AgentsConfig::builtin_only(Path::new("/tmp/voro.toml"));
         let none = |_: &str| false;
         let message = config.resolve_with(None, &none).unwrap_err().to_string();
         assert!(message.contains("no default agent"), "{message}");
@@ -849,9 +817,9 @@ mod tests {
     #[test]
     fn user_default_is_honoured_over_the_path_probe() {
         let text = r#"
-            default = "codex"
+            default_agent = "codex"
         "#;
-        let config = AgentsConfig::parse(text, Path::new("/tmp/agents.toml")).unwrap();
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
         // even a probe that would pick claude yields the user's codex
         let both = |_: &str| true;
         assert_eq!(config.resolve_with(None, &both).unwrap().name, "codex");
@@ -860,7 +828,7 @@ mod tests {
     // --- session verbs (task #75) ---
 
     const VERBS_CONFIG: &str = r#"
-        default = "claude"
+        default_agent = "claude"
 
         [agents.claude]
         dispatch = "claude --bg \"$(cat {prompt_file})\""
@@ -876,7 +844,7 @@ mod tests {
 
     #[test]
     fn verbs_parse_and_resolve() {
-        let config = AgentsConfig::parse(VERBS_CONFIG, Path::new("/tmp/agents.toml")).unwrap();
+        let config = AgentsConfig::parse(VERBS_CONFIG, Path::new("/tmp/voro.toml")).unwrap();
         let claude = config.resolve(None).unwrap();
         assert_eq!(claude.sessions.as_deref(), Some("claude agents --json"));
         assert_eq!(claude.attach.as_deref(), Some("claude attach {session}"));
@@ -908,13 +876,13 @@ mod tests {
     #[test]
     fn both_dispatch_and_cmd_is_rejected() {
         let text = r#"
-            default = "claude"
+            default_agent = "claude"
 
             [agents.claude]
             cmd = "claude -p {prompt_file}"
             dispatch = "claude --bg {prompt_file}"
         "#;
-        let message = AgentsConfig::parse(text, Path::new("/tmp/agents.toml"))
+        let message = AgentsConfig::parse(text, Path::new("/tmp/voro.toml"))
             .unwrap_err()
             .to_string();
         assert!(message.contains("alias"), "{message}");
@@ -923,12 +891,12 @@ mod tests {
     #[test]
     fn agent_without_dispatch_or_cmd_is_rejected() {
         let text = r#"
-            default = "claude"
+            default_agent = "claude"
 
             [agents.claude]
             sessions = "claude agents --json"
         "#;
-        let message = AgentsConfig::parse(text, Path::new("/tmp/agents.toml"))
+        let message = AgentsConfig::parse(text, Path::new("/tmp/voro.toml"))
             .unwrap_err()
             .to_string();
         assert!(message.contains("dispatch"), "{message}");
@@ -938,10 +906,10 @@ mod tests {
     fn attach_resume_continue_require_the_session_placeholder() {
         for verb in ["attach", "resume", "continue"] {
             let text = format!(
-                "default = \"a\"\n\n[agents.a]\ndispatch = \"run {{prompt_file}}\"\n\
+                "default_agent = \"a\"\n\n[agents.a]\ndispatch = \"run {{prompt_file}}\"\n\
                  {verb} = \"reopen {{prompt_file}}\"\n"
             );
-            let message = AgentsConfig::parse(&text, Path::new("/tmp/agents.toml"))
+            let message = AgentsConfig::parse(&text, Path::new("/tmp/voro.toml"))
                 .unwrap_err()
                 .to_string();
             assert!(message.contains("{session}"), "{verb}: {message}");
@@ -952,13 +920,13 @@ mod tests {
     #[test]
     fn continue_requires_the_prompt_file_placeholder() {
         let text = r#"
-            default = "a"
+            default_agent = "a"
 
             [agents.a]
             dispatch = "run {prompt_file}"
             continue = "reopen {session}"
         "#;
-        let message = AgentsConfig::parse(text, Path::new("/tmp/agents.toml"))
+        let message = AgentsConfig::parse(text, Path::new("/tmp/voro.toml"))
             .unwrap_err()
             .to_string();
         assert!(message.contains("{prompt_file}"), "{message}");
@@ -967,7 +935,7 @@ mod tests {
 
     #[test]
     fn agent_looks_up_templates_by_name() {
-        let config = AgentsConfig::parse(VERBS_CONFIG, Path::new("/tmp/agents.toml")).unwrap();
+        let config = AgentsConfig::parse(VERBS_CONFIG, Path::new("/tmp/voro.toml")).unwrap();
         let claude = config.agent("claude").unwrap();
         assert_eq!(claude.attach(), Some("claude attach {session}"));
         assert_eq!(claude.sessions(), Some("claude agents --json"));
@@ -1015,7 +983,7 @@ mod tests {
     #[test]
     fn viewer_is_read_from_the_viewer_table() {
         let text = r#"
-            default = "claude"
+            default_agent = "claude"
 
             [agents.claude]
             cmd = "claude -p {prompt_file}"
@@ -1023,7 +991,7 @@ mod tests {
             [viewer]
             cmd = "zed {path}"
         "#;
-        let config = AgentsConfig::parse(text, Path::new("/tmp/agents.toml")).unwrap();
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
         assert_eq!(config.viewer(), Some("zed {path}"));
     }
 
@@ -1116,41 +1084,6 @@ mod tests {
         assert!(agents.contains_key("codex"));
         assert!(agents["claude"].sessions().is_some());
         assert!(agents["codex"].continue_cmd().is_some());
-    }
-
-    #[test]
-    fn resolve_in_prefers_voro_toml_then_legacy() {
-        let dir = std::env::temp_dir().join(format!("voro-resolve-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let voro = dir.join("voro.toml");
-        let legacy = dir.join("agents.toml");
-
-        // neither exists: resolves to the canonical voro.toml (what init writes)
-        assert_eq!(AgentsConfig::resolve_in(&dir), voro);
-
-        // only the legacy file exists: falls back to it so old installs load
-        std::fs::write(&legacy, "").unwrap();
-        assert_eq!(AgentsConfig::resolve_in(&dir), legacy);
-        assert!(AgentsConfig::is_legacy_path(&legacy));
-
-        // voro.toml present: it wins even with a legacy file beside it
-        std::fs::write(&voro, "").unwrap();
-        assert_eq!(AgentsConfig::resolve_in(&dir), voro);
-        assert!(!AgentsConfig::is_legacy_path(&voro));
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn legacy_default_key_is_accepted_as_default_agent() {
-        // Pre-rename files used `default`; it still resolves via the alias.
-        let text = r#"
-            default = "codex"
-        "#;
-        let config = AgentsConfig::parse(text, Path::new("/tmp/agents.toml")).unwrap();
-        let both = |_: &str| true;
-        assert_eq!(config.resolve_with(None, &both).unwrap().name, "codex");
     }
 
     #[test]

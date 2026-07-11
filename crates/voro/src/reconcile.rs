@@ -68,7 +68,7 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
     if live.is_empty() {
         return Ok(0);
     }
-    // A missing or invalid agents.toml degrades every session to the pid
+    // A missing or invalid voro.toml degrades every session to the pid
     // check rather than failing the read that triggered reconciliation.
     let config = AgentsConfig::load(agents_path).ok();
     // One listing per agent per pass, however many of its sessions are live.
@@ -197,7 +197,7 @@ mod tests {
     /// like `manual` still degrades to the pid check — the built-in `claude`
     /// and `codex` carry a `sessions` verb and take the listing path instead.
     fn no_config() -> PathBuf {
-        PathBuf::from("/nonexistent/agents.toml")
+        PathBuf::from("/nonexistent/voro.toml")
     }
 
     /// A ready task started (`running`), ready to hang a session off of.
@@ -316,7 +316,7 @@ mod tests {
 
     // --- sessions-verb liveness (task #75) ---
 
-    /// An `agents.toml` whose `claude` agent lists sessions by catting a
+    /// An `voro.toml` whose `claude` agent lists sessions by catting a
     /// canned JSON file, plus that file's path for the test to fill in.
     fn sessions_fixture(name: &str, listing_json: &str) -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -327,11 +327,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let listing = dir.join("sessions.json");
         std::fs::write(&listing, listing_json).unwrap();
-        let agents_path = dir.join("agents.toml");
+        let agents_path = dir.join("voro.toml");
         std::fs::write(
             &agents_path,
             format!(
-                "default = \"claude\"\n\n[agents.claude]\n\
+                "default_agent = \"claude\"\n\n[agents.claude]\n\
                  dispatch = \"cat {{prompt_file}}\"\nsessions = \"cat '{}'\"\n",
                 listing.display()
             ),
@@ -437,10 +437,10 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let agents_path = dir.join("agents.toml");
+        let agents_path = dir.join("voro.toml");
         std::fs::write(
             &agents_path,
-            "default = \"claude\"\n\n[agents.claude]\n\
+            "default_agent = \"claude\"\n\n[agents.claude]\n\
              dispatch = \"cat {prompt_file}\"\nsessions = \"false\"\n",
         )
         .unwrap();

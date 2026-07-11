@@ -380,14 +380,6 @@ fn agent_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
                 )
                 .unwrap(),
             }
-            if AgentsConfig::is_legacy_path(path) {
-                writeln!(
-                    out,
-                    "note: loaded from the legacy agents.toml — rename it to voro.toml \
-                     (same directory) to silence this."
-                )
-                .unwrap();
-            }
             Ok(out)
         }
         "path" => Ok(path.display().to_string()),
@@ -1283,7 +1275,7 @@ mod tests {
     #[test]
     fn open_refuses_a_non_review_task_and_help_documents_it() {
         // The state guard fires before any config is loaded, so a `ready` task
-        // is refused without touching the real user agents.toml `ctx()` names.
+        // is refused without touching the real user voro.toml `ctx()` names.
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
@@ -1682,11 +1674,11 @@ mod tests {
         git(&["init", "-q"]);
 
         let db_path = root.join("voro.db");
-        let agents_path = root.join("agents.toml");
+        let agents_path = root.join("voro.toml");
         // an agent command that exits immediately with failure, as if it crashed
         std::fs::write(
             &agents_path,
-            "default = \"stub\"\n\n[agents.stub]\ncmd = \"false {prompt_file}\"\n",
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"false {prompt_file}\"\n",
         )
         .unwrap();
 
@@ -1736,7 +1728,7 @@ mod tests {
     // --- answer → continuation (task #31, DESIGN.md §6/§8) ---
 
     /// A scratch database, a freshly-`git init`ed clean project, and an
-    /// `agents.toml` whose one agent is a stub command — the same shape as
+    /// `voro.toml` whose one agent is a stub command — the same shape as
     /// `dispatch.rs`'s own fixture, duplicated here since that one is private
     /// to its module's tests.
     fn scratch_env(cmd: &str) -> (Store, DispatchCtx, std::path::PathBuf) {
@@ -1763,10 +1755,10 @@ mod tests {
         assert!(status.success(), "git init failed");
 
         let db_path = root.join("voro.db");
-        let agents_path = root.join("agents.toml");
+        let agents_path = root.join("voro.toml");
         std::fs::write(
             &agents_path,
-            format!("default = \"stub\"\n\n[agents.stub]\ncmd = \"{cmd}\"\n"),
+            format!("default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"{cmd}\"\n"),
         )
         .unwrap();
 

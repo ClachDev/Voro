@@ -53,9 +53,7 @@ replaces that built-in wholesale (so copy every verb you still want — `agent
 init` writes the built-ins commented out, ready to copy). `{prompt_file}` is
 replaced with a path to the task's prompt, and `default_agent` names the agent
 used when a task has no `--agent` override. A dispatched session runs
-unattended, so most agents need a non-interactive permission flag. (The file
-was called `agents.toml` before it grew app options like `[viewer]`; that name
-still loads, and `agent list` nudges you to rename it.)
+unattended, so most agents need a non-interactive permission flag.
 
 A dispatched agent reports back through the return-path verbs (`voro ask/done/
 propose`). For the `CLAUDE.md`/`AGENTS.md` snippet that advertises them, and a
