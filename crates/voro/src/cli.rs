@@ -32,7 +32,11 @@ projects
 
 tasks
   add <project> <title> [--body TEXT | --body-file PATH] [--priority 0-3]
-      [--state proposed|parked|ready] [--agent NAME] [--blocks IDS] [--human]
+      [--state proposed|parked|ready] [--agent NAME] [--blocked-by IDS]
+      [--blocks IDS] [--human]
+                                  --blocked-by lists the tasks this one waits
+                                  on; --blocks makes the listed tasks wait on
+                                  this one
                                   --human marks a task no agent can execute:
                                   never dispatched, worked by hand, and its
                                   completion goes straight to done
@@ -40,9 +44,12 @@ tasks
                                   create a proposed task; --from (default
                                   $VORO_TASK_ID) links it discovered-from
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
-      [--body TEXT | --body-file PATH] [--blocks IDS] [--pr URL | --no-pr]
-      [--branch NAME | --no-branch] [--human | --no-human]
+      [--body TEXT | --body-file PATH] [--blocked-by IDS] [--blocks IDS]
+      [--pr URL | --no-pr] [--branch NAME | --no-branch] [--human | --no-human]
       [--summary TEXT | --summary-file PATH]
+                                  --blocked-by replaces this task's own
+                                  blocker list; --blocks adds this task as a
+                                  blocker of each listed task
                                   --pr tracks a GitHub PR (URL or owner/repo#N)
                                   for review; --no-pr clears it. --branch sets
                                   the git branch dispatch injects into the
@@ -231,15 +238,32 @@ fn parse_priority(raw: &str) -> Result<Priority, String> {
     Priority::from_int(n).map_err(|e| e.to_string())
 }
 
-fn parse_blocks(raw: &str) -> Result<Vec<i64>, String> {
+fn parse_ids(flag: &str, raw: &str) -> Result<Vec<i64>, String> {
     raw.split([',', ' '])
         .filter(|s| !s.trim().is_empty())
         .map(|s| {
             s.trim()
                 .parse()
-                .map_err(|_| format!("blocks must be task ids, got '{s}'"))
+                .map_err(|_| format!("{flag} must be task ids, got '{s}'"))
         })
         .collect()
+}
+
+/// Apply `--blocks IDS`: make `blocker_id` a blocker of each listed task, and
+/// echo every edge loudly — `task 104 blocks #43 — #43 demoted to parked` —
+/// so authoring the wrong direction by muscle memory is visible immediately.
+fn apply_blocks_flag(store: &mut Store, blocker_id: i64, raw: &str) -> Result<String, String> {
+    let affected = store
+        .block_tasks(blocker_id, &parse_ids("blocks", raw)?)
+        .map_err(|e| e.to_string())?;
+    let mut out = String::new();
+    for (dep, before) in affected {
+        write!(out, "\ntask {} blocks #{}", blocker_id, dep.id).unwrap();
+        if before == TaskState::Ready && dep.state == TaskState::Parked {
+            write!(out, " — #{} demoted to parked", dep.id).unwrap();
+        }
+    }
+    Ok(out)
 }
 
 fn body_from(flags: &HashMap<String, String>) -> Result<Option<String>, String> {
@@ -456,16 +480,17 @@ fn add_verb(
             human: flags.contains_key("human"),
         })
         .map_err(|e| e.to_string())?;
-    let task = match flags.get("blocks") {
+    let task = match flags.get("blocked-by") {
         Some(raw) => store
-            .set_blocks_deps(task.id, &parse_blocks(raw)?)
+            .set_blocks_deps(task.id, &parse_ids("blocked-by", raw)?)
             .map_err(|e| e.to_string())?,
         None => task,
     };
-    Ok(format!(
-        "task {} '{}' created ({})",
-        task.id, task.title, task.state
-    ))
+    let mut out = format!("task {} '{}' created ({})", task.id, task.title, task.state);
+    if let Some(raw) = flags.get("blocks") {
+        out.push_str(&apply_blocks_flag(store, task.id, raw)?);
+    }
+    Ok(out)
 }
 
 /// The agent return-path form of `add` (DESIGN.md §8): always lands in
@@ -541,11 +566,15 @@ fn set_verb(
         human,
     };
     let task = store.update_task(id, edit).map_err(|e| e.to_string())?;
-    let task = match flags.get("blocks") {
+    let task = match flags.get("blocked-by") {
         Some(raw) => store
-            .set_blocks_deps(id, &parse_blocks(raw)?)
+            .set_blocks_deps(id, &parse_ids("blocked-by", raw)?)
             .map_err(|e| e.to_string())?,
         None => task,
+    };
+    let blocks_echo = match flags.get("blocks") {
+        Some(raw) => apply_blocks_flag(store, id, raw)?,
+        None => String::new(),
     };
     let task = match (flags.contains_key("no-pr"), flags.get("pr")) {
         (true, Some(_)) => return Err("--pr and --no-pr are mutually exclusive".into()),
@@ -570,7 +599,10 @@ fn set_verb(
         Some(text) => store.set_summary(id, &text).map_err(|e| e.to_string())?,
         None => task,
     };
-    Ok(format!("task {} updated ({})", task.id, task.state))
+    Ok(format!(
+        "task {} updated ({}){blocks_echo}",
+        task.id, task.state
+    ))
 }
 
 /// `pr <task-id> [--yes]` (DESIGN.md §8/§11c): with a tracked PR, open it in a
@@ -762,7 +794,12 @@ fn show_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     }
     let deps = store.deps_of(id).map_err(|e| e.to_string())?;
     for dep in &deps {
-        writeln!(out, "dep: {} {}", dep.kind, dep.depends_on).unwrap();
+        // `deps(task_id, depends_on, 'blocks')` means this task is blocked
+        // *by* `depends_on` — say so, rather than reading the kind backwards.
+        match dep.kind {
+            DepKind::Blocks => writeln!(out, "dep: blocked by #{}", dep.depends_on).unwrap(),
+            _ => writeln!(out, "dep: {} {}", dep.kind, dep.depends_on).unwrap(),
+        }
     }
     if !task.body.is_empty() {
         writeln!(out, "\n{}", task.body).unwrap();
@@ -1263,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_flag_demotes_and_promotion_flows() {
+    fn blocked_by_flag_demotes_and_promotion_flows() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "Blocker", "--state", "ready"]);
@@ -1275,7 +1312,7 @@ mod tests {
                 "Dependent",
                 "--state",
                 "ready",
-                "--blocks",
+                "--blocked-by",
                 "1",
             ],
         );
@@ -1285,6 +1322,165 @@ mod tests {
         ok(&mut s, &["done", "1"]);
         ok(&mut s, &["accept", "1"]);
         assert!(ok(&mut s, &["list", "--state", "ready"]).contains("Dependent"));
+    }
+
+    #[test]
+    fn add_blocks_authors_the_reverse_edge_and_echoes_the_demotion() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Dependent", "--state", "ready"]);
+        let out = ok(
+            &mut s,
+            &[
+                "add",
+                "demo",
+                "Prerequisite",
+                "--state",
+                "ready",
+                "--blocks",
+                "1",
+            ],
+        );
+        assert!(out.contains("task 2 blocks #1"), "{out}");
+        assert!(out.contains("#1 demoted to parked"), "{out}");
+
+        // the dependent carries the edge, and show names the blocker
+        let shown = ok(&mut s, &["show", "1"]);
+        assert!(shown.contains("blocked by #2"), "{shown}");
+        assert!(!shown.contains("blocks 2"), "{shown}");
+        assert!(
+            ok(&mut s, &["show", "2"])
+                .lines()
+                .all(|l| !l.starts_with("dep:"))
+        );
+
+        // closing the prerequisite promotes the dependent
+        ok(&mut s, &["start", "2"]);
+        ok(&mut s, &["done", "2"]);
+        ok(&mut s, &["accept", "2"]);
+        assert!(ok(&mut s, &["list", "--state", "ready"]).contains("Dependent"));
+    }
+
+    #[test]
+    fn add_blocks_echo_stays_quiet_without_a_demotion() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Deferred", "--state", "parked"]);
+        let out = ok(
+            &mut s,
+            &[
+                "add",
+                "demo",
+                "Prerequisite",
+                "--state",
+                "ready",
+                "--blocks",
+                "1",
+            ],
+        );
+        assert!(out.contains("task 2 blocks #1"), "{out}");
+        assert!(!out.contains("demoted"), "{out}");
+    }
+
+    #[test]
+    fn set_blocks_adds_without_detaching_other_blockers() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(
+            &mut s,
+            &["add", "demo", "First blocker", "--state", "ready"],
+        );
+        ok(
+            &mut s,
+            &["add", "demo", "Second blocker", "--state", "ready"],
+        );
+        ok(
+            &mut s,
+            &[
+                "add",
+                "demo",
+                "Dependent",
+                "--state",
+                "ready",
+                "--blocked-by",
+                "1",
+            ],
+        );
+
+        let out = ok(&mut s, &["set", "2", "--blocks", "3"]);
+        assert!(out.contains("task 2 blocks #3"), "{out}");
+        let shown = ok(&mut s, &["show", "3"]);
+        assert!(shown.contains("blocked by #1"), "{shown}");
+        assert!(shown.contains("blocked by #2"), "{shown}");
+
+        // re-adding the same edge is idempotent
+        ok(&mut s, &["set", "2", "--blocks", "3"]);
+        assert_eq!(s.deps_of(3).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn set_blocked_by_replaces_the_blocker_list() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(
+            &mut s,
+            &["add", "demo", "First blocker", "--state", "ready"],
+        );
+        ok(
+            &mut s,
+            &["add", "demo", "Second blocker", "--state", "ready"],
+        );
+        ok(
+            &mut s,
+            &[
+                "add",
+                "demo",
+                "Dependent",
+                "--state",
+                "ready",
+                "--blocked-by",
+                "1",
+            ],
+        );
+
+        ok(&mut s, &["set", "3", "--blocked-by", "2"]);
+        let shown = ok(&mut s, &["show", "3"]);
+        assert!(!shown.contains("blocked by #1"), "{shown}");
+        assert!(shown.contains("blocked by #2"), "{shown}");
+    }
+
+    #[test]
+    fn set_blocks_demotes_a_ready_dependent_loudly() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Dependent", "--state", "ready"]);
+        ok(&mut s, &["add", "demo", "Prerequisite", "--state", "ready"]);
+
+        let out = ok(&mut s, &["set", "2", "--blocks", "1"]);
+        assert!(
+            out.contains("task 2 blocks #1 — #1 demoted to parked"),
+            "{out}"
+        );
+        assert!(ok(&mut s, &["show", "1"]).contains("#1 parked"));
+    }
+
+    #[test]
+    fn both_blocks_directions_are_cycle_checked() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "A", "--state", "ready"]);
+        ok(
+            &mut s,
+            &["add", "demo", "B", "--state", "ready", "--blocked-by", "1"],
+        );
+
+        // 2 waits on 1; making 2 block 1 would close the loop, either way round
+        let e = err(&mut s, &["set", "2", "--blocks", "1"]);
+        assert!(e.contains("cycle"), "{e}");
+        let e = err(&mut s, &["set", "1", "--blocked-by", "2"]);
+        assert!(e.contains("cycle"), "{e}");
+        let e = err(&mut s, &["add", "demo", "C", "--blocks", "3"]);
+        assert!(e.contains("cycle"), "{e}");
     }
 
     fn propose(store: &mut Store, args: &[&str], env: Option<&str>) -> Result<String, String> {
@@ -1605,6 +1801,15 @@ mod tests {
         let e = err(&mut s, &["done", "1", "--branch", "feat/parser"]);
         assert!(e.contains("cannot"), "{e}");
         assert!(!ok(&mut s, &["show", "1"]).contains("branch:"));
+    }
+
+    #[test]
+    fn help_documents_both_blocks_directions() {
+        let mut s = store();
+        let out = ok(&mut s, &["help"]);
+        assert!(out.contains("--blocked-by IDS"), "{out}");
+        assert!(out.contains("--blocks IDS"), "{out}");
+        assert!(out.contains("wait on"), "{out}");
     }
 
     #[test]

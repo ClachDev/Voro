@@ -174,7 +174,7 @@ fn editor_session(app: &mut App, request: EditorRequest) {
                 app.status = Some(format!("task {task_id} not found"));
                 return;
             };
-            let blocks: Vec<i64> = match app.store.deps_of(task_id) {
+            let blocked_by: Vec<i64> = match app.store.deps_of(task_id) {
                 Ok(deps) => deps
                     .iter()
                     .filter(|d| d.kind == voro_core::DepKind::Blocks)
@@ -185,7 +185,7 @@ fn editor_session(app: &mut App, request: EditorRequest) {
                     return;
                 }
             };
-            (editor::template_edit(&task, &blocks), false)
+            (editor::template_edit(&task, &blocked_by), false)
         }
     };
 

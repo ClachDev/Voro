@@ -34,12 +34,20 @@ voro explain <id>       # score decomposition (weight × priority + age bonus)
 ## Writing
 
 ```
-voro add <project> <title> --body-file plan.md [--priority 0-3] [--blocks 3,7]
-voro set <id> [--title T] [--priority N] [--body-file F] [--blocks IDS]
+voro add <project> <title> --body-file plan.md [--priority 0-3]
+         [--blocked-by 3,7] [--blocks 9]
+voro set <id> [--title T] [--priority N] [--body-file F]
+              [--blocked-by IDS] [--blocks IDS]
               [--branch NAME]        # intended git branch dispatch injects
 voro project add <name> <path>
 voro weight <project> <0-5>          # 0 parks/hides the project
 ```
+
+Dependency flags mean exactly what they say: `--blocked-by 3,7` makes the
+task wait on tasks 3 and 7; `--blocks 9` makes task 9 wait on this one (the
+discovered-prerequisite pattern). On `set`, `--blocked-by` *replaces* the
+task's own blocker list while `--blocks` is *additive*. Both directions echo
+their effect and are cycle-checked; `show` renders the edge as `blocked by #N`.
 
 `add` defaults to state `proposed`, which is what an agent should almost
 always want: proposed tasks wait for human triage and never enter the queues
