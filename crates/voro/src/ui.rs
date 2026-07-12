@@ -941,9 +941,9 @@ pub fn popup_area(frame: &mut Frame, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voro_core::{Blocker, Priority, Task, TaskState};
+    use voro_core::{Priority, Task, TaskState};
 
-    fn row(state: TaskState, blockers: Vec<Blocker>) -> TaskRow {
+    fn row(state: TaskState, blockers: Vec<DepRef>) -> TaskRow {
         TaskRow {
             task: Task {
                 id: 9,
@@ -967,8 +967,13 @@ mod tests {
         }
     }
 
-    fn blocker(id: i64, state: TaskState) -> Blocker {
-        Blocker { id, state }
+    fn blocker(id: i64, state: TaskState) -> DepRef {
+        DepRef {
+            id,
+            title: String::new(),
+            state,
+            kind: DepKind::Blocks,
+        }
     }
 
     /// The rendered text of the suffix, ignoring styling.

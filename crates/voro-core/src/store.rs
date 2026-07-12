@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    Blocker, Dep, DepKind, DepRef, Event, Priority, Project, ReviewAction, RunningRow, Session,
+    Dep, DepKind, DepRef, Event, Priority, Project, ReviewAction, RunningRow, Session,
     SessionOutcome, Task, TaskState,
 };
 
@@ -453,36 +453,11 @@ impl Store {
         Ok(())
     }
 
-    /// Every `blocks` dependency in the store, keyed by the dependent task and
-    /// resolved to each blocker's current state. One query feeds the whole
-    /// browser so the render path never issues a per-row lookup.
-    pub fn blockers_by_task(&self) -> Result<HashMap<i64, Vec<Blocker>>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT d.task_id, d.depends_on, b.state
-             FROM deps d JOIN tasks b ON b.id = d.depends_on
-             WHERE d.kind = 'blocks'
-             ORDER BY d.task_id, d.depends_on",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let task_id: i64 = row.get(0)?;
-            let blocker = Blocker {
-                id: row.get(1)?,
-                state: row.get(2)?,
-            };
-            Ok((task_id, blocker))
-        })?;
-        let mut map: HashMap<i64, Vec<Blocker>> = HashMap::new();
-        for row in rows {
-            let (task_id, blocker) = row?;
-            map.entry(task_id).or_default().push(blocker);
-        }
-        Ok(map)
-    }
-
     /// Every dependency edge of every kind, keyed by the depending task and
     /// resolved to the dependency's current title and state — the forward
     /// direction a detail view renders as `blocked by #N` or `<kind> #N`.
-    /// One query feeds every pane, like [`blockers_by_task`](Store::blockers_by_task).
+    /// One query feeds every pane, browser rows included, so the render path
+    /// never issues a per-row lookup.
     pub fn deps_by_task(&self) -> Result<HashMap<i64, Vec<DepRef>>> {
         self.dep_refs(
             "SELECT d.task_id, t.id, t.title, t.state, d.kind
@@ -2042,50 +2017,6 @@ mod tests {
         drop(a);
         drop(b);
         let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn blockers_by_task_resolves_state_and_ignores_non_blocks_deps() {
-        use crate::model::{DepKind, Priority};
-        use crate::transition::Action;
-
-        let mut s = Store::open_in_memory().unwrap();
-        let p = s.create_project("voro", "/tmp/voro").unwrap();
-        let new = |title: &str, state: TaskState| NewTask {
-            project_id: p.id,
-            title: title.into(),
-            body: String::new(),
-            priority: Priority::P2,
-            state,
-            agent: None,
-            human: false,
-        };
-        let open = s.create_task(new("open", TaskState::Ready)).unwrap();
-        let closed = s.create_task(new("closed", TaskState::Ready)).unwrap();
-        s.apply(closed.id, Action::Start).unwrap();
-        s.apply(closed.id, Action::Complete(None)).unwrap();
-        s.apply(closed.id, Action::Accept).unwrap();
-        let sibling = s.create_task(new("sibling", TaskState::Ready)).unwrap();
-        let waiting = s.create_task(new("waiting", TaskState::Ready)).unwrap();
-
-        s.set_blocks_deps(waiting.id, &[open.id, closed.id])
-            .unwrap();
-        // A non-blocks dep must not appear as a blocker.
-        s.add_dep(waiting.id, sibling.id, DepKind::Related).unwrap();
-
-        let map = s.blockers_by_task().unwrap();
-        let blockers = &map[&waiting.id];
-        assert_eq!(blockers.len(), 2);
-        assert!(blockers.iter().all(|b| b.id != sibling.id));
-
-        let open_b = blockers.iter().find(|b| b.id == open.id).unwrap();
-        assert!(open_b.is_open());
-        let closed_b = blockers.iter().find(|b| b.id == closed.id).unwrap();
-        assert_eq!(closed_b.state, TaskState::Done);
-        assert!(!closed_b.is_open());
-
-        // Tasks without blocks deps are simply absent from the map.
-        assert!(!map.contains_key(&open.id));
     }
 
     #[test]
