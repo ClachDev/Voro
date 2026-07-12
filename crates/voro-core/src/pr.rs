@@ -244,7 +244,7 @@ pub fn plan_pr(task: &Task, latest_summary: Option<&str>) -> Result<PrPlan> {
         .ok_or_else(|| {
             Error::Invalid(format!(
                 "task {} has no completion summary for the PR body — record one with \
-                 `voro done --summary`",
+                 `voro set --summary`",
                 task.id
             ))
         })?;

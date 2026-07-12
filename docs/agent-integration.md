@@ -225,8 +225,10 @@ assistant message out of the transcript Claude Code names in the payload and
 passes it as `--summary`. When it can be read, the fallback lands a complete
 report a PR can be opened from; when it can't (no `jq`, an unreadable or
 schema-shifted transcript), the hook still records the branch and the task lands
-in `review` flagged `[incomplete report]` (DESIGN.md §8) — the operator supplies a
-real summary, or resumes the session, before `pr`. Either way the guarantee
+in `review` flagged `[incomplete report]` (DESIGN.md §8) — the operator (or a
+resumed session) supplies a real summary in place with
+`voro set <id> --summary`, which clears the flag without rejecting the work,
+before `pr`. Either way the guarantee
 holds: a complete report or a visible anomaly, never a silent gap. The final
 message is a genuine account of what the agent did, not a fabricated one, so it
 is safe to become the PR body — but it is the agent's *closing remarks*, not a

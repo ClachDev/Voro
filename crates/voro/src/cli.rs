@@ -42,10 +42,14 @@ tasks
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
       [--body TEXT | --body-file PATH] [--blocks IDS] [--pr URL | --no-pr]
       [--branch NAME | --no-branch] [--human | --no-human]
+      [--summary TEXT | --summary-file PATH]
                                   --pr tracks a GitHub PR (URL or owner/repo#N)
                                   for review; --no-pr clears it. --branch sets
                                   the git branch dispatch injects into the
-                                  prompt; --no-branch clears it
+                                  prompt; --no-branch clears it. --summary
+                                  sets or replaces a running/review task's
+                                  completion summary (the PR body `pr` opens
+                                  from) without a reject/done round trip
   show <task-id>                  full task: body, deps, events
   list [--state STATE] [--project P]
   inbox                           the next-action queue: questions, reviews,
@@ -561,6 +565,10 @@ fn set_verb(
             .set_branch(id, Some(name.trim()))
             .map_err(|e| e.to_string())?,
         (false, None) => task,
+    };
+    let task = match summary_from(flags)? {
+        Some(text) => store.set_summary(id, &text).map_err(|e| e.to_string())?,
+        None => task,
     };
     Ok(format!("task {} updated ({})", task.id, task.state))
 }
@@ -1802,6 +1810,98 @@ mod tests {
         assert!(!ok(&mut s, &["list"]).contains("[incomplete report]"));
         assert!(!ok(&mut s, &["show", "1"]).contains("incomplete report"));
         assert!(!ok(&mut s, &["show", "2"]).contains("incomplete report"));
+    }
+
+    // --- set --summary (task #99, DESIGN.md §8) ---
+
+    #[test]
+    fn set_summary_replaces_a_review_tasks_summary() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["done", "1", "--summary", "thin first draft"]);
+
+        ok(&mut s, &["set", "1", "--summary", "the PR-ready account"]);
+        assert_eq!(
+            s.latest_summary(1).unwrap().as_deref(),
+            Some("the PR-ready account")
+        );
+        // still in review — set never transitions
+        assert!(ok(&mut s, &["show", "1"]).contains("#1 review"));
+    }
+
+    #[test]
+    fn set_summary_clears_the_incomplete_report_marker() {
+        // The half-report shape the SessionEnd fallback leaves: branch, no
+        // summary. Supplying the summary in place clears the marker without a
+        // reject/done round trip.
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["done", "1", "--branch", "feat/x"]);
+        assert!(ok(&mut s, &["list"]).contains("[incomplete report]"));
+
+        ok(&mut s, &["set", "1", "--summary", "the missing half"]);
+        assert!(!ok(&mut s, &["list"]).contains("[incomplete report]"));
+        assert!(!ok(&mut s, &["show", "1"]).contains("incomplete report"));
+    }
+
+    #[test]
+    fn set_summary_file_records_the_summary_on_a_running_task() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        let path = std::env::temp_dir().join(format!("voro-set-summary-{}.md", std::process::id()));
+        std::fs::write(&path, "## What\nAmended account\n").unwrap();
+
+        ok(
+            &mut s,
+            &["set", "1", "--summary-file", path.to_str().unwrap()],
+        );
+        assert!(
+            s.latest_summary(1)
+                .unwrap()
+                .unwrap()
+                .contains("Amended account")
+        );
+        assert!(ok(&mut s, &["show", "1"]).contains("#1 running"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_summary_and_summary_file_are_mutually_exclusive() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        let e = err(
+            &mut s,
+            &["set", "1", "--summary", "x", "--summary-file", "/tmp/nope"],
+        );
+        assert!(e.contains("mutually exclusive"), "{e}");
+    }
+
+    #[test]
+    fn set_summary_is_refused_outside_running_and_review() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        let e = err(&mut s, &["set", "1", "--summary", "too early"]);
+        assert!(e.contains("running or review"), "{e}");
+        assert_eq!(s.latest_summary(1).unwrap(), None);
+    }
+
+    #[test]
+    fn help_documents_set_summary() {
+        let mut s = store();
+        let out = ok(&mut s, &["help"]);
+        assert!(
+            out.contains("[--summary TEXT | --summary-file PATH]"),
+            "{out}"
+        );
     }
 
     #[test]
