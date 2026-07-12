@@ -74,7 +74,10 @@ impl Store {
     /// Order matters: interfaces render these as menus with the first entry
     /// selected, so the most common action leads — for triage that is
     /// `ready`, since `parked` means blocked or deliberately parked.
-    pub fn legal_actions(state: TaskState) -> Vec<Action> {
+    /// `human` shortens the running path (DESIGN.md §6): a human task cannot
+    /// `ask` — its executor cannot be blocked on their own decision — and its
+    /// completion leads, since it goes straight to `done` with no review.
+    pub fn legal_actions(state: TaskState, human: bool) -> Vec<Action> {
         use TaskState::*;
         match state {
             Proposed => vec![
@@ -84,6 +87,7 @@ impl Store {
             ],
             Parked => vec![Action::Unpark, Action::Abandon],
             Ready => vec![Action::Start, Action::Park, Action::Abandon],
+            Running if human => vec![Action::Complete(None), Action::Abort],
             Running => vec![
                 Action::Ask(String::new()),
                 Action::Complete(None),
@@ -119,6 +123,7 @@ impl Store {
         log_path: Option<&str>,
     ) -> Result<(Task, Session)> {
         let tx = self.conn.transaction()?;
+        reject_human_dispatch(&tx, task_id)?;
         apply_action(&tx, task_id, Action::Start)?;
         let session_id = insert_session(&tx, task_id, agent, pid, log_path)?;
         tx.commit()?;
@@ -144,6 +149,7 @@ impl Store {
     ) -> Result<(Task, Session)> {
         let tx = self.conn.transaction()?;
         let task = get_task(&tx, task_id)?.ok_or(Error::TaskNotFound(task_id))?;
+        reject_human_dispatch(&tx, task_id)?;
         if task.state != TaskState::Running {
             return Err(Error::InvalidTransition {
                 from: task.state,
@@ -280,8 +286,22 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         (Proposed, Action::Triage(Triage::Ready)) => Ready,
         (Proposed, Action::Triage(Triage::Reject)) => Rejected,
         (Ready, Action::Start) => Running,
+        // A human task cannot be blocked on a decision — the executor *is* the
+        // human (DESIGN.md §6). Verifying its outcome is a downstream
+        // `blocks`-dependent task, not a sub-state of this one.
+        (Running, Action::Ask(_)) if task.human => {
+            return Err(Error::HumanTask {
+                id: task_id,
+                reason: "its executor is the human, who cannot be blocked on their own \
+                         decision — file a follow-up task that blocks on this one instead"
+                    .into(),
+            });
+        }
         (Running, Action::Ask(_)) => NeedsInput,
         (NeedsInput, Action::Answer(_)) => Running,
+        // Completing a human task skips `review`: the human is both executor
+        // and acceptor, so there is no one left to accept the work (§6).
+        (Running, Action::Complete(_)) if task.human => Done,
         (Running, Action::Complete(_)) => Review,
         (Review, Action::Accept) => Done,
         (Review, Action::RejectWork(_)) => Running,
@@ -352,6 +372,13 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         Action::Accept => {
             close_open_session(tx, task_id, SessionOutcome::Completed)?;
         }
+        // A human task's completion is itself terminal (running → done), so it
+        // owns the teardown `Accept` would otherwise perform. No agent session
+        // should exist on a human task, but the belt-and-braces close keeps
+        // the sessions-follow-the-task rule total.
+        Action::Complete(_) if to == TaskState::Done => {
+            close_open_session(tx, task_id, SessionOutcome::Completed)?;
+        }
         Action::Abort | Action::Abandon => {
             close_open_session(tx, task_id, SessionOutcome::Aborted)?;
         }
@@ -368,6 +395,20 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
     }
 
     Ok(to)
+}
+
+/// Refuse to open an agent session on a human-only task (DESIGN.md §6/§8):
+/// dispatch, redispatch, and continuation all route through here, before any
+/// state change or session insert, so the refusal writes nothing.
+fn reject_human_dispatch(tx: &Connection, task_id: i64) -> Result<()> {
+    let task = get_task(tx, task_id)?.ok_or(Error::TaskNotFound(task_id))?;
+    if task.human {
+        return Err(Error::HumanTask {
+            id: task_id,
+            reason: "no agent can execute it — start it by hand instead".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Reject `from` acquiring a `blocks` dependency on `to` if doing so would
@@ -528,6 +569,7 @@ mod tests {
             priority: Priority::P1,
             state,
             agent: None,
+            human: false,
         })
         .unwrap()
         .id
@@ -634,7 +676,7 @@ mod tests {
     #[test]
     fn legal_actions_agrees_with_apply() {
         for state in TaskState::ALL {
-            let legal = Store::legal_actions(state);
+            let legal = Store::legal_actions(state, false);
             for action in all_actions() {
                 let in_legal = legal
                     .iter()
@@ -650,6 +692,183 @@ mod tests {
                     in_legal,
                     "legal_actions disagrees for {state} + {action:?}"
                 );
+            }
+        }
+    }
+
+    // --- human-only tasks (DESIGN.md §3/§6): the shortened path ---
+
+    mod human {
+        use super::*;
+
+        fn create_human(s: &mut Store, project_id: i64, state: TaskState) -> i64 {
+            s.create_task(NewTask {
+                project_id,
+                title: format!("human task in {state}"),
+                body: String::new(),
+                priority: Priority::P1,
+                state,
+                agent: None,
+                human: true,
+            })
+            .unwrap()
+            .id
+        }
+
+        #[test]
+        fn completion_goes_straight_to_done() {
+            let (mut s, p) = store_with_project();
+            let id = create_human(&mut s, p, TaskState::Ready);
+            s.apply(id, Action::Start).unwrap();
+
+            let task = s
+                .apply(id, Action::Complete(Some("bag captured".into())))
+                .unwrap();
+            assert_eq!(task.state, TaskState::Done);
+            assert!(task.closed_at.is_some());
+
+            let events = s.events_for(id).unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.detail.as_deref() == Some("running -> done")),
+                "{events:?}"
+            );
+            // the summary still rides the completion, as on the agent path
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.kind == "summary" && e.detail.as_deref() == Some("bag captured"))
+            );
+        }
+
+        #[test]
+        fn ask_is_refused_and_writes_nothing() {
+            let (mut s, p) = store_with_project();
+            let id = create_human(&mut s, p, TaskState::Ready);
+            s.apply(id, Action::Start).unwrap();
+
+            let err = s.apply(id, Action::Ask("which bag?".into())).unwrap_err();
+            assert!(
+                matches!(err, Error::HumanTask { id: e, .. } if e == id),
+                "expected a human-only refusal, got {err}"
+            );
+            let task = s.task(id).unwrap();
+            assert_eq!(task.state, TaskState::Running);
+            assert!(task.question.is_none());
+        }
+
+        #[test]
+        fn record_dispatch_is_refused_and_writes_nothing() {
+            let (mut s, p) = store_with_project();
+            let id = create_human(&mut s, p, TaskState::Ready);
+
+            let err = s.record_dispatch(id, "claude", Some(1), None).unwrap_err();
+            assert!(
+                matches!(err, Error::HumanTask { id: e, .. } if e == id),
+                "expected a human-only refusal, got {err}"
+            );
+            assert_eq!(s.task(id).unwrap().state, TaskState::Ready);
+            assert!(s.sessions_for(id).unwrap().is_empty());
+        }
+
+        #[test]
+        fn record_continuation_is_refused() {
+            let (mut s, p) = store_with_project();
+            let id = create_human(&mut s, p, TaskState::Ready);
+            s.apply(id, Action::Start).unwrap();
+
+            let err = s.record_continuation(id, "claude", None, None).unwrap_err();
+            assert!(
+                matches!(err, Error::HumanTask { id: e, .. } if e == id),
+                "expected a human-only refusal, got {err}"
+            );
+            assert!(s.sessions_for(id).unwrap().is_empty());
+        }
+
+        #[test]
+        fn completion_unblocks_dependants() {
+            // running → done is terminal, so it must cascade readiness exactly
+            // as an accept does.
+            let (mut s, p) = store_with_project();
+            let blocker = create_human(&mut s, p, TaskState::Ready);
+            let dependant = create(&mut s, p, TaskState::Parked);
+            s.add_dep(dependant, blocker, DepKind::Blocks).unwrap();
+
+            s.apply(blocker, Action::Start).unwrap();
+            s.apply(blocker, Action::Complete(None)).unwrap();
+            assert_eq!(s.task(dependant).unwrap().state, TaskState::Ready);
+        }
+
+        #[test]
+        fn completion_closes_a_stray_open_session() {
+            // No agent session should ever exist on a human task, but the
+            // terminal completion still tears one down (sessions follow the
+            // task, §8) if a legacy or hand-made row is lying around.
+            let (mut s, p) = store_with_project();
+            let id = create_human(&mut s, p, TaskState::Ready);
+            s.apply(id, Action::Start).unwrap();
+            let stray = s.create_session(id, "claude", Some(1), None).unwrap();
+
+            s.apply(id, Action::Complete(None)).unwrap();
+            let closed = s.session(stray.id).unwrap();
+            assert!(closed.ended_at.is_some());
+            assert_eq!(closed.outcome, Some(SessionOutcome::Completed));
+        }
+
+        #[test]
+        fn legal_actions_omit_ask_and_agree_with_apply() {
+            let legal = Store::legal_actions(TaskState::Running, true);
+            assert_eq!(legal, vec![Action::Complete(None), Action::Abort]);
+            // every other state offers the same menu regardless of the flag
+            for state in TaskState::ALL {
+                if state != TaskState::Running {
+                    assert_eq!(
+                        Store::legal_actions(state, true),
+                        Store::legal_actions(state, false),
+                        "{state}"
+                    );
+                }
+            }
+        }
+
+        /// The matrix over the states a human task can actually reach —
+        /// `needs-input` and `review` are unreachable by construction (§6).
+        #[test]
+        fn full_transition_matrix_for_human_tasks() {
+            use TaskState::*;
+            for state in [Proposed, Parked, Ready, Running] {
+                for action in all_actions() {
+                    let (mut s, p) = store_with_project();
+                    let id = create_human(&mut s, p, if state == Running { Ready } else { state });
+                    if state == Running {
+                        s.apply(id, Action::Start).unwrap();
+                    }
+                    let result = s.apply(id, action.clone());
+                    let expected = match (state, &action) {
+                        // the two divergences from the agent path
+                        (Running, Action::Ask(_)) => None,
+                        (Running, Action::Complete(_)) => Some(Done),
+                        _ => expected(state, &action),
+                    };
+                    match expected {
+                        Some(to) => {
+                            let task = result.unwrap_or_else(|e| {
+                                panic!("human {state} + {action:?} should reach {to}: {e}")
+                            });
+                            assert_eq!(task.state, to, "human {state} + {action:?}");
+                        }
+                        None => {
+                            assert!(
+                                matches!(
+                                    result,
+                                    Err(Error::InvalidTransition { .. } | Error::HumanTask { .. })
+                                ),
+                                "human {state} + {action:?} should be rejected"
+                            );
+                        }
+                    }
+                }
             }
         }
     }

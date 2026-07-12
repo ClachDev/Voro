@@ -891,6 +891,7 @@ mod tests {
                 priority: Priority::P2,
                 state,
                 agent: None,
+                human: false,
                 question: None,
                 pr_url: None,
                 branch: None,
@@ -950,6 +951,7 @@ mod tests {
             priority: Priority::P2,
             state: TaskState::Ready,
             agent: None,
+            human: false,
         };
         let open = store.create_task(new("open blocker")).unwrap();
         let closed = store.create_task(new("closed blocker")).unwrap();
@@ -1003,6 +1005,7 @@ mod tests {
             priority: Priority::P2,
             state,
             agent: None,
+            human: false,
         };
         store.create_task(new("open", TaskState::Ready)).unwrap();
         let closed = store.create_task(new("closed", TaskState::Ready)).unwrap();
@@ -1066,6 +1069,7 @@ mod tests {
                 priority: Priority::P2,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
 
@@ -1121,6 +1125,7 @@ mod tests {
                 priority: Priority::P2,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
 
@@ -1197,6 +1202,7 @@ mod tests {
                 priority: Priority::P2,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
 
@@ -1263,6 +1269,7 @@ mod tests {
                 priority: Priority::P2,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
         let selected = App::new(store, ctx()).unwrap();
@@ -1325,6 +1332,7 @@ mod tests {
             priority: Priority::P2,
             state,
             agent: None,
+            human: false,
         };
         store.create_task(new("idea", TaskState::Proposed)).unwrap();
         store.create_task(new("go", TaskState::Ready)).unwrap();

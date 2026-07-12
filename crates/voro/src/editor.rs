@@ -15,6 +15,7 @@ pub struct TaskForm {
     pub priority: Priority,
     pub state: Option<TaskState>,
     pub agent: Option<String>,
+    pub human: bool,
     pub blocks: Vec<i64>,
     pub body: String,
 }
@@ -22,10 +23,12 @@ pub struct TaskForm {
 pub fn template_new() -> String {
     "# New task. The body below --- is the dispatchable prompt.\n\
      # Save an empty file to cancel. state: proposed | parked | ready\n\
+     # human: true marks a task no agent can execute (never dispatched)\n\
      title: \n\
      priority: 2\n\
      state: ready\n\
      agent: \n\
+     human: false\n\
      blocks: \n\
      ---\n"
         .to_string()
@@ -43,6 +46,7 @@ pub fn template_edit(task: &Task, blocks: &[i64]) -> String {
          title: {}\n\
          priority: {}\n\
          agent: {}\n\
+         human: {}\n\
          blocks: {}\n\
          ---\n\
          {}",
@@ -50,6 +54,7 @@ pub fn template_edit(task: &Task, blocks: &[i64]) -> String {
         task.title,
         task.priority.as_int(),
         task.agent.as_deref().unwrap_or(""),
+        task.human,
         blocks,
         task.body
     )
@@ -78,6 +83,7 @@ pub fn parse(text: &str, allow_state: bool) -> Result<TaskForm, String> {
         priority: Priority::P2,
         state: None,
         agent: None,
+        human: false,
         blocks: Vec::new(),
         body: String::new(),
     };
@@ -119,6 +125,13 @@ pub fn parse(text: &str, allow_state: bool) -> Result<TaskForm, String> {
                 form.state = Some(state);
             }
             "agent" => form.agent = (!value.is_empty()).then(|| value.to_string()),
+            "human" => {
+                form.human = match value {
+                    "" | "false" | "no" | "0" => false,
+                    "true" | "yes" | "1" => true,
+                    other => return Err(format!("human must be true or false, got '{other}'")),
+                }
+            }
             "blocks" => {
                 for id in value.split([',', ' ']).filter(|s| !s.trim().is_empty()) {
                     form.blocks.push(
@@ -196,6 +209,22 @@ mod tests {
     }
 
     #[test]
+    fn human_parses_defaults_and_rejects_junk() {
+        // absent or blank means dispatchable, the default
+        assert!(!parse(VALID, true).unwrap().human);
+        assert!(!parse("title: T\nhuman: \n---\n", true).unwrap().human);
+        assert!(!parse("title: T\nhuman: false\n---\n", true).unwrap().human);
+        assert!(parse("title: T\nhuman: true\n---\n", true).unwrap().human);
+        assert!(
+            parse("title: T\nhuman: maybe\n---\n", true)
+                .unwrap_err()
+                .contains("true or false")
+        );
+        // the new-task template carries the field ready to flip
+        assert!(template_new().contains("human: false"));
+    }
+
+    #[test]
     fn comments_and_blanks_are_skipped() {
         let form = parse("# a comment\n\ntitle: T\n---\n", true).unwrap();
         assert_eq!(form.title, "T");
@@ -255,6 +284,7 @@ mod tests {
             priority: Priority::P1,
             state: TaskState::Ready,
             agent: None,
+            human: false,
             question: None,
             pr_url: None,
             branch: None,
@@ -267,5 +297,13 @@ mod tests {
         assert_eq!(form.priority, task.priority);
         assert_eq!(form.blocks, vec![9]);
         assert_eq!(form.body, task.body);
+        assert!(!form.human);
+
+        // a human task's flag survives the round trip too
+        let human = Task {
+            human: true,
+            ..task
+        };
+        assert!(parse(&template_edit(&human, &[]), false).unwrap().human);
     }
 }

@@ -385,6 +385,14 @@ fn spawn_session(
     new_input: Option<&str>,
 ) -> Result<String, String> {
     let task = store.task(task_id).map_err(|e| e.to_string())?;
+    // Checked here so a human-only task is refused before anything spawns;
+    // voro-core's record_dispatch/record_continuation are the backstop.
+    if task.human {
+        return Err(format!(
+            "task {task_id} is human-only — no agent can execute it; work it by hand \
+             (`voro start {task_id}`, then `voro done {task_id}`)"
+        ));
+    }
     let required = kind.required_state();
     if task.state != required {
         return Err(format!(
@@ -753,6 +761,7 @@ mod tests {
                 priority: Priority::P1,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap()
             .id
@@ -1295,6 +1304,7 @@ mod tests {
                 priority: Priority::P1,
                 state: TaskState::Ready,
                 agent: Some("special".into()),
+                human: false,
             })
             .unwrap()
             .id;

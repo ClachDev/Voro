@@ -424,7 +424,7 @@ impl App {
                     buffer: String::new(),
                 };
             } else {
-                let actions = Store::legal_actions(task.state);
+                let actions = Store::legal_actions(task.state, task.human);
                 if !actions.is_empty() {
                     self.mode = Mode::Transition {
                         task_id: task.id,
@@ -616,7 +616,7 @@ impl App {
             }
             KeyCode::Char('s') => {
                 if let Some(task) = self.selected_task() {
-                    let actions = Store::legal_actions(task.state);
+                    let actions = Store::legal_actions(task.state, task.human);
                     if actions.is_empty() {
                         self.status = Some(format!("task is {} — nowhere to go", task.state));
                     } else {
@@ -1303,7 +1303,7 @@ impl App {
             KeyCode::Char('h') => self.show_history = !self.show_history,
             KeyCode::Enter | KeyCode::Char('s') => {
                 if let Some(task) = self.all.iter().map(|r| &r.task).find(|t| t.id == task_id) {
-                    let actions = Store::legal_actions(task.state);
+                    let actions = Store::legal_actions(task.state, task.human);
                     if actions.is_empty() {
                         self.status = Some(format!("task is {} — nowhere to go", task.state));
                     } else {
@@ -1357,6 +1357,7 @@ impl App {
             priority: form.priority,
             state: form.state.unwrap_or(TaskState::Proposed),
             agent: form.agent,
+            human: form.human,
         })?;
         if !form.blocks.is_empty() {
             self.store.set_blocks_deps(task.id, &form.blocks)?;
@@ -1376,6 +1377,7 @@ impl App {
                 body: form.body,
                 priority: form.priority,
                 agent: form.agent,
+                human: form.human,
             },
         )?;
         self.store.set_blocks_deps(task_id, &form.blocks)?;
@@ -1418,6 +1420,7 @@ mod tests {
                     priority: Priority::P1,
                     state: created,
                     agent: None,
+                    human: false,
                 })
                 .unwrap();
             match state {
@@ -1570,6 +1573,7 @@ mod tests {
                 priority: Priority::P1,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
         crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
@@ -1602,7 +1606,7 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         match &app.mode {
             Mode::Transition { actions, .. } => {
-                assert_eq!(*actions, Store::legal_actions(TaskState::Review));
+                assert_eq!(*actions, Store::legal_actions(TaskState::Review, false));
             }
             _ => panic!("enter on a review row should open the transition menu"),
         }
@@ -1657,7 +1661,7 @@ mod tests {
             Mode::Transition {
                 actions, task_id, ..
             } => {
-                assert_eq!(*actions, Store::legal_actions(TaskState::Proposed));
+                assert_eq!(*actions, Store::legal_actions(TaskState::Proposed, false));
                 *task_id
             }
             _ => panic!("enter on a proposed row should open the triage menu"),
@@ -1685,7 +1689,7 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         match &app.mode {
             Mode::Transition { actions, .. } => {
-                assert_eq!(*actions, Store::legal_actions(TaskState::Ready));
+                assert_eq!(*actions, Store::legal_actions(TaskState::Ready, false));
             }
             _ => panic!("enter in the detail view should open the transition menu"),
         }
@@ -1937,6 +1941,7 @@ mod tests {
                 priority: Priority::P1,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
 
@@ -2007,6 +2012,7 @@ mod tests {
                 priority: Priority::P1,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
 
@@ -2074,6 +2080,7 @@ mod tests {
                 priority: Priority::P1,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
 
@@ -2121,6 +2128,7 @@ mod tests {
                 priority: Priority::P1,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
         crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
@@ -2190,6 +2198,7 @@ mod tests {
                 priority: Priority::P1,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
         crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
@@ -2263,6 +2272,7 @@ mod tests {
                 priority: Priority::P1,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
         store.apply(task.id, Action::Start).unwrap();

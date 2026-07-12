@@ -32,13 +32,16 @@ projects
 
 tasks
   add <project> <title> [--body TEXT | --body-file PATH] [--priority 0-3]
-      [--state proposed|parked|ready] [--agent NAME] [--blocks IDS]
+      [--state proposed|parked|ready] [--agent NAME] [--blocks IDS] [--human]
+                                  --human marks a task no agent can execute:
+                                  never dispatched, worked by hand, and its
+                                  completion goes straight to done
   propose <project> <title> [--body TEXT | --body-file PATH] [--from TASK-ID]
                                   create a proposed task; --from (default
                                   $VORO_TASK_ID) links it discovered-from
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
       [--body TEXT | --body-file PATH] [--blocks IDS] [--pr URL | --no-pr]
-      [--branch NAME | --no-branch]
+      [--branch NAME | --no-branch] [--human | --no-human]
                                   --pr tracks a GitHub PR (URL or owner/repo#N)
                                   for review; --no-pr clears it. --branch sets
                                   the git branch dispatch injects into the
@@ -168,6 +171,12 @@ fn split_args(args: Vec<String>) -> Result<(Vec<String>, HashMap<String, String>
             }
             Some("no-branch") => {
                 flags.insert("no-branch".to_string(), String::new());
+            }
+            Some("human") => {
+                flags.insert("human".to_string(), String::new());
+            }
+            Some("no-human") => {
+                flags.insert("no-human".to_string(), String::new());
             }
             Some("from-pr") => {
                 flags.insert("from-pr".to_string(), String::new());
@@ -440,6 +449,7 @@ fn add_verb(
             priority,
             state,
             agent: flags.get("agent").cloned(),
+            human: flags.contains_key("human"),
         })
         .map_err(|e| e.to_string())?;
     let task = match flags.get("blocks") {
@@ -485,6 +495,7 @@ fn propose_verb(
             priority: Priority::P2,
             state: TaskState::Proposed,
             agent: None,
+            human: false,
         })
         .map_err(|e| e.to_string())?;
     let mut out = format!("task {} '{}' proposed", task.id, task.title);
@@ -509,6 +520,12 @@ fn set_verb(
     } else {
         flags.get("agent").cloned().or(current.agent)
     };
+    let human = match (flags.contains_key("human"), flags.contains_key("no-human")) {
+        (true, true) => return Err("--human and --no-human are mutually exclusive".into()),
+        (true, false) => true,
+        (false, true) => false,
+        (false, false) => current.human,
+    };
     let edit = TaskEdit {
         title: flags.get("title").cloned().unwrap_or(current.title),
         body: body_from(flags)?.unwrap_or(current.body),
@@ -517,6 +534,7 @@ fn set_verb(
             None => current.priority,
         },
         agent,
+        human,
     };
     let task = store.update_task(id, edit).map_err(|e| e.to_string())?;
     let task = match flags.get("blocks") {
@@ -669,23 +687,26 @@ fn done_verb(
         write!(out, " (branch {})", name.trim()).unwrap();
     }
     // A PR needs both a branch and a summary; warn (never fail) about whichever
-    // is absent so the operator knows `pr` will not yet open one.
-    let has_branch = store.task(id).map_err(|e| e.to_string())?.branch.is_some();
-    let has_summary = store
-        .latest_summary(id)
-        .map_err(|e| e.to_string())?
-        .is_some();
-    let missing: Vec<&str> = [("branch", has_branch), ("summary", has_summary)]
-        .into_iter()
-        .filter_map(|(what, present)| (!present).then_some(what))
-        .collect();
-    if !missing.is_empty() {
-        write!(
-            out,
-            "\nnote: no {} recorded — `voro pr {id}` needs a branch and summary to open a PR",
-            missing.join(" or ")
-        )
-        .unwrap();
+    // is absent so the operator knows `pr` will not yet open one. A human task
+    // lands straight in `done` with no PR to open, so it earns no warning.
+    if task.state == TaskState::Review {
+        let has_branch = store.task(id).map_err(|e| e.to_string())?.branch.is_some();
+        let has_summary = store
+            .latest_summary(id)
+            .map_err(|e| e.to_string())?
+            .is_some();
+        let missing: Vec<&str> = [("branch", has_branch), ("summary", has_summary)]
+            .into_iter()
+            .filter_map(|(what, present)| (!present).then_some(what))
+            .collect();
+        if !missing.is_empty() {
+            write!(
+                out,
+                "\nnote: no {} recorded — `voro pr {id}` needs a branch and summary to open a PR",
+                missing.join(" or ")
+            )
+            .unwrap();
+        }
     }
     Ok(out)
 }
@@ -702,6 +723,13 @@ fn show_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
         task.created_at, task.state_since
     )
     .unwrap();
+    if task.human {
+        writeln!(
+            out,
+            "human-only: never dispatched; completion goes straight to done"
+        )
+        .unwrap();
+    }
     if let Some(agent) = &task.agent {
         writeln!(out, "agent override: {agent}").unwrap();
     }
@@ -1373,6 +1401,74 @@ mod tests {
         assert!(!ok(&mut s, &["show", "1"]).contains("codex"));
     }
 
+    // --- human-only tasks (DESIGN.md §3/§6) ---
+
+    #[test]
+    fn a_human_task_lives_start_to_done_and_refuses_dispatch() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(
+            &mut s,
+            &[
+                "add",
+                "demo",
+                "Capture a bag",
+                "--state",
+                "ready",
+                "--human",
+            ],
+        );
+        assert!(ok(&mut s, &["show", "1"]).contains("human-only"));
+
+        // dispatch refuses with a clear error, before touching any config
+        let e = err(&mut s, &["dispatch", "1"]);
+        assert!(e.contains("human-only"), "{e}");
+
+        // by hand it starts like any task, cannot ask, and completes straight
+        // to done with no review and no PR nag
+        ok(&mut s, &["start", "1"]);
+        let e = err(&mut s, &["ask", "1", "--question", "which bag?"]);
+        assert!(e.contains("human-only"), "{e}");
+        let out = ok(&mut s, &["done", "1"]);
+        assert!(out.contains("-> done"), "{out}");
+        assert!(!out.contains("note:"), "{out}");
+    }
+
+    #[test]
+    fn set_toggles_human_and_guards_the_agent_override() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+
+        ok(&mut s, &["set", "1", "--human"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("human-only"));
+        ok(&mut s, &["set", "1", "--no-human"]);
+        assert!(!ok(&mut s, &["show", "1"]).contains("human-only"));
+
+        let e = err(&mut s, &["set", "1", "--human", "--no-human"]);
+        assert!(e.contains("mutually exclusive"), "{e}");
+
+        // an existing override blocks --human until cleared in the same edit
+        ok(&mut s, &["set", "1", "--agent", "codex"]);
+        let e = err(&mut s, &["set", "1", "--human"]);
+        assert!(e.contains("agent override"), "{e}");
+        ok(&mut s, &["set", "1", "--human", "--no-agent"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("human-only"));
+
+        // ...and the human flag blocks a new override symmetrically
+        let e = err(&mut s, &["set", "1", "--agent", "codex"]);
+        assert!(e.contains("agent override"), "{e}");
+    }
+
+    #[test]
+    fn add_refuses_human_with_an_agent_override() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        let e = err(&mut s, &["add", "demo", "T", "--human", "--agent", "codex"]);
+        assert!(e.contains("agent override"), "{e}");
+        assert!(ok(&mut s, &["list"]).is_empty());
+    }
+
     #[test]
     fn open_refuses_a_non_review_task_and_help_documents_it() {
         // The state guard fires before any config is loaded, so a `ready` task
@@ -1939,6 +2035,7 @@ mod tests {
                 priority: Priority::P1,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
         crate::dispatch::dispatch(store, ctx, task.id, None).unwrap();

@@ -56,6 +56,7 @@ pub fn issue_new_task(project_id: i64, issue: &GithubIssue) -> NewTask {
         priority: Priority::P2,
         state: TaskState::Proposed,
         agent: None,
+        human: false,
     }
 }
 

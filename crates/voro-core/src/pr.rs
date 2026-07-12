@@ -368,6 +368,7 @@ mod tests {
             priority: Priority::P1,
             state,
             agent: None,
+            human: false,
             question: None,
             pr_url: None,
             branch: branch.map(str::to_string),

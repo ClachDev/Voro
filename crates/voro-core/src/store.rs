@@ -16,6 +16,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0004_add_session_ref.sql"),
     include_str!("../migrations/0005_add_branch.sql"),
     include_str!("../migrations/0006_one_open_session_per_task.sql"),
+    include_str!("../migrations/0007_add_human.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -34,6 +35,7 @@ pub struct NewTask {
     pub priority: Priority,
     pub state: TaskState,
     pub agent: Option<String>,
+    pub human: bool,
 }
 
 /// Content edits. State is deliberately absent — use `Store::apply`.
@@ -43,6 +45,7 @@ pub struct TaskEdit {
     pub body: String,
     pub priority: Priority,
     pub agent: Option<String>,
+    pub human: bool,
 }
 
 impl Store {
@@ -225,18 +228,26 @@ impl Store {
                 new.state
             )));
         }
+        if new.human && new.agent.is_some() {
+            return Err(Error::Invalid(
+                "a human-only task cannot carry an agent override — the override only \
+                 selects a dispatch agent, and no agent can execute the task"
+                    .into(),
+            ));
+        }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO tasks (project_id, title, body, priority, state, agent,
+            "INSERT INTO tasks (project_id, title, body, priority, state, agent, human,
                                 state_since, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), datetime('now'))",
             params![
                 new.project_id,
                 new.title,
                 new.body,
                 new.priority,
                 new.state,
-                new.agent
+                new.agent,
+                new.human
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -258,13 +269,55 @@ impl Store {
     }
 
     pub fn update_task(&mut self, id: i64, edit: TaskEdit) -> Result<Task> {
-        let changed = self.conn.execute(
-            "UPDATE tasks SET title = ?1, body = ?2, priority = ?3, agent = ?4 WHERE id = ?5",
-            params![edit.title, edit.body, edit.priority, edit.agent, id],
-        )?;
-        if changed == 0 {
-            return Err(Error::TaskNotFound(id));
+        let current = self.task(id)?;
+        if edit.human && edit.agent.is_some() {
+            return Err(Error::HumanTask {
+                id,
+                reason: "an agent override is meaningless on a task no agent can execute — \
+                         clear one or the other"
+                    .into(),
+            });
         }
+        // `needs-input` and `review` are unreachable for human tasks (§6): the
+        // executor cannot be blocked on their own decision, and completion
+        // skips review. A task sitting in either — or one an agent session is
+        // still open on — is demonstrably agent-executed, so it cannot be
+        // marked human-only as it stands.
+        if edit.human && !current.human {
+            if matches!(current.state, TaskState::NeedsInput | TaskState::Review) {
+                return Err(Error::HumanTask {
+                    id,
+                    reason: format!(
+                        "a task in state '{}' was executed by an agent; resolve it first",
+                        current.state
+                    ),
+                });
+            }
+            let open_sessions: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sessions WHERE task_id = ?1 AND ended_at IS NULL",
+                [id],
+                |r| r.get(0),
+            )?;
+            if open_sessions > 0 {
+                return Err(Error::HumanTask {
+                    id,
+                    reason: "an agent session is still open on it; complete or abort it first"
+                        .into(),
+                });
+            }
+        }
+        self.conn.execute(
+            "UPDATE tasks SET title = ?1, body = ?2, priority = ?3, agent = ?4, human = ?5
+             WHERE id = ?6",
+            params![
+                edit.title,
+                edit.body,
+                edit.priority,
+                edit.agent,
+                edit.human,
+                id
+            ],
+        )?;
         self.task(id)
     }
 
@@ -605,7 +658,7 @@ impl Store {
 
 pub(crate) const TASK_COLUMNS: &str = "id, project_id, title, body, priority, state, agent, \
                                        question, pr_url, branch, state_since, created_at, \
-                                       closed_at";
+                                       closed_at, human";
 
 pub(crate) fn get_task(conn: &Connection, id: i64) -> Result<Option<Task>> {
     Ok(conn
@@ -632,6 +685,7 @@ pub(crate) fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         state_since: row.get(10)?,
         created_at: row.get(11)?,
         closed_at: row.get(12)?,
+        human: row.get(13)?,
     })
 }
 
@@ -756,6 +810,7 @@ mod tests {
                 priority: Priority::P2,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
 
@@ -790,6 +845,7 @@ mod tests {
                 priority: Priority::P2,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
         assert!(s.task(t.id).unwrap().pr_url.is_none());
@@ -825,6 +881,7 @@ mod tests {
                 priority: Priority::P2,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
 
@@ -856,6 +913,7 @@ mod tests {
                 priority: Priority::P2,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
         assert!(s.task(t.id).unwrap().branch.is_none());
@@ -879,6 +937,157 @@ mod tests {
             s.set_branch(999, None),
             Err(Error::TaskNotFound(999))
         ));
+    }
+
+    // --- the human flag and the agent override are mutually exclusive (§3/§6) ---
+
+    /// A store, a project, and a `NewTask` builder for the human-flag tests.
+    fn human_fixture() -> (Store, i64) {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        (s, p.id)
+    }
+
+    fn new_with(project_id: i64, agent: Option<&str>, human: bool) -> NewTask {
+        NewTask {
+            project_id,
+            title: "hands-on".into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state: TaskState::Ready,
+            agent: agent.map(str::to_string),
+            human,
+        }
+    }
+
+    fn edit_of(task: &Task, agent: Option<&str>, human: bool) -> TaskEdit {
+        TaskEdit {
+            title: task.title.clone(),
+            body: task.body.clone(),
+            priority: task.priority,
+            agent: agent.map(str::to_string),
+            human,
+        }
+    }
+
+    #[test]
+    fn create_task_refuses_a_human_task_with_an_agent_override() {
+        let (mut s, p) = human_fixture();
+        let err = s.create_task(new_with(p, Some("codex"), true)).unwrap_err();
+        assert!(err.to_string().contains("agent override"), "{err}");
+        assert!(s.tasks().unwrap().is_empty());
+
+        // either alone is fine
+        assert!(s.create_task(new_with(p, Some("codex"), false)).is_ok());
+        let human = s.create_task(new_with(p, None, true)).unwrap();
+        assert!(human.human);
+    }
+
+    #[test]
+    fn update_task_guards_the_agent_human_exclusivity_both_ways() {
+        let (mut s, p) = human_fixture();
+
+        // an agent override cannot land on a human task
+        let human = s.create_task(new_with(p, None, true)).unwrap();
+        let err = s
+            .update_task(human.id, edit_of(&human, Some("codex"), true))
+            .unwrap_err();
+        assert!(matches!(err, Error::HumanTask { id, .. } if id == human.id));
+
+        // ...and the flag cannot land while an override is kept
+        let agented = s.create_task(new_with(p, Some("codex"), false)).unwrap();
+        let err = s
+            .update_task(agented.id, edit_of(&agented, Some("codex"), true))
+            .unwrap_err();
+        assert!(matches!(err, Error::HumanTask { id, .. } if id == agented.id));
+
+        // clearing the override in the same edit is the designed way through
+        let flipped = s
+            .update_task(agented.id, edit_of(&agented, None, true))
+            .unwrap();
+        assert!(flipped.human);
+        assert!(flipped.agent.is_none());
+    }
+
+    #[test]
+    fn update_task_refuses_flagging_human_in_agent_executed_states() {
+        use crate::transition::Action;
+
+        // needs-input and review are unreachable for human tasks (§6), so a
+        // task already sitting there cannot be flagged as one.
+        for walk in [TaskState::NeedsInput, TaskState::Review] {
+            let (mut s, p) = human_fixture();
+            let t = s.create_task(new_with(p, None, false)).unwrap();
+            s.apply(t.id, Action::Start).unwrap();
+            match walk {
+                TaskState::NeedsInput => {
+                    s.apply(t.id, Action::Ask("A or B?".into())).unwrap();
+                }
+                _ => {
+                    s.apply(t.id, Action::Complete(None)).unwrap();
+                }
+            }
+            let err = s.update_task(t.id, edit_of(&t, None, true)).unwrap_err();
+            assert!(
+                matches!(err, Error::HumanTask { id, .. } if id == t.id),
+                "{walk}: {err}"
+            );
+            assert!(!s.task(t.id).unwrap().human);
+        }
+    }
+
+    #[test]
+    fn update_task_refuses_flagging_human_while_a_session_is_open() {
+        use crate::transition::Action;
+
+        let (mut s, p) = human_fixture();
+        let t = s.create_task(new_with(p, None, false)).unwrap();
+        s.record_dispatch(t.id, "claude", Some(1), None).unwrap();
+
+        let err = s.update_task(t.id, edit_of(&t, None, true)).unwrap_err();
+        assert!(matches!(err, Error::HumanTask { id, .. } if id == t.id));
+
+        // once the session is torn down the flip is allowed again
+        s.apply(t.id, Action::Abort).unwrap();
+        let flipped = s.update_task(t.id, edit_of(&t, None, true)).unwrap();
+        assert!(flipped.human);
+
+        // a hand-started running task has no session and can flip freely
+        let by_hand = s.create_task(new_with(p, None, false)).unwrap();
+        s.apply(by_hand.id, Action::Start).unwrap();
+        assert!(
+            s.update_task(by_hand.id, edit_of(&by_hand, None, true))
+                .unwrap()
+                .human
+        );
+    }
+
+    /// A database from before migration 0007 must open with every existing
+    /// task dispatchable (`human = 0`), and the CHECK must reject junk.
+    #[test]
+    fn migration_0007_defaults_existing_tasks_to_dispatchable() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
+            .unwrap();
+        conn.execute("INSERT INTO projects (name, path) VALUES ('p', '/tmp')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (project_id, title, state, state_since, created_at)
+             VALUES (1, 'pre-flag', 'ready', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let store = Store::from_connection(conn).unwrap();
+        assert!(!store.task(1).unwrap().human);
+
+        let junk = store
+            .conn
+            .execute("UPDATE tasks SET human = 2 WHERE id = 1", []);
+        assert!(junk.is_err(), "the CHECK must reject values outside 0/1");
     }
 
     #[test]
@@ -929,6 +1138,7 @@ mod tests {
                 priority: Priority::P1,
                 state,
                 agent: None,
+                human: false,
             })
             .unwrap()
             .id
@@ -1036,11 +1246,10 @@ mod tests {
     fn migration_0006_dedupes_open_sessions_and_enforces_the_index() {
         let conn = Connection::open_in_memory().unwrap();
         // apply 0001..=0005, i.e. everything before the invariant migration
-        for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+        for sql in &MIGRATIONS[..5] {
             conn.execute_batch(sql).unwrap();
         }
-        conn.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
-            .unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
         conn.execute("INSERT INTO projects (name, path) VALUES ('p', '/tmp')", [])
             .unwrap();
         conn.execute(
@@ -1120,6 +1329,7 @@ mod tests {
                 priority: Priority::P2,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
         s.apply(task.id, Action::Start).unwrap();
@@ -1156,6 +1366,7 @@ mod tests {
                 priority: Priority::P2,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
         // no summary yet
@@ -1195,6 +1406,7 @@ mod tests {
                     priority: Priority::P2,
                     state: TaskState::Ready,
                     agent: None,
+                    human: false,
                 })
                 .unwrap();
             s.apply(t.id, Action::Start).unwrap();
@@ -1241,6 +1453,7 @@ mod tests {
                 priority: Priority::P2,
                 state: TaskState::Ready,
                 agent: None,
+                human: false,
             })
             .unwrap();
         s.set_branch(t.id, Some("feat/x")).unwrap();
@@ -1483,6 +1696,7 @@ mod tests {
             priority: Priority::P2,
             state: TaskState::Ready,
             agent: None,
+            human: false,
         };
 
         // review keeps its session open, yet must not appear in the strip
@@ -1579,6 +1793,7 @@ mod tests {
             priority: Priority::P2,
             state,
             agent: None,
+            human: false,
         };
         let open = s.create_task(new("open", TaskState::Ready)).unwrap();
         let closed = s.create_task(new("closed", TaskState::Ready)).unwrap();
