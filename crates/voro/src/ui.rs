@@ -4,7 +4,9 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use voro_core::{DepKind, DepRef, Event, ScoreBreakdown, StateCounts, TaskState};
+use voro_core::{
+    DepKind, DepRef, Event, ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
+};
 
 use crate::app::{App, CockpitRow, Mode, Screen, TaskRow};
 
@@ -204,6 +206,9 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             }
             if let Some(branch) = &t.branch {
                 lines.push(Line::from(branch_span(branch)));
+            }
+            if let Some(session) = app.stalled_sessions.get(task_id) {
+                lines.extend(stalled_session_lines(session));
             }
             lines.extend(dep_lines(
                 app.deps.get(task_id).map_or(&[][..], |v| v),
@@ -465,6 +470,46 @@ fn review_substate_span(task: &voro_core::Task) -> Option<Span<'static>> {
     })
 }
 
+/// A stalled task's post-mortem (task #73): what the dead dispatch's session
+/// did (`failed` or `capped`, per reconcile — DESIGN.md §8), which agent, when
+/// it ended, and where its log is, so "what happened" is answerable from the
+/// detail views without dropping to the sessions table. `capped` is yellow —
+/// it clears on its own when the quota resets — while `failed` is red and
+/// wants its log read.
+fn stalled_session_lines(session: &Session) -> Vec<Line<'static>> {
+    let outcome_color = match session.outcome {
+        Some(SessionOutcome::Capped) => Color::Yellow,
+        _ => Color::Red,
+    };
+    let outcome = session
+        .outcome
+        .map(|o| o.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let ended = session.ended_at.as_deref().unwrap_or("?");
+    let mut lines = vec![Line::from(vec![
+        Span::raw("last session: "),
+        Span::styled(
+            outcome,
+            Style::new().fg(outcome_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · {} · ended {ended}", session.agent),
+            Style::new().dim(),
+        ),
+    ])];
+    lines.push(match &session.log_path {
+        Some(path) => Line::from(vec![
+            Span::styled(format!("log: {path}"), Style::new().dim()),
+            Span::styled("  (l opens in $PAGER)", Style::new().fg(Color::Blue)),
+        ]),
+        None => Line::from(Span::styled(
+            "no session log was recorded",
+            Style::new().dim(),
+        )),
+    });
+    lines
+}
+
 /// The verb a queue row's Enter performs, from its state. A `stalled` row's
 /// action is redispatching the dead dispatch (DESIGN.md §8) — "restart" is
 /// how that reads as one next action.
@@ -604,6 +649,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(branch) = &task.branch {
         lines.push(Line::from(branch_span(branch)));
+    }
+    if let Some(session) = app.stalled_sessions.get(&task.id) {
+        lines.extend(stalled_session_lines(session));
     }
     lines.extend(dep_lines(
         app.deps.get(&task.id).map_or(&[][..], |v| v),
@@ -897,6 +945,9 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 pairs.push(("x", "score"));
                 pairs.push(("h", "history"));
             }
+            if app.selected_stalled_log().is_some() {
+                pairs.push(("l", "log"));
+            }
             pairs.push(("n", "new"));
             pairs.push(("e", "edit"));
             pairs.push(("tab", "tasks"));
@@ -906,6 +957,9 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         Screen::Tasks => {
             let mut pairs: Vec<(&'static str, &'static str)> = Vec::new();
             pairs.extend(enter);
+            if app.selected_stalled_log().is_some() {
+                pairs.push(("l", "log"));
+            }
             pairs.push(("s", "state"));
             pairs.push(("n", "new"));
             pairs.push(("e", "edit"));
@@ -1425,6 +1479,86 @@ mod tests {
             rendered.contains("History") && rendered.contains("created"),
             "history should fold into the Detail popup: {rendered}"
         );
+    }
+
+    /// The cockpit detail pane answers "what happened" for a stalled task
+    /// (task #73): the dead session's outcome, agent, end time, and log path
+    /// render under the metadata, and the key line advertises `l`. A capped
+    /// session reads `capped`; a clean ready task carries none of it.
+    #[test]
+    fn detail_pane_shows_a_stalled_tasks_session_post_mortem() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{NewTask, Store};
+
+        let ctx = || {
+            crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new("/nonexistent/voro.db"))
+        };
+        let app_with_session = |capped: bool| {
+            let mut store = Store::open_in_memory().unwrap();
+            let p = store.create_project("voro", "/tmp/voro").unwrap();
+            store.set_weight(p.id, 3).unwrap();
+            let task = store
+                .create_task(NewTask {
+                    project_id: p.id,
+                    title: "went quiet".into(),
+                    body: String::new(),
+                    priority: Priority::P2,
+                    state: TaskState::Ready,
+                    agent: None,
+                    human: false,
+                })
+                .unwrap();
+            let (_, session) = store
+                .record_dispatch(task.id, "claude", Some(1), Some("/tmp/voro/s.log"))
+                .unwrap();
+            store.reconcile_session(session.id, false, capped).unwrap();
+            App::new(store, ctx()).unwrap()
+        };
+        let render = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal.draw(|f| draw(f, app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        let failed = app_with_session(false);
+        let rendered = render(&failed);
+        assert!(rendered.contains("last session: failed"), "{rendered}");
+        assert!(rendered.contains("claude"), "{rendered}");
+        assert!(rendered.contains("ended 2"), "{rendered}");
+        assert!(rendered.contains("log: /tmp/voro/s.log"), "{rendered}");
+        let labels: Vec<&str> = key_hints(&failed).iter().map(|(_, l)| *l).collect();
+        assert!(labels.contains(&"log"), "{labels:?}");
+
+        let capped = app_with_session(true);
+        assert!(render(&capped).contains("last session: capped"));
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store.set_weight(p.id, 3).unwrap();
+        store
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "fresh".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+            })
+            .unwrap();
+        let clean = App::new(store, ctx()).unwrap();
+        let rendered = render(&clean);
+        assert!(!rendered.contains("last session"), "{rendered}");
+        let labels: Vec<&str> = key_hints(&clean).iter().map(|(_, l)| *l).collect();
+        assert!(!labels.contains(&"log"), "{labels:?}");
     }
 
     /// The cockpit key line only advertises the score/history toggles and the
