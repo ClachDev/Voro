@@ -1,7 +1,8 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use voro_core::{
-    Action, AgentsConfig, Blocker, Candidate, DepRef, Event, PrRef, Priority, Project, RunningRow,
-    ScoreBreakdown, StateCounts, Store, Task, TaskState, Triage, scheduler,
+    Action, AgentsConfig, Blocker, Candidate, DepRef, Event, PrRef, Priority, Project,
+    ReviewAction, ReviewMedium, RunningRow, ScoreBreakdown, StateCounts, Store, Task, TaskState,
+    Triage, scheduler,
 };
 
 /// Lines `PgDn`/`PgUp` move the focus card in one press. A fixed step, since
@@ -123,6 +124,18 @@ pub enum Mode {
         /// the task's own override, else the config default — highlighted in
         /// the list independently of cursor position.
         resolved: Option<String>,
+        sel: usize,
+    },
+    /// Picking a project's review action on the projects screen (DESIGN.md
+    /// §8/§11a): auto, pr, the default viewer, and each named viewer from
+    /// `voro.toml` — loaded fresh when the picker opens, like the agent
+    /// picker, so a just-added viewer shows up.
+    ReviewActionPicker {
+        project_id: i64,
+        options: Vec<ReviewAction>,
+        /// The project's action as stored, flagged in the list independently
+        /// of cursor position.
+        current: ReviewAction,
         sel: usize,
     },
 }
@@ -543,6 +556,12 @@ impl App {
                 resolved,
                 sel,
             } => self.key_agent_picker(key, task_id, agents, resolved, sel),
+            Mode::ReviewActionPicker {
+                project_id,
+                options,
+                current,
+                sel,
+            } => self.key_review_action_picker(key, project_id, options, current, sel),
         }
     }
 
@@ -581,7 +600,7 @@ impl App {
             _ => {}
         }
         // The projects screen owns weight/admin (DESIGN.md §9); its keys
-        // (`0`–`5`, `r`, `a`, `d`) are local and reinterpret keys that mean
+        // (`0`–`5`, `r`, `a`, `d`, `v`) are local and reinterpret keys that mean
         // other things on the task-oriented screens.
         if self.screen == Screen::Projects {
             self.key_projects(key);
@@ -794,11 +813,12 @@ impl App {
         self.report(refreshed);
     }
 
-    /// Open the selected task's checkout in the configured viewer (DESIGN.md
-    /// §11a) so its diff can be seen. Only `review`/`running` tasks have a diff
-    /// worth opening; anything else, or a missing `[viewer]`, reports through
-    /// the status line rather than doing nothing — the same "no-op with an
-    /// explanation" style the dispatch keys use.
+    /// Open the selected task's checkout in a configured viewer (DESIGN.md
+    /// §11a) so its diff can be seen — the explicit viewer key, reaching the
+    /// local diff even on a GitHub project. Only `review`/`running` tasks have
+    /// a diff worth opening; anything else, or a missing viewer, reports
+    /// through the status line rather than doing nothing — the same "no-op
+    /// with an explanation" style the dispatch keys use.
     fn open_selected_in_viewer(&mut self) {
         let (id, state) = match self.selected_task() {
             Some(task) => (task.id, task.state),
@@ -810,23 +830,26 @@ impl App {
             ));
             return;
         }
-        match crate::dispatch::open(&mut self.store, &self.dispatch_ctx, id) {
+        match crate::dispatch::open(&mut self.store, &self.dispatch_ctx, id, None) {
             Ok(summary) => self.status = Some(summary),
             Err(e) => self.status = Some(e),
         }
     }
 
-    /// The PR key. With a tracked PR: jump to it in a browser (DESIGN.md §11c),
+    /// The review key — the per-project "show me this task's diff" action
+    /// (DESIGN.md §8). With a tracked PR: jump to it in a browser (§11c),
     /// which never touches the store, so no refresh follows. With none: on a
-    /// `review` task, open the confirmation modal to *create* one from its
-    /// done-time summary (DESIGN.md §8) — or, if it is not yet PR-ready, report
-    /// the missing branch/summary on the status line; on any other state, fall
-    /// back to the link-an-existing-PR prompt (the TUI face of `set --pr`).
+    /// `review` task, resolve the project's review medium — on GitHub, open
+    /// the confirmation modal to *create* a PR from its done-time summary (or,
+    /// if it is not yet PR-ready, report the missing branch/summary on the
+    /// status line); on a viewer project, open the checkout in the configured
+    /// viewer, nothing to confirm. On any other state, fall back to the
+    /// link-an-existing-PR prompt (the TUI face of `set --pr`).
     fn open_selected_pr(&mut self) {
         let Some(task) = self.selected_task() else {
             return;
         };
-        let (id, state) = (task.id, task.state);
+        let (id, state, project_id) = (task.id, task.state, task.project_id);
         let has_pr = task.pr_url.is_some();
         if has_pr {
             match crate::pr::open(&self.store, id) {
@@ -840,6 +863,22 @@ impl App {
                 task_id: id,
                 buffer: String::new(),
             };
+            return;
+        }
+        let project = match self.store.project(project_id) {
+            Ok(project) => project,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        if let ReviewMedium::Viewer(viewer) = crate::pr::resolve_medium(&project) {
+            let result =
+                crate::dispatch::open(&mut self.store, &self.dispatch_ctx, id, viewer.as_deref());
+            match result {
+                Ok(summary) => self.status = Some(summary),
+                Err(e) => self.status = Some(e),
+            }
             return;
         }
         match crate::pr::plan(&self.store, id) {
@@ -1113,8 +1152,85 @@ impl App {
                         self.projects_sel.min(self.projects.len().saturating_sub(1));
                 }
             }
+            KeyCode::Char('v') => {
+                if let Some(project) = self.projects.get(self.projects_sel) {
+                    let (id, current) = (project.id, project.review_action.clone());
+                    self.open_review_action_picker(id, current);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Open the review-action picker for a project (DESIGN.md §8/§11a): auto,
+    /// pr, the default viewer, and each named viewer from `voro.toml`. The
+    /// config is loaded fresh so a just-added `[viewers.*]` table shows up;
+    /// the cursor starts on the project's current action.
+    fn open_review_action_picker(&mut self, project_id: i64, current: ReviewAction) {
+        let config = match AgentsConfig::load(&self.dispatch_ctx.agents_path) {
+            Ok(config) => config,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        let mut options = vec![
+            ReviewAction::Auto,
+            ReviewAction::Pr,
+            ReviewAction::Viewer(None),
+        ];
+        options.extend(
+            config
+                .viewer_names()
+                .into_iter()
+                .map(|name| ReviewAction::Viewer(Some(name))),
+        );
+        let sel = options.iter().position(|o| *o == current).unwrap_or(0);
+        self.mode = Mode::ReviewActionPicker {
+            project_id,
+            options,
+            current,
+            sel,
+        };
+    }
+
+    /// Drive the review-action picker: ⏎ stores the highlighted action via
+    /// `set_review_action` and refreshes so the projects row reflects it;
+    /// esc cancels without touching anything.
+    fn key_review_action_picker(
+        &mut self,
+        key: KeyEvent,
+        project_id: i64,
+        options: Vec<ReviewAction>,
+        current: ReviewAction,
+        mut sel: usize,
+    ) {
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Char('j') | KeyCode::Down => {
+                sel = (sel + 1).min(options.len().saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => sel = sel.saturating_sub(1),
+            KeyCode::Enter => {
+                if let Some(action) = options.get(sel) {
+                    let result = self
+                        .store
+                        .set_review_action(project_id, action)
+                        .and_then(|_| self.refresh());
+                    if self.report(result).is_some() {
+                        self.status = Some(format!("review action -> {action}"));
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+        self.mode = Mode::ReviewActionPicker {
+            project_id,
+            options,
+            current,
+            sel,
+        };
     }
 
     fn key_add_project(

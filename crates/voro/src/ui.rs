@@ -254,6 +254,34 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 .highlight_style(SELECTED);
             frame.render_stateful_widget(list, area, &mut state);
         }
+        Mode::ReviewActionPicker {
+            options,
+            current,
+            sel,
+            ..
+        } => {
+            let items: Vec<ListItem> = options
+                .iter()
+                .map(|o| {
+                    if o == current {
+                        ListItem::new(format!("{o}  (current)"))
+                    } else {
+                        ListItem::new(o.to_string())
+                    }
+                })
+                .collect();
+            let height = items.len() as u16 + 2;
+            let area = popup_area(frame, 52, height.max(3));
+            let mut state = ListState::default().with_selected(Some(*sel));
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Review action — ⏎ set, esc cancel"),
+                )
+                .highlight_style(SELECTED);
+            frame.render_stateful_widget(list, area, &mut state);
+        }
     }
 }
 
@@ -772,9 +800,10 @@ fn blocker_spans(row: &TaskRow) -> Vec<Span<'static>> {
 }
 
 /// The projects screen (DESIGN.md §9): one row per project — weight, name,
-/// path, open task count. Direct weight editing lives here (`0`–`5`), so the
-/// morning ritual is one keystroke per project. The open count is the
-/// project's non-terminal tasks, drawn from the already-loaded task list.
+/// path, open task count, and the review action when one is pinned (§8).
+/// Direct weight editing lives here (`0`–`5`), so the morning ritual is one
+/// keystroke per project. The open count is the project's non-terminal tasks,
+/// drawn from the already-loaded task list.
 fn draw_projects(frame: &mut Frame, app: &App) {
     let [list_area, status] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
@@ -793,8 +822,15 @@ fn draw_projects(frame: &mut Frame, app: &App) {
             } else {
                 Style::new()
             };
+            let action = match &p.review_action {
+                voro_core::ReviewAction::Auto => String::new(),
+                other => format!("  [{other}]"),
+            };
             ListItem::new(Line::from(Span::styled(
-                format!("{:>2}  {:14} {:28} {} open", p.weight, p.name, p.path, open),
+                format!(
+                    "{:>2}  {:14} {:28} {} open{action}",
+                    p.weight, p.name, p.path, open
+                ),
                 style,
             )))
         })
@@ -882,6 +918,7 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("r", "rename"),
             ("a", "add"),
             ("d", "delete"),
+            ("v", "review action"),
             ("tab", "cockpit"),
             ("q", "quit"),
         ],
