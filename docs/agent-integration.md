@@ -48,9 +48,10 @@ points, run the matching command — Voro surfaces it in the operator's queue:
 - `ask` when you are blocked on a human decision and cannot proceed.
 - `done` when the work is complete and ready for review. Record **both** flags on
   the one call: `--branch` is the git branch your work landed on and `--summary`
-  is a PR-ready account of what changed, why, and how you verified it — `voro pr`
-  opens the pull request straight from them and needs both, and a `done` that
-  supplies only one leaves the task flagged `[incomplete report]`. Omit both only
+  is a PR-ready account of what changed, why, and how you verified it — on a
+  GitHub-reviewed project `voro pr` opens the pull request straight from them
+  and needs both, on any project the summary is the review context, and a `done`
+  that supplies only one leaves the task flagged `[incomplete report]`. Omit both only
   for a task that produced no code (planning, triage). If the task named an
   intended branch, you were told which one in the dispatch preamble — create or
   check it out yourself.

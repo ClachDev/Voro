@@ -773,9 +773,12 @@ fn done_verb(
             .map_err(|e| e.to_string())?;
         write!(out, " (branch {})", name.trim()).unwrap();
     }
-    // A PR needs both a branch and a summary; warn (never fail) about whichever
-    // is absent so the operator knows `pr` will not yet open one. A human task
-    // lands straight in `done` with no PR to open, so it earns no warning.
+    // A complete report carries both a branch and a summary whatever the
+    // review medium — the summary is the review context and the feedback
+    // source even where `pr` opens a viewer instead of a PR — so warn (never
+    // fail) about whichever is absent without promising how `pr` will react.
+    // A human task lands straight in `done` with no report to read, so it
+    // earns no warning.
     if task.state == TaskState::Review {
         let has_branch = store.task(id).map_err(|e| e.to_string())?.branch.is_some();
         let has_summary = store
@@ -789,7 +792,7 @@ fn done_verb(
         if !missing.is_empty() {
             write!(
                 out,
-                "\nnote: no {} recorded — `voro pr {id}` needs a branch and summary to open a PR",
+                "\nnote: no {} recorded — complete the report with `voro set {id}` if this task produced code",
                 missing.join(" or ")
             )
             .unwrap();
@@ -835,7 +838,7 @@ fn show_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     {
         writeln!(
             out,
-            "incomplete report: needs a branch and summary before `voro pr {id}`"
+            "incomplete report: only one of branch and summary recorded — complete it with `voro set {id}`"
         )
         .unwrap();
     }
@@ -966,8 +969,11 @@ fn next_verb(store: &mut Store) -> Result<String, String> {
 
 /// `  [incomplete report]` when a `review` task carries only one of a branch
 /// and a summary (DESIGN.md §8), else empty — the half-finished done report a
-/// dispatched session left behind, surfaced so the operator sees it rather than
-/// hitting the gap at `pr` time. Re-derived per line, never stored.
+/// dispatched session left behind, surfaced so the operator sees the gap
+/// whatever the project's review medium. Says nothing about `pr`, which needs
+/// the report only on the GitHub medium — and deliberately does not resolve
+/// the medium, since `auto` resolution probes `gh` and this renders per line.
+/// Re-derived per line, never stored.
 fn incomplete_report_suffix(store: &Store, task_id: i64) -> &'static str {
     if store.incomplete_report_flag(task_id).unwrap_or(false) {
         "  [incomplete report]"
@@ -2158,6 +2164,22 @@ mod tests {
         assert!(out.contains("-> review"), "{out}");
         assert!(out.contains("note:"), "{out}");
         assert!(out.contains("branch or summary"), "{out}");
+        // The note names the report, not a `pr` failure — on a viewer-medium
+        // project `pr` opens the diff without either half.
+        assert!(!out.contains("open a PR"), "{out}");
+    }
+
+    #[test]
+    fn done_warning_promises_no_pr_failure_on_a_viewer_project() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["project", "action", "demo", "viewer:zed"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        let out = ok(&mut s, &["done", "1", "--branch", "feat/x"]);
+        assert!(out.contains("note: no summary recorded"), "{out}");
+        assert!(!out.contains("open a PR"), "{out}");
+        assert!(!out.contains("needs a branch and summary"), "{out}");
     }
 
     #[test]
@@ -2203,7 +2225,8 @@ mod tests {
 
         assert!(ok(&mut s, &["list"]).contains("[incomplete report]"));
         assert!(
-            ok(&mut s, &["show", "1"]).contains("incomplete report: needs a branch and summary")
+            ok(&mut s, &["show", "1"])
+                .contains("incomplete report: only one of branch and summary recorded")
         );
     }
 

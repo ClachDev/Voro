@@ -603,17 +603,18 @@ impl Store {
 
     /// Whether `task_id` is a `review` task carrying a *partial* completion
     /// report — exactly one of its branch and its summary is present (DESIGN.md
-    /// §8). A PR needs both (`pr` errors without either), so a review task with
-    /// one but not the other is a report a dispatched agent left half-finished:
-    /// it called `done` with `--branch` but no `--summary`, or the reverse, or
-    /// the `SessionEnd` fallback recorded a branch with no summary. That is the
-    /// "incomplete done report" anomaly the operator must see rather than
-    /// discover at `pr` time. A review task with *neither* is deliberately not
-    /// flagged — a planning or task-generation task legitimately produces no
-    /// branch and no summary — and one with *both* is a complete report. Gated
-    /// on `review` because that is the only state where a PR is opened; derived
-    /// fresh from task and event state on every read rather than stored on the
-    /// task.
+    /// §8). A dispatched agent should record both whatever the project's review
+    /// medium: the summary is the review context and the reject-with-feedback
+    /// source, the branch ties the task to its work, and on the GitHub medium
+    /// `pr` additionally needs both to open a PR. One without the other is
+    /// therefore a report left half-finished — `done` with `--branch` but no
+    /// `--summary`, or the reverse, or the `SessionEnd` fallback recording a
+    /// branch with no summary — an anomaly the operator must see. A review task
+    /// with *neither* is deliberately not flagged — a planning or
+    /// task-generation task legitimately produces no branch and no summary —
+    /// and one with *both* is a complete report. Gated on `review` because that
+    /// is where the report is read; derived fresh from task and event state on
+    /// every read rather than stored on the task.
     pub fn incomplete_report_flag(&self, task_id: i64) -> Result<bool> {
         let row: Option<(TaskState, Option<String>)> = self
             .conn
