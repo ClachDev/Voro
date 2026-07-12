@@ -17,6 +17,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0005_add_branch.sql"),
     include_str!("../migrations/0006_one_open_session_per_task.sql"),
     include_str!("../migrations/0007_add_human.sql"),
+    include_str!("../migrations/0008_add_stalled_state.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -278,13 +279,17 @@ impl Store {
                     .into(),
             });
         }
-        // `needs-input` and `review` are unreachable for human tasks (§6): the
-        // executor cannot be blocked on their own decision, and completion
-        // skips review. A task sitting in either — or one an agent session is
-        // still open on — is demonstrably agent-executed, so it cannot be
-        // marked human-only as it stands.
+        // `needs-input`, `review`, and `stalled` are unreachable for human
+        // tasks (§6): the executor cannot be blocked on their own decision,
+        // completion skips review, and only a dispatched session can die. A
+        // task sitting in any of them — or one an agent session is still open
+        // on — is demonstrably agent-executed, so it cannot be marked
+        // human-only as it stands.
         if edit.human && !current.human {
-            if matches!(current.state, TaskState::NeedsInput | TaskState::Review) {
+            if matches!(
+                current.state,
+                TaskState::NeedsInput | TaskState::Review | TaskState::Stalled
+            ) {
                 return Err(Error::HumanTask {
                     id,
                     reason: format!(
@@ -510,41 +515,6 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Whether `task_id` is a `ready` task whose most recent session ended
-    /// `failed` or `capped` — the redispatch flag (DESIGN.md §8). Derived from
-    /// session history on every read rather than stored on the task, per the
-    /// queue/task browser rendering it rather than owning it. Gated on `ready`
-    /// on purpose: the flag means "re-dispatchable, and its last run died", so
-    /// a still-`running` task whose session ended without reporting is *not*
-    /// flagged here — reconcile now leaves such a task running (§8), and it is
-    /// surfaced as an orphaned running row (§9) instead. Once a human aborts
-    /// that orphan back to `ready`, the flag reappears against the same
-    /// session history and redispatch becomes available.
-    pub fn redispatch_flag(&self, task_id: i64) -> Result<bool> {
-        let state: Option<TaskState> = self
-            .conn
-            .query_row("SELECT state FROM tasks WHERE id = ?1", [task_id], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        if state != Some(TaskState::Ready) {
-            return Ok(false);
-        }
-        let outcome: Option<SessionOutcome> = self
-            .conn
-            .query_row(
-                "SELECT outcome FROM sessions WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
-                [task_id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten();
-        Ok(matches!(
-            outcome,
-            Some(SessionOutcome::Failed | SessionOutcome::Capped)
-        ))
-    }
-
     /// Whether `task_id` is a `review` task carrying a *partial* completion
     /// report — exactly one of its branch and its summary is present (DESIGN.md
     /// §8). A PR needs both (`pr` errors without either), so a review task with
@@ -556,10 +526,8 @@ impl Store {
     /// flagged — a planning or task-generation task legitimately produces no
     /// branch and no summary — and one with *both* is a complete report. Gated
     /// on `review` because that is the only state where a PR is opened; derived
-    /// fresh from task and event state on every read, like [`redispatch_flag`],
-    /// rather than stored on the task.
-    ///
-    /// [`redispatch_flag`]: Store::redispatch_flag
+    /// fresh from task and event state on every read rather than stored on the
+    /// task.
     pub fn incomplete_report_flag(&self, task_id: i64) -> Result<bool> {
         let row: Option<(TaskState, Option<String>)> = self
             .conn
@@ -586,8 +554,8 @@ impl Store {
     /// task keeps its session open behind the scenes (for feedback/answer
     /// continuation, §8) but belongs to the queue, not the strip, so those
     /// never appear here even though their session row is still open. A task
-    /// nothing is actively driving — started by hand, or one whose session
-    /// ended without reporting (reconcile leaves it `running`, §8) — has no
+    /// nothing is actively driving — started by hand, so no session was ever
+    /// opened (a dead dispatch is stalled by reconcile instead, §8) — has no
     /// open session, so its `session_id`/`agent` are `NULL` and its elapsed
     /// time is measured from when it entered `running`. The one-open-session
     /// invariant (§8) makes the join at most one row per task, so a task
@@ -1013,20 +981,26 @@ mod tests {
     fn update_task_refuses_flagging_human_in_agent_executed_states() {
         use crate::transition::Action;
 
-        // needs-input and review are unreachable for human tasks (§6), so a
-        // task already sitting there cannot be flagged as one.
-        for walk in [TaskState::NeedsInput, TaskState::Review] {
+        // needs-input, review, and stalled are unreachable for human tasks
+        // (§6), so a task already sitting there cannot be flagged as one.
+        for walk in [TaskState::NeedsInput, TaskState::Review, TaskState::Stalled] {
             let (mut s, p) = human_fixture();
             let t = s.create_task(new_with(p, None, false)).unwrap();
-            s.apply(t.id, Action::Start).unwrap();
             match walk {
                 TaskState::NeedsInput => {
+                    s.apply(t.id, Action::Start).unwrap();
                     s.apply(t.id, Action::Ask("A or B?".into())).unwrap();
                 }
+                TaskState::Stalled => {
+                    let (_, session) = s.record_dispatch(t.id, "claude", Some(1), None).unwrap();
+                    s.reconcile_session(session.id, false, false).unwrap();
+                }
                 _ => {
+                    s.apply(t.id, Action::Start).unwrap();
                     s.apply(t.id, Action::Complete(None)).unwrap();
                 }
             }
+            assert_eq!(s.task(t.id).unwrap().state, walk);
             let err = s.update_task(t.id, edit_of(&t, None, true)).unwrap_err();
             assert!(
                 matches!(err, Error::HumanTask { id, .. } if id == t.id),
@@ -1067,11 +1041,10 @@ mod tests {
     #[test]
     fn migration_0007_defaults_existing_tasks_to_dispatchable() {
         let conn = Connection::open_in_memory().unwrap();
-        for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+        for sql in &MIGRATIONS[..6] {
             conn.execute_batch(sql).unwrap();
         }
-        conn.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
-            .unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
         conn.execute("INSERT INTO projects (name, path) VALUES ('p', '/tmp')", [])
             .unwrap();
         conn.execute(
@@ -1158,6 +1131,12 @@ mod tests {
             Review => {
                 let id = task_in_state(s, project_id, Running);
                 s.apply(id, Action::Complete(None)).unwrap();
+                id
+            }
+            Stalled => {
+                let id = create(s, Ready);
+                let (_, session) = s.record_dispatch(id, "claude", Some(1), None).unwrap();
+                s.reconcile_session(session.id, false, false).unwrap();
                 id
             }
             Done => {
@@ -1287,6 +1266,66 @@ mod tests {
             [],
         );
         assert!(second.is_err());
+    }
+
+    /// Migration 0008 must backfill exactly the tasks the derived redispatch
+    /// flag used to mark — `ready` with a most recent session ended
+    /// `failed`/`capped` — into `stalled`, leaving every other shape alone,
+    /// and must carry 0007's `human` column through the table rebuild.
+    #[test]
+    fn migration_0008_backfills_flagged_ready_tasks_to_stalled() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..7] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn.execute("INSERT INTO projects (name, path) VALUES ('p', '/tmp')", [])
+            .unwrap();
+        // 1: ready, last session failed          -> stalled
+        // 2: ready, last session capped          -> stalled
+        // 3: ready, last session aborted         -> stays ready
+        // 4: ready, failed session then aborted  -> stays ready (latest wins)
+        // 5: ready, no sessions                  -> stays ready
+        // 6: running, last session failed        -> stays running
+        conn.execute(
+            "INSERT INTO tasks (project_id, title, state, state_since, created_at)
+             VALUES (1, 't1', 'ready', datetime('now'), datetime('now')),
+                    (1, 't2', 'ready', datetime('now'), datetime('now')),
+                    (1, 't3', 'ready', datetime('now'), datetime('now')),
+                    (1, 't4', 'ready', datetime('now'), datetime('now')),
+                    (1, 't5', 'ready', datetime('now'), datetime('now')),
+                    (1, 't6', 'running', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (task_id, agent, started_at, ended_at, outcome)
+             VALUES (1, 'a', datetime('now'), datetime('now'), 'failed'),
+                    (2, 'a', datetime('now'), datetime('now'), 'capped'),
+                    (3, 'a', datetime('now'), datetime('now'), 'aborted'),
+                    (4, 'a', datetime('now'), datetime('now'), 'failed'),
+                    (4, 'a', datetime('now'), datetime('now'), 'aborted'),
+                    (6, 'a', datetime('now'), datetime('now'), 'failed')",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET human = 1 WHERE id = 5", [])
+            .unwrap();
+
+        let store = Store::from_connection(conn).unwrap();
+        assert_eq!(store.task(1).unwrap().state, TaskState::Stalled);
+        assert_eq!(store.task(2).unwrap().state, TaskState::Stalled);
+        assert_eq!(store.task(3).unwrap().state, TaskState::Ready);
+        assert_eq!(store.task(4).unwrap().state, TaskState::Ready);
+        assert_eq!(store.task(5).unwrap().state, TaskState::Ready);
+        assert_eq!(store.task(6).unwrap().state, TaskState::Running);
+        // the rebuild carries the human flag and its CHECK across
+        assert!(store.task(5).unwrap().human);
+        assert!(!store.task(1).unwrap().human);
+        let junk = store
+            .conn
+            .execute("UPDATE tasks SET human = 2 WHERE id = 5", []);
+        assert!(junk.is_err(), "the CHECK must reject values outside 0/1");
     }
 
     /// A project + running task to hang sessions off of.
@@ -1622,10 +1661,10 @@ mod tests {
         );
     }
 
-    /// A task can be `running` with no live session — started by hand, or a
-    /// task whose session ended without reporting (reconcile leaves it running,
-    /// §8). The running strip must still surface it (DESIGN.md §9), with no
-    /// session id or agent and elapsed measured from when it entered `running`.
+    /// A task can be `running` with no live session — started by hand, so no
+    /// session was ever opened. The running strip must still surface it
+    /// (DESIGN.md §9), with no session id or agent and elapsed measured from
+    /// when it entered `running`.
     #[test]
     fn running_rows_include_running_task_without_live_session() {
         let mut s = Store::open_in_memory().unwrap();

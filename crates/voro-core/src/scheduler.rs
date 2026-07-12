@@ -27,14 +27,15 @@ pub struct ScoreBreakdown {
 
 /// A static per-state weight folded into the priority term (§7). It ranks the
 /// human-attention states above plain startable work so agents stall as little
-/// as possible: `needs-input` blocks an idle agent, so it outweighs `review`,
-/// which only blocks a finished task; `ready` and `proposed` earn nothing —
-/// startable work rides its own priority and an untriaged proposal is trusted
-/// with nothing but the ties its score already deserves.
+/// as possible: `needs-input` blocks an idle agent, so it outweighs `review`
+/// and `stalled`, which only block a finished task from closing and a dead
+/// dispatch from restarting; `ready` and `proposed` earn nothing — startable
+/// work rides its own priority and an untriaged proposal is trusted with
+/// nothing but the ties its score already deserves.
 pub fn state_bonus(state: TaskState) -> f64 {
     match state {
         TaskState::NeedsInput => 4.0,
-        TaskState::Review => 2.0,
+        TaskState::Review | TaskState::Stalled => 2.0,
         _ => 0.0,
     }
 }
@@ -73,10 +74,11 @@ pub const QUEUE_MAX_ROWS: usize = 10;
 
 /// The next-action queue (§1): the `QUEUE_MAX_ROWS` highest-scoring tasks
 /// across every actionable state, in one list ordered by score. Each row is an
-/// action — answer, review, triage, or start; the human picks from the top,
-/// the score does not dictate. The cap is uniform: `needs-input`, `review`,
-/// `proposed`, and `ready` all compete for the same slots on score alone, so a
-/// low-scoring row of any state can fall below the cut (§7).
+/// action — answer, review, redispatch, triage, or start; the human picks from
+/// the top, the score does not dictate. The cap is uniform: `needs-input`,
+/// `review`, `stalled`, `proposed`, and `ready` all compete for the same slots
+/// on score alone, so a low-scoring row of any state can fall below the cut
+/// (§7).
 pub fn queue(candidates: &[Candidate]) -> Vec<&Candidate> {
     let mut items: Vec<&Candidate> = candidates.iter().collect();
     items.sort_by(|a, b| rank(a, b));
@@ -85,7 +87,9 @@ pub fn queue(candidates: &[Candidate]) -> Vec<&Candidate> {
 }
 
 /// The single highest-scoring `ready` task — what `voro next` hands an
-/// agent asking for work.
+/// agent asking for work. Deliberately `ready`-only: a `stalled` task needs
+/// redispatching with its prior session's context, not handing to an agent
+/// asking for fresh work (§7).
 pub fn focus(candidates: &[Candidate]) -> Option<&Candidate> {
     candidates
         .iter()
@@ -112,8 +116,9 @@ fn state_rank(state: TaskState) -> u8 {
     match state {
         TaskState::NeedsInput => 0,
         TaskState::Review => 1,
-        TaskState::Ready => 2,
-        _ => 3,
+        TaskState::Stalled => 2,
+        TaskState::Ready => 3,
+        _ => 4,
     }
 }
 
@@ -127,7 +132,8 @@ impl Store {
                     t.human, p.name, p.weight,
                     julianday('now') - julianday(t.state_since)
              FROM tasks t JOIN projects p ON p.id = t.project_id
-             WHERE p.weight > 0 AND t.state IN ('ready','needs-input','review','proposed')",
+             WHERE p.weight > 0
+               AND t.state IN ('ready','needs-input','review','stalled','proposed')",
         )?;
         let rows = stmt.query_map([], |row| {
             let task = task_from_row(row)?;
@@ -184,6 +190,7 @@ impl Store {
                 TaskState::Running => counts.running = n,
                 TaskState::NeedsInput => counts.needs_input = n,
                 TaskState::Review => counts.review = n,
+                TaskState::Stalled => counts.stalled = n,
                 TaskState::Done => counts.done = n,
                 TaskState::Parked | TaskState::Rejected => {}
             }
@@ -202,6 +209,7 @@ pub struct StateCounts {
     pub running: i64,
     pub needs_input: i64,
     pub review: i64,
+    pub stalled: i64,
     pub done: i64,
 }
 
@@ -303,6 +311,11 @@ mod tests {
     fn to_review(s: &mut Store, id: i64) {
         s.apply(id, crate::Action::Start).unwrap();
         s.apply(id, crate::Action::Complete(None)).unwrap();
+    }
+
+    fn to_stalled(s: &mut Store, id: i64) {
+        let (_, session) = s.record_dispatch(id, "claude", Some(1), None).unwrap();
+        s.reconcile_session(session.id, false, false).unwrap();
     }
 
     fn add_proposed(s: &mut Store, project_id: i64, title: &str, priority: Priority) -> i64 {
@@ -427,6 +440,50 @@ mod tests {
     }
 
     #[test]
+    fn a_stalled_task_scores_the_review_bonus_and_competes_in_the_queue() {
+        // stalled earns +2, the same as review (§7): a dead dispatch blocks no
+        // live agent context but wants redispatching the moment quota resets.
+        assert_eq!(state_bonus(TaskState::Stalled), 2.0);
+        assert_eq!(score(3, Priority::P2, TaskState::Stalled, 0.0).base, 12.0);
+
+        // A stalled P2 (3×(2+2) = 12) ties a ready P1 (3×4 = 12) exactly; the
+        // state precedence slots stalled after review, before ready.
+        let mut s = setup();
+        let p = add_project(&mut s, "p", 3);
+        let ready = add_task(&mut s, p, "ready", Priority::P1);
+        let stalled = add_task(&mut s, p, "stalled", Priority::P2);
+        to_stalled(&mut s, stalled);
+        s.conn
+            .execute(
+                "UPDATE tasks SET state_since = '2020-01-01 00:00:00' WHERE id IN (?1, ?2)",
+                (ready, stalled),
+            )
+            .unwrap();
+
+        let candidates = s.candidates().unwrap();
+        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
+        assert_eq!(ids, vec![stalled, ready]);
+    }
+
+    #[test]
+    fn focus_never_hands_out_a_stalled_task() {
+        // `voro next` answers with fresh startable work only: a stalled task
+        // needs redispatching with prior session context, so even one that
+        // outscores every ready task stays out of focus() while still leading
+        // the queue.
+        let mut s = setup();
+        let p = add_project(&mut s, "p", 3);
+        let stalled = add_task(&mut s, p, "stalled", Priority::P0);
+        to_stalled(&mut s, stalled);
+        let ready = add_task(&mut s, p, "ready", Priority::P3);
+
+        let candidates = s.candidates().unwrap();
+        assert_eq!(focus(&candidates).unwrap().task.id, ready);
+        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
+        assert_eq!(ids, vec![stalled, ready]);
+    }
+
+    #[test]
     fn state_precedence_still_breaks_genuinely_equal_totals() {
         // Contrived so the folded scores collide: needs-input 3×(1+4) = 15,
         // review 5×(1+2) = 15. With ages pinned equal the totals tie exactly,
@@ -531,6 +588,8 @@ mod tests {
         let reviewed = add_task(&mut s, active, "in review", Priority::P2);
         s.apply(reviewed, crate::Action::Start).unwrap();
         s.apply(reviewed, crate::Action::Complete(None)).unwrap();
+        let stalled = add_task(&mut s, active, "died mid-run", Priority::P2);
+        to_stalled(&mut s, stalled);
 
         // Everything in a parked (weight-0) project stays out of the tally.
         add_task(&mut s, parked, "hidden ready", Priority::P2);
@@ -550,6 +609,7 @@ mod tests {
         assert_eq!(c.proposed, 1);
         assert_eq!(c.needs_input, 1);
         assert_eq!(c.review, 1);
+        assert_eq!(c.stalled, 1);
         assert_eq!(c.running, 0);
         assert_eq!(c.done, 0);
         // proposed_count is the same guard-rail number the counts expose.

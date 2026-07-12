@@ -178,23 +178,20 @@ pub struct App {
     pub projects: Vec<Project>,
     pub queue: Vec<Candidate>,
     /// The cockpit's running strip (DESIGN.md §9): one row per `running` task
-    /// with its open session if any, so a task started by hand or one whose
-    /// session ended without reporting (reconcile leaves it running, §8) is
-    /// still visible. Filtered on task state, so `review`/`needs-input` tasks —
-    /// whose session stays open behind the scenes — stay in the queue, not here.
+    /// with its open session if any, so a task started by hand (no session at
+    /// all) is still visible. Filtered on task state, so `review`/`needs-input`
+    /// tasks — whose session stays open behind the scenes — stay in the queue,
+    /// not here; a dispatch that died is stalled by reconcile (§8) and belongs
+    /// to the queue too.
     pub running: Vec<RunningRow>,
     /// Task counts by state (DESIGN.md §12), rendered as the persistent header
     /// indicator so the triage backlog and the other queues stay felt even
     /// when a low-scoring row falls past the queue's uniform cap (§7).
     pub counts: StateCounts,
     pub all: Vec<TaskRow>,
-    /// Ready tasks whose most recent session ended `failed` or `capped`
-    /// (DESIGN.md §8) — read fresh from session history on every refresh,
-    /// never stored on the task itself.
-    pub redispatch: std::collections::HashSet<i64>,
     /// Review tasks carrying only one of a branch and a summary (DESIGN.md §8):
     /// the half-finished done report a dispatched session left behind, which a
-    /// PR cannot be opened from. Re-derived per refresh like `redispatch`.
+    /// PR cannot be opened from. Re-derived per refresh, never stored.
     pub incomplete_report: std::collections::HashSet<i64>,
 
     pub cockpit_rows: Vec<CockpitRow>,
@@ -232,11 +229,12 @@ fn browse_order(state: TaskState) -> u8 {
         TaskState::Proposed => 0,
         TaskState::NeedsInput => 1,
         TaskState::Review => 2,
-        TaskState::Ready => 3,
-        TaskState::Running => 4,
-        TaskState::Parked => 5,
-        TaskState::Done => 6,
-        TaskState::Rejected => 7,
+        TaskState::Stalled => 3,
+        TaskState::Ready => 4,
+        TaskState::Running => 5,
+        TaskState::Parked => 6,
+        TaskState::Done => 7,
+        TaskState::Rejected => 8,
     }
 }
 
@@ -253,7 +251,6 @@ impl App {
             running: Vec::new(),
             counts: StateCounts::default(),
             all: Vec::new(),
-            redispatch: std::collections::HashSet::new(),
             incomplete_report: std::collections::HashSet::new(),
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
@@ -327,16 +324,6 @@ impl App {
             })
             .collect();
         all.sort_by_key(|r| (browse_order(r.task.state), r.task.id));
-        self.redispatch = all
-            .iter()
-            .filter(|r| r.task.state == TaskState::Ready)
-            .filter_map(|r| {
-                self.store
-                    .redispatch_flag(r.task.id)
-                    .ok()?
-                    .then_some(r.task.id)
-            })
-            .collect();
         self.incomplete_report = all
             .iter()
             .filter(|r| r.task.state == TaskState::Review)
@@ -651,12 +638,12 @@ impl App {
                 self.scroll_detail(-DETAIL_PAGE_STEP)
             }
             KeyCode::Char('d') => {
-                if let Some((task_id, _)) = self.ready_selected_task() {
+                if let Some((task_id, _)) = self.dispatchable_selected_task() {
                     self.dispatch_task(task_id, None);
                 }
             }
             KeyCode::Char('D') => {
-                if let Some((task_id, agent)) = self.ready_selected_task() {
+                if let Some((task_id, agent)) = self.dispatchable_selected_task() {
                     self.open_agent_picker(task_id, agent);
                 }
             }
@@ -668,12 +655,11 @@ impl App {
     }
 
     /// Jump into the selected task's agent session (task #75): `attach` for a
-    /// running task, `resume` for a review or redispatch-flagged one. The
-    /// actual run happens in main() via `pending_attach`, with the TUI torn
-    /// down around it — attach/resume are full-screen interactive. Every
-    /// missing piece (state, session, captured ref, verb) reports through the
-    /// status line, the same "no-op with an explanation" style the dispatch
-    /// keys use.
+    /// running task, `resume` for a review or stalled one. The actual run
+    /// happens in main() via `pending_attach`, with the TUI torn down around
+    /// it — attach/resume are full-screen interactive. Every missing piece
+    /// (state, session, captured ref, verb) reports through the status line,
+    /// the same "no-op with an explanation" style the dispatch keys use.
     fn jump_into_session(&mut self) {
         let (task_id, state, project_id) = match self.selected_task() {
             Some(task) => (task.id, task.state, task.project_id),
@@ -681,12 +667,11 @@ impl App {
         };
         let attach = match state {
             TaskState::Running => true,
-            TaskState::Review => false,
-            TaskState::Ready if self.redispatch.contains(&task_id) => false,
+            TaskState::Review | TaskState::Stalled => false,
             _ => {
                 self.status = Some(format!(
                     "task is {state} — jump-in works on running, review, or \
-                     redispatch-flagged tasks"
+                     stalled tasks"
                 ));
                 return;
             }
@@ -761,18 +746,19 @@ impl App {
     }
 
     /// The selected task's id and agent override, if there is a selection and
-    /// it is `ready` — dispatch's own precondition (DESIGN.md §8). Anything
+    /// it is `ready` or `stalled` — dispatch's own precondition (DESIGN.md §8;
+    /// redispatching a stalled task is the whole point of the state). Anything
     /// else sets a status message and returns `None`, the same "no-op with an
     /// explanation" the transition keybindings (`s`) use for a state with
     /// nowhere to go, rather than silently doing nothing.
-    fn ready_selected_task(&mut self) -> Option<(i64, Option<String>)> {
+    fn dispatchable_selected_task(&mut self) -> Option<(i64, Option<String>)> {
         let (id, state, agent) = {
             let task = self.selected_task()?;
             (task.id, task.state, task.agent.clone())
         };
-        if state != TaskState::Ready {
+        if !matches!(state, TaskState::Ready | TaskState::Stalled) {
             self.status = Some(format!(
-                "task is {state} — only ready tasks can be dispatched"
+                "task is {state} — only ready or stalled tasks can be dispatched"
             ));
             return None;
         }
@@ -1964,10 +1950,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }
 
-    /// Dispatch requires `ready` (DESIGN.md §8); on anything else the key
-    /// no-ops with a status message rather than erroring deep inside dispatch
-    /// or silently doing nothing, mirroring how `s` reports a state with
-    /// nowhere to go.
+    /// Dispatch requires `ready` or `stalled` (DESIGN.md §8); on anything else
+    /// the key no-ops with a status message rather than erroring deep inside
+    /// dispatch or silently doing nothing, mirroring how `s` reports a state
+    /// with nowhere to go.
     #[test]
     fn dispatch_key_on_a_non_ready_task_reports_and_does_not_mutate() {
         // `Done` never appears in the cockpit queue at all, so select it on
@@ -1981,7 +1967,7 @@ mod tests {
             app.status
                 .as_deref()
                 .unwrap_or("")
-                .contains("only ready tasks can be dispatched"),
+                .contains("only ready or stalled tasks can be dispatched"),
             "{:?}",
             app.status
         );
@@ -2174,8 +2160,8 @@ mod tests {
     /// Without a captured ref there is nothing to substitute into the verb;
     /// the key explains instead of queuing a broken command. The fixture's
     /// verb-less stub agent also exercises the pid-reconcile path: the dead
-    /// session is finalised but the task is left running (DESIGN.md §8),
-    /// surfaced as an orphaned running row whose jump-in is `attach`.
+    /// session is finalised and the task lands in `stalled` (DESIGN.md §6/§8),
+    /// whose jump-in is `resume`.
     #[test]
     fn attach_key_without_a_captured_ref_reports_and_does_nothing() {
         let (mut store, ctx, project_path) = scratch_env(
@@ -2207,17 +2193,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let mut app = App::new(store, ctx).unwrap();
-        assert_eq!(app.store.task(task.id).unwrap().state, TaskState::Running);
-        // the dead session's task is left running and surfaced as an orphan
-        // (no live session) in the running strip, not auto-flagged for redispatch
-        assert!(!app.redispatch.contains(&task.id));
-        assert!(
-            app.running
-                .iter()
-                .any(|r| r.task_id == task.id && r.session_id.is_none()),
-            "orphaned running row expected: {:?}",
-            app.running
-        );
+        // the dead session's task is stalled by reconcile-on-read, so it
+        // belongs to the queue, not the running strip
+        assert_eq!(app.store.task(task.id).unwrap().state, TaskState::Stalled);
+        assert!(app.running.is_empty(), "{:?}", app.running);
         app.toggle_screen();
         key(&mut app, KeyCode::Char('a'));
 
@@ -2236,7 +2215,7 @@ mod tests {
 
     /// States with no session to jump into no-op with an explanation.
     #[test]
-    fn attach_key_on_an_unflagged_ready_task_reports_the_states_that_work() {
+    fn attach_key_on_a_ready_task_reports_the_states_that_work() {
         let mut app = app_with(&[TaskState::Ready]);
         key(&mut app, KeyCode::Char('a'));
 
@@ -2406,7 +2385,7 @@ mod tests {
             app.status
                 .as_deref()
                 .unwrap_or("")
-                .contains("only ready tasks can be dispatched"),
+                .contains("only ready or stalled tasks can be dispatched"),
             "{:?}",
             app.status
         );

@@ -1,5 +1,6 @@
 //! The observation half of dispatch (DESIGN.md §8): catching a `running`
-//! task whose backing process has exited without reporting, and finalising a
+//! task whose backing process has exited without reporting — landing it in
+//! `stalled`, the attention state for a dead dispatch — and finalising a
 //! session stranded on a task that has already closed. `voro-core` owns the
 //! reconciliation *decision* (`Store::reconcile_session`) given liveness as a
 //! plain bool; this module supplies that bool — and a best-effort read of
@@ -233,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_pid_finalises_the_session_and_leaves_the_task_running() {
+    fn a_dead_pid_finalises_the_session_and_stalls_the_task() {
         let (mut s, task_id) = running_task();
         // spawn and reap a child so its pid is guaranteed to no longer exist
         let mut child = Command::new("true").stdout(Stdio::null()).spawn().unwrap();
@@ -245,15 +246,14 @@ mod tests {
             .create_session(task_id, "manual", Some(dead_pid), None)
             .unwrap();
 
-        // the session is finalised, but the task is not auto-requeued
-        // (DESIGN.md §8): it stays running, surfaced as an orphaned running row.
+        // the session is finalised and the task lands in `stalled` (DESIGN.md
+        // §6/§8), the attention state that puts redispatch in the queue.
         assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 1);
-        assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
         assert_eq!(
             s.session(session.id).unwrap().outcome,
             Some(SessionOutcome::Failed)
         );
-        assert!(!s.redispatch_flag(task_id).unwrap());
     }
 
     #[test]
@@ -370,11 +370,11 @@ mod tests {
 
     /// The session left its agent's listing without any return-path verb: it
     /// shows up `state: done` (or drops out entirely). The reconciler finalises
-    /// the session but must *not* auto-requeue the task — a vanished session is
-    /// indistinguishable from a completion whose `voro done` has not landed yet
-    /// (DESIGN.md §8), so the task is left running for the human to handle.
+    /// the session and stalls the task (DESIGN.md §6/§8) — an attention state,
+    /// so even the rare misfire (a completion whose `voro done` has not landed)
+    /// surfaces in the queue instead of being silently requeued.
     #[test]
-    fn a_finished_or_missing_listed_session_is_left_running() {
+    fn a_finished_or_missing_listed_session_stalls_the_task() {
         for (name, listing) in [
             (
                 "done",
@@ -395,13 +395,12 @@ mod tests {
                 1,
                 "{name}"
             );
-            assert_eq!(s.task(task_id).unwrap().state, TaskState::Running, "{name}");
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled, "{name}");
             assert_eq!(
                 s.session(session.id).unwrap().outcome,
                 Some(SessionOutcome::Failed),
                 "{name}"
             );
-            assert!(!s.redispatch_flag(task_id).unwrap(), "{name}");
 
             let _ = std::fs::remove_dir_all(&dir);
         }
