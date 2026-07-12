@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use voro_core::{Event, ScoreBreakdown, StateCounts, TaskState};
+use voro_core::{DepKind, DepRef, Event, ScoreBreakdown, StateCounts, TaskState};
 
 use crate::app::{App, CockpitRow, Mode, Screen, TaskRow};
 
@@ -205,6 +205,10 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             if let Some(branch) = &t.branch {
                 lines.push(Line::from(branch_span(branch)));
             }
+            lines.extend(dep_lines(
+                app.deps.get(task_id).map_or(&[][..], |v| v),
+                app.dependents.get(task_id).map_or(&[][..], |v| v),
+            ));
             if app.show_score
                 && let Some(b) = app.score_breakdown(*task_id)
             {
@@ -573,6 +577,10 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(branch) = &task.branch {
         lines.push(Line::from(branch_span(branch)));
     }
+    lines.extend(dep_lines(
+        app.deps.get(&task.id).map_or(&[][..], |v| v),
+        app.dependents.get(&task.id).map_or(&[][..], |v| v),
+    ));
     if app.show_score
         && let Some(b) = app.score_breakdown(task.id)
     {
@@ -710,6 +718,34 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
         .highlight_style(SELECTED);
     frame.render_stateful_widget(list, list_area, &mut state);
     draw_status(frame, app, status);
+}
+
+/// The dependency section of a detail view (task #103), both directions, one
+/// line per edge: `blocked by #N title` for the task's own blockers,
+/// `blocks #N title` for the reverse edges — the tasks this one holds back —
+/// and other forward kinds by name (`discovered-from #N title`). Closed
+/// tasks are dimmed, the browser suffix convention of `blocker_spans`.
+fn dep_lines(deps: &[DepRef], dependents: &[DepRef]) -> Vec<Line<'static>> {
+    let blocked_by = deps.iter().filter(|d| d.kind == DepKind::Blocks);
+    let blocks = dependents.iter().filter(|d| d.kind == DepKind::Blocks);
+    let other = deps.iter().filter(|d| d.kind != DepKind::Blocks);
+    blocked_by
+        .map(|d| dep_line("blocked by", d))
+        .chain(blocks.map(|d| dep_line("blocks", d)))
+        .chain(other.map(|d| dep_line(d.kind.as_str(), d)))
+        .collect()
+}
+
+fn dep_line(label: &str, d: &DepRef) -> Line<'static> {
+    let target = if d.is_open() {
+        Style::new()
+    } else {
+        Style::new().dim()
+    };
+    Line::from(vec![
+        Span::styled(format!("{label} "), Style::new().dim()),
+        Span::styled(format!("{} {}", task_ref(d.id).trim(), d.title), target),
+    ])
 }
 
 /// The `blocked by #4, #7` suffix for a parked browser row: what it is waiting
@@ -1086,6 +1122,136 @@ mod tests {
             rendered.contains("History") && rendered.contains("created"),
             "history should fold into the detail pane: {rendered}"
         );
+    }
+
+    /// The dependency section lists the task's own blockers first, then the
+    /// reverse edges it holds back, then other kinds by name — closed tasks
+    /// dimmed, open ones plain — and reverse edges of non-blocks kinds (which
+    /// would read in the wrong direction) not at all.
+    #[test]
+    fn dep_lines_render_both_directions_with_closed_targets_dimmed() {
+        use voro_core::{DepKind, DepRef};
+
+        let dep = |id: i64, kind, state| DepRef {
+            id,
+            title: format!("t{id}"),
+            state,
+            kind,
+        };
+        let deps = vec![
+            dep(4, DepKind::Blocks, TaskState::Done),
+            dep(6, DepKind::DiscoveredFrom, TaskState::Ready),
+        ];
+        let dependents = vec![
+            dep(9, DepKind::Blocks, TaskState::Ready),
+            dep(11, DepKind::Related, TaskState::Ready),
+        ];
+
+        let lines = dep_lines(&deps, &dependents);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(
+            text,
+            vec!["blocked by #4 t4", "blocks #9 t9", "discovered-from #6 t6"]
+        );
+
+        let closed = &lines[0].spans[1];
+        assert!(closed.style.add_modifier.contains(Modifier::DIM));
+        let open = &lines[1].spans[1];
+        assert!(!open.style.add_modifier.contains(Modifier::DIM));
+
+        assert!(dep_lines(&[], &[]).is_empty());
+    }
+
+    /// End-to-end: a task with dependencies in both directions renders them in
+    /// the cockpit detail pane and in the tasks-screen Detail popup — blockers,
+    /// the task it blocks, and its discovered-from source, each with its title.
+    #[test]
+    fn detail_views_show_dependencies_in_both_directions() {
+        use crate::app::{App, Mode};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        use voro_core::{Action, DepKind, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let new = |title: &str, priority| NewTask {
+            project_id: p.id,
+            title: title.into(),
+            body: String::new(),
+            priority,
+            state: TaskState::Ready,
+            agent: None,
+            human: false,
+        };
+        let closed = store
+            .create_task(new("closed blocker", Priority::P2))
+            .unwrap();
+        store.apply(closed.id, Action::Start).unwrap();
+        store.apply(closed.id, Action::Complete(None)).unwrap();
+        store.apply(closed.id, Action::Accept).unwrap();
+        let source = store.create_task(new("source", Priority::P2)).unwrap();
+        // P1 puts the target at the top of the queue, so the cockpit detail
+        // pane shows it without moving the selection.
+        let target = store.create_task(new("target", Priority::P1)).unwrap();
+        let waiting = store.create_task(new("waiting", Priority::P2)).unwrap();
+        store
+            .add_dep(target.id, closed.id, DepKind::Blocks)
+            .unwrap();
+        store
+            .add_dep(target.id, source.id, DepKind::DiscoveredFrom)
+            .unwrap();
+        store
+            .add_dep(waiting.id, target.id, DepKind::Blocks)
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        let render = |app: &App, terminal: &mut Terminal<TestBackend>| -> String {
+            terminal.draw(|f| draw(f, app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        let blocked_by = format!("blocked by #{} closed blocker", closed.id);
+        let blocks = format!("blocks #{} waiting", waiting.id);
+        let discovered = format!("discovered-from #{} source", source.id);
+
+        let cockpit = render(&app, &mut terminal);
+        for needle in [&blocked_by, &blocks, &discovered] {
+            assert!(
+                cockpit.contains(needle.as_str()),
+                "cockpit detail pane should show '{needle}': {cockpit}"
+            );
+        }
+
+        // The same lines in the tasks-screen Detail popup, on the target row.
+        app.on_key(KeyEvent::from(KeyCode::Char('2')));
+        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(app.mode, Mode::Detail { task_id, .. } if task_id == target.id),
+            "expected the Detail popup on the target task"
+        );
+        let popup = render(&app, &mut terminal);
+        for needle in [&blocked_by, &blocks, &discovered] {
+            assert!(
+                popup.contains(needle.as_str()),
+                "Detail popup should show '{needle}': {popup}"
+            );
+        }
     }
 
     /// End-to-end: a body taller than the focus card overflows, so the pane
