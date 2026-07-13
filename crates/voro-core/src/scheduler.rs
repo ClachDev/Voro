@@ -1,14 +1,12 @@
 //! The scheduler (DESIGN.md §7): pure scoring and the ordering of the two
 //! views. The store supplies candidates (with `age_days` already computed);
-//! everything in this module is deterministic arithmetic on those rows, so it
-//! is trivially testable and identical beneath every interface.
+//! everything here is deterministic arithmetic on those rows.
 
 use crate::error::Result;
 use crate::model::{Priority, Task, TaskState};
 use crate::store::{Store, task_from_row};
 
-/// The score decomposition — every term visible so the number can be
-/// distrusted productively (§7, §12).
+/// The score decomposition — every term visible (§7, §12).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScoreBreakdown {
     pub weight: i64,
@@ -25,13 +23,10 @@ pub struct ScoreBreakdown {
     pub total: f64,
 }
 
-/// A static per-state weight folded into the priority term (§7). It ranks the
-/// human-attention states above plain startable work so agents stall as little
-/// as possible: `needs-input` blocks an idle agent, so it outweighs `review`
-/// and `stalled`, which only block a finished task from closing and a dead
-/// dispatch from restarting; `ready` and `proposed` earn nothing — startable
-/// work rides its own priority and an untriaged proposal is trusted with
-/// nothing but the ties its score already deserves.
+/// A static per-state weight folded into the priority term (§7), ranking
+/// human-attention states above plain startable work: `needs-input` (blocks an
+/// idle agent) outweighs `review` and `stalled`; `ready` and `proposed` earn
+/// nothing.
 pub fn state_bonus(state: TaskState) -> f64 {
     match state {
         TaskState::NeedsInput => 4.0,
@@ -66,19 +61,16 @@ pub struct Candidate {
     pub score: ScoreBreakdown,
 }
 
-/// How many rows the queue offers: enough to keep the autonomy to pick around
-/// the top item, few enough that the queue stays an answer rather than the
-/// whole backlog — the browser holds the rest. A single cap across every
-/// state, since each row is one next action competing on the same score (§7).
+/// How many rows the queue offers: enough to pick around the top item, few
+/// enough that the queue stays an answer rather than the whole backlog. A single
+/// cap across every state, since each row is one next action on the same score
+/// (§7).
 pub const QUEUE_MAX_ROWS: usize = 10;
 
 /// The next-action queue (§1): the `QUEUE_MAX_ROWS` highest-scoring tasks
-/// across every actionable state, in one list ordered by score. Each row is an
-/// action — answer, review, redispatch, triage, or start; the human picks from
-/// the top, the score does not dictate. The cap is uniform: `needs-input`,
-/// `review`, `stalled`, `proposed`, and `ready` all compete for the same slots
-/// on score alone, so a low-scoring row of any state can fall below the cut
-/// (§7).
+/// across every actionable state, in one list ordered by score. The cap is
+/// uniform — every state competes for the same slots on score alone, so a
+/// low-scoring row of any state can fall below the cut (§7).
 pub fn queue(candidates: &[Candidate]) -> Vec<&Candidate> {
     let mut items: Vec<&Candidate> = candidates.iter().collect();
     items.sort_by(|a, b| rank(a, b));
@@ -86,10 +78,9 @@ pub fn queue(candidates: &[Candidate]) -> Vec<&Candidate> {
     items
 }
 
-/// The single highest-scoring `ready` task — what `voro next` hands an
-/// agent asking for work. Deliberately `ready`-only: a `stalled` task needs
-/// redispatching with its prior session's context, not handing to an agent
-/// asking for fresh work (§7).
+/// The single highest-scoring `ready` task — what `voro next` hands an agent
+/// asking for work. Deliberately `ready`-only: a `stalled` task needs
+/// redispatching with its prior session's context, not fresh work (§7).
 pub fn focus(candidates: &[Candidate]) -> Option<&Candidate> {
     candidates
         .iter()
@@ -98,10 +89,9 @@ pub fn focus(candidates: &[Candidate]) -> Option<&Candidate> {
 }
 
 /// Total order for views: score desc. Score already folds in the per-state
-/// bonus (§7), so state usually settles itself; the `state_rank` tiebreak
-/// only decides genuinely equal totals, where an unanswered question still
-/// outranks a finished diff, startable work, then an untriaged proposal (§6).
-/// Priority, older `state_since`, and id tail it so the order is deterministic.
+/// bonus (§7), so the `state_rank` tiebreak only decides genuinely equal totals,
+/// where an unanswered question outranks a finished diff, startable work, then
+/// an untriaged proposal (§6). Priority, older `state_since`, then id tail it.
 fn rank(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     b.score
         .total
@@ -171,10 +161,9 @@ impl Store {
         Ok(self.state_counts()?.proposed)
     }
 
-    /// Task counts by state for the header indicator (DESIGN.md §12), so the
-    /// triage backlog and the other queues stay felt even when a low-scoring
-    /// row falls past the queue's uniform cap (§7). Parked (weight-0) projects
-    /// are excluded, matching what the queue and browser show.
+    /// Task counts by state for the header indicator (DESIGN.md §12), so a
+    /// backlog stays felt even when a low-scoring row falls past the queue's
+    /// cap (§7). Parked (weight-0) projects are excluded.
     pub fn state_counts(&self) -> Result<StateCounts> {
         let mut stmt = self.conn.prepare(
             "SELECT t.state, COUNT(*) FROM tasks t JOIN projects p ON p.id = t.project_id
@@ -200,8 +189,7 @@ impl Store {
 }
 
 /// Task counts by state, for the persistent header indicator (DESIGN.md §12).
-/// Parked and rejected tasks earn no field — the first is snoozed, the second
-/// closed — so the struct carries only the states worth a running tally.
+/// Parked and rejected tasks earn no field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StateCounts {
     pub proposed: i64,
@@ -372,15 +360,12 @@ mod tests {
 
         let candidates = s.candidates().unwrap();
         let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
-        // score folds in the state bonus, so the P2 question outranks the P1
-        // ready task despite a lower raw priority
+        // the state bonus lifts the P2 question over the P1 ready task
         assert_eq!(ids, vec![diff, question, ready, proposed, small]);
     }
 
     #[test]
     fn queue_caps_at_the_highest_scoring_rows() {
-        // More candidates than the cap: the queue keeps the QUEUE_MAX_ROWS
-        // highest-scoring and drops the rest, regardless of state.
         let mut s = setup();
         let p = add_project(&mut s, "p", 3);
         let tasks: Vec<i64> = (0..QUEUE_MAX_ROWS + 4)
@@ -425,8 +410,7 @@ mod tests {
 
     #[test]
     fn state_bonus_lifts_a_question_over_an_equal_priority_review() {
-        // Same weight and priority: the +4 needs-input bonus outscores the +2
-        // review bonus outright — no longer a tie broken by precedence.
+        // Same weight and priority: the +4 needs-input bonus outscores the +2 review.
         let mut s = setup();
         let p = add_project(&mut s, "p", 3);
         let diff = add_task(&mut s, p, "diff", Priority::P1); // 3×(4+2) = 18
@@ -441,8 +425,7 @@ mod tests {
 
     #[test]
     fn a_stalled_task_scores_the_review_bonus_and_competes_in_the_queue() {
-        // stalled earns +2, the same as review (§7): a dead dispatch blocks no
-        // live agent context but wants redispatching the moment quota resets.
+        // stalled earns +2, the same as review (§7).
         assert_eq!(state_bonus(TaskState::Stalled), 2.0);
         assert_eq!(score(3, Priority::P2, TaskState::Stalled, 0.0).base, 12.0);
 
@@ -467,10 +450,9 @@ mod tests {
 
     #[test]
     fn focus_never_hands_out_a_stalled_task() {
-        // `voro next` answers with fresh startable work only: a stalled task
-        // needs redispatching with prior session context, so even one that
-        // outscores every ready task stays out of focus() while still leading
-        // the queue.
+        // `voro next` answers with fresh startable work only, so even a stalled
+        // task that outscores every ready task stays out of focus() while
+        // still leading the queue.
         let mut s = setup();
         let p = add_project(&mut s, "p", 3);
         let stalled = add_task(&mut s, p, "stalled", Priority::P0);

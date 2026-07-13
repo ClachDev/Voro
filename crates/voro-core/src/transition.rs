@@ -35,9 +35,8 @@ pub enum Action {
     /// needs-input → running; the answer is appended to the body and logged
     Answer(String),
     /// running | stalled → review; the optional string is the completion
-    /// summary, logged as a `summary` event so review starts from it. From
-    /// `stalled` it reports a dead session's finished work on its behalf
-    /// (DESIGN.md §8) — the session is already closed, so only the state moves.
+    /// summary, logged as a `summary` event. From `stalled` it reports a dead
+    /// session's finished work on its behalf (DESIGN.md §8).
     Complete(Option<String>),
     /// review → done
     Accept,
@@ -72,14 +71,12 @@ impl Action {
 }
 
 impl Store {
-    /// Legal target of `action` from `state`, if any. Exposed so interfaces
-    /// can offer exactly the legal actions without duplicating the machine.
-    /// Order matters: interfaces render these as menus with the first entry
-    /// selected, so the most common action leads — for triage that is
-    /// `ready`, since `parked` means blocked or deliberately parked.
-    /// `human` shortens the running path (DESIGN.md §6): a human task cannot
-    /// `ask` — its executor cannot be blocked on their own decision — and its
-    /// completion leads, since it goes straight to `done` with no review.
+    /// Legal target of `action` from `state`, if any. Exposed so interfaces can
+    /// offer exactly the legal actions without duplicating the machine. Order
+    /// matters: interfaces render the first entry selected, so the most common
+    /// action leads (for triage, `ready`). `human` shortens the running path
+    /// (DESIGN.md §6): no `ask`, and completion leads since it goes straight to
+    /// `done`.
     pub fn legal_actions(state: TaskState, human: bool) -> Vec<Action> {
         use TaskState::*;
         match state {
@@ -120,11 +117,9 @@ impl Store {
     }
 
     /// Dispatch's atomic write (DESIGN.md §8): move the task `ready → running`
-    /// (or `stalled → running` — redispatch is the whole point of that state)
-    /// and open its session in one transaction, so a running task always has a
-    /// session and a session always has a running task. The state change goes
-    /// through the same machine as [`apply`](Store::apply); spawning the process
-    /// is the caller's job and happens before this commits.
+    /// (or `stalled → running`) and open its session in one transaction, so a
+    /// running task always has a session and a session always has a running
+    /// task. Spawning the process is the caller's job, before this commits.
     pub fn record_dispatch(
         &mut self,
         task_id: i64,
@@ -141,15 +136,12 @@ impl Store {
     }
 
     /// Record a continuation session (DESIGN.md §6/§8): the answer to a
-    /// `needs-input` question is fed back to the work not by writing to a live
-    /// pipe — the asking session has typically already exited — but by
-    /// dispatching a fresh session whose prompt is the task body, now carrying
-    /// the `## Answers` section `apply`'s `Answer` action just appended.
-    /// Unlike [`record_dispatch`](Store::record_dispatch), which performs the
-    /// `ready → running` transition itself, continuation asserts the task is
-    /// *already* `running` — `answer` puts it there — so this never weakens
-    /// the ready-only rule normal dispatch enforces; it only ever adds a
-    /// session to a task that reached `running` through the transition API.
+    /// `needs-input` question is fed back not through a live pipe but by
+    /// dispatching a fresh session over the task body, now carrying the appended
+    /// `## Answers` section. Unlike [`record_dispatch`](Store::record_dispatch),
+    /// this asserts the task is *already* `running`, so it never weakens the
+    /// ready-only rule — it only adds a session to a task the transition API
+    /// already moved.
     pub fn record_continuation(
         &mut self,
         task_id: i64,
@@ -171,43 +163,26 @@ impl Store {
         Ok((self.task(task_id)?, self.session(session_id)?))
     }
 
-    /// Reconcile an open session against its task's state (DESIGN.md §8, the
-    /// observation half of dispatch). The session's life now follows the task,
-    /// not the agent's process listing, so reconciliation is no longer what
-    /// closes healthy sessions — the terminal transitions do that. It keeps
-    /// only the one job it is good at (detecting a crash or cap mid-`running`)
-    /// plus finalising a session left stranded on a task that has already
-    /// closed. `pid_alive` and `likely_capped` are supplied by the caller —
-    /// voro-core stays free of process and log I/O — and only matter for a
-    /// `running` task:
+    /// Reconcile an open session against its task's state (DESIGN.md §8). The
+    /// session's life follows the task, not the process listing, so the terminal
+    /// transitions close healthy sessions; reconciliation only catches a crash
+    /// or cap mid-`running` and finalises sessions stranded on already-closed
+    /// tasks. `pid_alive`/`likely_capped` are supplied by the caller (voro-core
+    /// does no process or log I/O) and matter only for a `running` task:
     ///
-    /// - the session already ended: no-op (`Ok(None)`), so a caller looping
-    ///   over `live_sessions` repeatedly can't double-finalise one.
-    /// - task `running`, `pid_alive`: still working, left untouched.
-    /// - task `running`, process gone: it ended without calling `done`/`ask`.
-    ///   The outcome is recorded (`capped` if `likely_capped`, else `failed`)
-    ///   and the task lands `running → stalled` (DESIGN.md §6/§8) — the
-    ///   attention state for a dispatch that died, which puts redispatch in
-    ///   the queue with no human abort step in between. A vanished session is
-    ///   still indistinguishable from a completion whose return-path call has
-    ///   not landed, but `stalled` makes that misfire safe where the old
-    ///   automatic `running → ready` bounce was not: a stalled task is an
-    ///   attention row, never handed out by `voro next`, and a late `done`
-    ///   lands it in `review` on the dead session's behalf (DESIGN.md §6/§8)
-    ///   rather than racing a fresh dispatch — redispatch from `stalled` only
-    ///   ever happens by hand. A stalled
-    ///   task with an open blocker is demoted straight to `parked`, exactly
-    ///   as if it had landed `ready`.
-    /// - task `needs-input`/`review`: the session stays open on purpose — it is
-    ///   reused when the answer/feedback continues the work — so reconciliation
-    ///   leaves it alone (`Ok(None)`) regardless of process liveness. It is
-    ///   closed later by the next terminal transition or superseded by a
-    ///   continuation.
-    /// - task already closed (`done`/`rejected`) or otherwise off the active
-    ///   path: the session is stale — the terminal transition should have
-    ///   closed it — so it is finalised now (`completed` for `done`, else
-    ///   `aborted`) with no event. This is what heals a legacy stranded row
-    ///   (e.g. a `done` task still carrying an open session) on the next pass.
+    /// - session already ended: no-op (`Ok(None)`), so a repeated sweep can't
+    ///   double-finalise it.
+    /// - `running`, `pid_alive`: left untouched.
+    /// - `running`, process gone: outcome recorded (`capped`/`failed`) and the
+    ///   task goes `running → stalled` (DESIGN.md §6/§8) — an attention row never
+    ///   handed out by `voro next`; a late `done` lands it in `review` on the
+    ///   dead session's behalf. A stalled task with an open blocker demotes to
+    ///   `parked`.
+    /// - `needs-input`/`review`: the session stays open on purpose (reused by
+    ///   the continuation), so this leaves it alone (`Ok(None)`) regardless of
+    ///   liveness.
+    /// - task already closed or off the active path: the session is stale, so it
+    ///   is finalised now (`completed` for `done`, else `aborted`) with no event.
     pub fn reconcile_session(
         &mut self,
         session_id: i64,
@@ -301,13 +276,11 @@ impl Store {
     }
 
     /// The reverse authoring direction of
-    /// [`set_blocks_deps`](Store::set_blocks_deps): make `blocker_id` a
-    /// blocker of each task in `dependents`. Additive and idempotent — the
-    /// blocker set belongs to each dependent, so replacing it from here would
-    /// silently detach edges other tasks authored. Each dependent's readiness
-    /// is reconciled in the same write; the returned pairs carry the
-    /// dependent's state before that reconciliation so callers can surface a
-    /// demotion.
+    /// [`set_blocks_deps`](Store::set_blocks_deps): make `blocker_id` a blocker
+    /// of each task in `dependents`. Additive and idempotent (replacing the set
+    /// here would detach edges other tasks authored). Each dependent's readiness
+    /// is reconciled in the same write; the returned pairs carry its prior state
+    /// so callers can surface a demotion.
     pub fn block_tasks(
         &mut self,
         blocker_id: i64,
@@ -338,7 +311,7 @@ impl Store {
 
 /// The state machine proper: validate `action` against the task's current
 /// state, restamp `state_since`, maintain the `question`/`closed_at`
-/// invariants, append to the event log, and cascade dependant readiness — all
+/// invariants, append to the event log, and cascade dependant readiness —
 /// against an already-open transaction so callers can bundle further writes
 /// (a session insert, for dispatch) into the same atomic unit.
 fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskState> {
@@ -351,8 +324,7 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         (Proposed, Action::Triage(Triage::Reject)) => Rejected,
         (Ready | Stalled, Action::Start) => Running,
         // A human task cannot be blocked on a decision — the executor *is* the
-        // human (DESIGN.md §6). Verifying its outcome is a downstream
-        // `blocks`-dependent task, not a sub-state of this one.
+        // human (DESIGN.md §6).
         (Running, Action::Ask(_)) if task.human => {
             return Err(Error::HumanTask {
                 id: task_id,
@@ -367,10 +339,8 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         // and acceptor, so there is no one left to accept the work (§6).
         (Running | Stalled, Action::Complete(_)) if task.human => Done,
         // From `stalled`, completion reports a dead session's finished work on
-        // its behalf — the misfire case (§8), where the work landed but its
-        // `done` never did. The session is already closed, so only the state
-        // moves; a redispatch that has since happened makes the task `running`
-        // again and this arm no longer applies.
+        // its behalf — the misfire case (§8). The session is already closed, so
+        // only the state moves.
         (Running | Stalled, Action::Complete(_)) => Review,
         (Review, Action::Accept) => Done,
         (Review, Action::RejectWork(_)) => Running,
@@ -431,20 +401,17 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         _ => {}
     }
 
-    // The session's life follows the task (DESIGN.md §8): the terminal
-    // transitions tear down the running work, so they close the task's open
-    // session in the same transaction. `Accept` completed the work; `Abort`
-    // and `Abandon` threw it away. `Ask`/`Complete`/`Answer`/`RejectWork`
-    // deliberately leave the session open — it is reused across
-    // needs-input/review and superseded by the next continuation.
+    // The session's life follows the task (DESIGN.md §8): terminal transitions
+    // close the task's open session in the same transaction, while
+    // Ask/Complete/Answer/RejectWork deliberately leave it open for reuse across
+    // needs-input/review.
     match &action {
         Action::Accept => {
             close_open_session(tx, task_id, SessionOutcome::Completed)?;
         }
-        // A human task's completion is itself terminal (running → done), so it
-        // owns the teardown `Accept` would otherwise perform. No agent session
-        // should exist on a human task, but the belt-and-braces close keeps
-        // the sessions-follow-the-task rule total.
+        // A human completion is itself terminal (running → done), so it owns the
+        // teardown; the close is belt-and-braces, since no agent session should
+        // exist on a human task.
         Action::Complete(_) if to == TaskState::Done => {
             close_open_session(tx, task_id, SessionOutcome::Completed)?;
         }
@@ -457,9 +424,9 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
     if to.is_terminal() {
         reconcile_dependants(tx, task_id)?;
     } else if to == TaskState::Ready {
-        // `ready` must mean genuinely actionable: a transition landing here
-        // while a blocker is still open (triage, abort, unpark) reconciles
-        // straight back to `parked` so the scheduler never surfaces it.
+        // `ready` must mean genuinely actionable: a transition landing here with
+        // a blocker still open (triage, abort, unpark) reconciles back to
+        // `parked`.
         reconcile_readiness(tx, task_id)?;
     }
 
@@ -1689,8 +1656,8 @@ mod tests {
 
         #[test]
         fn aborting_closes_the_session_so_reconcile_is_a_noop() {
-            // Abort now closes the session itself, in the same transaction, so
-            // by the time reconcile sees it there is nothing left to do.
+            // Abort closes the session itself, in the same transaction, so
+            // reconcile finds nothing left to do.
             let (mut s, p) = store_with_project();
             let (task_id, session_id) = dispatch(&mut s, p);
             s.apply(task_id, Action::Abort).unwrap();
@@ -1710,11 +1677,9 @@ mod tests {
 
         #[test]
         fn a_stale_open_session_on_a_closed_task_is_finalised() {
-            // The session-25/#79 bug: a `done` task still carrying an open
-            // session because the pre-fix reconcile never closed it. The new
-            // logic finalises it on the next pass, without manual SQL. Forcing
-            // the state directly reproduces the legacy stranded row that
-            // `Accept` would otherwise have closed.
+            // A `done` task still carrying an open session (a stranded row):
+            // reconcile finalises it on the next pass. Forcing the state
+            // directly reproduces the row `Accept` would otherwise have closed.
             let (mut s, p) = store_with_project();
             let (task_id, session_id) = dispatch(&mut s, p);
             s.conn
@@ -1747,10 +1712,9 @@ mod tests {
 
         #[test]
         fn redispatch_supersedes_the_prior_session_keeping_one_open() {
-            // dispatch, abort, redispatch: abort now closes the first session
-            // itself, so the redispatch opens the only remaining open row. The
-            // one-open-session invariant holds, and reconciling the old
-            // already-closed session is a no-op that can't knock the task back.
+            // dispatch, abort, redispatch: abort closes the first session, so
+            // the redispatch opens the only remaining open row. The
+            // one-open-session invariant holds.
             let (mut s, p) = store_with_project();
             let (task_id, older_session) = dispatch(&mut s, p);
             s.apply(task_id, Action::Abort).unwrap();

@@ -1,11 +1,8 @@
-//! GitHub issue import (DESIGN.md §10, Milestone C): one-way capture of
-//! issues into tasks. Voro's store stays the source of truth for priority
-//! and state — this module only maps `gh issue list --json ...` output onto
-//! [`NewTask`] and detects issues already captured, so import is idempotent.
-//!
-//! The `gh` shell-out itself is I/O and lives in the `voro` crate, same as
-//! agent dispatch lives outside `voro-core`; everything here is pure enough
-//! to test against canned JSON.
+//! GitHub issue import (DESIGN.md §10): one-way capture of issues into tasks.
+//! Voro's store stays the source of truth for priority and state — this module
+//! only maps `gh issue list --json ...` output onto [`NewTask`] and detects
+//! issues already captured, so import is idempotent. The `gh` shell-out is I/O
+//! and lives in the `voro` crate; everything here is pure.
 
 use serde::Deserialize;
 

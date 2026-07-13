@@ -1,23 +1,15 @@
-//! Agent dispatch templates, per DESIGN.md §5 and §8. Agents are command
-//! templates, not state, so they live outside the database. This module owns
-//! the built-in definitions (`claude`, `codex`), layers the user's
-//! `~/.config/voro/voro.toml` on top, and resolves which agent a task should
-//! be dispatched with — spawning is the dispatcher's job.
+//! Agent dispatch templates (DESIGN.md §5, §8): command templates, not state,
+//! so they live outside the database. Owns the built-in `claude`/`codex`
+//! definitions, layers the user's `~/.config/voro/voro.toml` on top, and
+//! resolves which agent a task dispatches with.
 //!
-//! An agent is a set of verb templates. Only `dispatch` is required (`cmd` is
-//! accepted as an alias, so pre-verb configs load unchanged); the optional
-//! verbs — `sessions`, `attach`, `resume`, `continue` — unlock session-aware
-//! dispatch for agents that have a session layer of their own, and `plan`
-//! unlocks the TUI's interactive planning sessions (DESIGN.md §8). Every one
-//! of them degrades gracefully when absent (docs/agent-integration.md).
-//!
-//! Config is layered: the built-ins ship with the binary and so upgrade with
-//! it, then `voro.toml` is merged on top. A user file may add new agents,
-//! replace a built-in wholesale (whole-agent override, not per-verb), and set
-//! `default_agent` and the viewers (`[viewers.<name>]` tables plus
-//! `default_viewer`, or the single anonymous `[viewer]`). A missing file is
-//! not an error — the built-ins alone are a working config — so a fresh
-//! install with `claude` on PATH can dispatch without authoring any TOML.
+//! An agent is a set of verb templates; only `dispatch` is required (`cmd` is
+//! an accepted alias). The optional `sessions`/`attach`/`resume`/`continue`
+//! verbs unlock session-aware dispatch and `plan` unlocks the TUI's interactive
+//! planning sessions (DESIGN.md §8); each degrades gracefully when absent
+//! (docs/agent-integration.md). Config is layered: built-ins under `voro.toml`,
+//! which may add agents, override a built-in wholesale, and set `default_agent`
+//! and viewers. A missing file is not an error.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,11 +23,9 @@ use crate::error::{Error, Result};
 /// working directory is handled by the spawner, not the template.
 pub const PROMPT_FILE_PLACEHOLDER: &str = "{prompt_file}";
 
-/// The task-id substitution in the `dispatch` template: the numeric id of the
-/// task being dispatched. Unlike [`PROMPT_FILE_PLACEHOLDER`] it is optional —
-/// a template that omits it dispatches unchanged — so agents with a
-/// session-naming flag can tie the session back to its task (e.g.
-/// `--name "voro-{task_id}"`) while agents without one need no change.
+/// The task-id substitution in the `dispatch` template, the numeric id of the
+/// task. Optional — a template that omits it dispatches unchanged — so agents
+/// with a session-naming flag can tie the session back to its task.
 pub const TASK_ID_PLACEHOLDER: &str = "{task_id}";
 
 /// The session-reference substitution in `attach`, `resume`, and `continue`
@@ -43,22 +33,17 @@ pub const TASK_ID_PLACEHOLDER: &str = "{task_id}";
 /// session UUID, a Codex session id, a tmux session name).
 pub const SESSION_PLACEHOLDER: &str = "{session}";
 
-/// The substitution in a viewer command template (DESIGN.md §11a): the
-/// checkout path of the task's project. Optional — a viewer that operates on
-/// the current directory (`git difftool -d`) needs no placeholder, since the
-/// command is run in the project's path regardless.
+/// The substitution in a viewer command template (DESIGN.md §11a): the checkout
+/// path of the task's project. Optional — a viewer that acts on the current
+/// directory (`git difftool -d`) needs no placeholder.
 pub const VIEWER_PATH_PLACEHOLDER: &str = "{path}";
 
 /// The agents Voro ships with the binary, layered under any `voro.toml`
-/// (DESIGN.md §5/§8). Because they compile in, every install gets the current
-/// verb set — the session verbs from #75 — without re-running any init, and a
-/// binary upgrade upgrades the agents. A user `voro.toml` can replace either
-/// wholesale ([`Provenance::UserOverride`]) or leave it as-is.
-///
-/// `claude` launches attachably (`--bg`) in `auto` mode with the full session
-/// verb set and plans interactively in the foreground; `codex` covers the
-/// headless-resume shape. This must parse and pass [`validate_agent`] —
-/// [`builtin_agents`] enforces that at first use and a test exercises it.
+/// (DESIGN.md §5/§8). Compiled in, so a binary upgrade upgrades the agents; a
+/// user `voro.toml` can override either wholesale ([`Provenance::UserOverride`]).
+/// `claude` launches attachably (`--bg`) with the full session verb set and
+/// plans interactively in the foreground; `codex` covers the headless-resume
+/// shape. Must parse and pass [`validate_agent`].
 const BUILTIN_AGENTS: &str = "\
 [agents.claude]
 dispatch = \"claude --bg --name \\\"voro-{task_id}\\\" --permission-mode auto \\\"$(cat {prompt_file})\\\"\"
@@ -77,10 +62,9 @@ continue = \"codex exec resume {session} \\\"$(cat {prompt_file})\\\"\"
 /// configured: the first one both defined and installed wins (DESIGN.md §8).
 const DEFAULT_PROBE_ORDER: [&str; 2] = ["claude", "codex"];
 
-/// The parsed, validated built-in agent templates, layered under a user file
-/// by [`AgentsConfig::load`]. Parsed once; a parse or validation failure is a
-/// bug in [`BUILTIN_AGENTS`], so it panics rather than surfacing as a config
-/// error to the operator.
+/// The parsed, validated built-in templates, layered under a user file by
+/// [`AgentsConfig::load`]. A parse or validation failure is a bug in
+/// [`BUILTIN_AGENTS`], so it panics rather than surfacing as a config error.
 fn builtin_agents() -> &'static BTreeMap<String, AgentTemplate> {
     static BUILTINS: LazyLock<BTreeMap<String, AgentTemplate>> = LazyLock::new(|| {
         let raw: RawConfig = toml::from_str(BUILTIN_AGENTS).expect("built-in agents TOML parses");
@@ -126,13 +110,11 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #     the default.
 "#;
 
-/// The full skeleton `voro agent init` writes: the header, then the built-ins
-/// reproduced commented-out (so they can be copied to override an agent or
-/// model a new one), then example stanzas. Every line is a comment, so the
-/// written file defines nothing and the compiled built-ins stand alone until
-/// the user uncomments something — no frozen copy can go stale. Because the
-/// commented block is derived from [`BUILTIN_AGENTS`], it can never drift from
-/// what actually ships. A test exercises both properties.
+/// The full skeleton `voro agent init` writes: the header, the built-ins
+/// reproduced commented-out (copyable to override or model an agent), then
+/// example stanzas. Every line is a comment, so the file defines nothing until
+/// the user uncomments something; the commented block is derived from
+/// [`BUILTIN_AGENTS`] so it cannot drift from what ships.
 fn starter_config() -> String {
     let mut out = String::from(STARTER_HEADER);
     out.push_str(
@@ -168,10 +150,8 @@ fn starter_config() -> String {
 
 /// A named set of verb templates from `voro.toml`. `dispatch` (or its alias
 /// `cmd`) is required and always contains [`PROMPT_FILE_PLACEHOLDER`]; it may
-/// also carry the optional [`TASK_ID_PLACEHOLDER`] (unvalidated, since not
-/// every agent has a session-naming flag). The rest are optional, with their
-/// `{session}`/`{prompt_file}` placeholders validated at parse time so a bad
-/// template fails at load, not at use.
+/// also carry the optional [`TASK_ID_PLACEHOLDER`]. The rest are optional, with
+/// their `{session}`/`{prompt_file}` placeholders validated at parse time.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTemplate {
@@ -220,12 +200,10 @@ impl AgentTemplate {
     }
 }
 
-/// A viewer command template from `voro.toml` (DESIGN.md §11a): a shell
-/// command run in a task's checkout to open its diff. Defined as a named
-/// `[viewers.<name>]` table — so a project's review action can pick one by
-/// name — or as the anonymous `[viewer]` table, the single-viewer form that
-/// predates names and stays valid as a default. Unlike an agent template,
-/// `{path}` is optional, so nothing is validated at parse time.
+/// A viewer command template from `voro.toml` (DESIGN.md §11a): a shell command
+/// run in a task's checkout to open its diff. Defined as a named
+/// `[viewers.<name>]` table or the anonymous `[viewer]` default. `{path}` is
+/// optional, so nothing is validated at parse time.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewerTemplate {
@@ -257,9 +235,8 @@ impl Provenance {
 }
 
 /// The raw shape deserialized from `voro.toml` (or the built-in TOML) before
-/// layering. Every field is optional so a file that only sets `[viewer]`, only
-/// adds an agent, or is empty all parse — a missing config file is not an
-/// error under layered config.
+/// layering. Every field is optional, so a file that only sets `[viewer]`, only
+/// adds an agent, or is empty all parse.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -275,10 +252,10 @@ struct RawConfig {
     default_viewer: Option<String>,
 }
 
-/// Validate one agent's verb templates, factored out so the built-ins and the
-/// user file run through exactly the same checks. `dispatch` (or its alias
-/// `cmd`) must be present and carry the prompt-file placeholder; the session
-/// verbs must carry their placeholders when present.
+/// Validate one agent's verb templates, shared by the built-ins and the user
+/// file. `dispatch` (or its alias `cmd`) must be present and carry the
+/// prompt-file placeholder; the session verbs carry their placeholders when
+/// present.
 fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> {
     let invalid = |message: String| Error::AgentConfigInvalid {
         path: path.to_path_buf(),
@@ -334,10 +311,9 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
     Ok(())
 }
 
-/// Whether an executable named `name` is on `PATH`. Used to pick a default
-/// agent when the user file names none: the probe is by agent name, which for
-/// the built-ins is also the binary name. Pure filesystem inspection, no
-/// process spawn, so it stays inside `voro-core`.
+/// Whether an executable named `name` is on `PATH`, for picking a default agent
+/// when the user file names none. The probe is by agent name, which for the
+/// built-ins is also the binary name.
 fn binary_on_path(name: &str) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
@@ -546,11 +522,10 @@ impl AgentsConfig {
     }
 
     /// The name of the viewer used when nothing picks one by name, for
-    /// `viewer list` to flag it: the user's `default_viewer` when set
-    /// (honoured even if it names a missing viewer, so [`viewer_cmd`]
-    /// (Self::viewer_cmd) reports the mismatch), else the sole `[viewers.*]`
-    /// entry when there is exactly one. The anonymous `[viewer]` table has no
-    /// name, so it yields `None` here even though it resolves.
+    /// `viewer list` to flag: the user's `default_viewer` when set (honoured
+    /// even if it names a missing viewer), else the sole `[viewers.*]` entry.
+    /// The anonymous `[viewer]` table has no name, so it yields `None` here
+    /// even though it resolves.
     pub fn default_viewer_name(&self) -> Option<String> {
         if self.default_viewer.is_some() {
             return self.default_viewer.clone();
@@ -562,11 +537,9 @@ impl AgentsConfig {
     }
 
     /// Resolve a viewer command (DESIGN.md §11a): the named `[viewers.<name>]`
-    /// when a name is given — a project's `viewer:<name>` review action —
-    /// otherwise the default: `default_viewer` when set, else the anonymous
-    /// `[viewer]` table, else the sole `[viewers.*]` entry when there is
-    /// exactly one. Errors carry what to configure, so the open-in-viewer
-    /// action reports a fix rather than a silent no-op.
+    /// when a name is given, otherwise the default — `default_viewer` when set,
+    /// else the anonymous `[viewer]` table, else the sole `[viewers.*]` entry.
+    /// Errors carry what to configure.
     pub fn viewer_cmd(&self, name: Option<&str>) -> Result<&str> {
         let invalid = |message: String| Error::AgentConfigInvalid {
             path: self.path.clone(),
@@ -669,8 +642,7 @@ impl AgentsConfig {
 
     /// Write the [`starter_config`] skeleton to `path`, creating parent
     /// directories. Refuses to overwrite an existing file so a hand-tuned
-    /// config is never clobbered — `agent init` is an optional bootstrap, not
-    /// a reset.
+    /// config is never clobbered.
     pub fn write_starter(path: &Path) -> Result<()> {
         if path.exists() {
             return Err(Error::Invalid(format!(
@@ -706,9 +678,8 @@ pub struct AgentSessionEntry {
 }
 
 impl AgentSessionEntry {
-    /// Whether this entry is the session a stored reference points at —
-    /// either form of the id matches, since a log-parsed fallback capture may
-    /// have recorded the short id where the listing carries the full one.
+    /// Whether this entry is the session a stored reference points at — either
+    /// id form matches, since a log-parsed fallback may record the short id.
     pub fn matches_ref(&self, session_ref: &str) -> bool {
         self.session_ref == session_ref || self.short_id.as_deref() == Some(session_ref)
     }
@@ -843,8 +814,6 @@ mod tests {
 
     #[test]
     fn missing_file_loads_the_builtins() {
-        // A missing voro.toml is no longer an error: the built-ins stand
-        // alone as a working config.
         let config = AgentsConfig::load(Path::new("/nonexistent/voro.toml")).unwrap();
         assert_eq!(config.agent_names(), vec!["claude", "codex"]);
         assert_eq!(config.provenance("claude"), Some(Provenance::BuiltIn));
@@ -857,7 +826,6 @@ mod tests {
 
     #[test]
     fn builtins_layer_under_a_user_file() {
-        // A user file that adds an agent keeps the built-ins alongside it.
         let text = r#"
             [agents.mycustom]
             dispatch = "mytool {prompt_file}"
@@ -867,14 +835,11 @@ mod tests {
         assert_eq!(config.provenance("claude"), Some(Provenance::BuiltIn));
         assert_eq!(config.provenance("codex"), Some(Provenance::BuiltIn));
         assert_eq!(config.provenance("mycustom"), Some(Provenance::User));
-        // the built-in claude survives untouched
         assert!(config.agent("claude").unwrap().sessions().is_some());
     }
 
     #[test]
     fn a_user_table_overrides_a_builtin_wholesale() {
-        // A [agents.claude] table replaces the built-in entirely, verbs and
-        // all — a cmd-only override drops the session verbs.
         let text = r#"
             [agents.claude]
             cmd = "claude -p {prompt_file}"
@@ -885,7 +850,6 @@ mod tests {
         assert_eq!(claude.dispatch(), "claude -p {prompt_file}");
         assert_eq!(claude.sessions(), None, "override is not merged per-verb");
         assert_eq!(claude.attach(), None);
-        // the un-overridden codex built-in is still present
         assert_eq!(config.provenance("codex"), Some(Provenance::BuiltIn));
     }
 
@@ -900,13 +864,11 @@ mod tests {
         assert!(missing.contains(&"sessions"), "{missing:?}");
         assert!(missing.contains(&"attach"), "{missing:?}");
         assert!(missing.contains(&"resume"), "{missing:?}");
-        // built-in and additive-user agents warn about nothing
         assert!(config.override_missing_verbs("codex").is_empty());
     }
 
     #[test]
     fn default_probes_path_when_the_user_sets_none() {
-        // No `default`: the first built-in found on PATH wins, in fixed order.
         let config = AgentsConfig::builtin_only(Path::new("/tmp/voro.toml"));
         let only_codex = |name: &str| name == "codex";
         assert_eq!(
@@ -932,12 +894,11 @@ mod tests {
             default_agent = "codex"
         "#;
         let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
-        // even a probe that would pick claude yields the user's codex
         let both = |_: &str| true;
         assert_eq!(config.resolve_with(None, &both).unwrap().name, "codex");
     }
 
-    // --- session verbs (task #75) ---
+    // --- session verbs ---
 
     const VERBS_CONFIG: &str = r#"
         default_agent = "claude"
@@ -1240,15 +1201,11 @@ mod tests {
 
     #[test]
     fn starter_config_defines_nothing_and_leaves_the_builtins() {
-        // The skeleton is all comments — including the reproduced built-ins —
-        // so it adds no agents, no default, no viewer: the built-ins alone
-        // remain, and no frozen copy can go stale.
         let config = AgentsConfig::parse(&starter_config(), Path::new("/tmp/voro.toml")).unwrap();
         assert_eq!(config.agent_names(), vec!["claude", "codex"]);
         assert_eq!(config.provenance("claude"), Some(Provenance::BuiltIn));
         assert!(config.viewer_names().is_empty());
         assert!(config.viewer_cmd(None).is_err());
-        // the built-in claude still carries the #75 session verbs
         let claude = config.agent("claude").unwrap();
         assert!(claude.dispatch().contains("--bg"), "{}", claude.dispatch());
         assert!(
@@ -1263,8 +1220,6 @@ mod tests {
 
     #[test]
     fn starter_config_reproduces_the_builtins_commented_for_copying() {
-        // Every built-in line appears commented out, so a user has the exact
-        // verbs to copy for a whole-agent override or a new agent.
         let skeleton = starter_config();
         for line in BUILTIN_AGENTS.lines().filter(|l| !l.is_empty()) {
             let commented = format!("# {line}");
@@ -1273,8 +1228,7 @@ mod tests {
                 "skeleton is missing built-in line: {commented}"
             );
         }
-        // Uncommenting the reproduced claude block yields a valid override —
-        // proof the commented content is real, copyable TOML.
+        // Uncommenting the reproduced claude block must yield a valid override.
         let uncommented: String = BUILTIN_AGENTS
             .lines()
             .take_while(|l| !l.starts_with("[agents.codex]"))
@@ -1287,7 +1241,7 @@ mod tests {
 
     #[test]
     fn entries_carry_name_template_and_provenance() {
-        // CONFIG overrides both built-ins wholesale.
+        // CONFIG overrides both built-ins wholesale, hence UserOverride below.
         let config = config();
         let entries: Vec<_> = config.entries().collect();
         assert_eq!(entries.len(), 2);
@@ -1309,11 +1263,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         AgentsConfig::write_starter(&path).unwrap();
-        // the written skeleton loads back and leaves the built-ins in place
         let config = AgentsConfig::load(&path).unwrap();
         assert_eq!(config.agent_names(), vec!["claude", "codex"]);
 
-        // a second init refuses rather than overwriting a tuned config
         let err = AgentsConfig::write_starter(&path).unwrap_err().to_string();
         assert!(err.contains("already exists"), "{err}");
 
@@ -1322,7 +1274,6 @@ mod tests {
 
     #[test]
     fn builtins_parse_and_validate() {
-        // The compiled-in agents must survive their own validation.
         let agents = builtin_agents();
         assert!(agents.contains_key("claude"));
         assert!(agents.contains_key("codex"));
