@@ -34,8 +34,10 @@ pub enum Action {
     Ask(String),
     /// needs-input → running; the answer is appended to the body and logged
     Answer(String),
-    /// running → review; the optional string is the agent's completion summary,
-    /// logged as a `summary` event so review starts from it
+    /// running | stalled → review; the optional string is the completion
+    /// summary, logged as a `summary` event so review starts from it. From
+    /// `stalled` it reports a dead session's finished work on its behalf
+    /// (DESIGN.md §8) — the session is already closed, so only the state moves.
     Complete(Option<String>),
     /// review → done
     Accept,
@@ -100,7 +102,12 @@ impl Store {
                 Action::RejectWork(String::new()),
                 Action::Abandon,
             ],
-            Stalled => vec![Action::Start, Action::Park, Action::Abandon],
+            Stalled => vec![
+                Action::Start,
+                Action::Complete(None),
+                Action::Park,
+                Action::Abandon,
+            ],
             Done | Rejected => vec![],
         }
     }
@@ -186,7 +193,9 @@ impl Store {
     ///   not landed, but `stalled` makes that misfire safe where the old
     ///   automatic `running → ready` bounce was not: a stalled task is an
     ///   attention row, never handed out by `voro next`, and a late `done`
-    ///   is refused loudly rather than racing a fresh dispatch. A stalled
+    ///   lands it in `review` on the dead session's behalf (DESIGN.md §6/§8)
+    ///   rather than racing a fresh dispatch — redispatch from `stalled` only
+    ///   ever happens by hand. A stalled
     ///   task with an open blocker is demoted straight to `parked`, exactly
     ///   as if it had landed `ready`.
     /// - task `needs-input`/`review`: the session stays open on purpose — it is
@@ -356,8 +365,13 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         (NeedsInput, Action::Answer(_)) => Running,
         // Completing a human task skips `review`: the human is both executor
         // and acceptor, so there is no one left to accept the work (§6).
-        (Running, Action::Complete(_)) if task.human => Done,
-        (Running, Action::Complete(_)) => Review,
+        (Running | Stalled, Action::Complete(_)) if task.human => Done,
+        // From `stalled`, completion reports a dead session's finished work on
+        // its behalf — the misfire case (§8), where the work landed but its
+        // `done` never did. The session is already closed, so only the state
+        // moves; a redispatch that has since happened makes the task `running`
+        // again and this arm no longer applies.
+        (Running | Stalled, Action::Complete(_)) => Review,
         (Review, Action::Accept) => Done,
         (Review, Action::RejectWork(_)) => Running,
         (Running, Action::Abort) => Ready,
@@ -701,7 +715,7 @@ mod tests {
             (Ready | Stalled, Action::Park) => Some(Parked),
             (Parked, Action::Unpark) => Some(Ready),
             (Running, Action::Ask(_)) => Some(NeedsInput),
-            (Running, Action::Complete(_)) => Some(Review),
+            (Running | Stalled, Action::Complete(_)) => Some(Review),
             (Running, Action::Abort) => Some(Ready),
             (NeedsInput, Action::Answer(_)) => Some(Running),
             (Review, Action::Accept) => Some(Done),
@@ -1554,6 +1568,50 @@ mod tests {
             assert_eq!(task.state, TaskState::Running);
             assert_eq!(session.agent, "codex");
             assert!(session.ended_at.is_none());
+        }
+
+        #[test]
+        fn a_stalled_task_completes_to_review_on_the_dead_sessions_behalf() {
+            // The misfire case (DESIGN.md §8): the session finished but its
+            // `done` never landed, so reconcile stalled the task. Completion
+            // from `stalled` reaches review directly — no session is reopened
+            // and the dead session keeps its recorded outcome.
+            let (mut s, p) = store_with_project();
+            let (task_id, session_id) = dispatch(&mut s, p);
+            s.reconcile_session(session_id, false, false).unwrap();
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
+
+            let task = s
+                .apply(task_id, Action::Complete(Some("landed on feat/x".into())))
+                .unwrap();
+            assert_eq!(task.state, TaskState::Review);
+
+            let session = s.session(session_id).unwrap();
+            assert!(session.ended_at.is_some());
+            assert_eq!(session.outcome, Some(SessionOutcome::Failed));
+            assert!(
+                s.sessions_for(task_id)
+                    .unwrap()
+                    .iter()
+                    .all(|x| x.ended_at.is_some()),
+                "completing a stall must not open a session"
+            );
+
+            let events = s.events_for(task_id).unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.kind == "transition"
+                        && e.detail.as_deref() == Some("stalled -> review")),
+                "{events:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.kind == "summary"
+                        && e.detail.as_deref() == Some("landed on feat/x")),
+                "{events:?}"
+            );
         }
 
         #[test]

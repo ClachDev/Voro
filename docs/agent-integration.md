@@ -248,12 +248,12 @@ rejected and leaves the task exactly as it was.
 
 So the hooks never need to inspect the task's current state before acting — the
 rejection is all the protection required. This composes with the reconciler for
-the same reason: whichever of the hook and the reconciler reaches the task first
-wins. A hook's `done` moving the task to `review` makes the reconciler leave it
-alone; a reconciler that gets there first lands the task in `stalled` (DESIGN.md
-§8) and the hook's late `done` is rejected — the completion surfaces as a
-redispatch row rather than corrupted state. In practice the hook runs while the
-session's process is still alive, so it always wins that race. Wiring the hooks
+the same reason, and here the race is confluent: a hook's `done` moving the task
+to `review` makes the reconciler leave it alone, while a reconciler that gets
+there first lands the task in `stalled` (DESIGN.md §8) and the hook's late
+`done` then completes it on the dead session's behalf, `stalled → review` — the
+same place either order ends. In practice the hook runs while the session's
+process is still alive, so it usually wins that race outright. Wiring the hooks
 cannot corrupt state; the worst case is a harmless rejected command.
 
 ## Sample configuration

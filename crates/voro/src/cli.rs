@@ -120,7 +120,9 @@ transitions
                                   session with the answer in the prompt body
                                   (--no-dispatch skips that)
   done <task-id> [--summary TEXT | --summary-file PATH] [--branch NAME]
-                                  running → review; the summary is the agent's
+                                  running | stalled → review (from stalled:
+                                  reporting a dead session's finished work on
+                                  its behalf); the summary is the agent's
                                   completion note (kept as a summary event, and
                                   the PR body `pr` opens from) — write it as a
                                   PR description; --branch records the git branch
@@ -744,16 +746,18 @@ fn reject_verb(
 }
 
 /// `done <task-id> [--summary TEXT | --summary-file PATH] [--branch NAME]`
-/// (DESIGN.md §6/§8): running → review. The summary is the agent's completion
+/// (DESIGN.md §6/§8): running | stalled → review — from `stalled` it reports a
+/// dead session's finished work on its behalf, the misfire case where the work
+/// landed but the session's own `done` never did. The summary is the completion
 /// note, kept as a summary event by the transition and read back as the PR body
 /// when `pr` opens a pull request — so it should read as a PR description
 /// (`--summary-file` lets the agent write a multi-line one without cramming a
 /// command line). `--branch` is the branch the agent reports its work landed on
 /// (task #81), recorded on the task (overwriting any intended name dispatch
 /// injected) so the task correlates with its branch and PR. The completion
-/// transition is applied first, so a task that is not `running` is refused
-/// before any branch is recorded. Voro never runs git; it only stores the
-/// reported name. A `done` that leaves the task without a branch or summary
+/// transition is applied first, so a task that is neither `running` nor
+/// `stalled` is refused before any branch is recorded. Voro never runs git;
+/// it only stores the reported name. A `done` that leaves the task without a branch or summary
 /// *warns* rather than failing — planning and task-generation work produces
 /// neither — so both stay optional through the whole lifecycle.
 fn done_verb(
@@ -1888,6 +1892,31 @@ mod tests {
         let out = ok(&mut s, &["done", "1"]);
         assert!(out.contains("-> review"), "{out}");
         assert!(!ok(&mut s, &["show", "1"]).contains("branch:"));
+    }
+
+    /// `done` on a stalled task reports the dead session's finished work on
+    /// its behalf (DESIGN.md §6/§8): stalled → review, no manual `start`
+    /// detour and no session reopened.
+    #[test]
+    fn done_on_a_stalled_task_reaches_review() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        let (_, session) = s.record_dispatch(1, "claude", Some(1), None).unwrap();
+        s.reconcile_session(session.id, false, false).unwrap();
+        assert_eq!(s.task(1).unwrap().state, TaskState::Stalled);
+
+        let out = ok(
+            &mut s,
+            &[
+                "done",
+                "1",
+                "--summary",
+                "finished; the report never landed",
+            ],
+        );
+        assert!(out.contains("-> review"), "{out}");
+        assert!(s.session(session.id).unwrap().ended_at.is_some());
     }
 
     /// `done --branch` on a non-running task is refused by the transition
