@@ -88,6 +88,7 @@ dispatch = "claude --bg --name \"voro-{task_id}\" --permission-mode auto \"$(cat
 sessions = "claude agents --json"
 attach   = "claude attach {session}"
 resume   = "claude --resume {session}"
+plan     = "claude --permission-mode auto \"$(cat {prompt_file})\""
 
 [agents.codex]
 dispatch = "codex exec \"$(cat {prompt_file})\""
@@ -108,6 +109,11 @@ continue = "codex exec resume {session} \"$(cat {prompt_file})\""
 - `resume` reopens a *finished* session interactively.
 - `continue` feeds a session new input headless — `{prompt_file}` holds the
   input (an answer), `{session}` addresses the session.
+- `plan` runs an interactive *foreground* session for the TUI's agent-assisted
+  task creation (DESIGN.md §8): `{prompt_file}` holds the planning brief, and
+  the command owns the terminal until the conversation ends, so it must not
+  background itself. It carries no `{session}` — a planning session belongs to
+  no task and records no session row.
 
 The dispatch template above runs Claude in `auto` mode: a dispatched session is
 unattended, and `auto` auto-approves the actions it judges safe — edits, a cargo
@@ -156,8 +162,9 @@ falls back to spawning a fresh session re-sent the whole task body.
 
 Every verb degrades gracefully when absent: no `attach`/`resume` disables the
 jump-in key for that agent, no `sessions` keeps pid-liveness reconciliation,
-no `continue` keeps fresh-spawn continuation. An agent defining only
-`dispatch`/`cmd` behaves exactly as before the verbs existed.
+no `continue` keeps fresh-spawn continuation, no `plan` turns the TUI's
+planning key into a status line saying what to configure. An agent defining
+only `dispatch`/`cmd` behaves exactly as before the verbs existed.
 
 ### tmux as a universal fallback
 

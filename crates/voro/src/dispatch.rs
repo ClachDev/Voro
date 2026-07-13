@@ -87,6 +87,38 @@ const UNASSIGNED_BRANCH_TEMPLATE: &str = "\n\n\
 Pick a git branch for this work, create or check it out — Voro runs no git — and
 {register}; `<name>` is the name you choose.";
 
+/// Rendered per planning session (DESIGN.md §8) and written as the whole
+/// prompt — unlike dispatch there is no task body to prepend it to, because
+/// producing one is the session's job. `{project}` is the project's name,
+/// `{project_arg}` the same name shell-quoted for the `voro add` line, and
+/// `{db}` the same conditional `--db` flag the return-path preamble renders,
+/// for the same reason: the command must name its database literally.
+const PLANNING_PROMPT_TEMPLATE: &str = "\
+<!-- Voro planning session: the deliverable is a task, not a PR -->
+You are an agent launched by Voro to help the operator plan a new task for the
+project `{project}`. This is an interactive planning conversation: ask the
+operator what they want, and interview them until the task is well defined —
+scope, approach where it is settled, and what done looks like. Do not modify
+the project's files; the checkout is there to read, so the task can name real
+files and code.
+
+Write the task body as a self-contained dispatchable prompt: the agent that
+picks it up later gets no other context, so name the relevant files, spell out
+the decisions already made, and give concrete acceptance criteria.
+
+When the operator confirms the draft, write the body to a file outside the
+checkout and create the task with:
+
+    voro add {project_arg} \"<title>\"{db} --body-file <path>
+
+Add `--priority <0-3>` if the operator wants something other than the default
+P2. The task is created in `proposed` and the operator triages it from the
+queue, so do not pass a state. If the operator decides against creating a
+task, end the session without creating one — that is a no-op, not a failure.
+Never modify Voro's database with raw SQL, which would bypass the state
+machine and event log.
+";
+
 /// How often the session-ref capture re-polls the agent's `sessions` command
 /// while waiting for the freshly-launched session to appear in the listing.
 const REF_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -119,6 +151,76 @@ fn render_preamble(task_id: i64, db_path: &Path, branch: Option<&str>) -> String
         .replace("{branch}", &branch_block)
         .replace("{task_id}", &task_id.to_string())
         .replace("{db}", &db_flag)
+}
+
+/// Fill [`PLANNING_PROMPT_TEMPLATE`] for a concrete project: the `voro add`
+/// line carries the shell-quoted project name and, exactly as
+/// [`render_preamble`] does, a `--db` flag only when the database is not the
+/// default one the verb resolves to unaided.
+fn render_planning_prompt(project: &str, db_path: &Path) -> String {
+    let db_flag = if db_path == Store::default_db_path() {
+        String::new()
+    } else {
+        format!(" --db {}", shell_quote(db_path))
+    };
+    PLANNING_PROMPT_TEMPLATE
+        .replace("{project_arg}", &shell_quote(Path::new(project)))
+        .replace("{project}", project)
+        .replace("{db}", &db_flag)
+}
+
+/// The assembled launch of a planning session: the agent's `plan` template
+/// with the prompt file substituted, and the project checkout to run it in.
+/// The TUI turns this into a foreground terminal round-trip, the same
+/// suspend/restore as `$EDITOR` and attach/resume.
+#[derive(Debug)]
+pub struct PlanLaunch {
+    pub command: String,
+    pub cwd: String,
+}
+
+/// Assemble an interactive planning session for a project (DESIGN.md §8):
+/// resolve the default agent, require its `plan` verb, write the planning
+/// prompt outside the checkout, and substitute it into the template. No
+/// session row is recorded and no task state changes — the session's
+/// deliverable is a `proposed` task the agent creates through `voro add`, so
+/// one that exits without creating anything has simply done nothing. There is
+/// deliberately no dirty-tree guard: planning writes nothing to the tree.
+pub fn plan_session(
+    store: &Store,
+    ctx: &DispatchCtx,
+    project_id: i64,
+) -> Result<PlanLaunch, String> {
+    let project = store.project(project_id).map_err(|e| e.to_string())?;
+    let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
+    let agent = config.resolve(None).map_err(|e| e.to_string())?;
+    let Some(plan_cmd) = agent.plan.as_deref() else {
+        return Err(format!(
+            "agent '{}' defines no plan template in {} — add plan = \"<interactive command> \
+             {{prompt_file}}\" to its [agents.{}] table to plan tasks with it",
+            agent.name,
+            ctx.agents_path.display(),
+            agent.name
+        ));
+    };
+    std::fs::create_dir_all(&ctx.runtime_dir)
+        .map_err(|e| format!("cannot create {}: {e}", ctx.runtime_dir.display()))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let prompt_path = ctx
+        .runtime_dir
+        .join(format!("plan-{project_id}-{stamp}.prompt.md"));
+    std::fs::write(
+        &prompt_path,
+        render_planning_prompt(&project.name, &ctx.db_path),
+    )
+    .map_err(|e| format!("cannot write prompt {}: {e}", prompt_path.display()))?;
+    Ok(PlanLaunch {
+        command: plan_cmd.replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path)),
+        cwd: project.path,
+    })
 }
 
 /// Which of the two flows `spawn_session` is performing — they share every
@@ -1389,6 +1491,73 @@ mod tests {
         let err = open(&mut store, &ctx, id, Some("emacs")).unwrap_err();
         assert!(err.contains("emacs"), "{err}");
         assert!(err.contains("zed"), "{err}");
+    }
+
+    // --- planning sessions (task #112) ---
+
+    #[test]
+    fn plan_session_assembles_the_launch_and_writes_the_prompt() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file}\"\nplan = \"stub --interactive {prompt_file}\"\n",
+        );
+        let p = store
+            .create_project("proj", project.to_str().unwrap())
+            .unwrap();
+        // planning writes nothing to the tree, so a dirty checkout is fine
+        std::fs::write(project.join("scratch.txt"), "uncommitted").unwrap();
+
+        let launch = plan_session(&store, &ctx, p.id).unwrap();
+        assert_eq!(launch.cwd, project.to_str().unwrap());
+
+        // the plan template ran through the same {prompt_file} substitution as
+        // dispatch, pointing at a prompt written outside the checkout
+        let prompt_path = prompt_files(&ctx).pop().unwrap();
+        assert_eq!(
+            launch.command,
+            format!("stub --interactive {}", shell_quote(&prompt_path))
+        );
+
+        let prompt = std::fs::read_to_string(&prompt_path).unwrap();
+        assert!(prompt.contains("plan a new task"), "{prompt}");
+        assert!(prompt.contains("`proj`"), "{prompt}");
+        assert!(prompt.contains("voro add 'proj' \"<title>\""), "{prompt}");
+        assert!(prompt.contains("--body-file"), "{prompt}");
+        assert!(prompt.contains("acceptance criteria"), "{prompt}");
+        assert!(prompt.contains("`proposed`"), "{prompt}");
+        // the fixture database is not the default, so every command carries it
+        assert!(
+            prompt.contains(&format!("--db {}", shell_quote(&ctx.db_path))),
+            "{prompt}"
+        );
+
+        // no dispatch happened: no session row, no state change, no task at all
+        assert!(store.tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn planning_prompt_renders_the_db_flag_only_for_a_non_default_database() {
+        let rendered = render_planning_prompt("proj", &Store::default_db_path());
+        assert!(
+            rendered.contains("voro add 'proj' \"<title>\" --body-file"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("--db"), "{rendered}");
+    }
+
+    #[test]
+    fn plan_without_a_plan_verb_reports_what_to_configure() {
+        // the fixture's stub agent defines only dispatch
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let p = store
+            .create_project("proj", project.to_str().unwrap())
+            .unwrap();
+
+        let err = plan_session(&store, &ctx, p.id).unwrap_err();
+        assert!(err.contains("stub"), "{err}");
+        assert!(err.contains("plan"), "{err}");
+        assert!(err.contains("{prompt_file}"), "{err}");
+        assert!(err.contains(ctx.agents_path.to_str().unwrap()), "{err}");
     }
 
     #[test]
