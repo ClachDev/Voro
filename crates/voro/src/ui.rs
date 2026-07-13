@@ -447,36 +447,19 @@ fn branch_span(branch: &str) -> Span<'static> {
     Span::styled(format!("branch: {branch}"), Style::new().fg(Color::Green))
 }
 
-/// The review sub-state (DESIGN.md §8), read from fields rather than a new
-/// task state: a review task with no tracked PR shows "next: pr" (the PR key
-/// opens one from its summary), one with a PR shows "PR open". `None` for any
-/// task that is not in `review`.
-fn review_substate_span(task: &voro_core::Task) -> Option<Span<'static>> {
+/// A review row's next action rendered as a browser suffix (`next: pr` /
+/// `next: review PR`), from the single derivation (DESIGN.md §3). The browser
+/// shows state in its own column, so only `review` — whose verb reads the
+/// tracked PR, not the state alone — earns the suffix.
+fn review_next_span(task: &voro_core::Task) -> Option<Span<'static>> {
     if task.state != voro_core::TaskState::Review {
         return None;
     }
-    Some(if task.pr_url.is_some() {
-        Span::styled("  PR open", Style::new().fg(Color::Blue))
-    } else {
-        Span::styled(
-            "  next: pr",
-            Style::new().fg(Color::Blue).add_modifier(Modifier::DIM),
-        )
-    })
-}
-
-/// The verb a queue row's Enter performs, from its state. A `stalled` row's
-/// action is redispatching the dead dispatch (DESIGN.md §8) — "restart" is
-/// how that reads as one next action.
-fn action_verb(state: voro_core::TaskState) -> &'static str {
-    match state {
-        voro_core::TaskState::NeedsInput => "answer",
-        voro_core::TaskState::Review => "review",
-        voro_core::TaskState::Proposed => "triage",
-        voro_core::TaskState::Ready => "start",
-        voro_core::TaskState::Stalled => "restart",
-        _ => "",
-    }
+    let verb = task.next_action()?;
+    Some(Span::styled(
+        format!("  next: {verb}"),
+        Style::new().fg(Color::Blue),
+    ))
 }
 
 fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
@@ -501,9 +484,9 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
                     score,
                     Span::styled(
                         format!(
-                            "{} {:7} {} {}: {}",
+                            "{} {:10} {} {}: {}",
                             task_ref(c.task.id),
-                            action_verb(c.task.state),
+                            c.task.next_action().map_or("", |a| a.as_str()),
                             c.task.priority,
                             c.project_name,
                             c.task.title
@@ -518,11 +501,9 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
                     ));
                 }
                 if app.incomplete_report.contains(&c.task.id) {
-                    // Replaces the optimistic "next: pr" — a PR cannot be opened
-                    // from a half-finished report, so name the gap instead.
+                    // The verb column says "pr", but a PR cannot be opened
+                    // from a half-finished report, so name the gap too.
                     spans.push(incomplete_report_span());
-                } else if let Some(substate) = review_substate_span(&c.task) {
-                    spans.push(substate);
                 }
                 ListItem::new(Line::from(spans))
             }
@@ -592,13 +573,18 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(pr) = &task.pr_url {
         lines.push(Line::from(pr_span(pr)));
-    } else if app.incomplete_report.contains(&task.id) {
+    }
+    if app.incomplete_report.contains(&task.id) {
         // A review task missing a branch or summary: `pr` would fail, so say
         // what is needed rather than the optimistic "next: pr".
         lines.push(Line::from(incomplete_report_span()));
-    } else if task.state == TaskState::Review {
+    } else if let Some(verb) = task.next_action() {
+        let hint = match verb {
+            voro_core::NextAction::Pr => "  (g opens one from the summary)",
+            _ => "",
+        };
         lines.push(Line::from(Span::styled(
-            "next: pr  (g opens one from the summary)",
+            format!("next: {verb}{hint}"),
             Style::new().fg(Color::Blue),
         )));
     }
@@ -729,8 +715,8 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
             )];
             if app.incomplete_report.contains(&r.task.id) {
                 spans.push(incomplete_report_span());
-            } else if let Some(substate) = review_substate_span(&r.task) {
-                spans.push(substate);
+            } else if let Some(span) = review_next_span(&r.task) {
+                spans.push(span);
             }
             spans.extend(blocker_spans(r));
             ListItem::new(Line::from(spans))
@@ -1292,6 +1278,98 @@ mod tests {
             assert!(
                 popup.contains(needle.as_str()),
                 "Detail popup should show '{needle}': {popup}"
+            );
+        }
+    }
+
+    /// End-to-end: every queue row carries its next-action verb (DESIGN.md §3),
+    /// one task per arm of the derivation, rendered through the real cockpit
+    /// draw path. `do` versus `dispatch` is also the human-task marker.
+    #[test]
+    fn cockpit_queue_shows_the_next_action_verb_on_each_row() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store.set_weight(p.id, 3).unwrap();
+        let new = |title: &str, state, human| NewTask {
+            project_id: p.id,
+            title: title.into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state,
+            agent: None,
+            human,
+        };
+
+        let triage = store
+            .create_task(new("untriaged", TaskState::Proposed, false))
+            .unwrap();
+        let answer = store
+            .create_task(new("asking", TaskState::Ready, false))
+            .unwrap();
+        store.apply(answer.id, Action::Start).unwrap();
+        store
+            .apply(answer.id, Action::Ask("A or B?".into()))
+            .unwrap();
+        let pr = store
+            .create_task(new("done, no PR", TaskState::Ready, false))
+            .unwrap();
+        store.apply(pr.id, Action::Start).unwrap();
+        store.apply(pr.id, Action::Complete(None)).unwrap();
+        let review_pr = store
+            .create_task(new("done, PR open", TaskState::Ready, false))
+            .unwrap();
+        store.apply(review_pr.id, Action::Start).unwrap();
+        store.apply(review_pr.id, Action::Complete(None)).unwrap();
+        store
+            .set_pr(review_pr.id, Some("https://github.com/o/r/pull/1"))
+            .unwrap();
+        let redispatch = store
+            .create_task(new("died", TaskState::Ready, false))
+            .unwrap();
+        let (_, session) = store
+            .record_dispatch(redispatch.id, "claude", Some(1), None)
+            .unwrap();
+        store.reconcile_session(session.id, false, false).unwrap();
+        let do_ = store
+            .create_task(new("by hand", TaskState::Ready, true))
+            .unwrap();
+        let dispatch = store
+            .create_task(new("startable", TaskState::Ready, false))
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let app = App::new(store, ctx).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+
+        for (task, verb) in [
+            (&triage, "triage"),
+            (&answer, "answer"),
+            (&pr, "pr"),
+            (&review_pr, "review PR"),
+            (&redispatch, "redispatch"),
+            (&do_, "do"),
+            (&dispatch, "dispatch"),
+        ] {
+            let cell = format!("{} {:10}", task_ref(task.id), verb);
+            assert!(
+                rendered.contains(&cell),
+                "queue row for #{} should carry '{verb}': {rendered}",
+                task.id
             );
         }
     }

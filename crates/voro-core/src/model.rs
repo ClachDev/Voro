@@ -381,6 +381,70 @@ pub struct Task {
     pub human: bool,
 }
 
+/// The verb a task's queue row asks of the human (DESIGN.md §3): the queue is
+/// a list of human next-actions, so every row carries its one next action,
+/// derived from state × fields rather than stored. `do` versus `dispatch` is
+/// also how a human-only task reads in the queue — no separate marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NextAction {
+    /// An untriaged proposal: accept, park, or reject it.
+    Triage,
+    /// A question is waiting; answering it unblocks the work.
+    Answer,
+    /// A review task with no tracked PR: open one from its done-time summary.
+    Pr,
+    /// A review task whose PR is open: review it there.
+    ReviewPr,
+    /// A ready human-only task: only the human can execute it.
+    Do,
+    /// A stalled task: its dispatch died, restart it with the prior
+    /// session's context.
+    Redispatch,
+    /// A ready task an agent can take: hand it to one.
+    Dispatch,
+}
+
+impl NextAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NextAction::Triage => "triage",
+            NextAction::Answer => "answer",
+            NextAction::Pr => "pr",
+            NextAction::ReviewPr => "review PR",
+            NextAction::Do => "do",
+            NextAction::Redispatch => "redispatch",
+            NextAction::Dispatch => "dispatch",
+        }
+    }
+}
+
+impl fmt::Display for NextAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+impl Task {
+    /// The single next-action derivation (DESIGN.md §3): what the human does
+    /// next with this task, from state × fields. `None` for states that ask
+    /// nothing of the human — `running` rows belong to the running strip, not
+    /// the queue, and `parked`/`done`/`rejected` wait on nothing. `stalled`
+    /// needs no human check: dispatch refuses human tasks and a stalled task
+    /// cannot be flagged human, so a stall is always a dead agent dispatch.
+    pub fn next_action(&self) -> Option<NextAction> {
+        match self.state {
+            TaskState::Proposed => Some(NextAction::Triage),
+            TaskState::NeedsInput => Some(NextAction::Answer),
+            TaskState::Review if self.pr_url.is_some() => Some(NextAction::ReviewPr),
+            TaskState::Review => Some(NextAction::Pr),
+            TaskState::Stalled => Some(NextAction::Redispatch),
+            TaskState::Ready if self.human => Some(NextAction::Do),
+            TaskState::Ready => Some(NextAction::Dispatch),
+            TaskState::Running | TaskState::Parked | TaskState::Done | TaskState::Rejected => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dep {
     pub task_id: i64,
@@ -469,6 +533,87 @@ mod tests {
     fn priority_display_honors_width() {
         assert_eq!(format!("{:>6}", Priority::P0), "    P0");
         assert_eq!(format!("{:>6}", Priority::P2), "    P2");
+    }
+
+    fn task_in(state: TaskState, pr_url: Option<&str>, human: bool) -> Task {
+        Task {
+            id: 1,
+            project_id: 1,
+            title: "t".into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state,
+            agent: None,
+            question: None,
+            pr_url: pr_url.map(str::to_string),
+            branch: None,
+            state_since: "2026-01-01T00:00:00Z".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            closed_at: None,
+            human,
+        }
+    }
+
+    #[test]
+    fn next_action_derives_every_arm() {
+        // The single derivation (DESIGN.md §3), one case per arm: state ×
+        // (pr_url, human) → the verb the queue row carries.
+        for (state, pr_url, human, expected) in [
+            (TaskState::Proposed, None, false, Some(NextAction::Triage)),
+            (TaskState::NeedsInput, None, false, Some(NextAction::Answer)),
+            (TaskState::Review, None, false, Some(NextAction::Pr)),
+            (
+                TaskState::Review,
+                Some("https://github.com/o/r/pull/1"),
+                false,
+                Some(NextAction::ReviewPr),
+            ),
+            (TaskState::Ready, None, true, Some(NextAction::Do)),
+            (TaskState::Ready, None, false, Some(NextAction::Dispatch)),
+            (
+                TaskState::Stalled,
+                None,
+                false,
+                Some(NextAction::Redispatch),
+            ),
+            // running rows belong to the strip, not the queue; parked and the
+            // closed states ask nothing of the human.
+            (TaskState::Running, None, false, None),
+            (TaskState::Parked, None, false, None),
+            (TaskState::Done, None, false, None),
+            (TaskState::Rejected, None, false, None),
+        ] {
+            assert_eq!(
+                task_in(state, pr_url, human).next_action(),
+                expected,
+                "{state} pr_url={pr_url:?} human={human}"
+            );
+        }
+    }
+
+    #[test]
+    fn next_action_ignores_fields_its_arm_does_not_read() {
+        // A proposal's PR link or human flag changes nothing: only review
+        // reads pr_url, only ready reads human.
+        assert_eq!(
+            task_in(TaskState::Proposed, Some("https://x"), true).next_action(),
+            Some(NextAction::Triage)
+        );
+        assert_eq!(
+            task_in(TaskState::NeedsInput, None, true).next_action(),
+            Some(NextAction::Answer)
+        );
+        assert_eq!(
+            task_in(TaskState::Ready, Some("https://x"), false).next_action(),
+            Some(NextAction::Dispatch)
+        );
+    }
+
+    #[test]
+    fn next_action_display_honors_width() {
+        assert_eq!(format!("{:10}", NextAction::Do), "do        ");
+        assert_eq!(format!("{:10}", NextAction::ReviewPr), "review PR ");
+        assert_eq!(format!("{:10}", NextAction::Redispatch), "redispatch");
     }
 
     #[test]
