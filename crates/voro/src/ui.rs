@@ -156,26 +156,6 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             );
             frame.render_widget(para, area);
         }
-        Mode::ConfirmCleanup { task_id, plan } => {
-            let lines = vec![
-                Line::from(Span::styled(
-                    plan.describe(),
-                    Style::new().fg(Color::Yellow),
-                )),
-                Line::default(),
-                Line::from(Span::styled(
-                    "⏎/y confirm · esc/n leave it",
-                    Style::new().dim(),
-                )),
-            ];
-            let area = popup_area(frame, 72, 5);
-            let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!("Clean up the worktree for #{task_id}?")),
-            );
-            frame.render_widget(para, area);
-        }
         Mode::Detail { task_id, scroll } => {
             let Some(row) = app.all.iter().find(|r| r.task.id == *task_id) else {
                 return;
