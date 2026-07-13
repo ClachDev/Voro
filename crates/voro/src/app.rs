@@ -1,6 +1,6 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use voro_core::{
-    Action, AgentsConfig, Blocker, Candidate, DepRef, Event, PrRef, Priority, Project,
+    Action, AgentsConfig, Candidate, DepKind, DepRef, Event, PrRef, Priority, Project,
     ReviewAction, ReviewMedium, RunningRow, ScoreBreakdown, StateCounts, Store, Task, TaskState,
     Triage, scheduler,
 };
@@ -29,8 +29,9 @@ pub struct TaskRow {
     pub project: String,
     pub weight: i64,
     /// The task's `blocks` dependencies with each blocker's state, so the
-    /// browser can show a parked row what it is waiting on.
-    pub blockers: Vec<Blocker>,
+    /// browser can show a parked row what it is waiting on. Filtered from the
+    /// same [`Store::deps_by_task`] load that feeds the detail panes.
+    pub blockers: Vec<DepRef>,
 }
 
 /// What a text prompt is collecting, and the transition it feeds.
@@ -322,7 +323,9 @@ impl App {
         let candidates = self.store.candidates()?;
         self.queue = scheduler::queue(&candidates).into_iter().cloned().collect();
 
-        let mut blockers = self.store.blockers_by_task()?;
+        self.deps = self.store.deps_by_task()?;
+        self.dependents = self.store.dependents_by_task()?;
+
         let mut all: Vec<TaskRow> = self
             .store
             .tasks()?
@@ -334,7 +337,16 @@ impl App {
                     .find(|p| p.id == task.project_id)
                     .map(|p| (p.name.clone(), p.weight))
                     .unwrap_or_default();
-                let blockers = blockers.remove(&task.id).unwrap_or_default();
+                let blockers = self
+                    .deps
+                    .get(&task.id)
+                    .map(|deps| {
+                        deps.iter()
+                            .filter(|d| d.kind == DepKind::Blocks)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 TaskRow {
                     task,
                     project,
@@ -355,8 +367,6 @@ impl App {
             })
             .collect();
         self.all = all;
-        self.deps = self.store.deps_by_task()?;
-        self.dependents = self.store.dependents_by_task()?;
         self.running = self.store.running_rows()?;
         self.counts = self.store.state_counts()?;
 
@@ -896,7 +906,8 @@ impl App {
     /// Drive the create-PR confirmation modal (DESIGN.md §8). Enter (or `y`)
     /// runs the same `crate::pr::create` routine the CLI's `pr` calls — push
     /// the branch, open a ready PR, record the URL — then refreshes so the row
-    /// flips to "PR open"; esc (or `n`) cancels without touching anything.
+    /// flips to `next: review PR`; esc (or `n`) cancels without touching
+    /// anything.
     fn key_confirm_pr(&mut self, key: KeyEvent, task_id: i64, branch: String, title: String) {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
