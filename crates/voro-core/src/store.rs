@@ -208,11 +208,9 @@ impl Store {
         self.project(project_id)
     }
 
-    /// Delete a project outright — only ever safe when it has no tasks, since
-    /// tasks reference their project by id and deleting from under them would
-    /// orphan history. A project with tasks in any state (including `done` and
-    /// `rejected`) refuses; weight 0 is the designed way to snooze a project
-    /// without losing its history.
+    /// Delete a project outright — only safe when it has no tasks, since tasks
+    /// reference their project by id and deleting would orphan history. A project
+    /// with tasks in any state refuses; weight 0 snoozes without losing history.
     pub fn delete_project(&mut self, project_id: i64) -> Result<()> {
         self.project(project_id)?;
         let task_count: i64 = self.conn.query_row(
@@ -293,12 +291,9 @@ impl Store {
                     .into(),
             });
         }
-        // `needs-input`, `review`, and `stalled` are unreachable for human
-        // tasks (§6): the executor cannot be blocked on their own decision,
-        // completion skips review, and only a dispatched session can die. A
-        // task sitting in any of them — or one an agent session is still open
-        // on — is demonstrably agent-executed, so it cannot be marked
-        // human-only as it stands.
+        // `needs-input`, `review`, and `stalled` are unreachable for human tasks
+        // (§6), so a task sitting in one — or one an agent session is still open
+        // on — is demonstrably agent-executed and cannot be flagged human.
         if edit.human && !current.human {
             if matches!(
                 current.state,
@@ -340,11 +335,9 @@ impl Store {
         self.task(id)
     }
 
-    /// Re-prioritise a task in isolation (DESIGN.md §7), the fast path used when
-    /// the operator realises mid-review that a task's priority is wrong. Unlike
-    /// `update_task` this touches only `priority`, and it logs the change so the
-    /// audit trail records when a task was re-prioritised. Task state is left
-    /// untouched; scoring picks up the new priority on the next refresh.
+    /// Re-prioritise a task in isolation (DESIGN.md §7). Unlike `update_task`
+    /// this touches only `priority`, and it logs the change. Task state is left
+    /// untouched.
     pub fn set_priority(&mut self, id: i64, priority: Priority) -> Result<Task> {
         let changed = self.conn.execute(
             "UPDATE tasks SET priority = ?1 WHERE id = ?2",
@@ -358,10 +351,8 @@ impl Store {
     }
 
     /// Track (or, with `None`, untrack) a GitHub PR on a task (DESIGN.md §11c).
-    /// The URL is stored verbatim — validation and canonicalisation are the
-    /// caller's job, since only the `voro` crate knows a PR reference from any
-    /// other string — and the change is logged so the audit trail records when
-    /// a task became reviewable-by-PR. Leaves task state untouched.
+    /// The URL is stored verbatim — validation is the caller's job — and the
+    /// change is logged. Leaves task state untouched.
     pub fn set_pr(&mut self, id: i64, pr_url: Option<&str>) -> Result<Task> {
         let changed = self.conn.execute(
             "UPDATE tasks SET pr_url = ?1 WHERE id = ?2",
@@ -374,12 +365,10 @@ impl Store {
         self.task(id)
     }
 
-    /// Record (or, with `None`, clear) the git branch a task's work lives on
-    /// (task #81) — the intended name a human sets for dispatch to inject, or
-    /// the name an agent reports back through `voro done --branch`. The value
-    /// is stored verbatim; Voro never runs git, so it neither validates the
-    /// name nor touches the checkout. The change is logged, and task state is
-    /// left untouched.
+    /// Record (or, with `None`, clear) the git branch a task's work lives on —
+    /// the intended name a human sets for dispatch to inject, or the name an
+    /// agent reports through `voro done --branch`. Stored verbatim (Voro never
+    /// runs git) and logged; task state is left untouched.
     pub fn set_branch(&mut self, id: i64, branch: Option<&str>) -> Result<Task> {
         let changed = self.conn.execute(
             "UPDATE tasks SET branch = ?1 WHERE id = ?2",
@@ -392,18 +381,12 @@ impl Store {
         self.task(id)
     }
 
-    /// Set or replace a task's completion summary outside `done` (DESIGN.md
-    /// §8): append a `summary` event, which [`latest_summary`] naturally
-    /// supersedes with — the PR body, the detail view, and the
-    /// incomplete-report flag all read the newest event, so every consumer
-    /// picks up the replacement on its next read and the append-only log keeps
-    /// the older account. This is how a stale PR body gets amended and how a
-    /// `review` task flagged `[incomplete report]` gets its missing summary
-    /// without a `reject` → re-`done` round trip. Allowed only on a `running`
-    /// task (a resumed agent recording its account before `done`) or a
-    /// `review` task (fixing the report after it); it never touches
-    /// `tasks.state`, so it composes with the transition API rather than
-    /// bypassing it.
+    /// Set or replace a task's completion summary outside `done` (DESIGN.md §8):
+    /// append a `summary` event, which [`latest_summary`] supersedes with, so the
+    /// PR body, detail view, and incomplete-report flag all pick up the newest.
+    /// This amends a stale PR body or supplies a missing `[incomplete report]`
+    /// summary without a `reject` → re-`done` round trip. Allowed only on a
+    /// `running` or `review` task; it never touches `tasks.state`.
     ///
     /// [`latest_summary`]: Store::latest_summary
     pub fn set_summary(&mut self, id: i64, summary: &str) -> Result<Task> {
@@ -455,9 +438,8 @@ impl Store {
 
     /// Every dependency edge of every kind, keyed by the depending task and
     /// resolved to the dependency's current title and state — the forward
-    /// direction a detail view renders as `blocked by #N` or `<kind> #N`.
-    /// One query feeds every pane, browser rows included, so the render path
-    /// never issues a per-row lookup.
+    /// direction a detail view renders as `blocked by #N`. One query feeds every
+    /// pane, so the render path never issues a per-row lookup.
     pub fn deps_by_task(&self) -> Result<HashMap<i64, Vec<DepRef>>> {
         self.dep_refs(
             "SELECT d.task_id, t.id, t.title, t.state, d.kind
@@ -467,8 +449,7 @@ impl Store {
     }
 
     /// The reverse edges: every dependency keyed by the task depended *on*,
-    /// resolved to the depending task — who a task blocks (or spawned), which
-    /// no forward query can answer.
+    /// resolved to the depending task — who a task blocks (or spawned).
     pub fn dependents_by_task(&self) -> Result<HashMap<i64, Vec<DepRef>>> {
         self.dep_refs(
             "SELECT d.depends_on, t.id, t.title, t.state, d.kind
@@ -568,9 +549,9 @@ impl Store {
     }
 
     /// Every task's newest session, keyed by task id, in one query — what the
-    /// TUI loads per refresh so the detail views and the log key can answer
-    /// "what is/was this session doing?" for any task without querying the
-    /// store mid-draw. Session ids are monotonic, so `max(id)` is the latest.
+    /// TUI loads per refresh to answer "what is/was this session doing?" without
+    /// querying the store mid-draw. Session ids are monotonic, so `max(id)` is
+    /// the latest.
     pub fn latest_sessions(&self) -> Result<std::collections::HashMap<i64, Session>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {SESSION_COLUMNS} FROM sessions s
@@ -592,19 +573,9 @@ impl Store {
     }
 
     /// Whether `task_id` is a `review` task carrying a *partial* completion
-    /// report — exactly one of its branch and its summary is present (DESIGN.md
-    /// §8). A dispatched agent should record both whatever the project's review
-    /// medium: the summary is the review context and the reject-with-feedback
-    /// source, the branch ties the task to its work, and on the GitHub medium
-    /// `pr` additionally needs both to open a PR. One without the other is
-    /// therefore a report left half-finished — `done` with `--branch` but no
-    /// `--summary`, or the reverse, or the `SessionEnd` fallback recording a
-    /// branch with no summary — an anomaly the operator must see. A review task
-    /// with *neither* is deliberately not flagged — a planning or
-    /// task-generation task legitimately produces no branch and no summary —
-    /// and one with *both* is a complete report. Gated on `review` because that
-    /// is where the report is read; derived fresh from task and event state on
-    /// every read rather than stored on the task.
+    /// report — exactly one of its branch and summary present (DESIGN.md §8).
+    /// Neither is deliberately not flagged (a planning task produces neither),
+    /// both is complete. Gated on `review`, derived fresh rather than stored.
     pub fn incomplete_report_flag(&self, task_id: i64) -> Result<bool> {
         let row: Option<(TaskState, Option<String>)> = self
             .conn
@@ -627,17 +598,10 @@ impl Store {
 
     /// Rows for the cockpit's running strip (DESIGN.md §9): every `running`
     /// task, joined with its open session if it has one. The strip filters on
-    /// task *state*, not on "has an open session" — a `review` or `needs-input`
-    /// task keeps its session open behind the scenes (for feedback/answer
-    /// continuation, §8) but belongs to the queue, not the strip, so those
-    /// never appear here even though their session row is still open. A task
-    /// nothing is actively driving — started by hand, so no session was ever
-    /// opened (a dead dispatch is stalled by reconcile instead, §8) — has no
-    /// open session, so its `session_id`/`agent` are `NULL` and its elapsed
-    /// time is measured from when it entered `running`. The one-open-session
-    /// invariant (§8) makes the join at most one row per task, so a task
-    /// appears exactly once. Elapsed time is computed against the database's
-    /// clock so the TUI only formats it.
+    /// task *state*, so `review`/`needs-input` tasks (session still open) do not
+    /// appear. A hand-started task with no session shows with `session_id`/
+    /// `agent` `NULL`. The one-open-session invariant (§8) bounds the join to one
+    /// row per task; elapsed is computed in SQL so the TUI only formats it.
     pub fn running_rows(&self) -> Result<Vec<RunningRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id AS session_id, t.id, t.title, t.state, s.agent,
@@ -667,11 +631,8 @@ impl Store {
 
     /// The most recent completion summary a task recorded (DESIGN.md §8): the
     /// detail of its newest `summary` event, logged by `done --summary` or
-    /// amended in place by `set --summary` ([`set_summary`]). This
-    /// is the PR body when `pr` opens a pull request, and the presence check
-    /// `done` warns on. `None` when the task has never carried a summary — a
-    /// planning or task-generation task that produced no code, which is why the
-    /// summary stays optional through the whole lifecycle.
+    /// amended by `set --summary` ([`set_summary`]). This is the PR body when
+    /// `pr` opens a pull request. `None` when the task never carried a summary.
     ///
     /// [`set_summary`]: Store::set_summary
     pub fn latest_summary(&self, task_id: i64) -> Result<Option<String>> {
@@ -775,11 +736,10 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 }
 
 /// Insert a session row, stamping `started_at`, and return its id. Shared by
-/// [`Store::create_session`] and the dispatch/continuation transactions in
-/// `transition.rs`. Enforces the one-open-session invariant (DESIGN.md §8):
-/// opening a new session first closes any predecessor still open for the same
-/// task (stamped `aborted` — it was superseded), so a task never carries two
-/// open rows at once. The partial unique index is the schema-level backstop.
+/// [`Store::create_session`] and the dispatch/continuation transactions.
+/// Enforces the one-open-session invariant (DESIGN.md §8): opening a new session
+/// first closes any predecessor still open (stamped `aborted`). The partial
+/// unique index is the schema-level backstop.
 pub(crate) fn insert_session(
     conn: &Connection,
     task_id: i64,
@@ -796,12 +756,10 @@ pub(crate) fn insert_session(
     Ok(conn.last_insert_rowid())
 }
 
-/// Close a task's currently-open session, if it has one, stamping `ended_at`
-/// and `outcome`. The one-open-session invariant (DESIGN.md §8) means this
-/// touches at most one row. Used both to supersede a predecessor when a new
-/// session opens and to close the session on a terminal transition
-/// (accept/abandon/abort) in `transition.rs`, all within the caller's
-/// transaction. Returns the number of rows closed (0 if none was open).
+/// Close a task's currently-open session, if any, stamping `ended_at` and
+/// `outcome`. The one-open-session invariant (DESIGN.md §8) means this touches
+/// at most one row. Used to supersede a predecessor and to close the session on
+/// a terminal transition. Returns the number of rows closed (0 if none was open).
 pub(crate) fn close_open_session(
     conn: &Connection,
     task_id: i64,
@@ -814,10 +772,9 @@ pub(crate) fn close_open_session(
     )?)
 }
 
-/// Stamp `ended_at` and record `outcome` on a session, returning the number
-/// of rows changed (0 if the id is unknown). Shared by [`Store::end_session`]
-/// and reconciliation (`transition.rs`), which folds it into the same
-/// transaction as the task's `running → ready` drop.
+/// Stamp `ended_at` and record `outcome` on a session, returning the number of
+/// rows changed (0 if the id is unknown). Shared by [`Store::end_session`] and
+/// reconciliation.
 pub(crate) fn set_session_outcome(
     conn: &Connection,
     id: i64,
@@ -1058,7 +1015,6 @@ mod tests {
         assert!(err.to_string().contains("agent override"), "{err}");
         assert!(s.tasks().unwrap().is_empty());
 
-        // either alone is fine
         assert!(s.create_task(new_with(p, Some("codex"), false)).is_ok());
         let human = s.create_task(new_with(p, None, true)).unwrap();
         assert!(human.human);
@@ -1272,7 +1228,6 @@ mod tests {
         let err = s.set_summary(t.id, "too late").unwrap_err();
         assert!(err.to_string().contains("done"), "{err}");
 
-        // and never with nothing to record, nor for a missing task
         assert!(s.set_summary(t.id, "   ").is_err());
         assert!(matches!(
             s.set_summary(999, "x"),
@@ -1435,9 +1390,9 @@ mod tests {
     }
 
     /// Migration 0006 must dedupe a task that already carries several open
-    /// sessions (the duplicate-rows bug) — keeping the newest open and closing
-    /// the rest — before it can create the one-open-session index, and the
-    /// index must then reject any further second open row.
+    /// sessions — keeping the newest open and closing the rest — before it can
+    /// create the one-open-session index, and the index must then reject any
+    /// further second open row.
     #[test]
     fn migration_0006_dedupes_open_sessions_and_enforces_the_index() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1625,7 +1580,6 @@ mod tests {
                 human: false,
             })
             .unwrap();
-        // no summary yet
         assert_eq!(s.latest_summary(t.id).unwrap(), None);
 
         s.apply(t.id, Action::Start).unwrap();
@@ -1999,7 +1953,6 @@ mod tests {
         s.apply(rejected, Action::Abort).unwrap();
         s.apply(rejected, Action::Abandon).unwrap();
 
-        // one genuinely running task remains
         let running = s.create_task(new("running")).unwrap().id;
         s.record_dispatch(running, "claude", Some(4), None).unwrap();
 
@@ -2008,9 +1961,8 @@ mod tests {
         assert_eq!(rows[0].task_id, running);
     }
 
-    /// The direct session-25/#79 reproduction: a `done` task left carrying an
-    /// open session (a lingering listing entry could otherwise keep it "alive")
-    /// must stay out of the strip purely on its state.
+    /// A `done` task left carrying an open session must stay out of the strip
+    /// purely on its state.
     #[test]
     fn running_rows_ignore_a_stale_open_session_on_a_closed_task() {
         let mut s = Store::open_in_memory().unwrap();

@@ -1,8 +1,7 @@
-//! Tracking a GitHub PR on a task (DESIGN.md §11c): parsing a PR reference
-//! into the pieces a `gh` call needs, and turning a PR's review comments into
-//! a reject-with-feedback body. Pure of I/O — the `gh` shell-out lives in the
-//! `voro` crate, same as issue import — so everything here is testable against
-//! canned strings.
+//! Tracking a GitHub PR on a task (DESIGN.md §11c): parsing a PR reference into
+//! the pieces a `gh` call needs, and turning a PR's review comments into a
+//! reject-with-feedback body. Pure of I/O — the `gh` shell-out lives in the
+//! `voro` crate — so everything here is testable against canned strings.
 
 use serde::Deserialize;
 
@@ -151,10 +150,8 @@ fn login(user: &Option<GhUser>) -> &str {
 
 /// Build a reject-with-feedback body from a PR's reviews and inline comments
 /// (DESIGN.md §11c), so a GitHub review reaches the agent without retyping.
-/// Reviews with an empty body (a bare approval, or one that carries only inline
-/// comments) are skipped; the inline comments carry their own text. Returns an
-/// empty string when there is nothing to relay, which the caller turns into a
-/// "no review comments" message rather than an empty rejection.
+/// Reviews with an empty body are skipped; the inline comments carry their own
+/// text. Returns an empty string when there is nothing to relay.
 pub fn format_review_feedback(
     pr: &PrRef,
     reviews_json: &str,
@@ -203,8 +200,7 @@ pub fn format_review_feedback(
 
 /// Everything the forge needs to open a PR for a review task (DESIGN.md §8):
 /// the branch to push and the title and body of the pull request. Assembled by
-/// [`plan_pr`] once the task is proven PR-ready, so the process-facing create
-/// routine in the `voro` crate never has to re-derive or re-validate it.
+/// [`plan_pr`] once the task is proven PR-ready.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrPlan {
     pub branch: String,
@@ -212,13 +208,11 @@ pub struct PrPlan {
     pub body: String,
 }
 
-/// Validate that a task can have a PR opened from its done-time state, and if
-/// so assemble the [`PrPlan`] (DESIGN.md §8). A PR is created from a `review`
-/// task that carries both a branch (the work to push) and a completion summary
-/// (the PR body, kept as a `summary` event — the caller supplies the latest).
-/// Each gap fails naming exactly what is missing — state, branch, or summary —
-/// so `pr` can tell the operator what to fix. Pure of I/O, so the forge seam in
-/// the `voro` crate is the only part that touches git or `gh`.
+/// Validate that a task can have a PR opened from its done-time state, and if so
+/// assemble the [`PrPlan`] (DESIGN.md §8): a `review` task carrying both a branch
+/// (the work to push) and a completion summary (the PR body; the caller supplies
+/// the latest). Each gap fails naming what is missing — state, branch, or
+/// summary. Pure of I/O.
 pub fn plan_pr(task: &Task, latest_summary: Option<&str>) -> Result<PrPlan> {
     if task.state != TaskState::Review {
         return Err(Error::Invalid(format!(

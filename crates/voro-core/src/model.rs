@@ -246,9 +246,7 @@ impl ToSql for SessionOutcome {
 
 /// A project's review medium (DESIGN.md §8/§11a): which of the two media the
 /// unified `pr` action uses to get a review task's diff in front of the
-/// operator. Stored on the project (`projects.review_action`), since the
-/// medium is a property of where the project's code review happens, not of
-/// any task.
+/// operator. Stored on the project (`projects.review_action`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ReviewAction {
     /// Resolve at use: GitHub when the checkout is a GitHub repo, otherwise
@@ -280,9 +278,8 @@ impl ReviewAction {
         }
     }
 
-    /// Resolve the medium once the checkout's GitHub-ness is known. Pure —
-    /// probing whether the checkout actually is a GitHub repo is process I/O
-    /// and lives in the `voro` crate; only `Auto` consults the probe's answer.
+    /// Resolve the medium once the checkout's GitHub-ness is known. Only `Auto`
+    /// consults the probe's answer.
     pub fn resolve(&self, on_github: bool) -> ReviewMedium {
         match self {
             ReviewAction::Auto if on_github => ReviewMedium::GithubPr,
@@ -362,29 +359,25 @@ pub struct Task {
     pub agent: Option<String>,
     pub question: Option<String>,
     /// The canonical URL of a GitHub PR tracked on this task (DESIGN.md §11c),
-    /// or `None`. Naming the PR's base repo, it survives forks where the
+    /// or `None`. Names the PR's base repo, so it survives forks where the
     /// checkout's `origin` is not that repo.
     pub pr_url: Option<String>,
-    /// The git branch this task's work lives on (task #81), or `None`. Holds
-    /// the *intended* name dispatch injects into the agent's prompt, later
-    /// overwritten by the branch the agent *reports*. Voro never runs git; it
-    /// only passes this name into the prompt and records what comes back.
+    /// The git branch this task's work lives on, or `None`. Holds the *intended*
+    /// name dispatch injects into the prompt, later overwritten by the branch
+    /// the agent *reports* — Voro never runs git, it only records what returns.
     pub branch: Option<String>,
     pub state_since: String,
     pub created_at: String,
     pub closed_at: Option<String>,
-    /// Marks a task no agent can execute at all — hands-on work at real
-    /// hardware, say (DESIGN.md §3/§6). Dispatch, continuation, `ask`, and the
-    /// agent override refuse it; completion goes `running → done` directly,
-    /// since the human is both executor and acceptor. The default (`false`)
-    /// means dispatchable, with the human still free to start it by hand.
+    /// Marks a task no agent can execute — hands-on work at real hardware, say
+    /// (DESIGN.md §3/§6). Dispatch, continuation, `ask`, and the agent override
+    /// refuse it; completion goes `running → done` directly. Default `false`
+    /// means dispatchable.
     pub human: bool,
 }
 
-/// The verb a task's queue row asks of the human (DESIGN.md §3): the queue is
-/// a list of human next-actions, so every row carries its one next action,
-/// derived from state × fields rather than stored. `do` versus `dispatch` is
-/// also how a human-only task reads in the queue — no separate marker.
+/// The verb a task's queue row asks of the human (DESIGN.md §3), derived from
+/// state × fields rather than stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NextAction {
     /// An untriaged proposal: accept, park, or reject it.
@@ -426,11 +419,10 @@ impl fmt::Display for NextAction {
 
 impl Task {
     /// The single next-action derivation (DESIGN.md §3): what the human does
-    /// next with this task, from state × fields. `None` for states that ask
-    /// nothing of the human — `running` rows belong to the running strip, not
-    /// the queue, and `parked`/`done`/`rejected` wait on nothing. `stalled`
-    /// needs no human check: dispatch refuses human tasks and a stalled task
-    /// cannot be flagged human, so a stall is always a dead agent dispatch.
+    /// next, from state × fields. `None` for states that ask nothing of the
+    /// human — `running` belongs to the running strip, `parked`/`done`/`rejected`
+    /// wait on nothing. `stalled` always means a dead agent dispatch, since
+    /// dispatch refuses human tasks.
     pub fn next_action(&self) -> Option<NextAction> {
         match self.state {
             TaskState::Proposed => Some(NextAction::Triage),
@@ -499,14 +491,10 @@ pub struct Session {
 }
 
 /// A row of the cockpit's running strip (DESIGN.md §9): one per `running` task,
-/// joined with its open session if it has one. The strip filters on task state,
-/// so `review`/`needs-input` tasks — whose session stays open behind the scenes
-/// (§8) — never appear; they belong to the queue, as does a `stalled` task
-/// whose dispatch died. A task with no open session (started by hand, so
-/// nothing was ever dispatched) still shows, with `session_id`/`agent` set
-/// to `None`. `elapsed_secs` is computed in SQL against the database's clock —
-/// a live session's age, or how long a session-less task has sat in `running` —
-/// so the TUI only has to format it.
+/// joined with its open session if it has one. A task with no open session
+/// (started by hand) still shows, with `session_id`/`agent` set to `None`.
+/// `elapsed_secs` is computed in SQL against the database's clock, so the TUI
+/// only has to format it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningRow {
     pub session_id: Option<i64>,
@@ -556,8 +544,6 @@ mod tests {
 
     #[test]
     fn next_action_derives_every_arm() {
-        // The single derivation (DESIGN.md §3), one case per arm: state ×
-        // (pr_url, human) → the verb the queue row carries.
         for (state, pr_url, human, expected) in [
             (TaskState::Proposed, None, false, Some(NextAction::Triage)),
             (TaskState::NeedsInput, None, false, Some(NextAction::Answer)),
@@ -576,8 +562,6 @@ mod tests {
                 false,
                 Some(NextAction::Redispatch),
             ),
-            // running rows belong to the strip, not the queue; parked and the
-            // closed states ask nothing of the human.
             (TaskState::Running, None, false, None),
             (TaskState::Parked, None, false, None),
             (TaskState::Done, None, false, None),
@@ -593,8 +577,6 @@ mod tests {
 
     #[test]
     fn next_action_ignores_fields_its_arm_does_not_read() {
-        // A proposal's PR link or human flag changes nothing: only review
-        // reads pr_url, only ready reads human.
         assert_eq!(
             task_in(TaskState::Proposed, Some("https://x"), true).next_action(),
             Some(NextAction::Triage)
@@ -634,7 +616,6 @@ mod tests {
 
     #[test]
     fn review_action_resolves_the_medium() {
-        // auto is the only form that consults the GitHub probe
         assert_eq!(ReviewAction::Auto.resolve(true), ReviewMedium::GithubPr);
         assert_eq!(
             ReviewAction::Auto.resolve(false),
