@@ -1,0 +1,15 @@
+# `voro` owns the single lockstep tag and rewrites the workspace CHANGELOG.md,
+# which lives at the repository root (../../ from this crate). The replacements
+# turn the top "Unreleased" heading into a dated release section whose compare
+# link is closed at the new tag, then re-seed a fresh Unreleased heading above
+# it. Keep a Changelog format and the version headings that cargo-dist parses
+# for GitHub Release notes are preserved; inline links keep each section's body
+# free of trailing link-reference definitions.
+tag = true
+
+pre-release-replacements = [
+  { file = "../../CHANGELOG.md", search = "Unreleased", replace = "{{version}}", min = 1 },
+  { file = "../../CHANGELOG.md", search = "\\.\\.\\.HEAD", replace = "...{{tag_name}}", exactly = 1 },
+  { file = "../../CHANGELOG.md", search = "ReleaseDate", replace = "{{date}}", min = 1 },
+  { file = "../../CHANGELOG.md", search = "<!-- next-header -->", replace = "<!-- next-header -->\n\n## [Unreleased](https://github.com/ClachDev/Voro/compare/{{tag_name}}...HEAD) - ReleaseDate", exactly = 1 },
+]

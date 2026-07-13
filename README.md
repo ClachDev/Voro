@@ -30,6 +30,24 @@ cargo test --workspace
 cargo run -p voro
 ```
 
+## Releasing
+
+Releases are cut with [cargo-release](https://github.com/crate-ci/cargo-release)
+and built by [cargo-dist](https://github.com/axodotdev/cargo-dist). Both crates
+share one version and ship under a single `v{version}` tag; pushing that tag
+runs [`.github/workflows/release.yml`](.github/workflows/release.yml), which
+builds `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` tarballs with
+checksums and a `curl | sh` installer, then publishes a GitHub Release whose
+notes come from the matching [`CHANGELOG.md`](CHANGELOG.md) section.
+
+Record changes under the `Unreleased` heading in `CHANGELOG.md` as you go. To
+cut a release, from a clean `main` run `cargo release <level> --execute` (e.g.
+`patch`); cargo-release bumps the version, rolls `Unreleased` into a dated
+section, commits, and tags. It does not push — review, then
+`git push --follow-tags` to trigger the build. The first `v0.1.0` release is
+special: the version is already `0.1.0`, so tag it directly with
+`git tag v0.1.0 && git push origin v0.1.0`.
+
 ## Dispatching to agents
 
 Voro dispatches a task by running a shell command template per agent, and ships
