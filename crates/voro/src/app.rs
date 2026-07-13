@@ -212,6 +212,12 @@ pub struct App {
     /// Loaded whole per refresh so the render path never queries the store.
     pub deps: std::collections::HashMap<i64, Vec<DepRef>>,
     pub dependents: std::collections::HashMap<i64, Vec<DepRef>>,
+    /// Each task's newest session (tasks #73/#110), keyed by task id: what the
+    /// detail views render — a stalled task's post-mortem (DESIGN.md §8), an
+    /// open session's agent and log — and what gates the `l` log key, which
+    /// pages the session log regardless of task state. Loaded per refresh like
+    /// the dependency maps, so the render path never queries the store.
+    pub last_sessions: std::collections::HashMap<i64, voro_core::Session>,
 
     pub cockpit_rows: Vec<CockpitRow>,
     pub cockpit_sel: usize,
@@ -273,6 +279,7 @@ impl App {
             incomplete_report: std::collections::HashSet::new(),
             deps: std::collections::HashMap::new(),
             dependents: std::collections::HashMap::new(),
+            last_sessions: std::collections::HashMap::new(),
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
             tasks_sel: 0,
@@ -366,6 +373,7 @@ impl App {
                     .then_some(r.task.id)
             })
             .collect();
+        self.last_sessions = self.store.latest_sessions()?;
         self.all = all;
         self.running = self.store.running_rows()?;
         self.counts = self.store.state_counts()?;
@@ -688,8 +696,51 @@ impl App {
             KeyCode::Char('o') => self.open_selected_in_viewer(),
             KeyCode::Char('g') => self.open_selected_pr(),
             KeyCode::Char('a') => self.jump_into_session(),
+            KeyCode::Char('l') => self.view_session_log(),
             _ => {}
         }
+    }
+
+    /// Page through the selected task's newest session log (tasks #73/#110) —
+    /// "what is/was this session doing?", answerable in any state that has a
+    /// session on record. `$PAGER` (default `less`) owns the terminal for the
+    /// duration, so this runs through `pending_attach` with the TUI torn down
+    /// around it, the same treatment attach/resume get. Every missing piece —
+    /// no session, no recorded log — reports through the status line.
+    fn view_session_log(&mut self) {
+        let (task_id, project_id) = match self.selected_task() {
+            Some(task) => (task.id, task.project_id),
+            None => return,
+        };
+        let Some(session) = self.last_sessions.get(&task_id) else {
+            self.status = Some(format!("task {task_id} has no session on record"));
+            return;
+        };
+        let Some(log_path) = session.log_path.clone() else {
+            self.status = Some(format!("session {} recorded no log path", session.id));
+            return;
+        };
+        let project = match self.store.project(project_id) {
+            Ok(project) => project,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        self.pending_attach = Some(AttachRequest {
+            command: format!(
+                "${{PAGER:-less}} {}",
+                crate::dispatch::shell_quote(std::path::Path::new(&log_path))
+            ),
+            cwd: project.path,
+        });
+    }
+
+    /// The selected task's newest-session log path, whatever its state — what
+    /// gates the `l` key and its key-line hint.
+    pub fn selected_session_log(&self) -> Option<&str> {
+        let id = self.selected_task_id()?;
+        self.last_sessions.get(&id)?.log_path.as_deref()
     }
 
     /// Jump into the selected task's agent session (task #75): `attach` for a
@@ -1443,6 +1494,11 @@ impl App {
                     self.set_priority(task_id, priority);
                 }
             }
+            // The popup renders the same stalled post-mortem as the cockpit
+            // pane, so its advertised `l` has to work here too. The popup can
+            // only open on the selected task, so the selection-based helper
+            // pages the right log.
+            KeyCode::Char('l') => self.view_session_log(),
             _ => {}
         }
         self.mode = Mode::Detail { task_id, scroll };
@@ -1559,6 +1615,14 @@ mod tests {
                     store.apply(task.id, Action::Start).unwrap();
                     store.apply(task.id, Action::Complete(None)).unwrap();
                     store.apply(task.id, Action::Accept).unwrap();
+                }
+                // A dispatch that died: reconcile records the outcome and
+                // stalls the task (DESIGN.md §8).
+                TaskState::Stalled => {
+                    let (_, session) = store
+                        .record_dispatch(task.id, "claude", Some(1), Some("/tmp/demo/s.log"))
+                        .unwrap();
+                    store.reconcile_session(session.id, false, false).unwrap();
                 }
                 other => panic!("fixture does not build {other} tasks"),
             }
@@ -2358,6 +2422,118 @@ mod tests {
         assert!(app.pending_attach.is_none());
         assert!(
             app.status.as_deref().unwrap_or("").contains("jump-in"),
+            "{:?}",
+            app.status
+        );
+    }
+
+    // --- last-session surfacing and the log key (tasks #73/#110) ---
+
+    /// Refresh captures each task's newest session, so the detail views
+    /// render it without querying the store mid-draw.
+    #[test]
+    fn refresh_captures_a_stalled_tasks_last_session() {
+        let app = app_with(&[TaskState::Stalled]);
+        let task_id = app.queue[0].task.id;
+        let session = app.last_sessions.get(&task_id).expect("a captured session");
+        assert_eq!(session.outcome, Some(voro_core::SessionOutcome::Failed));
+        assert!(session.ended_at.is_some());
+        assert_eq!(session.log_path.as_deref(), Some("/tmp/demo/s.log"));
+        assert_eq!(app.selected_session_log(), Some("/tmp/demo/s.log"));
+    }
+
+    /// `l` on a stalled task queues `$PAGER <log>` for main() to run with the
+    /// TUI suspended, in the project's checkout.
+    #[test]
+    fn log_key_pages_a_stalled_tasks_session_log() {
+        let mut app = app_with(&[TaskState::Stalled]);
+        key(&mut app, KeyCode::Char('l'));
+
+        let request = app.pending_attach.clone().expect("a pager request");
+        assert_eq!(request.command, "${PAGER:-less} '/tmp/demo/s.log'");
+        assert_eq!(request.cwd, "/tmp/demo");
+    }
+
+    /// The key is not gated on state (task #110): a task whose session is
+    /// still open — here parked mid-flight into needs-input — pages the same
+    /// way, answering "what is this session doing?".
+    #[test]
+    fn log_key_pages_an_open_sessions_log_in_any_state() {
+        let mut store = Store::open_in_memory().unwrap();
+        let project = store.create_project("demo", "/tmp/demo").unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: project.id,
+                title: "mid-flight".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+            })
+            .unwrap();
+        store
+            .record_dispatch(task.id, "claude", Some(1), Some("/tmp/demo/open.log"))
+            .unwrap();
+        store.apply(task.id, Action::Ask("A or B?".into())).unwrap();
+
+        let mut app = App::new(store, dummy_ctx()).unwrap();
+        assert_eq!(
+            app.store.task(task.id).unwrap().state,
+            TaskState::NeedsInput
+        );
+        assert_eq!(app.selected_session_log(), Some("/tmp/demo/open.log"));
+        key(&mut app, KeyCode::Char('l'));
+
+        let request = app.pending_attach.clone().expect("a pager request");
+        assert_eq!(request.command, "${PAGER:-less} '/tmp/demo/open.log'");
+        assert_eq!(request.cwd, "/tmp/demo");
+    }
+
+    /// `l` on a task nothing ever dispatched explains itself instead of
+    /// paging nothing.
+    #[test]
+    fn log_key_on_a_ready_task_reports_and_does_nothing() {
+        let mut app = app_with(&[TaskState::Ready]);
+        assert!(app.selected_session_log().is_none());
+        key(&mut app, KeyCode::Char('l'));
+
+        assert!(app.pending_attach.is_none());
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("no session"),
+            "{:?}",
+            app.status
+        );
+    }
+
+    /// A stalled session that recorded no log path refuses with an
+    /// explanation rather than handing the pager an empty argument.
+    #[test]
+    fn log_key_without_a_recorded_log_path_reports() {
+        let mut store = Store::open_in_memory().unwrap();
+        let project = store.create_project("demo", "/tmp/demo").unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: project.id,
+                title: "died without a log".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+            })
+            .unwrap();
+        let (_, session) = store
+            .record_dispatch(task.id, "claude", Some(1), None)
+            .unwrap();
+        store.reconcile_session(session.id, false, false).unwrap();
+
+        let mut app = App::new(store, dummy_ctx()).unwrap();
+        key(&mut app, KeyCode::Char('l'));
+
+        assert!(app.pending_attach.is_none());
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("no log path"),
             "{:?}",
             app.status
         );
