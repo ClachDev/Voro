@@ -101,18 +101,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-/// Run an agent's attach/resume command — or a planning session (DESIGN.md
-/// §8) — in the foreground, the terminal already restored by the caller. The
-/// command inherits stdio so the agent's own TUI takes over; on return —
-/// detach or session end — the state of the world may have moved, so refresh
-/// before redrawing. `label` names the flow in the launch log's breadcrumbs.
-///
-/// A non-zero exit (e.g. `claude attach <id>` printing `No job matching …`)
-/// used to be painted over the instant the TUI reinitialised, leaving only a
-/// terse status line. So on failure the outcome is left on screen — below
-/// whatever the subprocess printed — until a key is pressed, and every
-/// round-trip is appended to the launch log so even a swallowed failure is
-/// recoverable.
+/// Run an agent's attach/resume command — or a planning session (DESIGN.md §8)
+/// — in the foreground, the terminal already restored by the caller. The
+/// command inherits stdio so the agent's own TUI takes over; on return the
+/// world may have moved, so refresh before redrawing. `label` names the flow in
+/// the launch log's breadcrumbs. On a non-zero exit the outcome is held on
+/// screen until a keypress, and every round-trip is appended to the launch log
+/// so even a swallowed failure is recoverable.
 fn foreground_session(app: &mut App, label: &str, command: &str, cwd: &str) {
     let status = std::process::Command::new("sh")
         .arg("-c")
@@ -133,9 +128,8 @@ fn foreground_session(app: &mut App, label: &str, command: &str, cwd: &str) {
     };
     dispatch::append_launch_log(&app.launch_log_path(), &log_line);
 
-    // On failure keep the subprocess's own error output readable: print the
-    // outcome beneath it and hold until a keypress, rather than reinitialising
-    // the TUI straight over the top of it.
+    // Keep the subprocess's own error output readable: print the outcome
+    // beneath it and hold until a keypress before the TUI reinitialises.
     if !succeeded {
         println!("\n{message}");
         println!("(press any key to return to voro)");

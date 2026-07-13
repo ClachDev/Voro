@@ -35,11 +35,10 @@ pub struct Cleanup {
 /// `git branch -d` cannot see it as merged — a merged PR is the reliable signal
 /// that authorises the force-delete.
 enum BranchPlan {
-    /// A merged PR makes the content upstream even though git cannot see it, so
-    /// `git branch -D` is safe.
+    /// A merged PR authorises `git branch -D`.
     ForceDelete,
-    /// No merged PR to lean on: attempt `git branch -d`, which git refuses for
-    /// an unmerged branch, so the branch simply survives when it isn't merged.
+    /// `git branch -d`, which git refuses for an unmerged branch — so an
+    /// unmerged branch simply survives.
     SafeDelete,
 }
 

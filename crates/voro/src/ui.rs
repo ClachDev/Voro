@@ -294,9 +294,9 @@ fn draw_mode(frame: &mut Frame, app: &App) {
 }
 
 /// The inline score decomposition (DESIGN.md §7) that `x` folds into a detail
-/// view: one dim line breaking the total down, plus the "not scheduled" note
-/// where the task's state keeps it out of the queue. Shared by the cockpit
-/// detail pane and the tasks-screen Detail popup so both read identically.
+/// view: one dim line breaking the total down, plus a "not scheduled" note
+/// where the task's state keeps it out of the queue. Shared by the cockpit pane
+/// and the tasks-screen Detail popup.
 fn score_lines(b: &ScoreBreakdown) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         format!(
@@ -330,7 +330,7 @@ fn score_lines(b: &ScoreBreakdown) -> Vec<Line<'static>> {
 
 /// The event-history section that `h` folds into a detail view: a bold
 /// "History" header over one line per event — timestamp dim, kind bold, detail
-/// plain, oldest first — matching the line format the popup used before.
+/// plain, oldest first.
 fn history_lines(events: &[Event]) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled("History", Style::new().bold()))];
     if events.is_empty() {
@@ -396,9 +396,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The persistent header indicator (DESIGN.md §12): a compact per-state tally
-/// so the triage backlog and the other queues stay felt independently of the
-/// queue's uniform cap (§7). Each state shows only when non-zero; the untriaged
-/// `triage` count — the guard rail §12 leans on — is highlighted, the rest dim.
+/// so the backlogs stay felt independently of the queue's uniform cap (§7).
+/// Each state shows only when non-zero; the untriaged `triage` count is
+/// highlighted, the rest dim.
 fn counts_line(counts: &StateCounts) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut push = |label: &str, n: i64, style: Style| {
@@ -429,10 +429,8 @@ fn score_span(total: f64) -> Span<'static> {
 }
 
 /// The incomplete-report flag (DESIGN.md §8): a `review` task carrying only one
-/// of a branch and a summary — the half-finished done report a dispatched
-/// session left behind, an anomaly on every review medium. Yellow to match the
-/// running strip's "no live session" warning, since both are anomalies needing
-/// the operator.
+/// of a branch and a summary. Yellow to match the running strip's "no live
+/// session" warning, since both are anomalies needing the operator.
 fn incomplete_report_span() -> Span<'static> {
     Span::styled(
         "  [incomplete report]",
@@ -440,9 +438,8 @@ fn incomplete_report_span() -> Span<'static> {
     )
 }
 
-/// The human-only flag (task #100) rendered as a row marker: this task is
-/// never dispatched, only worked by the operator. A property of the task
-/// rather than an anomaly, so it stays dim where the warning flags shout.
+/// The human-only flag (task #100) rendered as a row marker. A property of the
+/// task rather than an anomaly, so it stays dim where the warning flags shout.
 fn human_span() -> Span<'static> {
     Span::styled("  [human]", Style::new().dim())
 }
@@ -470,10 +467,9 @@ fn branch_span(branch: &str) -> Span<'static> {
     Span::styled(format!("branch: {branch}"), Style::new().fg(Color::Green))
 }
 
-/// A review row's next action rendered as a browser suffix (`next: pr` /
-/// `next: review PR`), from the single derivation (DESIGN.md §3). The browser
-/// shows state in its own column, so only `review` — whose verb reads the
-/// tracked PR, not the state alone — earns the suffix.
+/// A review row's next action rendered as a browser suffix (DESIGN.md §3). The
+/// browser shows state in its own column, so only `review` — whose verb reads
+/// the tracked PR, not the state alone — earns the suffix.
 fn review_next_span(task: &voro_core::Task) -> Option<Span<'static>> {
     if task.state != voro_core::TaskState::Review {
         return None;
@@ -485,16 +481,12 @@ fn review_next_span(task: &voro_core::Task) -> Option<Span<'static>> {
     ))
 }
 
-/// A task's newest session, rendered for the attention states (tasks #73/#110)
-/// so "what is/was this session doing?" is answerable from the detail views
-/// without dropping to the sessions table. A finished session is a post-mortem:
-/// its outcome (`capped` is yellow — it clears on its own when the quota
-/// resets — while `failed` is red and wants its log read), agent, and end
-/// time. An open one — the usual shape on `running`, `review`, and
-/// `needs-input`, whose session stays open (DESIGN.md §8) — shows the agent
-/// and start time. Both end on the log path the `l` key pages. States where
-/// the session is history rather than context (`done`, `rejected`, a
-/// redispatch-ready task) render nothing, keeping their panes clean.
+/// A task's newest session, rendered for the attention states (tasks #73/#110).
+/// A finished session is a post-mortem: its outcome (`capped` yellow — it clears
+/// when the quota resets — `failed` red and wanting its log read), agent, and
+/// end time. An open one shows agent and start time. Both end on the log path
+/// the `l` key pages. States where the session is history rather than context
+/// (`done`, `rejected`, a redispatch-ready task) render nothing.
 fn session_lines(session: &Session, state: TaskState) -> Vec<Line<'static>> {
     if !matches!(
         state,
@@ -699,10 +691,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
 
-    // Bodies are full dispatchable prompts, so a long one overflows the pane;
-    // measure the wrapped height against the inner area to clamp the scroll and
-    // decide whether to advertise it. `line_count` wants the text width, so
-    // pass the inner width and keep the block off this measuring paragraph.
+    // Measure the wrapped body height against the inner area to clamp the
+    // scroll and decide whether to advertise it. `line_count` wants the text
+    // width, so pass the inner width with the block off this measuring paragraph.
     let inner = block.inner(area);
     let total = para.line_count(inner.width) as u16;
     let max_scroll = total.saturating_sub(inner.height);
@@ -720,8 +711,8 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Live sessions (DESIGN.md §9): agent, task state, and elapsed time since
-/// dispatch. Collapsed to a zero-height area by `draw_cockpit` when nothing
-/// is running, so there is nothing to draw here in the common case.
+/// dispatch. `draw_cockpit` collapses this to a zero-height area when nothing
+/// is running.
 fn draw_running(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
@@ -829,10 +820,9 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
 }
 
 /// The dependency section of a detail view (task #103), both directions, one
-/// line per edge: `blocked by #N title` for the task's own blockers,
-/// `blocks #N title` for the reverse edges — the tasks this one holds back —
-/// and other forward kinds by name (`discovered-from #N title`). Closed
-/// tasks are dimmed, the browser suffix convention of `blocker_spans`.
+/// line per edge: `blocked by #N title` for the task's own blockers, `blocks #N
+/// title` for the reverse edges, and other forward kinds by name. Closed tasks
+/// are dimmed, as in `blocker_spans`.
 fn dep_lines(deps: &[DepRef], dependents: &[DepRef]) -> Vec<Line<'static>> {
     let blocked_by = deps.iter().filter(|d| d.kind == DepKind::Blocks);
     let blocks = dependents.iter().filter(|d| d.kind == DepKind::Blocks);
@@ -856,10 +846,9 @@ fn dep_line(label: &str, d: &DepRef) -> Line<'static> {
     ])
 }
 
-/// The `blocked by #4, #7` suffix for a parked browser row: what it is waiting
-/// on, with already-closed blockers dimmed so the open ones read as the reason
-/// it is still parked. Empty for any other state or a parked task with no
-/// blockers (which is deliberately deferred, not blocked).
+/// The `blocked by #4, #7` suffix for a parked browser row, with already-closed
+/// blockers dimmed so the open ones read as the reason it is still parked. Empty
+/// for any other state, or a parked task with no blockers (deferred, not blocked).
 fn blocker_spans(row: &TaskRow) -> Vec<Span<'static>> {
     if row.task.state != voro_core::TaskState::Parked || row.blockers.is_empty() {
         return Vec::new();
@@ -880,10 +869,8 @@ fn blocker_spans(row: &TaskRow) -> Vec<Span<'static>> {
 }
 
 /// The projects screen (DESIGN.md §9): one row per project — weight, name,
-/// path, open task count, and the review action when one is pinned (§8).
-/// Direct weight editing lives here (`0`–`5`), so the morning ritual is one
-/// keystroke per project. The open count is the project's non-terminal tasks,
-/// drawn from the already-loaded task list.
+/// path, open task count, and the review action when one is pinned (§8). The
+/// open count is the project's non-terminal tasks, from the loaded task list.
 fn draw_projects(frame: &mut Frame, app: &App) {
     let [list_area, status] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
@@ -952,11 +939,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The contextual per-screen key line (ui-redesign §2): the actions that apply
 /// on the current screen and selection, as key/label pairs the caller renders
-/// key-bold, label-dim. It lists actions, not navigation — `j`/`k` and the
-/// arrows are omitted, and `r` refresh stays bound but unadvertised — while `q`
-/// and `tab` are always present. On the cockpit the dispatch keys and the
-/// score/history toggles only apply to a selected task, so they drop out when
-/// nothing is selected.
+/// key-bold, label-dim. It lists actions, not navigation (`j`/`k` and `r`
+/// refresh are omitted); `q` and `tab` are always present. Selection-only
+/// actions drop out on the cockpit when nothing is selected.
 fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     // `enter_hint` yields "⏎ <verb>"; split the glyph from the verb so the
     // glyph renders as the bold key and the verb as the dim label.

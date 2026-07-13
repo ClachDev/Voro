@@ -24,18 +24,11 @@ use voro_core::{
     TASK_ID_PLACEHOLDER, Task, TaskState, VIEWER_PATH_PLACEHOLDER, parse_sessions_json,
 };
 
-/// Rendered per dispatch and prepended verbatim to every prompt so the agent
-/// learns the return-path verbs (DESIGN.md §8) with no per-project install and no
-/// reliance on a skill being loaded — the dispatcher already owns the prompt
-/// file, so injection is the most robust delivery. The `{task_id}` and `{db}`
-/// placeholders are filled by [`render_preamble`] so every verb names its task
-/// and database literally, rather than relying on inherited `VORO_TASK_ID`/
-/// `VORO_DB` env vars — those do not survive a launcher that hands the real
-/// session to a supervisor daemon (e.g. `claude --bg`), the exact launch style
-/// the starter config ships. Deliberately says nothing about `voro start`:
-/// dispatch has already transitioned the task `ready → running`. Kept as a
-/// single template so the injected text cannot drift; the voro-cli SKILL.md is
-/// the richer, dev-facing version covering manual runs.
+/// Prepended to every dispatched prompt so the agent learns the return-path
+/// verbs (DESIGN.md §8). [`render_preamble`] fills the `{task_id}` and `{db}`
+/// placeholders literally rather than relying on inherited `VORO_TASK_ID`/
+/// `VORO_DB` env vars, which do not survive a launcher that hands the session
+/// to a supervisor daemon (e.g. `claude --bg`).
 const RETURN_PATH_PREAMBLE_TEMPLATE: &str = "\
 <!-- Voro dispatch: how to report back -->
 You are an agent dispatched by Voro on task {task_id}. Voro tracks this task in a
@@ -58,23 +51,16 @@ bypass the state machine and event log.{branch}
 
 ";
 
-/// The one sentence shared by both branch blocks below, so the early-registration
-/// instruction cannot drift between them (task #96): the agent registers the
-/// branch it will work on with Voro the moment it exists, letting reconcile,
-/// attach, `voro pr`, and the UI reflect the real branch while the task is still
-/// `running` — and capturing it even if the agent never reaches a clean `done`.
-/// `{name}` is the concrete branch (assigned case) or the `<name>` the agent will
-/// choose; `{task_id}`/`{db}` keep the command copy-pasteable under launch styles
-/// that drop the environment (same rationale as the return-path verbs).
+/// Shared by both branch blocks below so the early-registration instruction
+/// cannot drift (task #96). `{name}` is the assigned branch or the `<name>` the
+/// agent will choose; `{task_id}`/`{db}` keep the command copy-pasteable under
+/// launch styles that drop the environment.
 const BRANCH_REGISTER_SENTENCE: &str = "register it with `voro set {task_id}{db} --branch {name}` as you do, so Voro \
      tracks the real branch while the task runs";
 
-/// The `{branch}` block [`render_preamble`] substitutes when the task carries an
-/// intended git branch (task #81): the agent is told the name, to create or check
-/// it out itself (Voro runs no git), to register it early via
-/// [`BRANCH_REGISTER_SENTENCE`], and to confirm the branch its work landed on at
-/// completion. `{name}` is the branch name and `{task_id}`/`{db}` keep the verbs
-/// copy-pasteable.
+/// The `{branch}` block for a task that carries an intended git branch (task
+/// #81): the agent is told the name, to check it out itself, to register it
+/// early via [`BRANCH_REGISTER_SENTENCE`], and to confirm it at completion.
 const ASSIGNED_BRANCH_TEMPLATE: &str = "\n\n\
 This task is assigned the git branch `{name}`. Create or check it out yourself
 before making changes — Voro runs no git — and {register}. Confirm the branch your
@@ -128,12 +114,9 @@ const REF_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// beat behind the timestamp taken here just before the spawn.
 const SPAWN_CLOCK_SLACK_MS: i64 = 2000;
 
-/// Fill [`RETURN_PATH_PREAMBLE_TEMPLATE`] for a concrete dispatch: substitute the
-/// literal task id into every verb, and add a `--db <path>` flag to each verb
-/// only when the dispatching database is not the default one the verbs resolve to
-/// on their own. Putting both values in the visible command is what makes the
-/// return path robust under launch styles that drop the spawned process's
-/// environment.
+/// Fill [`RETURN_PATH_PREAMBLE_TEMPLATE`] for a concrete dispatch: the literal
+/// task id in every verb, plus a `--db <path>` flag only when the dispatching
+/// database is not the default one the verbs resolve to on their own.
 fn render_preamble(task_id: i64, db_path: &Path, branch: Option<&str>) -> String {
     let db_flag = if db_path == Store::default_db_path() {
         String::new()
@@ -223,18 +206,16 @@ pub fn plan_session(
     })
 }
 
-/// Which of the two flows `spawn_session` is performing — they share every
-/// mechanic (agent resolution, the dirty-tree guard, prompt/log files,
-/// spawning and reaping the process) and differ only in which state the task
-/// must already be in and which `Store` method records the result.
+/// Which of the two flows `spawn_session` is performing: they share every
+/// mechanic and differ only in the required starting state and which `Store`
+/// method records the result.
 #[derive(Clone, Copy)]
 enum SpawnKind {
-    /// A fresh dispatch: the task must be `ready` — or `stalled`, redispatch
-    /// being the whole point of that state (DESIGN.md §6/§8); recording it
-    /// performs the transition to `running`.
+    /// The task must be `ready` or `stalled` (redispatch, DESIGN.md §6/§8);
+    /// recording it performs the transition to `running`.
     Fresh,
-    /// A continuation: the task must already be `running` — `answer` just put
-    /// it there — so recording it only opens a session, never changes state.
+    /// The task must already be `running` (`answer` just put it there), so
+    /// recording it only opens a session, never changes state.
     Continuation,
 }
 
@@ -319,12 +300,9 @@ impl DispatchCtx {
     }
 
     /// The rolling log for subprocess launches that are *not* dispatches —
-    /// viewer opens and attach/resume round-trips. Dispatch and continuation
-    /// each own a per-session log (`log_path`); these one-off launches share a
-    /// single append-only file beside those session logs so a failure that
-    /// would otherwise be painted over by the TUI leaves a breadcrumb. Single
-    /// file, no rotation — the same single-operator argument as session logs
-    /// (DESIGN.md §8).
+    /// viewer opens and attach/resume round-trips, which have no per-session
+    /// log. They share one append-only file so a failure the TUI would paint
+    /// over still leaves a breadcrumb. Single file, no rotation (DESIGN.md §8).
     pub fn launch_log_path(&self) -> PathBuf {
         self.runtime_dir.join("launches.log")
     }
@@ -349,10 +327,9 @@ pub(crate) fn append_launch_log(path: &Path, line: &str) {
 
 /// Dispatch a ready task — or redispatch a stalled one — to a headless agent
 /// session, returning a summary line. `agent_override` is the CLI `--agent`
-/// picker flag, which outranks the task's own override (DESIGN.md §8). Every
-/// check that can fail — task state, agent resolution, the dirty-tree guard,
-/// writing the prompt — runs before the process is spawned, so a failed
-/// dispatch never leaves an orphan session.
+/// flag, which outranks the task's own override (DESIGN.md §8). Every check
+/// that can fail runs before the process is spawned, so a failed dispatch never
+/// leaves an orphan session.
 pub fn dispatch(
     store: &mut Store,
     ctx: &DispatchCtx,
@@ -364,16 +341,12 @@ pub fn dispatch(
 
 /// Continue a task that `answer` just moved `needs-input → running` (DESIGN.md
 /// §6). When the agent defines a `continue` verb and the task's last session
-/// has a captured reference, the answer is fed to *that session* headless —
-/// `new_input` (the answer text) becomes the prompt file substituted into the
-/// template alongside `{session}`. Otherwise this falls back to what it always
-/// did: spawn a fresh session whose prompt is the task body — now carrying the
-/// `## Answers` section the answer appended — so the work resumes with the
-/// answer in hand. Shares every mechanic with [`dispatch`] except the required
-/// starting state and how the result is recorded: `record_continuation`
-/// asserts the task is already `running` instead of performing the `ready →
-/// running` transition itself, so this can never be used to smuggle a task
-/// into `running` outside the transition API.
+/// has a captured reference, the answer (`new_input`) is fed to *that session*
+/// headless; otherwise it falls back to a fresh spawn of the task body, now
+/// carrying the `## Answers` section the answer appended. Unlike [`dispatch`],
+/// `record_continuation` asserts the task is already `running` rather than
+/// performing the transition, so this cannot smuggle a task into `running`
+/// outside the transition API.
 pub fn continue_dispatch(
     store: &mut Store,
     ctx: &DispatchCtx,
@@ -392,15 +365,11 @@ pub fn continue_dispatch(
 }
 
 /// Open a `review` (or `running`) task's checkout in a viewer so its diff can
-/// be seen (DESIGN.md §11a): the viewer medium of the per-project review
-/// action (§8). The viewer command from `voro.toml` is run detached in the
-/// project's path — a shell-out baseline that reuses the command-template
-/// model rather than hard-coding an editor. `viewer_override` names a
-/// `[viewers.<name>]` entry; `None` falls back to the viewer the project's
-/// review action picks, or the config's default. With no viewer configured,
-/// the caller gets back what to add rather than a silent no-op; opening never
-/// touches task state, so no clean-tree guard and no `Store` mutation are
-/// involved (the diff being reviewed is often the uncommitted work itself).
+/// be seen (DESIGN.md §11a): the viewer medium of the per-project review action
+/// (§8), run detached in the project's path. `viewer_override` names a
+/// `[viewers.<name>]` entry; `None` falls back to the project's review action or
+/// the config default. Opening never touches task state, so there is no
+/// clean-tree guard (the diff reviewed is often the uncommitted work itself).
 pub fn open(
     store: &mut Store,
     ctx: &DispatchCtx,
@@ -416,9 +385,8 @@ pub fn open(
     }
     let project = store.project(task.project_id).map_err(|e| e.to_string())?;
 
-    // The project's review action may pin a named viewer even when this open
-    // was invoked directly (`voro open`, the TUI's o key) rather than through
-    // the resolved `pr` action.
+    // The project's review action may pin a named viewer even when open was
+    // invoked directly rather than through the resolved `pr` action.
     let project_viewer = match &project.review_action {
         ReviewAction::Viewer(Some(name)) => Some(name.clone()),
         _ => None,
@@ -435,10 +403,8 @@ pub fn open(
         &shell_quote(Path::new(&project.path)),
     );
 
-    // A detached viewer's output was previously discarded to `/dev/null`, so a
-    // failing viewer command was completely silent. Redirect it to the shared
-    // launch log instead, and record the exit status there when the reap thread
-    // collects it, so a silent failure has a breadcrumb.
+    // Redirect the detached viewer's output to the shared launch log so a
+    // silent failure leaves a breadcrumb.
     std::fs::create_dir_all(&ctx.runtime_dir)
         .map_err(|e| format!("cannot create {}: {e}", ctx.runtime_dir.display()))?;
     let launch_log = ctx.launch_log_path();
@@ -467,10 +433,9 @@ pub fn open(
         .map_err(|e| format!("cannot spawn viewer in {}: {e}", project.path))?;
     let pid = i64::from(child.id());
 
-    // Nothing waits on the viewer — like dispatch, reap it in a detached thread
-    // so an exited child never lingers as a zombie in a long-lived TUI session.
-    // The reap records the exit status so a viewer that failed after spawning is
-    // findable in the log, not just one that failed to spawn.
+    // Nothing waits on the viewer — reap it in a detached thread so an exited
+    // child never lingers as a zombie, and record its exit status so a viewer
+    // that failed after spawning is findable in the log.
     let reap_log = launch_log.clone();
     let reap_command = command.clone();
     std::thread::spawn(move || {
@@ -637,20 +602,17 @@ fn spawn_session(
         }
     };
 
-    // Nothing in this process waits on the child otherwise, since dispatch
-    // must return as soon as the session is recorded. Left unreaped, an
-    // exited child sits as a zombie for as long as this process runs — and
-    // `kill -0` on a zombie still succeeds, which would permanently defeat
-    // reconciliation's pid-liveness check in a long-lived TUI session. A
-    // detached reaper thread collects the exit status the moment it's
-    // available without blocking dispatch.
+    // Dispatch returns as soon as the session is recorded, so nothing else
+    // waits on the child. Left unreaped it becomes a zombie, and `kill -0` on a
+    // zombie still succeeds — permanently defeating reconciliation's
+    // pid-liveness check in a long-lived TUI. A detached reaper collects the
+    // exit status without blocking dispatch.
     std::thread::spawn(move || {
         let _ = child.wait();
     });
 
     let ref_outcome = match (continue_ref, &agent.sessions) {
-        // A continue-verb continuation addressed the prior session, so the
-        // new row keeps addressing it.
+        // A continuation addressed the prior session; the new row keeps its ref.
         (Some(session_ref), _) => {
             let result = store.set_session_ref(session.id, &session_ref);
             result.map_err(|e| e.to_string())?;
@@ -695,10 +657,9 @@ fn spawn_session(
 }
 
 /// Capture the agent's reference for the session just spawned: poll the
-/// agent's `sessions` listing for a session started in this project at or
-/// after the spawn, falling back to the `backgrounded · <id>` line launchers
-/// print (which lands in the log, since stdout is redirected there). `None`
-/// once the timeout passes without either source producing a reference.
+/// `sessions` listing for a session started in this project at or after the
+/// spawn, falling back to the `backgrounded · <id>` line launchers print into
+/// the log. `None` once the timeout passes without either source producing one.
 fn capture_session_ref(
     sessions_cmd: &str,
     project_path: &str,
@@ -934,9 +895,8 @@ mod tests {
         assert!(prompt.contains("voro propose"), "{prompt}");
         assert!(!prompt.contains("VORO_TASK_ID"), "{prompt}");
         // even with no assigned branch, the agent is told to register the branch
-        // it picks the moment it exists — `voro set` naming the literal task id,
-        // with the `<name>` placeholder it will fill in (a `--db` flag may sit
-        // between the two under a non-default store)
+        // it picks (`voro set` and `--branch <name>` asserted apart, since a
+        // `--db` flag may sit between them under a non-default store)
         assert!(prompt.contains(&format!("voro set {id}")), "{prompt}");
         assert!(prompt.contains("--branch <name>"), "{prompt}");
         assert!(prompt.contains("Detailed prompt."), "{prompt}");
@@ -977,19 +937,17 @@ mod tests {
 
     #[test]
     fn preamble_tells_both_cases_to_register_the_branch_early() {
-        // no assigned branch: the agent picks a name, but is still told to
-        // register it early with `voro set`, naming the literal task id. The
-        // branch-*assignment* wording (naming a specific branch) is absent, and
-        // there is no completion `voro done --branch`, since no name is known.
+        // no assigned branch: the agent is told to register the name it picks,
+        // but branch-assignment wording and a completion `voro done --branch`
+        // are absent, since no name is known.
         let plain = render_preamble(62, &Store::default_db_path(), None);
         assert!(!plain.contains("git branch `"), "{plain}");
         assert!(plain.contains("voro set 62 --branch <name>"), "{plain}");
         assert!(!plain.contains("voro done 62 --branch"), "{plain}");
         assert!(plain.contains("Voro runs no git"), "{plain}");
 
-        // with a branch: the agent is told to use it, to register it early with
-        // `voro set`, and how to confirm it at completion — every verb naming the
-        // literal task id and the concrete branch.
+        // with a branch: the agent is told to use it, register it, and confirm
+        // it at completion.
         let branched = render_preamble(62, &Store::default_db_path(), Some("feat/parser"));
         assert!(branched.contains("git branch `feat/parser`"), "{branched}");
         assert!(branched.contains("Voro runs no git"), "{branched}");
@@ -1013,10 +971,8 @@ mod tests {
 
         let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
         assert!(prompt.contains("git branch `feat/parser`"), "{prompt}");
-        // the branch is both registered early (`voro set`) and confirmed at
-        // completion (`voro done`); each names the literal task id and branch,
-        // though a `--db` flag may sit between id and `--branch` under a
-        // non-default store, so the two are asserted apart
+        // registered (`voro set`) and confirmed (`voro done`); id and `--branch`
+        // asserted apart, since a `--db` flag may sit between them
         assert!(prompt.contains(&format!("voro set {id}")), "{prompt}");
         assert!(prompt.contains(&format!("voro done {id}")), "{prompt}");
         assert!(prompt.contains("--branch feat/parser"), "{prompt}");

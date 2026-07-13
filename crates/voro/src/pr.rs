@@ -1,10 +1,9 @@
 //! The `gh` shell-outs for a task's tracked GitHub PR (DESIGN.md §11c):
-//! opening the PR in a browser (jump-to-PR) and pulling its review comments
-//! into a reject-with-feedback body. The parsing and formatting that matters
-//! lives in `voro_core::pr` and is tested against canned strings; this module
-//! is the thin, network-facing seam that invokes `gh` for real. Kept in the
-//! `voro` crate so `voro_core` stays free of process I/O, same as issue import
-//! and agent dispatch.
+//! opening the PR in a browser, pulling its review comments into a
+//! reject-with-feedback body, and creating a PR on review. Parsing and
+//! formatting live in `voro_core::pr`; this is the network-facing seam that
+//! invokes `gh`, kept in the `voro` crate so `voro_core` stays free of
+//! process I/O.
 
 use std::process::{Command, Stdio};
 
@@ -20,9 +19,8 @@ fn tracked_pr(store: &Store, task_id: i64) -> Result<PrRef, String> {
 }
 
 /// Open a task's tracked PR in a browser via `gh pr view --web` (DESIGN.md
-/// §11c): the review action's jump-to-PR, landing on the page where the diff
-/// and its comments already live. Spawned detached and reaped like the viewer
-/// in `dispatch::open`, so nothing lingers as a zombie.
+/// §11c). Spawned detached and reaped like the viewer in `dispatch::open`, so
+/// nothing lingers as a zombie.
 pub fn open(store: &Store, task_id: i64) -> Result<String, String> {
     let pr = tracked_pr(store, task_id)?;
     let mut child = Command::new("gh")
@@ -39,10 +37,9 @@ pub fn open(store: &Store, task_id: i64) -> Result<String, String> {
 }
 
 /// Pull a task's tracked PR's review comments into a reject-with-feedback body
-/// (DESIGN.md §11c). Fetches the PR's review summaries and inline diff comments
-/// via `gh api` — scoped to the PR's *base* repo, so a fork's checkout origin
-/// is irrelevant — and hands both to `voro_core` to format. Errors when the PR
-/// has no relayable comments, rather than returning an empty rejection.
+/// (DESIGN.md §11c). Fetches review summaries and inline diff comments via `gh
+/// api`, scoped to the PR's *base* repo so a fork's checkout origin is
+/// irrelevant. Errors when the PR has no relayable comments.
 pub fn pull_review_feedback(store: &Store, task_id: i64) -> Result<String, String> {
     let pr = tracked_pr(store, task_id)?;
     let reviews = gh_api(&pr, &pr.api_path("reviews"))?;
@@ -56,9 +53,7 @@ pub fn pull_review_feedback(store: &Store, task_id: i64) -> Result<String, Strin
 
 /// Assemble the plan for opening a PR on a review task (DESIGN.md §8): its
 /// branch, title, and summary body, validated in `voro_core::plan_pr`. Shared
-/// by the CLI and TUI so both name the same gap when a task is not PR-ready,
-/// and so each can quote the branch and title in its confirmation before
-/// anything is pushed.
+/// by the CLI and TUI so both name the same gap when a task is not PR-ready.
 pub fn plan(store: &Store, task_id: i64) -> Result<PrPlan, String> {
     let task = store.task(task_id).map_err(|e| e.to_string())?;
     let summary = store.latest_summary(task_id).map_err(|e| e.to_string())?;
@@ -66,13 +61,12 @@ pub fn plan(store: &Store, task_id: i64) -> Result<PrPlan, String> {
 }
 
 /// Create a ready-for-review GitHub PR for a review task and record its URL
-/// (DESIGN.md §8): push the task's branch, open a non-draft PR whose title is
-/// the task title and whose body is the completion summary, and store the URL
-/// via the `set --pr` write path. No state change — the task stays in `review`
-/// until a human accepts. The caller (CLI confirm, TUI modal) has already
-/// gated on the operator; the dispatched agent still cannot publish, since
-/// `pr` is operator-invoked. Only ever called when the task has no tracked PR;
-/// a tracked one jumps to [`open`] instead.
+/// (DESIGN.md §8): push the task's branch, open a non-draft PR titled with the
+/// task title and bodied with the completion summary, and store the URL. No
+/// state change — the task stays in `review` until a human accepts. The
+/// operator has already been gated by the caller; `pr` is operator-invoked, so
+/// the dispatched agent still cannot publish. Only called when no PR is
+/// tracked; a tracked one jumps to [`open`] instead.
 pub fn create(store: &mut Store, task_id: i64) -> Result<String, String> {
     let plan = plan(store, task_id)?;
     let task = store.task(task_id).map_err(|e| e.to_string())?;
@@ -88,12 +82,10 @@ pub fn create(store: &mut Store, task_id: i64) -> Result<String, String> {
     Ok(format!("opened {} for task {task_id}", pr.url))
 }
 
-/// Resolve a project's review medium (DESIGN.md §8): the single "show me this
-/// task's diff" action `pr` performs. The decision itself is
-/// `ReviewAction::resolve` in `voro-core`; this seam only supplies the one
-/// input core cannot compute — whether the checkout is a GitHub repo `gh` can
-/// address — and only when the action is `auto`, so pinned media never pay for
-/// the probe.
+/// Resolve a project's review medium (DESIGN.md §8). The decision is
+/// `ReviewAction::resolve` in `voro-core`; this seam supplies the one input it
+/// cannot compute — whether the checkout is a GitHub repo `gh` can address —
+/// and only when the action is `auto`, so pinned media never pay for the probe.
 pub fn resolve_medium(project: &Project) -> ReviewMedium {
     let on_github = project.review_action.needs_probe() && is_github_repo(&project.path);
     project.review_action.resolve(on_github)
@@ -114,11 +106,9 @@ fn is_github_repo(project_path: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// The forge-specific half of [`create`] (DESIGN.md §8), kept behind one seam:
-/// push the branch and open a ready PR against the repo's default branch,
-/// returning the PR URL. This is the only part that knows about GitHub. A
-/// project whose checkout is not a GitHub repo gets a clear error pointing at
-/// the viewer medium — the other half of the folded review action (§8/§11a).
+/// The forge-specific half of [`create`] (DESIGN.md §8): push the branch and
+/// open a ready PR against the repo's default branch, returning the PR URL. A
+/// non-GitHub checkout gets a clear error pointing at the viewer medium.
 fn open_pr_on_github(project_path: &str, plan: &PrPlan) -> Result<String, String> {
     ensure_github_repo(project_path)?;
     push_branch(project_path, &plan.branch)?;
