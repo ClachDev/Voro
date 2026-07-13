@@ -1,39 +1,29 @@
-//! The observation half of dispatch (DESIGN.md §8): catching a `running`
-//! task whose backing process has exited without reporting — landing it in
-//! `stalled`, the attention state for a dead dispatch — and finalising a
-//! session stranded on a task that has already closed. `voro-core` owns the
-//! reconciliation *decision* (`Store::reconcile_session`) given liveness as a
-//! plain bool; this module supplies that bool — and a best-effort read of
-//! whether the log looks like a usage cap — the inputs that need process or
-//! filesystem I/O and so stay out of voro-core.
+//! The observation half of dispatch (DESIGN.md §8): catch a `running` task
+//! whose backing process has exited without reporting — landing it in
+//! `stalled` — and finalise a session stranded on a task that has already
+//! closed. `voro-core` owns the reconciliation decision
+//! (`Store::reconcile_session`) given liveness as a bool; this module supplies
+//! that bool, plus a best-effort read of whether the log looks usage-capped,
+//! the inputs that need process or filesystem I/O.
 //!
-//! Because the session lifecycle follows the task, a liveness probe is only
-//! run for a `running` task. `needs-input`/`review` keep their session open on
-//! purpose (it is reused when the answer or feedback continues the work), so
-//! they are left untouched without any probe; a session still open on a closed
-//! task is stale and is finalised. Reconciliation is no longer the thing that
-//! eventually closes healthy sessions — the terminal transitions do that — so a
-//! lingering `blocked`/`null` listing entry for a task that has moved on stops
-//! mattering.
+//! A liveness probe runs only for a `running` task. `needs-input`/`review`
+//! keep their session open on purpose (reused when the answer or feedback
+//! continues the work), and a session still open on a closed task is stale and
+//! finalised — neither needs a probe.
 //!
-//! Liveness comes from one of two sources, per agent (task #75). An agent
-//! that defines a `sessions` verb is asked directly: its listing is queried
-//! once per reconcile pass, and a session is live while its captured
-//! reference appears there not-yet-`done`. This is the only correct source
-//! for supervisor-owned launches (`claude --bg`), where the pid Voro spawned
-//! is a launcher that exits at birth — pid-checking would declare every such
-//! dispatch dead immediately, so those sessions are *never* pid-checked; if
-//! their liveness can't be determined (no ref captured, listing failed) they
-//! are left alone rather than guessed at. Agents without a `sessions` verb
-//! keep the original pid-liveness check.
+//! Liveness has two sources per agent (task #75). An agent defining a
+//! `sessions` verb is queried directly — its listing once per pass — and a
+//! session is live while its captured ref appears there not-yet-`done`. This is
+//! the only correct source for supervisor-owned launches (`claude --bg`), whose
+//! spawned pid is a launcher that exits at birth: pid-checking would declare
+//! every such dispatch dead, so those sessions are *never* pid-checked, and
+//! undeterminable liveness (no ref, listing failed) is left alone rather than
+//! guessed. Agents without a `sessions` verb keep the pid check.
 //!
-//! There is no daemon watching for a session's process to exit — the
-//! dispatching `voro` invocation may not outlive it, whether that was a
-//! one-shot `voro dispatch` or a TUI session closed hours ago. A pragmatic
-//! v1 instead reconciles on read: `App::refresh` and every CLI verb call
-//! [`reconcile_live_sessions`] before consulting session or task state, so a
-//! dead session is finalised the next time anything looks, without ever
-//! needing a resident watcher.
+//! There is no daemon watching for process exit. Reconciliation runs on read:
+//! `App::refresh` and every CLI verb call [`reconcile_live_sessions`] before
+//! consulting session or task state, so a dead session is finalised the next
+//! time anything looks.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -46,24 +36,16 @@ use voro_core::{AgentSessionEntry, AgentsConfig, Result, Store, TaskState, parse
 const LOG_TAIL_BYTES: u64 = 4096;
 
 /// Phrases that plausibly mean "usage cap", checked case-insensitively
-/// against the log tail. Deliberately narrow (DESIGN.md §8): this is not a
-/// general log parser, and anything it misses is reported `failed` rather
-/// than guessed at — a wrong `failed` costs a beat (redispatch still works
-/// the same either way), a wrong `capped` would be a confident lie about the
-/// cause.
+/// against the log tail. Deliberately narrow (DESIGN.md §8): not a general log
+/// parser — anything it misses is reported `failed` rather than misattributed
+/// as `capped`.
 const CAP_SIGNATURES: [&str; 3] = ["usage limit", "rate limit", "quota exceeded"];
 
 /// Reconcile every session still marked live, per its task's state (DESIGN.md
-/// §8). The session lifecycle now follows the task, so a liveness probe is only
-/// meaningful for a `running` task — its process going away without a
-/// return-path call is the one thing observation can catch. A `needs-input` or
-/// `review` task keeps its session open on purpose (for answer/feedback
-/// continuation), so it is left alone without any probe; a session still open
-/// on a task that has already closed is stale and is finalised. The
-/// probe-or-not decision is made here; [`Store::reconcile_session`] owns the
-/// resulting write. Returns how many were finalised. Cheap to call on every
-/// read — with no live sessions it costs one query; the agents config is only
-/// consulted when a `running` session needs a listing-based probe.
+/// §8). The probe-or-not decision is made here; [`Store::reconcile_session`]
+/// owns the resulting write. Returns how many were finalised. Cheap to call on
+/// every read — with no live sessions it costs one query, and the agents config
+/// is only consulted when a `running` session needs a listing-based probe.
 pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<usize> {
     let live = store.live_sessions()?;
     if live.is_empty() {
@@ -80,32 +62,28 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
         let task_state = store.task(session.task_id)?.state;
         if task_state != TaskState::Running {
             // needs-input / review keep their session open (reconcile_session
-            // returns None); a session still open on a closed task is stale and
-            // gets finalised. Neither needs a liveness probe, so none is run.
+            // returns None); a session on a closed task is stale and finalised.
             if store.reconcile_session(session.id, false, false)?.is_some() {
                 finalised += 1;
             }
             continue;
         }
 
-        // A running task: probe liveness. `None` means it can't be determined
-        // right now (no ref captured, listing failed, no pid) — in which case
-        // the session is left alone rather than wrongly finalised.
+        // A running task: probe liveness. `None` (no ref, listing failed, no
+        // pid) leaves the session alone rather than wrongly finalising it.
         let sessions_cmd = config
             .as_ref()
             .and_then(|c| c.agent(&session.agent))
             .and_then(|a| a.sessions());
         let alive: Option<bool> = match sessions_cmd {
             Some(cmd) => match session.session_ref.as_deref() {
-                // No ref was captured — this session can't be found in the
-                // listing, and pid-checking a supervisor-owned launch would
-                // wrongly kill it, so liveness is unknowable.
+                // No ref: not findable in the listing, and pid-checking a
+                // supervisor-owned launch would wrongly kill it.
                 None => None,
                 Some(session_ref) => {
                     let listing = listings
                         .entry(session.agent.clone())
                         .or_insert_with(|| run_sessions_command(cmd));
-                    // The listing itself failing leaves liveness unknowable.
                     listing.as_ref().map(|entries| {
                         entries
                             .iter()
@@ -151,11 +129,9 @@ fn run_sessions_command(cmd: &str) -> Option<Vec<AgentSessionEntry>> {
     parse_sessions_json(&String::from_utf8_lossy(&output.stdout)).ok()
 }
 
-/// Whether a process with this pid still exists, via `kill -0` — checks
-/// existence/permission without sending a real signal, the same mechanism
-/// `dispatch.rs` uses to terminate a session's process group. A non-positive
-/// pid is refused rather than probed, since 0 and negative pids address
-/// process groups, not the single process meant here.
+/// Whether a process with this pid still exists, via `kill -0` (existence
+/// check, no signal sent). A non-positive pid is refused: 0 and negative pids
+/// address process groups, not the single process meant here.
 fn pid_is_alive(pid: i64) -> bool {
     if pid <= 0 {
         return false;
@@ -166,10 +142,8 @@ fn pid_is_alive(pid: i64) -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
-/// A trivial, best-effort usage-cap detector (DESIGN.md §8): scan the last
-/// few KB of the log for a short list of phrases agents print when a usage
-/// limit stops them mid-session. Anything this misses simply reports as
-/// `failed` instead of `capped` — see [`CAP_SIGNATURES`].
+/// Best-effort usage-cap detector (DESIGN.md §8): scan the log tail for the
+/// phrases in [`CAP_SIGNATURES`].
 fn log_tail_looks_capped(path: &str) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
@@ -193,10 +167,9 @@ mod tests {
     use std::path::PathBuf;
     use voro_core::{Action, NewTask, Priority, SessionOutcome, TaskState};
 
-    /// An agents path that never exists. It loads the built-ins (a missing
-    /// file is no longer an error), so a session under a verb-less agent name
-    /// like `manual` still degrades to the pid check — the built-in `claude`
-    /// and `codex` carry a `sessions` verb and take the listing path instead.
+    /// An agents path that never exists — loads the built-ins, so a verb-less
+    /// agent name like `manual` degrades to the pid check while the built-in
+    /// `claude`/`codex` (which carry a `sessions` verb) take the listing path.
     fn no_config() -> PathBuf {
         PathBuf::from("/nonexistent/voro.toml")
     }
@@ -246,8 +219,6 @@ mod tests {
             .create_session(task_id, "manual", Some(dead_pid), None)
             .unwrap();
 
-        // the session is finalised and the task lands in `stalled` (DESIGN.md
-        // §6/§8), the attention state that puts redispatch in the queue.
         assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 1);
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
         assert_eq!(
@@ -293,10 +264,9 @@ mod tests {
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
     }
 
-    /// A `needs-input` or `review` task keeps its session open on purpose, so
-    /// reconciliation leaves it alone even with a dead process — no probe, no
-    /// finalise. Otherwise its session would be closed and the ref lost before
-    /// the answer/feedback could continue the same agent session.
+    /// `needs-input`/`review` keep their session open, so reconciliation leaves
+    /// it alone even with a dead process — otherwise the ref would be lost
+    /// before the answer/feedback could continue the same agent session.
     #[test]
     fn a_needs_input_or_review_session_is_left_open() {
         for action in [Action::Ask("A or B?".into()), Action::Complete(None)] {
@@ -341,10 +311,9 @@ mod tests {
         (agents_path, dir)
     }
 
-    /// A session whose recorded pid is dead — the trap case: with `--bg`-style
-    /// launches the spawned pid always exits at birth. With the session still
-    /// listed live by the agent, reconciliation must trust the listing and
-    /// leave the task running, never the pid.
+    /// The trap case: a `--bg`-style launch's spawned pid exits at birth, so
+    /// with the session still listed live the reconciler must trust the listing
+    /// and leave the task running, never the dead pid.
     #[test]
     fn a_listed_live_session_is_left_alone_despite_a_dead_pid() {
         let (agents_path, dir) = sessions_fixture(
@@ -368,11 +337,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The session left its agent's listing without any return-path verb: it
-    /// shows up `state: done` (or drops out entirely). The reconciler finalises
-    /// the session and stalls the task (DESIGN.md §6/§8) — an attention state,
-    /// so even the rare misfire (a completion whose `voro done` has not landed)
-    /// surfaces in the queue instead of being silently requeued.
+    /// A session that left the listing without a return-path verb (shows
+    /// `state: done`, or drops out) is finalised and the task stalled — an
+    /// attention state, so even a rare misfire surfaces rather than requeues.
     #[test]
     fn a_finished_or_missing_listed_session_stalls_the_task() {
         for (name, listing) in [

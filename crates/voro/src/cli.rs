@@ -1,13 +1,8 @@
 //! The command-line verb surface: every TUI action, scriptable and
-//! agent-legible (DESIGN.md §9). Verbs that §8 names for the agent return
-//! path (`ask`, `done`, `propose`) keep those names and flags so Milestone B
-//! extends rather than renames. Parsing is clap derive: each verb declares
-//! its flags exactly once as typed fields, and anything a verb does not
-//! declare is rejected by name (with a did-you-mean) before any handler runs
-//! — a swallowed flag reads as success while dropping whatever the caller
-//! meant to record. The one clap default overridden is help: the hand-written
-//! single-page overview in `HELP` beats generated per-command help for a
-//! surface this small, so every help request short-circuits to it.
+//! agent-legible (DESIGN.md §9). Parsing is clap derive, so a flag a verb does
+//! not declare is rejected by name rather than silently swallowed. Help is the
+//! one clap default overridden: every help request short-circuits to the
+//! hand-written `HELP` overview.
 
 use std::fmt::Write as _;
 
@@ -192,19 +187,16 @@ enum Verb {
         agent: Option<String>,
     },
     /// Spawn a fresh session on a task that is already `running`, without
-    /// touching its state — the mechanics `answer` uses automatically for a
-    /// previously-dispatched task, exposed directly so a continuation that
-    /// failed (a dirty tree, a misconfigured agent) can be retried once fixed.
+    /// touching its state — the mechanics `answer` uses automatically, exposed
+    /// directly so a continuation that failed can be retried once fixed.
     Continue {
         task_id: i64,
         #[arg(long)]
         agent: Option<String>,
     },
     /// Run a configured viewer on a review/running task's checkout so its diff
-    /// can be seen (DESIGN.md §8/§11a) — the explicit spelling of `pr`'s
-    /// viewer medium, kept for reaching the local diff even on a GitHub
-    /// project. Spawning lives in the dispatch module beside the other process
-    /// work; `voro-core` stays process-free.
+    /// can be seen (DESIGN.md §8/§11a) — the explicit spelling of `pr`'s viewer
+    /// medium, reaching the local diff even on a GitHub project.
     Open {
         task_id: i64,
     },
@@ -522,12 +514,10 @@ fn apply_blocks_flag(store: &mut Store, blocker_id: i64, raw: &str) -> Result<St
     Ok(out)
 }
 
-/// A value given inline (`--body TEXT`, `--summary TEXT`) or read from a file
-/// (`--body-file PATH`, `--summary-file PATH`) — the latter lets an agent
-/// leave a multi-line, PR-ready text without cramming it onto one command
-/// line (DESIGN.md §8). The pairs are declared mutually exclusive in the
-/// parser, so at most one arrives here; `None` when neither is given, which
-/// stays valid: not every task produces one.
+/// A value given inline (`--body TEXT`) or read from a file (`--body-file
+/// PATH`), the latter for multi-line PR-ready text (DESIGN.md §8). The pairs
+/// are mutually exclusive in the parser, so at most one arrives here; `None`
+/// when neither is given stays valid.
 fn text_or_file(text: Option<String>, path: Option<String>) -> Result<Option<String>, String> {
     match (text, path) {
         (Some(text), _) => Ok(Some(text)),
@@ -615,10 +605,8 @@ fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
     }
 }
 
-/// Manage the `voro.toml` that dispatch resolves against — the config that
-/// lives outside the database (DESIGN.md §8), so this verb takes no `store`.
-/// `init` scaffolds a starter file, `list` shows the effective agents, and
-/// `path` prints where dispatch looks for it.
+/// Manage the `voro.toml` that dispatch resolves against — config that lives
+/// outside the database (DESIGN.md §8), so this verb takes no `store`.
 fn agent_verb(cmd: AgentCmd, ctx: &DispatchCtx) -> Result<String, String> {
     let path = &ctx.agents_path;
     match cmd {
@@ -848,15 +836,10 @@ fn set_verb(store: &mut Store, args: SetArgs) -> Result<String, String> {
 }
 
 /// `pr <task-id> [--yes]` (DESIGN.md §8/§11c): the per-project "show me this
-/// task's diff" action. With a tracked PR, open it in a browser — the
-/// jump-to-PR that lands on the diff and its comments. Without one, resolve
-/// the project's review medium: on GitHub, *create* the PR from the review
-/// task's done-time state — assert it is PR-ready (naming any missing state,
-/// branch, or summary), confirm with the operator unless `--yes`, then push
-/// the branch and open a non-draft PR whose body is the completion summary,
-/// recording its URL; on a viewer project, open the checkout in the
-/// configured viewer instead, exactly as `open` does. The `git`/`gh`
-/// shell-outs live in the `pr` module beside the other process work.
+/// task's diff" action. With a tracked PR, open it in a browser. Without one,
+/// resolve the project's review medium: GitHub creates the PR from the review
+/// task's done-time state (asserting PR-readiness, confirming unless `--yes`),
+/// a viewer project opens the checkout, as `open` does.
 fn pr_verb(store: &mut Store, id: i64, yes: bool, ctx: &DispatchCtx) -> Result<String, String> {
     let task = store.task(id).map_err(|e| e.to_string())?;
     if task.pr_url.is_some() {
@@ -875,11 +858,9 @@ fn pr_verb(store: &mut Store, id: i64, yes: bool, ctx: &DispatchCtx) -> Result<S
     crate::pr::create(store, id)
 }
 
-/// Ask a yes/no question on the terminal, defaulting to no (DESIGN.md §8): the
-/// interactive gate before `pr` pushes a branch and opens a PR. Mirrors the
-/// TUI's confirmation modal; `--yes` skips it. A non-interactive stdin (a pipe
-/// at EOF) reads as "no", so a scripted run without `--yes` declines rather
-/// than blocking.
+/// Ask a yes/no question on the terminal, defaulting to no (DESIGN.md §8). A
+/// non-interactive stdin (a pipe at EOF) reads as "no", so a scripted run
+/// without `--yes` declines rather than blocking.
 fn confirm(question: &str) -> Result<bool, String> {
     use std::io::Write as _;
     print!("{question} [y/N] ");
@@ -895,12 +876,9 @@ fn confirm(question: &str) -> Result<bool, String> {
 
 /// `reject <task-id> [TEXT] [--from-pr] [--no-dispatch]` (DESIGN.md §6/§8/§11c):
 /// review → running with feedback. `--from-pr` pulls the tracked PR's review
-/// comments as that feedback so a GitHub review reaches the agent without
-/// retyping; any extra TEXT is appended below them. Without the flag, TEXT is
+/// comments as that feedback, with any extra TEXT appended; otherwise TEXT is
 /// the feedback. Like `answer`, a task with prior session history then continues
-/// the work with the feedback in hand — and because review keeps the session
-/// open, that reuses the *same* agent session; `--no-dispatch` forces the plain
-/// transition, and a task only ever started by hand has nothing to continue.
+/// the work with the feedback in hand; `--no-dispatch` forces the plain transition.
 fn reject_verb(store: &mut Store, args: RejectArgs, ctx: &DispatchCtx) -> Result<String, String> {
     let id = args.task_id;
     let feedback = if args.from_pr {
@@ -937,19 +915,13 @@ fn reject_verb(store: &mut Store, args: RejectArgs, ctx: &DispatchCtx) -> Result
 
 /// `done <task-id> [--summary TEXT | --summary-file PATH] [--branch NAME]`
 /// (DESIGN.md §6/§8): running | stalled → review — from `stalled` it reports a
-/// dead session's finished work on its behalf, the misfire case where the work
-/// landed but the session's own `done` never did. The summary is the completion
-/// note, kept as a summary event by the transition and read back as the PR body
-/// when `pr` opens a pull request — so it should read as a PR description
-/// (`--summary-file` lets the agent write a multi-line one without cramming a
-/// command line). `--branch` is the branch the agent reports its work landed on
-/// (task #81), recorded on the task (overwriting any intended name dispatch
-/// injected) so the task correlates with its branch and PR. The completion
-/// transition is applied first, so a task that is neither `running` nor
-/// `stalled` is refused before any branch is recorded. Voro never runs git;
-/// it only stores the reported name. A `done` that leaves the task without a branch or summary
-/// *warns* rather than failing — planning and task-generation work produces
-/// neither — so both stay optional through the whole lifecycle.
+/// dead session's finished work on its behalf. The summary is the completion
+/// note, read back as the PR body when `pr` opens a pull request. `--branch` is
+/// the branch the agent reports its work landed on (task #81), overwriting any
+/// intended name dispatch injected. The transition applies first, so a task
+/// that is neither `running` nor `stalled` is refused before any branch is
+/// recorded. A `done` that leaves the task without a branch or summary *warns*
+/// rather than failing, so both stay optional through the lifecycle.
 fn done_verb(store: &mut Store, args: DoneArgs) -> Result<String, String> {
     let id = args.task_id;
     let summary = text_or_file(args.summary, args.summary_file)?;
@@ -963,12 +935,9 @@ fn done_verb(store: &mut Store, args: DoneArgs) -> Result<String, String> {
             .map_err(|e| e.to_string())?;
         write!(out, " (branch {})", name.trim()).unwrap();
     }
-    // A complete report carries both a branch and a summary whatever the
-    // review medium — the summary is the review context and the feedback
-    // source even where `pr` opens a viewer instead of a PR — so warn (never
-    // fail) about whichever is absent without promising how `pr` will react.
-    // A human task lands straight in `done` with no report to read, so it
-    // earns no warning.
+    // A complete report carries both a branch and a summary whatever the review
+    // medium, so warn (never fail) about whichever is absent. A human task lands
+    // straight in `done` with no report to read, so it earns no warning.
     if task.state == TaskState::Review {
         let has_branch = store.task(id).map_err(|e| e.to_string())?.branch.is_some();
         let has_summary = store
@@ -1093,8 +1062,7 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
     Ok(out)
 }
 
-/// A review row's next action as a browser suffix (`  next: pr` /
-/// `  next: review PR`), from the single derivation (DESIGN.md §3). The list
+/// A review row's next action as a browser suffix (DESIGN.md §3). The list
 /// shows state in its own column, so only `review` — whose verb reads the
 /// tracked PR, not the state alone — earns the suffix.
 fn review_next_suffix(task: &Task) -> String {
@@ -1109,9 +1077,8 @@ fn inbox_verb(store: &mut Store) -> Result<String, String> {
     let candidates = store.candidates().map_err(|e| e.to_string())?;
     let mut out = String::new();
     for c in scheduler::queue(&candidates) {
-        // The queue row carries the verb instead of the state, mirroring the
-        // TUI queue: every inbox row is a next action, and the verb is the
-        // richer rendering of the same derivation (DESIGN.md §3).
+        // The queue row carries the verb instead of the state: every inbox row
+        // is a next action (DESIGN.md §3), like the TUI queue.
         write!(
             out,
             "{:5.1}  #{} {:10} {} {}: {}",
@@ -1135,10 +1102,8 @@ fn inbox_verb(store: &mut Store) -> Result<String, String> {
     Ok(out)
 }
 
-/// The always-visible untriaged count (DESIGN.md §12) and its companions, as a
-/// scriptable readout: task counts by state, excluding parked projects so the
-/// numbers match the queue and header. `triage` is the untriaged-proposal
-/// guard rail; the rest give the other queues a running tally.
+/// Task counts by state (DESIGN.md §12) as a scriptable readout, excluding
+/// parked projects so the numbers match the queue and header.
 fn stats_verb(store: &mut Store) -> Result<String, String> {
     let c = store.state_counts().map_err(|e| e.to_string())?;
     let mut out = String::new();
@@ -1179,12 +1144,8 @@ fn next_verb(store: &mut Store) -> Result<String, String> {
 }
 
 /// `  [incomplete report]` when a `review` task carries only one of a branch
-/// and a summary (DESIGN.md §8), else empty — the half-finished done report a
-/// dispatched session left behind, surfaced so the operator sees the gap
-/// whatever the project's review medium. Says nothing about `pr`, which needs
-/// the report only on the GitHub medium — and deliberately does not resolve
-/// the medium, since `auto` resolution probes `gh` and this renders per line.
-/// Re-derived per line, never stored.
+/// and a summary (DESIGN.md §8), else empty. Deliberately does not resolve the
+/// review medium, since `auto` resolution probes `gh` and this renders per line.
 fn incomplete_report_suffix(store: &Store, task_id: i64) -> &'static str {
     if store.incomplete_report_flag(task_id).unwrap_or(false) {
         "  [incomplete report]"
@@ -1232,14 +1193,11 @@ fn explain_verb(store: &mut Store, id: i64) -> Result<String, String> {
 }
 
 /// `answer <task-id> TEXT [--no-dispatch]` (DESIGN.md §6): needs-input →
-/// running, answer appended to the body and logged — the transition alone
-/// always applies first. "fed to the session" then means dispatching a fresh
-/// continuation whose prompt carries the `## Answers` section, not writing to
-/// a live pipe: by the time a human answers, the asking session has typically
-/// already exited. That continuation only makes sense for a task with prior
-/// session history — one only ever started by hand has nothing to continue,
-/// and stays a plain transition, which is also what `--no-dispatch` forces
-/// even when history exists.
+/// running, answer appended to the body — the transition applies first. It then
+/// dispatches a fresh continuation whose prompt carries the `## Answers` section
+/// (the asking session has typically exited by the time a human answers). That
+/// only fires for a task with prior session history; `--no-dispatch` forces the
+/// plain transition even when history exists.
 fn answer_verb(store: &mut Store, args: AnswerArgs, ctx: &DispatchCtx) -> Result<String, String> {
     let id = args.task_id;
     let text = joined(&args.text, "answer text")?;
@@ -1264,10 +1222,8 @@ fn answer_verb(store: &mut Store, args: AnswerArgs, ctx: &DispatchCtx) -> Result
     }
 }
 
-/// `viewer list` (DESIGN.md §8/§11a): the viewers `voro.toml` defines, with
-/// the default — the one used when neither a project's review action nor
-/// `default_viewer` names one — flagged. Like `agent`, this manages config
-/// that lives outside the database, so it takes no store.
+/// `viewer list` (DESIGN.md §8/§11a): the viewers `voro.toml` defines, with the
+/// default flagged. Like `agent`, config outside the database, so no store.
 fn viewer_verb(cmd: ViewerCmd, ctx: &DispatchCtx) -> Result<String, String> {
     let path = &ctx.agents_path;
     match cmd {
@@ -1338,10 +1294,9 @@ fn ask_verb(store: &mut Store, args: AskArgs) -> Result<String, String> {
     apply_action(store, args.task_id, Action::Ask(question), false)
 }
 
-/// Apply a plain state-machine action. The task closes worktree in tow (§8):
-/// `accept`/`abandon` are the terminal transitions that own the dispatch
-/// worktree's teardown (`yes` skips its confirmation). The transition is
-/// applied first and stands regardless of what the cleanup does.
+/// Apply a plain state-machine action. `accept`/`abandon` are the terminal
+/// transitions that own the dispatch worktree's teardown (§8; `yes` skips its
+/// confirmation). The transition applies first and stands regardless of cleanup.
 fn apply_action(store: &mut Store, id: i64, action: Action, yes: bool) -> Result<String, String> {
     let closes = matches!(action, Action::Accept | Action::Abandon);
     let task = store.apply(id, action).map_err(|e| e.to_string())?;
@@ -1353,12 +1308,10 @@ fn apply_action(store: &mut Store, id: i64, action: Action, yes: bool) -> Result
     Ok(out)
 }
 
-/// Remove the worktree of a just-closed task after showing the operator exactly
-/// what will go (worktree path, branch, why the branch is judged safe) and
-/// confirming — `--yes` skips the prompt for scripting. Declining still returns
-/// `Ok`, so the transition it followed stands; `None` means there was nothing to
-/// clean (no branch, or no matching worktree). The git/`gh` work lives in the
-/// `worktree` module beside dispatch.
+/// Remove the worktree of a just-closed task after showing the operator what
+/// will go and confirming (`--yes` skips the prompt). Declining still returns
+/// `Ok`, so the transition it followed stands; `None` means nothing to clean
+/// (no branch, or no matching worktree).
 fn clean_up_worktree(store: &Store, task: &Task, yes: bool) -> Result<Option<String>, String> {
     let project = store.project(task.project_id).map_err(|e| e.to_string())?;
     let Some(plan) = crate::worktree::Cleanup::plan(task, &project.path)? else {

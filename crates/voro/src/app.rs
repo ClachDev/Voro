@@ -84,30 +84,25 @@ pub enum Mode {
         kind: PromptKind,
         buffer: String,
     },
-    /// Collecting a GitHub PR reference to track on a task (DESIGN.md §11c),
-    /// reached by pressing the jump-to-PR key on a task that has none. Unlike
-    /// `Prompt`, this feeds a store mutation (`set_pr`), not a state
+    /// Collecting a GitHub PR reference to track on a task (DESIGN.md §11c).
+    /// Unlike `Prompt`, this feeds a store mutation (`set_pr`), not a state
     /// transition, so it carries no `PromptKind`.
     LinkPr {
         task_id: i64,
         buffer: String,
     },
     /// Confirming that `pr` should push a review task's branch and open a ready
-    /// PR (DESIGN.md §8), reached by the PR key on a review task that has none.
-    /// The modal states exactly what is about to happen; confirming runs the
-    /// same `crate::pr::create` core routine the CLI calls. A tracked PR skips
-    /// this and jumps to the PR instead.
+    /// PR (DESIGN.md §8). Confirming runs the same `crate::pr::create` the CLI
+    /// calls; a tracked PR skips this and jumps to the PR instead.
     ConfirmPr {
         task_id: i64,
         branch: String,
         title: String,
     },
     /// Confirming that a just-closed task's dispatch worktree should be torn
-    /// down (DESIGN.md §8), reached when `accept`/`abandon` land on a task whose
-    /// branch has a matching worktree. The transition has already committed; the
-    /// plan states exactly what will be removed and why the branch is safe to
-    /// delete, and confirming runs the same `crate::worktree` teardown the CLI
-    /// calls. Declining leaves the worktree in place.
+    /// down (DESIGN.md §8). The transition has already committed; confirming
+    /// runs the same `crate::worktree` teardown the CLI calls, declining leaves
+    /// the worktree in place.
     ConfirmCleanup {
         task_id: i64,
         plan: crate::worktree::Cleanup,
@@ -116,9 +111,8 @@ pub enum Mode {
         task_id: i64,
         scroll: u16,
     },
-    /// Dispatch-via-picker (DESIGN.md §8): agents loaded fresh from
-    /// `voro.toml` when the picker opens, never cached, since the whole
-    /// point is to catch a config that's changed since the last dispatch.
+    /// Dispatch-via-picker (DESIGN.md §8): agents loaded fresh from `voro.toml`
+    /// when the picker opens, to catch a config changed since the last dispatch.
     AgentPicker {
         task_id: i64,
         agents: Vec<String>,
@@ -130,8 +124,7 @@ pub enum Mode {
     },
     /// Picking a project's review action on the projects screen (DESIGN.md
     /// §8/§11a): auto, pr, the default viewer, and each named viewer from
-    /// `voro.toml` — loaded fresh when the picker opens, like the agent
-    /// picker, so a just-added viewer shows up.
+    /// `voro.toml`, loaded fresh so a just-added viewer shows up.
     ReviewActionPicker {
         project_id: i64,
         options: Vec<ReviewAction>,
@@ -159,9 +152,8 @@ pub enum EditorRequest {
 }
 
 /// A request for main() to suspend the terminal and run an agent's
-/// `attach`/`resume` command in the foreground (task #75) — like the editor,
-/// these are full-screen interactive programs that own the terminal until
-/// the user detaches or the session ends.
+/// `attach`/`resume` command in the foreground (task #75) — a full-screen
+/// interactive program that owns the terminal until the user detaches.
 #[derive(Debug, Clone)]
 pub struct AttachRequest {
     /// The verb template with `{session}` already substituted.
@@ -190,10 +182,8 @@ pub fn action_label(action: &Action) -> &'static str {
 
 pub struct App {
     pub store: Store,
-    /// Where a continuation dispatch (DESIGN.md §6, "fed to the session")
-    /// finds its inputs and puts its artefacts — the same context the CLI's
-    /// `dispatch`/`continue`/`answer` verbs use, so the TUI's answer action
-    /// behaves identically.
+    /// The dispatch context a continuation dispatch (DESIGN.md §6) uses — the
+    /// same one the CLI verbs use, so the TUI's answer action behaves identically.
     dispatch_ctx: crate::dispatch::DispatchCtx,
     pub screen: Screen,
     pub should_quit: bool,
@@ -202,15 +192,12 @@ pub struct App {
     pub projects: Vec<Project>,
     pub queue: Vec<Candidate>,
     /// The cockpit's running strip (DESIGN.md §9): one row per `running` task
-    /// with its open session if any, so a task started by hand (no session at
-    /// all) is still visible. Filtered on task state, so `review`/`needs-input`
-    /// tasks — whose session stays open behind the scenes — stay in the queue,
-    /// not here; a dispatch that died is stalled by reconcile (§8) and belongs
-    /// to the queue too.
+    /// with its open session if any, so a task started by hand is still visible.
+    /// Filtered on task state, so `review`/`needs-input` tasks stay in the queue.
     pub running: Vec<RunningRow>,
     /// Task counts by state (DESIGN.md §12), rendered as the persistent header
-    /// indicator so the triage backlog and the other queues stay felt even
-    /// when a low-scoring row falls past the queue's uniform cap (§7).
+    /// indicator so the backlogs stay felt even when a low-scoring row falls
+    /// past the queue's uniform cap (§7).
     pub counts: StateCounts,
     pub all: Vec<TaskRow>,
     /// Review tasks carrying only one of a branch and a summary (DESIGN.md §8):
@@ -224,9 +211,8 @@ pub struct App {
     pub dependents: std::collections::HashMap<i64, Vec<DepRef>>,
     /// Each task's newest session (tasks #73/#110), keyed by task id: what the
     /// detail views render — a stalled task's post-mortem (DESIGN.md §8), an
-    /// open session's agent and log — and what gates the `l` log key, which
-    /// pages the session log regardless of task state. Loaded per refresh like
-    /// the dependency maps, so the render path never queries the store.
+    /// open session's agent and log — and what gates the `l` log key. Loaded per
+    /// refresh like the dependency maps, so the render path never queries the store.
     pub last_sessions: std::collections::HashMap<i64, voro_core::Session>,
 
     pub cockpit_rows: Vec<CockpitRow>,
@@ -236,15 +222,14 @@ pub struct App {
 
     pub mode: Mode,
     /// Whether the detail views fold the score decomposition (DESIGN.md §7) and
-    /// the event history in — toggled by `x` and `h`. Held per app-state rather
-    /// than per task so the choice persists as the selection moves, and shared
-    /// by the cockpit detail pane and the tasks-screen Detail popup.
+    /// the event history in — toggled by `x` and `h`. Held per app-state so the
+    /// choice persists as the selection moves, shared by the cockpit pane and
+    /// the tasks-screen Detail popup.
     pub show_score: bool,
     pub show_history: bool,
-    /// Vertical scroll offset of the cockpit focus card (DESIGN.md §9). Task
-    /// bodies are full dispatchable prompts, so a long one overruns the pane;
-    /// `J`/`K` and `PgDn`/`PgUp` scroll it. Reset to the top whenever the
-    /// selection moves, since the pane follows the selection.
+    /// Vertical scroll offset of the cockpit focus card (DESIGN.md §9), driven
+    /// by `J`/`K` and `PgDn`/`PgUp`. Reset to the top when the selection moves,
+    /// since the pane follows the selection.
     pub detail_scroll: u16,
     /// The largest useful `detail_scroll` for the pane as last rendered — the
     /// key handler has no geometry of its own, so `draw_detail` records the
@@ -315,8 +300,7 @@ impl App {
 
     /// Where main() records the outcome of an attach/resume round-trip — the
     /// same rolling launch log a viewer open writes to (DESIGN.md §11a), so a
-    /// failing attach leaves a breadcrumb even though the TUI paints back over
-    /// its output.
+    /// failing attach leaves a breadcrumb the TUI cannot paint over.
     pub fn launch_log_path(&self) -> std::path::PathBuf {
         self.dispatch_ctx.launch_log_path()
     }
@@ -512,13 +496,10 @@ impl App {
     }
 
     /// Apply a transition and refresh. An `Answer` or `RejectWork` on a task
-    /// with prior session history additionally triggers a continuation
-    /// dispatch (DESIGN.md §6/§8: "fed to the session" means resuming the work
-    /// with the answer or feedback in hand, not writing to a live pipe) — the
-    /// same rule and the same mechanics `voro answer`/`voro reject` use on the
-    /// CLI, so the two stay consistent. Because review keeps the session open,
-    /// a reject continues the *same* agent session. A task only ever started by
-    /// hand has no session history and the transition stands alone.
+    /// with prior session history additionally triggers a continuation dispatch
+    /// (DESIGN.md §6/§8), the same rule and mechanics `voro answer`/`voro reject`
+    /// use. A task only ever started by hand has no history and the transition
+    /// stands alone.
     fn apply_and_refresh(&mut self, task_id: i64, action: Action) {
         let continuation_input = match &action {
             Action::Answer(text) | Action::RejectWork(text) => Some(text.clone()),
@@ -632,8 +613,7 @@ impl App {
             }
             _ => {}
         }
-        // The projects screen owns weight/admin (DESIGN.md §9); its keys
-        // (`0`–`5`, `r`, `a`, `d`, `v`) are local and reinterpret keys that mean
+        // The projects screen's keys (DESIGN.md §9) reinterpret keys that mean
         // other things on the task-oriented screens.
         if self.screen == Screen::Projects {
             self.key_projects(key);
@@ -666,20 +646,16 @@ impl App {
                     }
                 }
             }
-            // The score and history sections live in the detail pane on the
-            // cockpit and in the Detail popup on the tasks screen; on the
-            // cockpit `x`/`h` fold them into the pane in place, while on the
-            // tasks screen they are local to the popup (see `key_detail`).
+            // On the cockpit `x`/`h` fold score/history into the detail pane;
+            // the tasks-screen equivalents are local to the popup (`key_detail`).
             KeyCode::Char('x') if self.screen == Screen::Cockpit => {
                 self.show_score = !self.show_score;
             }
             KeyCode::Char('h') if self.screen == Screen::Cockpit => {
                 self.show_history = !self.show_history;
             }
-            // Scroll the focus card body (task #2). Lowercase `j`/`k` already
-            // move the row selection, so the shifted `J`/`K` and the page keys
-            // drive the pane. Clamped in `scroll_detail` against the last
-            // rendered overflow.
+            // Scroll the focus card body (task #2): `j`/`k` already move the row
+            // selection, so shifted `J`/`K` and the page keys drive the pane.
             KeyCode::Char('J') if self.screen == Screen::Cockpit => self.scroll_detail(1),
             KeyCode::Char('K') if self.screen == Screen::Cockpit => self.scroll_detail(-1),
             KeyCode::PageDown if self.screen == Screen::Cockpit => {
@@ -706,12 +682,11 @@ impl App {
         }
     }
 
-    /// Page through the selected task's newest session log (tasks #73/#110) —
-    /// "what is/was this session doing?", answerable in any state that has a
-    /// session on record. `$PAGER` (default `less`) owns the terminal for the
-    /// duration, so this runs through `pending_attach` with the TUI torn down
-    /// around it, the same treatment attach/resume get. Every missing piece —
-    /// no session, no recorded log — reports through the status line.
+    /// Page through the selected task's newest session log (tasks #73/#110), in
+    /// any state that has a session on record. `$PAGER` (default `less`) owns
+    /// the terminal, so this runs through `pending_attach` with the TUI torn
+    /// down around it, like attach/resume. Missing pieces report via the status
+    /// line.
     fn view_session_log(&mut self) {
         let (task_id, project_id) = match self.selected_task() {
             Some(task) => (task.id, task.project_id),
@@ -780,11 +755,10 @@ impl App {
     }
 
     /// Jump into the selected task's agent session (task #75): `attach` for a
-    /// running task, `resume` for a review or stalled one. The actual run
-    /// happens in main() via `pending_attach`, with the TUI torn down around
-    /// it — attach/resume are full-screen interactive. Every missing piece
-    /// (state, session, captured ref, verb) reports through the status line,
-    /// the same "no-op with an explanation" style the dispatch keys use.
+    /// running task, `resume` for a review or stalled one. The run happens in
+    /// main() via `pending_attach`, with the TUI torn down around it. Every
+    /// missing piece (state, session, captured ref, verb) reports via the
+    /// status line.
     fn jump_into_session(&mut self) {
         let (task_id, state, project_id) = match self.selected_task() {
             Some(task) => (task.id, task.state, task.project_id),
@@ -870,12 +844,9 @@ impl App {
         self.store.events_for(task_id).unwrap_or_default()
     }
 
-    /// The selected task's id and agent override, if there is a selection and
-    /// it is `ready` or `stalled` — dispatch's own precondition (DESIGN.md §8;
-    /// redispatching a stalled task is the whole point of the state). Anything
-    /// else sets a status message and returns `None`, the same "no-op with an
-    /// explanation" the transition keybindings (`s`) use for a state with
-    /// nowhere to go, rather than silently doing nothing.
+    /// The selected task's id and agent override, if it is `ready` or `stalled`
+    /// — dispatch's own precondition (DESIGN.md §8). Any other state sets a
+    /// status message and returns `None` rather than silently doing nothing.
     fn dispatchable_selected_task(&mut self) -> Option<(i64, Option<String>)> {
         let (id, state, agent) = {
             let task = self.selected_task()?;
@@ -892,9 +863,7 @@ impl App {
 
     /// Dispatch-with-resolved-agent, or the picker's chosen override — both
     /// dispatch actions (DESIGN.md §8/§9) land here. Dispatch errors (dirty
-    /// tree, unknown agent, missing config) surface through `self.status`,
-    /// the same error style every other action already uses; they never
-    /// panic or fail silently.
+    /// tree, unknown agent, missing config) surface through `self.status`.
     fn dispatch_task(&mut self, task_id: i64, agent_override: Option<String>) {
         let result = crate::dispatch::dispatch(
             &mut self.store,
@@ -911,11 +880,9 @@ impl App {
     }
 
     /// Open the selected task's checkout in a configured viewer (DESIGN.md
-    /// §11a) so its diff can be seen — the explicit viewer key, reaching the
-    /// local diff even on a GitHub project. Only `review`/`running` tasks have
-    /// a diff worth opening; anything else, or a missing viewer, reports
-    /// through the status line rather than doing nothing — the same "no-op
-    /// with an explanation" style the dispatch keys use.
+    /// §11a): the explicit viewer key, reaching the local diff even on a GitHub
+    /// project. Only `review`/`running` tasks have a diff worth opening; anything
+    /// else, or a missing viewer, reports via the status line.
     fn open_selected_in_viewer(&mut self) {
         let (id, state) = match self.selected_task() {
             Some(task) => (task.id, task.state),
@@ -934,14 +901,10 @@ impl App {
     }
 
     /// The review key — the per-project "show me this task's diff" action
-    /// (DESIGN.md §8). With a tracked PR: jump to it in a browser (§11c),
-    /// which never touches the store, so no refresh follows. With none: on a
-    /// `review` task, resolve the project's review medium — on GitHub, open
-    /// the confirmation modal to *create* a PR from its done-time summary (or,
-    /// if it is not yet PR-ready, report the missing branch/summary on the
-    /// status line); on a viewer project, open the checkout in the configured
-    /// viewer, nothing to confirm. On any other state, fall back to the
-    /// link-an-existing-PR prompt (the TUI face of `set --pr`).
+    /// (DESIGN.md §8). With a tracked PR, jump to it in a browser (§11c). With
+    /// none: a `review` task resolves the project's review medium — GitHub opens
+    /// the create-PR confirmation modal, a viewer project opens the checkout —
+    /// and any other state falls back to the link-an-existing-PR prompt.
     fn open_selected_pr(&mut self) {
         let Some(task) = self.selected_task() else {
             return;
@@ -991,10 +954,8 @@ impl App {
     }
 
     /// Drive the create-PR confirmation modal (DESIGN.md §8). Enter (or `y`)
-    /// runs the same `crate::pr::create` routine the CLI's `pr` calls — push
-    /// the branch, open a ready PR, record the URL — then refreshes so the row
-    /// flips to `next: review PR`; esc (or `n`) cancels without touching
-    /// anything.
+    /// runs the same `crate::pr::create` the CLI's `pr` calls, then refreshes;
+    /// esc (or `n`) cancels without touching anything.
     fn key_confirm_pr(&mut self, key: KeyEvent, task_id: i64, branch: String, title: String) {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -1021,9 +982,8 @@ impl App {
     /// Apply a terminal transition (`Accept`/`Abandon`) and, if the closed task
     /// owns a dispatch worktree, open the confirmation modal to tear it down
     /// (DESIGN.md §8). The transition commits and refreshes first — cleanup is a
-    /// follow-on the operator confirms, and the transition stands whether they
-    /// go through with it or not. A task with no branch, or a branch with no
-    /// worktree, plans to nothing and closes exactly as before.
+    /// follow-on the operator confirms, and the transition stands either way. A
+    /// task with no branch or no matching worktree plans to nothing.
     fn apply_and_clean_up(&mut self, task_id: i64, action: Action) {
         let result = self.store.apply(task_id, action);
         let Some(task) = self.report(result) else {
@@ -1047,9 +1007,7 @@ impl App {
 
     /// Drive the worktree-teardown confirmation modal (DESIGN.md §8). Enter (or
     /// `y`) runs the same `crate::worktree` teardown the CLI's `accept`/`abandon`
-    /// call — remove the worktree, delete the branch when it is safe — then
-    /// refreshes; esc (or `n`) leaves the worktree in place. Either way the
-    /// transition that opened this modal already stands.
+    /// call, then refreshes; esc (or `n`) leaves the worktree in place.
     fn key_confirm_cleanup(&mut self, key: KeyEvent, task_id: i64, plan: crate::worktree::Cleanup) {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -1088,10 +1046,9 @@ impl App {
         self.mode = Mode::LinkPr { task_id, buffer };
     }
 
-    /// Validate and track a PR reference on a task, then refresh so the new
-    /// link shows immediately. An unparseable reference keeps the prompt open
-    /// with the typed text intact and the parse error on the status line, so
-    /// the human can fix a typo without retyping the whole URL.
+    /// Validate and track a PR reference on a task, then refresh. An unparseable
+    /// reference keeps the prompt open with the typed text intact and the parse
+    /// error on the status line, so a typo can be fixed without retyping.
     fn link_pr(&mut self, task_id: i64, raw: &str) {
         let pr = match PrRef::parse(raw) {
             Ok(pr) => pr,
@@ -1115,10 +1072,9 @@ impl App {
 
     /// The initial text of a transition prompt. A `RejectWork` prompt on a task
     /// with a tracked PR is pre-filled with that PR's review comments (DESIGN.md
-    /// §11c), so a GitHub review reaches the agent without retyping; the human
-    /// can still edit before submitting. Everything else — and a PR with no
-    /// pullable comments, or a `gh` failure — starts empty, with the reason on
-    /// the status line.
+    /// §11c), still editable before submitting. Everything else — and a PR with
+    /// no pullable comments, or a `gh` failure — starts empty, reason on the
+    /// status line.
     fn prompt_seed(&mut self, task_id: i64, kind: PromptKind) -> String {
         if kind != PromptKind::RejectWork {
             return String::new();
@@ -1144,12 +1100,10 @@ impl App {
         }
     }
 
-    /// Open the agent picker (DESIGN.md §8): agents are loaded from
-    /// `voro.toml` right now, not cached from some earlier read, so a
-    /// config that changed since the last dispatch — the usage-cap case this
-    /// exists for — is always reflected. A load failure renders in the same
-    /// status-line error style as a failed dispatch rather than opening an
-    /// empty or stale modal.
+    /// Open the agent picker (DESIGN.md §8): agents are loaded from `voro.toml`
+    /// now, not cached, so a config changed since the last dispatch — the
+    /// usage-cap case this exists for — is reflected. A load failure reports via
+    /// the status line rather than opening an empty or stale modal.
     fn open_agent_picker(&mut self, task_id: i64, task_agent: Option<String>) {
         let config = match AgentsConfig::load(&self.dispatch_ctx.agents_path) {
             Ok(config) => config,
@@ -1206,11 +1160,10 @@ impl App {
     }
 
     /// The projects screen's local keys (DESIGN.md §9). `0`–`5` sets the
-    /// selected project's weight immediately — the every-morning action, one
-    /// keystroke per project; `r` opens the AddProject form pre-filled to
-    /// rename/re-path, `a` opens it blank to add a project, `d` deletes behind
-    /// the store's own guard (only projects with no tasks). Movement and
-    /// screen switching are handled by `key_normal` before it delegates here.
+    /// selected project's weight; `r` opens the AddProject form pre-filled to
+    /// rename/re-path, `a` opens it blank, `d` deletes behind the store's own
+    /// guard (only projects with no tasks), `v` picks the review action.
+    /// Movement and screen switching are handled by `key_normal`.
     fn key_projects(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c @ '0'..='5') => {
@@ -1528,10 +1481,8 @@ impl App {
                     self.set_priority(task_id, priority);
                 }
             }
-            // The popup renders the same stalled post-mortem as the cockpit
-            // pane, so its advertised `l` has to work here too. The popup can
-            // only open on the selected task, so the selection-based helper
-            // pages the right log.
+            // The popup only opens on the selected task, so the selection-based
+            // helper pages the right log.
             KeyCode::Char('l') => self.view_session_log(),
             _ => {}
         }

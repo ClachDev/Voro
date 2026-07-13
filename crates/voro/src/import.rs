@@ -1,8 +1,7 @@
 //! The `import` verb's I/O: shelling out to `gh issue list` and turning its
-//! output into tasks. The mapping and idempotency logic that matters is in
-//! `voro_core::import` and is unit-tested there against canned JSON; this
-//! module is the thin, deliberately untested-against-the-network seam that
-//! calls `gh` for real and hands its stdout to that logic.
+//! output into tasks. The mapping and idempotency logic lives in
+//! `voro_core::import`; this module is the seam that calls `gh` for real and
+//! hands its stdout to that logic.
 
 use std::process::Command;
 
