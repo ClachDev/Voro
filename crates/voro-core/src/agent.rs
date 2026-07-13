@@ -7,7 +7,8 @@
 //! An agent is a set of verb templates. Only `dispatch` is required (`cmd` is
 //! accepted as an alias, so pre-verb configs load unchanged); the optional
 //! verbs — `sessions`, `attach`, `resume`, `continue` — unlock session-aware
-//! dispatch for agents that have a session layer of their own, and every one
+//! dispatch for agents that have a session layer of their own, and `plan`
+//! unlocks the TUI's interactive planning sessions (DESIGN.md §8). Every one
 //! of them degrades gracefully when absent (docs/agent-integration.md).
 //!
 //! Config is layered: the built-ins ship with the binary and so upgrade with
@@ -55,15 +56,16 @@ pub const VIEWER_PATH_PLACEHOLDER: &str = "{path}";
 /// wholesale ([`Provenance::UserOverride`]) or leave it as-is.
 ///
 /// `claude` launches attachably (`--bg`) in `auto` mode with the full session
-/// verb set; `codex` covers the headless-resume shape. This must parse and
-/// pass [`validate_agent`] — [`builtin_agents`] enforces that at first use and
-/// a test exercises it.
+/// verb set and plans interactively in the foreground; `codex` covers the
+/// headless-resume shape. This must parse and pass [`validate_agent`] —
+/// [`builtin_agents`] enforces that at first use and a test exercises it.
 const BUILTIN_AGENTS: &str = "\
 [agents.claude]
 dispatch = \"claude --bg --name \\\"voro-{task_id}\\\" --permission-mode auto \\\"$(cat {prompt_file})\\\"\"
 sessions = \"claude agents --json\"
 attach   = \"claude attach {session}\"
 resume   = \"claude --resume {session}\"
+plan     = \"claude --permission-mode auto \\\"$(cat {prompt_file})\\\"\"
 
 [agents.codex]
 dispatch = \"codex exec \\\"$(cat {prompt_file})\\\"\"
@@ -109,6 +111,7 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #       attach    open a running session interactively    ({session})
 #       resume    reopen a finished session interactively  ({session})
 #       continue  feed a session new input headless        ({session} {prompt_file})
+#       plan      run an interactive foreground planning session ({prompt_file})
 #     See docs/agent-integration.md for the full contract.
 #   * override a built-in — a table named `claude` or `codex` REPLACES that
 #     built-in entirely (not per-verb), so copy every verb you still want. The
@@ -180,6 +183,10 @@ pub struct AgentTemplate {
     resume: Option<String>,
     #[serde(rename = "continue")]
     continue_: Option<String>,
+    /// An interactive foreground command carrying [`PROMPT_FILE_PLACEHOLDER`],
+    /// run by the TUI's planning flow (DESIGN.md §8) — no `{session}`, since a
+    /// planning session belongs to no task or session row.
+    plan: Option<String>,
 }
 
 impl AgentTemplate {
@@ -206,6 +213,10 @@ impl AgentTemplate {
 
     pub fn continue_cmd(&self) -> Option<&str> {
         self.continue_.as_deref()
+    }
+
+    pub fn plan(&self) -> Option<&str> {
+        self.plan.as_deref()
     }
 }
 
@@ -313,6 +324,13 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
             "agent '{name}' continue is missing the {PROMPT_FILE_PLACEHOLDER} placeholder"
         )));
     }
+    if let Some(template) = &agent.plan
+        && !template.contains(PROMPT_FILE_PLACEHOLDER)
+    {
+        return Err(invalid(format!(
+            "agent '{name}' plan is missing the {PROMPT_FILE_PLACEHOLDER} placeholder"
+        )));
+    }
     Ok(())
 }
 
@@ -338,6 +356,7 @@ pub struct ResolvedAgent {
     pub attach: Option<String>,
     pub resume: Option<String>,
     pub continue_cmd: Option<String>,
+    pub plan: Option<String>,
 }
 
 /// The effective agent config: the built-in agents with any `voro.toml`
@@ -497,6 +516,7 @@ impl AgentsConfig {
             attach: agent.attach.clone(),
             resume: agent.resume.clone(),
             continue_cmd: agent.continue_.clone(),
+            plan: agent.plan.clone(),
         })
     }
 
@@ -627,6 +647,7 @@ impl AgentsConfig {
                 builtin.continue_.is_some(),
                 user.continue_.is_some(),
             ),
+            ("plan", builtin.plan.is_some(), user.plan.is_some()),
         ]
         .into_iter()
         .filter_map(|(verb, in_builtin, in_user)| (in_builtin && !in_user).then_some(verb))
@@ -1006,6 +1027,69 @@ mod tests {
             assert!(message.contains("{session}"), "{verb}: {message}");
             assert!(message.contains(verb), "{verb}: {message}");
         }
+    }
+
+    // --- plan verb (task #112) ---
+
+    #[test]
+    fn plan_parses_resolves_and_is_optional() {
+        let text = r#"
+            default_agent = "a"
+
+            [agents.a]
+            dispatch = "run {prompt_file}"
+            plan = "run --interactive {prompt_file}"
+
+            [agents.b]
+            dispatch = "other {prompt_file}"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        let a = config.resolve(None).unwrap();
+        assert_eq!(a.plan.as_deref(), Some("run --interactive {prompt_file}"));
+        assert_eq!(config.agent("a").unwrap().plan(), a.plan.as_deref());
+        // an agent without the verb resolves with it absent, like the others
+        let b = config.resolve(Some("b")).unwrap();
+        assert_eq!(b.plan, None);
+        assert_eq!(config.agent("b").unwrap().plan(), None);
+    }
+
+    #[test]
+    fn plan_requires_the_prompt_file_placeholder() {
+        let text = r#"
+            default_agent = "a"
+
+            [agents.a]
+            dispatch = "run {prompt_file}"
+            plan = "run --interactive"
+        "#;
+        let message = AgentsConfig::parse(text, Path::new("/tmp/voro.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("{prompt_file}"), "{message}");
+        assert!(message.contains("plan"), "{message}");
+    }
+
+    #[test]
+    fn builtin_claude_defines_plan_and_an_override_dropping_it_is_reported() {
+        let agents = builtin_agents();
+        let plan = agents["claude"].plan().unwrap();
+        assert!(plan.contains(PROMPT_FILE_PLACEHOLDER), "{plan}");
+        assert!(
+            !plan.contains("--bg"),
+            "plan runs in the foreground: {plan}"
+        );
+        assert!(agents["codex"].plan().is_none());
+
+        let text = r#"
+            [agents.claude]
+            cmd = "claude -p {prompt_file}"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        assert!(
+            config.override_missing_verbs("claude").contains(&"plan"),
+            "{:?}",
+            config.override_missing_verbs("claude")
+        );
     }
 
     #[test]

@@ -646,6 +646,7 @@ fn agent_verb(cmd: AgentCmd, ctx: &DispatchCtx) -> Result<String, String> {
                     ("attach", template.attach()),
                     ("resume", template.resume()),
                     ("continue", template.continue_cmd()),
+                    ("plan", template.plan()),
                 ]
                 .into_iter()
                 .filter_map(|(verb, defined)| defined.map(|_| verb))

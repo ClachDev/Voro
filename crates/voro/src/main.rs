@@ -83,7 +83,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // attach/resume are full-screen interactive sessions that own the
             // terminal until the user detaches, same treatment as $EDITOR.
             ratatui::restore();
-            attach_session(&mut app, request);
+            foreground_session(&mut app, "attach", &request.command, &request.cwd);
+            terminal = ratatui::init();
+        }
+        if let Some(launch) = app.pending_plan.take() {
+            // a planning session is interactive in the same way; the refresh
+            // on return is what makes the task it proposed appear in the queue.
+            ratatui::restore();
+            foreground_session(&mut app, "plan", &launch.command, &launch.cwd);
             terminal = ratatui::init();
         }
         if app.should_quit {
@@ -94,10 +101,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-/// Run an agent's attach/resume command in the foreground (task #75), the
-/// terminal already restored by the caller. The command inherits stdio so the
-/// agent's own TUI takes over; on return — detach or session end — the state
-/// of the world may have moved, so refresh before redrawing.
+/// Run an agent's attach/resume command — or a planning session (DESIGN.md
+/// §8) — in the foreground, the terminal already restored by the caller. The
+/// command inherits stdio so the agent's own TUI takes over; on return —
+/// detach or session end — the state of the world may have moved, so refresh
+/// before redrawing. `label` names the flow in the launch log's breadcrumbs.
 ///
 /// A non-zero exit (e.g. `claude attach <id>` printing `No job matching …`)
 /// used to be painted over the instant the TUI reinitialised, leaving only a
@@ -105,29 +113,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// whatever the subprocess printed — until a key is pressed, and every
 /// round-trip is appended to the launch log so even a swallowed failure is
 /// recoverable.
-fn attach_session(app: &mut App, request: app::AttachRequest) {
+fn foreground_session(app: &mut App, label: &str, command: &str, cwd: &str) {
     let status = std::process::Command::new("sh")
         .arg("-c")
-        .arg(&request.command)
-        .current_dir(&request.cwd)
+        .arg(command)
+        .current_dir(cwd)
         .status();
 
     let succeeded = matches!(&status, Ok(s) if s.success());
     let message = match &status {
-        Ok(s) if s.success() => format!("returned from: {}", request.command),
-        Ok(s) => format!("'{}' exited with {s}", request.command),
-        Err(e) => format!("cannot run '{}' in {}: {e}", request.command, request.cwd),
+        Ok(s) if s.success() => format!("returned from: {command}"),
+        Ok(s) => format!("'{command}' exited with {s}"),
+        Err(e) => format!("cannot run '{command}' in {cwd}: {e}"),
     };
 
     let log_line = match &status {
-        Ok(s) => format!(
-            "attach: {} (cwd {}) exited with {s}",
-            request.command, request.cwd
-        ),
-        Err(e) => format!(
-            "attach: {} (cwd {}) could not be run: {e}",
-            request.command, request.cwd
-        ),
+        Ok(s) => format!("{label}: {command} (cwd {cwd}) exited with {s}"),
+        Err(e) => format!("{label}: {command} (cwd {cwd}) could not be run: {e}"),
     };
     dispatch::append_launch_log(&app.launch_log_path(), &log_line);
 
@@ -146,9 +148,10 @@ fn attach_session(app: &mut App, request: app::AttachRequest) {
     }
 }
 
-/// Block until the next key press, used to hold a failed attach's output on
-/// screen. Raw mode is toggled on just for the read so a single key suffices
-/// (no Enter); any read error simply returns rather than trapping the user.
+/// Block until the next key press, used to hold a failed foreground command's
+/// output on screen. Raw mode is toggled on just for the read so a single key
+/// suffices (no Enter); any read error simply returns rather than trapping
+/// the user.
 fn wait_for_keypress() {
     use ratatui::crossterm::terminal;
     let raw = terminal::enable_raw_mode().is_ok();

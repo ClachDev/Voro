@@ -72,6 +72,7 @@ pub enum Mode {
     },
     PickProject {
         sel: usize,
+        flow: CreateFlow,
     },
     Transition {
         task_id: i64,
@@ -139,6 +140,15 @@ pub enum Mode {
         current: ReviewAction,
         sel: usize,
     },
+}
+
+/// Which create flow the project picker feeds (DESIGN.md §8/§9): the manual
+/// `$EDITOR` form on `n`, or an interactive agent planning session on `N` —
+/// the same lowercase-default, uppercase-variant pairing as `d`/`D`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateFlow {
+    Editor,
+    Plan,
 }
 
 /// A request for main() to suspend the terminal and run $EDITOR.
@@ -242,6 +252,10 @@ pub struct App {
     pub detail_max_scroll: std::cell::Cell<u16>,
     pub pending_editor: Option<EditorRequest>,
     pub pending_attach: Option<AttachRequest>,
+    /// A planning session waiting for main() to suspend the terminal and run
+    /// it (DESIGN.md §8) — the same round-trip as `pending_attach`, kept
+    /// separate so main() can label its log breadcrumbs and refresh message.
+    pub pending_plan: Option<crate::dispatch::PlanLaunch>,
 
     /// Last `PRAGMA data_version` seen, used to detect commits from other
     /// processes and refresh without reacting to our own mutations.
@@ -291,6 +305,7 @@ impl App {
             detail_max_scroll: std::cell::Cell::new(0),
             pending_editor: None,
             pending_attach: None,
+            pending_plan: None,
             last_data_version: 0,
         };
         app.refresh()?;
@@ -549,7 +564,7 @@ impl App {
                 on_path,
                 editing,
             } => self.key_add_project(key, name, path, on_path, editing),
-            Mode::PickProject { sel } => self.key_pick_project(key, sel),
+            Mode::PickProject { sel, flow } => self.key_pick_project(key, sel, flow),
             Mode::Transition {
                 task_id,
                 actions,
@@ -630,18 +645,8 @@ impl App {
                 self.report(result);
             }
             KeyCode::Enter => self.activate_selection(),
-            KeyCode::Char('n') => match self.projects.len() {
-                0 => {
-                    self.status =
-                        Some("no projects yet — add one on the projects screen (3)".into())
-                }
-                1 => {
-                    self.pending_editor = Some(EditorRequest::Create {
-                        project_id: self.projects[0].id,
-                    })
-                }
-                _ => self.mode = Mode::PickProject { sel: 0 },
-            },
+            KeyCode::Char('n') => self.new_task(CreateFlow::Editor),
+            KeyCode::Char('N') => self.new_task(CreateFlow::Plan),
             KeyCode::Char('e') => {
                 if let Some(id) = self.selected_task_id() {
                     self.pending_editor = Some(EditorRequest::Edit { task_id: id });
@@ -741,6 +746,37 @@ impl App {
     pub fn selected_session_log(&self) -> Option<&str> {
         let id = self.selected_task_id()?;
         self.last_sessions.get(&id)?.log_path.as_deref()
+    }
+
+    /// Begin creating a task in one of the two flows (DESIGN.md §9): straight
+    /// into it when there is exactly one project, via the project picker when
+    /// there are several, and a pointer to the projects screen when there are
+    /// none.
+    fn new_task(&mut self, flow: CreateFlow) {
+        match self.projects.len() {
+            0 => self.status = Some("no projects yet — add one on the projects screen (3)".into()),
+            1 => self.start_create(self.projects[0].id, flow),
+            _ => self.mode = Mode::PickProject { sel: 0, flow },
+        }
+    }
+
+    /// Launch the chosen create flow on a project: queue the `$EDITOR` form,
+    /// or assemble a planning session (DESIGN.md §8) for main() to run in the
+    /// foreground. An agent without a `plan` verb — or any other assembly
+    /// failure — reports what to configure through the status line, the same
+    /// "no-op with an explanation" style as the dispatch keys.
+    fn start_create(&mut self, project_id: i64, flow: CreateFlow) {
+        match flow {
+            CreateFlow::Editor => {
+                self.pending_editor = Some(EditorRequest::Create { project_id });
+            }
+            CreateFlow::Plan => {
+                match crate::dispatch::plan_session(&self.store, &self.dispatch_ctx, project_id) {
+                    Ok(launch) => self.pending_plan = Some(launch),
+                    Err(e) => self.status = Some(e),
+                }
+            }
+        }
     }
 
     /// Jump into the selected task's agent session (task #75): `attach` for a
@@ -1379,7 +1415,7 @@ impl App {
         };
     }
 
-    fn key_pick_project(&mut self, key: KeyEvent, mut sel: usize) {
+    fn key_pick_project(&mut self, key: KeyEvent, mut sel: usize, flow: CreateFlow) {
         match key.code {
             KeyCode::Esc => return,
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1388,15 +1424,13 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => sel = sel.saturating_sub(1),
             KeyCode::Enter => {
                 if let Some(project) = self.projects.get(sel) {
-                    self.pending_editor = Some(EditorRequest::Create {
-                        project_id: project.id,
-                    });
+                    self.start_create(project.id, flow);
                 }
                 return;
             }
             _ => {}
         }
-        self.mode = Mode::PickProject { sel };
+        self.mode = Mode::PickProject { sel, flow };
     }
 
     fn key_transition(
@@ -2701,5 +2735,94 @@ mod tests {
             "{:?}",
             app.status
         );
+    }
+
+    // --- planning sessions (task #112) ---
+
+    /// An app whose dispatch context reads a scratch `voro.toml`, so the
+    /// planning keys resolve a known agent instead of the developer's real
+    /// config and PATH.
+    fn app_with_agents(agents_toml: &str) -> App {
+        let mut app = app_with(&[TaskState::Ready]);
+        let dir = std::env::temp_dir().join(format!(
+            "voro-plan-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agents_path = dir.join("voro.toml");
+        std::fs::write(&agents_path, agents_toml).unwrap();
+        app.dispatch_ctx = crate::dispatch::DispatchCtx {
+            db_path: dir.join("voro.db"),
+            agents_path,
+            runtime_dir: dir.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
+        };
+        app
+    }
+
+    /// `N` with a single project launches the planning session directly: the
+    /// assembled command lands in `pending_plan` for main() to run with the
+    /// terminal suspended, and no store write has happened.
+    #[test]
+    fn plan_key_queues_the_planning_session() {
+        let mut app = app_with_agents(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file}\"\nplan = \"stub --interactive {prompt_file}\"\n",
+        );
+        key(&mut app, KeyCode::Char('N'));
+
+        assert!(matches!(app.mode, Mode::Normal));
+        let launch = app.pending_plan.take().expect("a planning session queued");
+        assert!(
+            launch.command.starts_with("stub --interactive "),
+            "{}",
+            launch.command
+        );
+        assert_eq!(launch.cwd, "/tmp/demo");
+    }
+
+    /// `N` when the resolved agent defines no `plan` verb degrades to a status
+    /// explaining what to configure — no session, no crash.
+    #[test]
+    fn plan_key_reports_a_missing_plan_verb() {
+        let mut app = app_with_agents(
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n",
+        );
+        key(&mut app, KeyCode::Char('N'));
+
+        assert!(app.pending_plan.is_none());
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(status.contains("plan"), "{status}");
+        assert!(status.contains("stub"), "{status}");
+    }
+
+    /// With several projects `N` opens the same project picker as `n`, marked
+    /// with the planning flow; Enter launches the session for the picked
+    /// project.
+    #[test]
+    fn plan_key_routes_through_the_project_picker() {
+        let mut app = app_with_agents(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file}\"\nplan = \"stub --interactive {prompt_file}\"\n",
+        );
+        app.store.create_project("second", "/tmp/second").unwrap();
+        app.refresh().unwrap();
+
+        key(&mut app, KeyCode::Char('N'));
+        assert!(matches!(
+            app.mode,
+            Mode::PickProject {
+                flow: CreateFlow::Plan,
+                ..
+            }
+        ));
+
+        key(&mut app, KeyCode::Enter);
+        let launch = app.pending_plan.take().expect("a planning session queued");
+        assert_eq!(launch.cwd, "/tmp/demo");
     }
 }

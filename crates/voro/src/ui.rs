@@ -58,7 +58,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             .block(Block::default().borders(Borders::ALL).title(title));
             frame.render_widget(para, area);
         }
-        Mode::PickProject { sel } => {
+        Mode::PickProject { sel, flow } => {
             let items: Vec<ListItem> = app
                 .projects
                 .iter()
@@ -67,12 +67,12 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             let height = items.len() as u16 + 2;
             let area = popup_area(frame, 44, height.max(3));
             let mut state = ListState::default().with_selected(Some(*sel));
+            let title = match flow {
+                crate::app::CreateFlow::Editor => "Project for the new task",
+                crate::app::CreateFlow::Plan => "Project to plan a task in",
+            };
             let list = List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Project for the new task"),
-                )
+                .block(Block::default().borders(Borders::ALL).title(title))
                 .highlight_style(SELECTED);
             frame.render_stateful_widget(list, area, &mut state);
         }
@@ -981,6 +981,7 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 pairs.push(("l", "log"));
             }
             pairs.push(("n", "new"));
+            pairs.push(("N", "plan"));
             pairs.push(("e", "edit"));
             pairs.push(("tab", "tasks"));
             pairs.push(("q", "quit"));
@@ -994,6 +995,7 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             }
             pairs.push(("s", "state"));
             pairs.push(("n", "new"));
+            pairs.push(("N", "plan"));
             pairs.push(("e", "edit"));
             pairs.push(("tab", "projects"));
             pairs.push(("q", "quit"));
