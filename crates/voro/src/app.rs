@@ -896,7 +896,8 @@ impl App {
     /// Drive the create-PR confirmation modal (DESIGN.md §8). Enter (or `y`)
     /// runs the same `crate::pr::create` routine the CLI's `pr` calls — push
     /// the branch, open a ready PR, record the URL — then refreshes so the row
-    /// flips to "PR open"; esc (or `n`) cancels without touching anything.
+    /// flips to `next: review PR`; esc (or `n`) cancels without touching
+    /// anything.
     fn key_confirm_pr(&mut self, key: KeyEvent, task_id: i64, branch: String, title: String) {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
