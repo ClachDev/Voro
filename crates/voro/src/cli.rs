@@ -1,11 +1,17 @@
 //! The command-line verb surface: every TUI action, scriptable and
 //! agent-legible (DESIGN.md §9). Verbs that §8 names for the agent return
 //! path (`ask`, `done`, `propose`) keep those names and flags so Milestone B
-//! extends rather than renames. Parsing is hand-rolled: positionals plus
-//! `--flag value` pairs is all the grammar this needs.
+//! extends rather than renames. Parsing is clap derive: each verb declares
+//! its flags exactly once as typed fields, and anything a verb does not
+//! declare is rejected by name (with a did-you-mean) before any handler runs
+//! — a swallowed flag reads as success while dropping whatever the caller
+//! meant to record. The one clap default overridden is help: the hand-written
+//! single-page overview in `HELP` beats generated per-command help for a
+//! surface this small, so every help request short-circuits to it.
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use voro_core::{
     Action, AgentsConfig, DepKind, NewTask, PrRef, Priority, Project, ReviewAction, ReviewMedium,
@@ -142,94 +148,329 @@ transitions
                                   then offers to remove the task's worktree
 ";
 
+#[derive(Parser)]
+#[command(
+    name = "voro",
+    disable_help_flag = true,
+    disable_help_subcommand = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    verb: Verb,
+}
+
+#[derive(Subcommand)]
+enum Verb {
+    Project {
+        #[command(subcommand)]
+        cmd: ProjectCmd,
+    },
+    Weight {
+        project: String,
+        weight: i64,
+    },
+    Add(AddArgs),
+    Propose(ProposeArgs),
+    Set(SetArgs),
+    Show {
+        task_id: i64,
+    },
+    List(ListArgs),
+    Inbox,
+    Next,
+    Stats,
+    Explain {
+        task_id: i64,
+    },
+    Agent {
+        #[command(subcommand)]
+        cmd: AgentCmd,
+    },
+    Dispatch {
+        task_id: i64,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Spawn a fresh session on a task that is already `running`, without
+    /// touching its state — the mechanics `answer` uses automatically for a
+    /// previously-dispatched task, exposed directly so a continuation that
+    /// failed (a dirty tree, a misconfigured agent) can be retried once fixed.
+    Continue {
+        task_id: i64,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Run a configured viewer on a review/running task's checkout so its diff
+    /// can be seen (DESIGN.md §8/§11a) — the explicit spelling of `pr`'s
+    /// viewer medium, kept for reaching the local diff even on a GitHub
+    /// project. Spawning lives in the dispatch module beside the other process
+    /// work; `voro-core` stays process-free.
+    Open {
+        task_id: i64,
+    },
+    Viewer {
+        #[command(subcommand)]
+        cmd: ViewerCmd,
+    },
+    Pr {
+        task_id: i64,
+        #[arg(long)]
+        yes: bool,
+    },
+    Reject(RejectArgs),
+    Done(DoneArgs),
+    Answer(AnswerArgs),
+    Import(ImportArgs),
+    Triage {
+        task_id: i64,
+        target: TriageTarget,
+    },
+    Start {
+        task_id: i64,
+    },
+    Ask(AskArgs),
+    Accept {
+        task_id: i64,
+        #[arg(long)]
+        yes: bool,
+    },
+    Abort {
+        task_id: i64,
+    },
+    Park {
+        task_id: i64,
+    },
+    Unpark {
+        task_id: i64,
+    },
+    Abandon {
+        task_id: i64,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCmd {
+    Add { name: String, path: String },
+    List,
+    Rename { project: String, name: String },
+    Path { project: String, path: String },
+    Delete { project: String },
+    Action { project: String, action: String },
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+    Init,
+    List,
+    Path,
+}
+
+#[derive(Subcommand)]
+enum ViewerCmd {
+    List,
+}
+
+#[derive(Args)]
+struct AddArgs {
+    project: String,
+    #[arg(value_name = "TITLE")]
+    title: Vec<String>,
+    #[arg(long)]
+    body: Option<String>,
+    #[arg(long, conflicts_with = "body")]
+    body_file: Option<String>,
+    #[arg(long, value_parser = parse_priority)]
+    priority: Option<Priority>,
+    #[arg(long)]
+    state: Option<String>,
+    #[arg(long)]
+    agent: Option<String>,
+    #[arg(long)]
+    blocked_by: Option<String>,
+    #[arg(long)]
+    blocks: Option<String>,
+    #[arg(long)]
+    human: bool,
+}
+
+#[derive(Args)]
+struct ProposeArgs {
+    project: String,
+    #[arg(value_name = "TITLE")]
+    title: Vec<String>,
+    #[arg(long)]
+    body: Option<String>,
+    #[arg(long, conflicts_with = "body")]
+    body_file: Option<String>,
+    #[arg(long)]
+    from: Option<i64>,
+    /// Hidden: accepted only so the handler can refuse it with a pointer to
+    /// `add --state` instead of a generic unknown-argument error.
+    #[arg(long, hide = true)]
+    state: Option<String>,
+}
+
+#[derive(Args)]
+struct SetArgs {
+    task_id: i64,
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long, value_parser = parse_priority)]
+    priority: Option<Priority>,
+    #[arg(long)]
+    agent: Option<String>,
+    #[arg(long)]
+    no_agent: bool,
+    #[arg(long)]
+    body: Option<String>,
+    #[arg(long, conflicts_with = "body")]
+    body_file: Option<String>,
+    #[arg(long)]
+    blocked_by: Option<String>,
+    #[arg(long)]
+    blocks: Option<String>,
+    #[arg(long)]
+    pr: Option<String>,
+    #[arg(long, conflicts_with = "pr")]
+    no_pr: bool,
+    #[arg(long)]
+    branch: Option<String>,
+    #[arg(long, conflicts_with = "branch")]
+    no_branch: bool,
+    #[arg(long)]
+    human: bool,
+    #[arg(long, conflicts_with = "human")]
+    no_human: bool,
+    #[arg(long)]
+    summary: Option<String>,
+    #[arg(long, conflicts_with = "summary")]
+    summary_file: Option<String>,
+}
+
+#[derive(Args)]
+struct ListArgs {
+    #[arg(long)]
+    state: Option<String>,
+    #[arg(long)]
+    project: Option<String>,
+}
+
+#[derive(Args)]
+struct RejectArgs {
+    task_id: i64,
+    #[arg(value_name = "TEXT")]
+    text: Vec<String>,
+    #[arg(long)]
+    from_pr: bool,
+    #[arg(long)]
+    no_dispatch: bool,
+}
+
+#[derive(Args)]
+struct DoneArgs {
+    task_id: i64,
+    #[arg(long)]
+    summary: Option<String>,
+    #[arg(long, conflicts_with = "summary")]
+    summary_file: Option<String>,
+    #[arg(long)]
+    branch: Option<String>,
+}
+
+#[derive(Args)]
+struct AnswerArgs {
+    task_id: i64,
+    #[arg(value_name = "TEXT")]
+    text: Vec<String>,
+    #[arg(long)]
+    no_dispatch: bool,
+}
+
+#[derive(Args)]
+struct ImportArgs {
+    project: String,
+    #[arg(long)]
+    repo: Option<String>,
+}
+
+#[derive(Args)]
+struct AskArgs {
+    task_id: i64,
+    #[arg(value_name = "TEXT")]
+    text: Vec<String>,
+    #[arg(long)]
+    question: Option<String>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TriageTarget {
+    Parked,
+    Ready,
+    Reject,
+}
+
+impl From<TriageTarget> for Triage {
+    fn from(target: TriageTarget) -> Triage {
+        match target {
+            TriageTarget::Parked => Triage::Parked,
+            TriageTarget::Ready => Triage::Ready,
+            TriageTarget::Reject => Triage::Reject,
+        }
+    }
+}
+
 pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<String, String> {
     // Reconcile-on-read (DESIGN.md §8): before any verb consults session or
     // task state, close out sessions whose process has already exited.
     crate::reconcile::reconcile_live_sessions(store, &ctx.agents_path)
         .map_err(|e| e.to_string())?;
 
-    let (pos, flags) = split_args(args)?;
-    let verb = pos.first().map(String::as_str).unwrap_or("help");
-    match verb {
-        "help" | "--help" | "-h" => Ok(HELP.to_string()),
-        "project" => project_verb(store, &pos, &flags),
-        "weight" => weight_verb(store, &pos),
-        "add" => add_verb(store, &pos, &flags),
-        "propose" => propose_verb(store, &pos, &flags, std::env::var("VORO_TASK_ID").ok()),
-        "set" => set_verb(store, &pos, &flags),
-        "show" => show_verb(store, &pos),
-        "list" => list_verb(store, &flags),
-        "inbox" => inbox_verb(store),
-        "next" => next_verb(store),
-        "stats" => stats_verb(store),
-        "explain" => explain_verb(store, &pos),
-        "agent" => agent_verb(&pos, ctx),
-        "dispatch" => dispatch_verb(store, &pos, &flags, ctx),
-        "continue" => continue_verb(store, &pos, &flags, ctx),
-        "open" => open_verb(store, &pos, ctx),
-        "viewer" => viewer_verb(&pos, ctx),
-        "pr" => pr_verb(store, &pos, &flags, ctx),
-        "reject" => reject_verb(store, &pos, &flags, ctx),
-        "done" => done_verb(store, &pos, &flags),
-        "answer" => answer_verb(store, &pos, &flags, ctx),
-        "import" => import_verb(store, &pos, &flags),
-        "triage" | "start" | "ask" | "accept" | "abort" | "park" | "unpark" | "abandon" => {
-            transition_verb(store, verb, &pos, &flags)
-        }
-        other => Err(format!("unknown verb '{other}' — try 'voro help'")),
+    // Every help request gets the hand-written overview page; clap's own help
+    // machinery is disabled so it can never shadow this.
+    if args.is_empty() || args[0] == "help" || args.iter().any(|a| a == "--help" || a == "-h") {
+        return Ok(HELP.to_string());
     }
-}
-
-fn split_args(args: Vec<String>) -> Result<(Vec<String>, HashMap<String, String>), String> {
-    let mut pos = Vec::new();
-    let mut flags = HashMap::new();
-    let mut it = args.into_iter();
-    while let Some(arg) = it.next() {
-        match arg.strip_prefix("--") {
-            Some("no-agent") => {
-                flags.insert("no-agent".to_string(), String::new());
-            }
-            Some("no-dispatch") => {
-                flags.insert("no-dispatch".to_string(), String::new());
-            }
-            Some("no-pr") => {
-                flags.insert("no-pr".to_string(), String::new());
-            }
-            Some("no-branch") => {
-                flags.insert("no-branch".to_string(), String::new());
-            }
-            Some("human") => {
-                flags.insert("human".to_string(), String::new());
-            }
-            Some("no-human") => {
-                flags.insert("no-human".to_string(), String::new());
-            }
-            Some("from-pr") => {
-                flags.insert("from-pr".to_string(), String::new());
-            }
-            Some("yes") => {
-                flags.insert("yes".to_string(), String::new());
-            }
-            Some("help") => pos.insert(0, "help".to_string()),
-            Some(key) => {
-                let value = it.next().ok_or_else(|| format!("--{key} needs a value"))?;
-                flags.insert(key.to_string(), value);
-            }
-            None => pos.push(arg),
+    let cli = Cli::try_parse_from(std::iter::once("voro".to_string()).chain(args))
+        .map_err(|e| e.to_string().trim_end().to_string())?;
+    match cli.verb {
+        Verb::Project { cmd } => project_verb(store, cmd),
+        Verb::Weight { project, weight } => weight_verb(store, &project, weight),
+        Verb::Add(args) => add_verb(store, args),
+        Verb::Propose(args) => propose_verb(store, args, std::env::var("VORO_TASK_ID").ok()),
+        Verb::Set(args) => set_verb(store, args),
+        Verb::Show { task_id } => show_verb(store, task_id),
+        Verb::List(args) => list_verb(store, &args),
+        Verb::Inbox => inbox_verb(store),
+        Verb::Next => next_verb(store),
+        Verb::Stats => stats_verb(store),
+        Verb::Explain { task_id } => explain_verb(store, task_id),
+        Verb::Agent { cmd } => agent_verb(cmd, ctx),
+        Verb::Dispatch { task_id, agent } => {
+            dispatch::dispatch(store, ctx, task_id, agent.as_deref())
         }
+        Verb::Continue { task_id, agent } => {
+            dispatch::continue_dispatch(store, ctx, task_id, agent.as_deref(), None)
+        }
+        Verb::Open { task_id } => dispatch::open(store, ctx, task_id, None),
+        Verb::Viewer { cmd } => viewer_verb(cmd, ctx),
+        Verb::Pr { task_id, yes } => pr_verb(store, task_id, yes, ctx),
+        Verb::Reject(args) => reject_verb(store, args, ctx),
+        Verb::Done(args) => done_verb(store, args),
+        Verb::Answer(args) => answer_verb(store, args, ctx),
+        Verb::Import(args) => import_verb(store, args),
+        Verb::Triage { task_id, target } => {
+            apply_action(store, task_id, Action::Triage(target.into()), false)
+        }
+        Verb::Start { task_id } => apply_action(store, task_id, Action::Start, false),
+        Verb::Ask(args) => ask_verb(store, args),
+        Verb::Accept { task_id, yes } => apply_action(store, task_id, Action::Accept, yes),
+        Verb::Abort { task_id } => apply_action(store, task_id, Action::Abort, false),
+        Verb::Park { task_id } => apply_action(store, task_id, Action::Park, false),
+        Verb::Unpark { task_id } => apply_action(store, task_id, Action::Unpark, false),
+        Verb::Abandon { task_id, yes } => apply_action(store, task_id, Action::Abandon, yes),
     }
-    Ok((pos, flags))
-}
-
-fn need<'a>(pos: &'a [String], index: usize, what: &str) -> Result<&'a str, String> {
-    pos.get(index)
-        .map(String::as_str)
-        .ok_or_else(|| format!("missing {what} — try 'voro help'"))
-}
-
-fn task_id(pos: &[String], index: usize) -> Result<i64, String> {
-    let raw = need(pos, index, "task id")?;
-    raw.parse().map_err(|_| format!("'{raw}' is not a task id"))
 }
 
 fn resolve_project(store: &Store, key: &str) -> Result<Project, String> {
@@ -281,34 +522,26 @@ fn apply_blocks_flag(store: &mut Store, blocker_id: i64, raw: &str) -> Result<St
     Ok(out)
 }
 
-fn body_from(flags: &HashMap<String, String>) -> Result<Option<String>, String> {
-    match (flags.get("body"), flags.get("body-file")) {
-        (Some(_), Some(_)) => Err("--body and --body-file are mutually exclusive".into()),
-        (Some(text), None) => Ok(Some(text.clone())),
-        (None, Some(path)) => std::fs::read_to_string(path)
+/// A value given inline (`--body TEXT`, `--summary TEXT`) or read from a file
+/// (`--body-file PATH`, `--summary-file PATH`) — the latter lets an agent
+/// leave a multi-line, PR-ready text without cramming it onto one command
+/// line (DESIGN.md §8). The pairs are declared mutually exclusive in the
+/// parser, so at most one arrives here; `None` when neither is given, which
+/// stays valid: not every task produces one.
+fn text_or_file(text: Option<String>, path: Option<String>) -> Result<Option<String>, String> {
+    match (text, path) {
+        (Some(text), _) => Ok(Some(text)),
+        (None, Some(path)) => std::fs::read_to_string(&path)
             .map(Some)
             .map_err(|e| format!("cannot read {path}: {e}")),
         (None, None) => Ok(None),
     }
 }
 
-/// The agent's completion summary from `--summary TEXT` or `--summary-file
-/// PATH` (DESIGN.md §8), mutually exclusive — the latter lets an agent leave a
-/// PR-ready description without cramming it onto one command line. `None` when
-/// neither is given, which stays valid: not every task produces one.
-fn summary_from(flags: &HashMap<String, String>) -> Result<Option<String>, String> {
-    match (flags.get("summary"), flags.get("summary-file")) {
-        (Some(_), Some(_)) => Err("--summary and --summary-file are mutually exclusive".into()),
-        (Some(text), None) => Ok(Some(text.clone())),
-        (None, Some(path)) => std::fs::read_to_string(path)
-            .map(Some)
-            .map_err(|e| format!("cannot read {path}: {e}")),
-        (None, None) => Ok(None),
-    }
-}
-
-fn rest_text(pos: &[String], from: usize, what: &str) -> Result<String, String> {
-    let text = pos[from.min(pos.len())..].join(" ");
+/// Free-text positionals (a title, an answer, rejection feedback) arrive as
+/// the words the shell split them into; join them back and refuse emptiness.
+fn joined(words: &[String], what: &str) -> Result<String, String> {
+    let text = words.join(" ");
     if text.trim().is_empty() {
         return Err(format!("missing {what} — try 'voro help'"));
     }
@@ -317,28 +550,18 @@ fn rest_text(pos: &[String], from: usize, what: &str) -> Result<String, String> 
 
 // --- verbs ---
 
-fn project_verb(
-    store: &mut Store,
-    pos: &[String],
-    _flags: &HashMap<String, String>,
-) -> Result<String, String> {
-    match need(
-        pos,
-        1,
-        "project subcommand (add|list|rename|path|action|delete)",
-    )? {
-        "add" => {
-            let name = need(pos, 2, "project name")?;
-            let path = need(pos, 3, "project path")?;
+fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
+    match cmd {
+        ProjectCmd::Add { name, path } => {
             let p = store
-                .create_project(name, path)
+                .create_project(&name, &path)
                 .map_err(|e| e.to_string())?;
             Ok(format!(
                 "project {} '{}' created (weight {})",
                 p.id, p.name, p.weight
             ))
         }
-        "list" => {
+        ProjectCmd::List => {
             let mut out = String::new();
             for p in store.projects().map_err(|e| e.to_string())? {
                 let action = match &p.review_action {
@@ -354,37 +577,33 @@ fn project_verb(
             }
             Ok(out)
         }
-        "rename" => {
-            let project = resolve_project(store, need(pos, 2, "project")?)?;
-            let name = need(pos, 3, "new name")?;
+        ProjectCmd::Rename { project, name } => {
+            let project = resolve_project(store, &project)?;
             let p = store
-                .rename_project(project.id, name)
+                .rename_project(project.id, &name)
                 .map_err(|e| e.to_string())?;
             Ok(format!(
                 "project {} renamed '{}' -> '{}'",
                 p.id, project.name, p.name
             ))
         }
-        "path" => {
-            let project = resolve_project(store, need(pos, 2, "project")?)?;
-            let path = need(pos, 3, "new path")?;
+        ProjectCmd::Path { project, path } => {
+            let project = resolve_project(store, &project)?;
             let p = store
-                .set_path(project.id, path)
+                .set_path(project.id, &path)
                 .map_err(|e| e.to_string())?;
             Ok(format!("project {} path -> {}", p.id, p.path))
         }
-        "delete" => {
-            let project = resolve_project(store, need(pos, 2, "project")?)?;
+        ProjectCmd::Delete { project } => {
+            let project = resolve_project(store, &project)?;
             store
                 .delete_project(project.id)
                 .map_err(|e| e.to_string())?;
             Ok(format!("project {} '{}' deleted", project.id, project.name))
         }
-        "action" => {
-            let project = resolve_project(store, need(pos, 2, "project")?)?;
-            let action =
-                ReviewAction::parse(need(pos, 3, "review action (auto|pr|viewer[:NAME])")?)
-                    .map_err(|e| e.to_string())?;
+        ProjectCmd::Action { project, action } => {
+            let project = resolve_project(store, &project)?;
+            let action = ReviewAction::parse(&action).map_err(|e| e.to_string())?;
             let p = store
                 .set_review_action(project.id, &action)
                 .map_err(|e| e.to_string())?;
@@ -393,7 +612,6 @@ fn project_verb(
                 p.name, project.review_action, p.review_action
             ))
         }
-        other => Err(format!("unknown project subcommand '{other}'")),
     }
 }
 
@@ -401,10 +619,10 @@ fn project_verb(
 /// lives outside the database (DESIGN.md §8), so this verb takes no `store`.
 /// `init` scaffolds a starter file, `list` shows the effective agents, and
 /// `path` prints where dispatch looks for it.
-fn agent_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
+fn agent_verb(cmd: AgentCmd, ctx: &DispatchCtx) -> Result<String, String> {
     let path = &ctx.agents_path;
-    match need(pos, 1, "agent subcommand (init|list|path)")? {
-        "init" => {
+    match cmd {
+        AgentCmd::Init => {
             AgentsConfig::write_starter(path).map_err(|e| e.to_string())?;
             Ok(format!(
                 "wrote a config skeleton to {} — optional, since the built-in claude/codex \
@@ -413,7 +631,7 @@ fn agent_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
                 path.display()
             ))
         }
-        "list" => {
+        AgentCmd::List => {
             let config = AgentsConfig::load(path).map_err(|e| e.to_string())?;
             let default = config.default_name();
             let mut out = String::new();
@@ -467,16 +685,12 @@ fn agent_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
             }
             Ok(out)
         }
-        "path" => Ok(path.display().to_string()),
-        other => Err(format!("unknown agent subcommand '{other}'")),
+        AgentCmd::Path => Ok(path.display().to_string()),
     }
 }
 
-fn weight_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
-    let project = resolve_project(store, need(pos, 1, "project")?)?;
-    let weight: i64 = need(pos, 2, "weight (0-5)")?
-        .parse()
-        .map_err(|_| "weight must be 0-5".to_string())?;
+fn weight_verb(store: &mut Store, project: &str, weight: i64) -> Result<String, String> {
+    let project = resolve_project(store, project)?;
     store
         .set_weight(project.id, weight)
         .map_err(|e| e.to_string())?;
@@ -486,14 +700,10 @@ fn weight_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     ))
 }
 
-fn add_verb(
-    store: &mut Store,
-    pos: &[String],
-    flags: &HashMap<String, String>,
-) -> Result<String, String> {
-    let project = resolve_project(store, need(pos, 1, "project")?)?;
-    let title = rest_text(pos, 2, "title")?;
-    let state = match flags.get("state").map(String::as_str) {
+fn add_verb(store: &mut Store, args: AddArgs) -> Result<String, String> {
+    let project = resolve_project(store, &args.project)?;
+    let title = joined(&args.title, "title")?;
+    let state = match args.state.as_deref() {
         None => TaskState::Proposed,
         Some(raw) => {
             let state = TaskState::parse(raw).map_err(|e| e.to_string())?;
@@ -506,29 +716,25 @@ fn add_verb(
             state
         }
     };
-    let priority = match flags.get("priority") {
-        Some(raw) => parse_priority(raw)?,
-        None => Priority::P2,
-    };
     let task = store
         .create_task(NewTask {
             project_id: project.id,
             title,
-            body: body_from(flags)?.unwrap_or_default(),
-            priority,
+            body: text_or_file(args.body, args.body_file)?.unwrap_or_default(),
+            priority: args.priority.unwrap_or(Priority::P2),
             state,
-            agent: flags.get("agent").cloned(),
-            human: flags.contains_key("human"),
+            agent: args.agent,
+            human: args.human,
         })
         .map_err(|e| e.to_string())?;
-    let task = match flags.get("blocked-by") {
+    let task = match &args.blocked_by {
         Some(raw) => store
             .set_blocks_deps(task.id, &parse_ids("blocked-by", raw)?)
             .map_err(|e| e.to_string())?,
         None => task,
     };
     let mut out = format!("task {} '{}' created ({})", task.id, task.title, task.state);
-    if let Some(raw) = flags.get("blocks") {
+    if let Some(raw) = &args.blocks {
         out.push_str(&apply_blocks_flag(store, task.id, raw)?);
     }
     Ok(out)
@@ -539,29 +745,31 @@ fn add_verb(
 /// explicitly, or the `VORO_TASK_ID` a dispatched session runs under.
 fn propose_verb(
     store: &mut Store,
-    pos: &[String],
-    flags: &HashMap<String, String>,
+    args: ProposeArgs,
     env_source: Option<String>,
 ) -> Result<String, String> {
-    if flags.contains_key("state") {
+    if args.state.is_some() {
         return Err("propose always creates 'proposed' tasks — use 'add --state' instead".into());
     }
-    let project = resolve_project(store, need(pos, 1, "project")?)?;
-    let title = rest_text(pos, 2, "title")?;
-    let source = match flags.get("from").cloned().or(env_source) {
-        Some(raw) => {
-            let id: i64 = raw
-                .parse()
-                .map_err(|_| format!("'{raw}' is not a task id"))?;
-            Some(store.task(id).map_err(|e| e.to_string())?)
-        }
+    let project = resolve_project(store, &args.project)?;
+    let title = joined(&args.title, "title")?;
+    let source_id = match (args.from, env_source) {
+        (Some(id), _) => Some(id),
+        (None, Some(raw)) => Some(
+            raw.parse()
+                .map_err(|_| format!("'{raw}' is not a task id"))?,
+        ),
+        (None, None) => None,
+    };
+    let source = match source_id {
+        Some(id) => Some(store.task(id).map_err(|e| e.to_string())?),
         None => None,
     };
     let task = store
         .create_task(NewTask {
             project_id: project.id,
             title,
-            body: body_from(flags)?.unwrap_or_default(),
+            body: text_or_file(args.body, args.body_file)?.unwrap_or_default(),
             priority: Priority::P2,
             state: TaskState::Proposed,
             agent: None,
@@ -578,65 +786,57 @@ fn propose_verb(
     Ok(out)
 }
 
-fn set_verb(
-    store: &mut Store,
-    pos: &[String],
-    flags: &HashMap<String, String>,
-) -> Result<String, String> {
-    let id = task_id(pos, 1)?;
+fn set_verb(store: &mut Store, args: SetArgs) -> Result<String, String> {
+    let id = args.task_id;
     let current = store.task(id).map_err(|e| e.to_string())?;
-    let agent = if flags.contains_key("no-agent") {
+    let agent = if args.no_agent {
         None
     } else {
-        flags.get("agent").cloned().or(current.agent)
+        args.agent.or(current.agent)
     };
-    let human = match (flags.contains_key("human"), flags.contains_key("no-human")) {
-        (true, true) => return Err("--human and --no-human are mutually exclusive".into()),
-        (true, false) => true,
-        (false, true) => false,
+    let human = match (args.human, args.no_human) {
+        (true, _) => true,
+        (_, true) => false,
         (false, false) => current.human,
     };
     let edit = TaskEdit {
-        title: flags.get("title").cloned().unwrap_or(current.title),
-        body: body_from(flags)?.unwrap_or(current.body),
-        priority: match flags.get("priority") {
-            Some(raw) => parse_priority(raw)?,
-            None => current.priority,
-        },
+        title: args.title.unwrap_or(current.title),
+        body: text_or_file(args.body, args.body_file)?.unwrap_or(current.body),
+        priority: args.priority.unwrap_or(current.priority),
         agent,
         human,
     };
     let task = store.update_task(id, edit).map_err(|e| e.to_string())?;
-    let task = match flags.get("blocked-by") {
+    let task = match &args.blocked_by {
         Some(raw) => store
             .set_blocks_deps(id, &parse_ids("blocked-by", raw)?)
             .map_err(|e| e.to_string())?,
         None => task,
     };
-    let blocks_echo = match flags.get("blocks") {
+    let blocks_echo = match &args.blocks {
         Some(raw) => apply_blocks_flag(store, id, raw)?,
         None => String::new(),
     };
-    let task = match (flags.contains_key("no-pr"), flags.get("pr")) {
-        (true, Some(_)) => return Err("--pr and --no-pr are mutually exclusive".into()),
-        (true, None) => store.set_pr(id, None).map_err(|e| e.to_string())?,
-        (false, Some(raw)) => {
-            // Validate and canonicalise the reference before storing, so a
-            // tracked PR is always addressable and the stored form is stable.
-            let pr = PrRef::parse(raw).map_err(|e| e.to_string())?;
-            store.set_pr(id, Some(&pr.url)).map_err(|e| e.to_string())?
-        }
-        (false, None) => task,
+    let task = if args.no_pr {
+        store.set_pr(id, None).map_err(|e| e.to_string())?
+    } else if let Some(raw) = &args.pr {
+        // Validate and canonicalise the reference before storing, so a
+        // tracked PR is always addressable and the stored form is stable.
+        let pr = PrRef::parse(raw).map_err(|e| e.to_string())?;
+        store.set_pr(id, Some(&pr.url)).map_err(|e| e.to_string())?
+    } else {
+        task
     };
-    let task = match (flags.contains_key("no-branch"), flags.get("branch")) {
-        (true, Some(_)) => return Err("--branch and --no-branch are mutually exclusive".into()),
-        (true, None) => store.set_branch(id, None).map_err(|e| e.to_string())?,
-        (false, Some(name)) => store
+    let task = if args.no_branch {
+        store.set_branch(id, None).map_err(|e| e.to_string())?
+    } else if let Some(name) = &args.branch {
+        store
             .set_branch(id, Some(name.trim()))
-            .map_err(|e| e.to_string())?,
-        (false, None) => task,
+            .map_err(|e| e.to_string())?
+    } else {
+        task
     };
-    let task = match summary_from(flags)? {
+    let task = match text_or_file(args.summary, args.summary_file)? {
         Some(text) => store.set_summary(id, &text).map_err(|e| e.to_string())?,
         None => task,
     };
@@ -656,13 +856,7 @@ fn set_verb(
 /// recording its URL; on a viewer project, open the checkout in the
 /// configured viewer instead, exactly as `open` does. The `git`/`gh`
 /// shell-outs live in the `pr` module beside the other process work.
-fn pr_verb(
-    store: &mut Store,
-    pos: &[String],
-    flags: &HashMap<String, String>,
-    ctx: &DispatchCtx,
-) -> Result<String, String> {
-    let id = task_id(pos, 1)?;
+fn pr_verb(store: &mut Store, id: i64, yes: bool, ctx: &DispatchCtx) -> Result<String, String> {
     let task = store.task(id).map_err(|e| e.to_string())?;
     if task.pr_url.is_some() {
         return crate::pr::open(store, id);
@@ -674,9 +868,7 @@ fn pr_verb(
     // Assert PR-ready and learn the branch before prompting, so a task missing
     // state, branch, or summary fails naming the gap rather than at the prompt.
     let plan = crate::pr::plan(store, id)?;
-    if !flags.contains_key("yes")
-        && !confirm(&format!("push `{}` and open a PR for #{id}?", plan.branch))?
-    {
+    if !yes && !confirm(&format!("push `{}` and open a PR for #{id}?", plan.branch))? {
         return Ok(format!("cancelled — no PR opened for #{id}"));
     }
     crate::pr::create(store, id)
@@ -708,21 +900,18 @@ fn confirm(question: &str) -> Result<bool, String> {
 /// the work with the feedback in hand — and because review keeps the session
 /// open, that reuses the *same* agent session; `--no-dispatch` forces the plain
 /// transition, and a task only ever started by hand has nothing to continue.
-fn reject_verb(
-    store: &mut Store,
-    pos: &[String],
-    flags: &HashMap<String, String>,
-    ctx: &DispatchCtx,
-) -> Result<String, String> {
-    let id = task_id(pos, 1)?;
-    let feedback = if flags.contains_key("from-pr") {
+fn reject_verb(store: &mut Store, args: RejectArgs, ctx: &DispatchCtx) -> Result<String, String> {
+    let id = args.task_id;
+    let feedback = if args.from_pr {
         let pulled = crate::pr::pull_review_feedback(store, id)?;
-        match pos.get(2..).map(|rest| rest.join(" ")) {
-            Some(extra) if !extra.trim().is_empty() => format!("{pulled}\n{extra}"),
-            _ => pulled,
+        let extra = args.text.join(" ");
+        if extra.trim().is_empty() {
+            pulled
+        } else {
+            format!("{pulled}\n{extra}")
         }
     } else {
-        rest_text(pos, 2, "rejection feedback")?
+        joined(&args.text, "rejection feedback")?
     };
     let has_history = !store
         .sessions_for(id)
@@ -734,7 +923,7 @@ fn reject_verb(
         .map_err(|e| e.to_string())?;
     let out = format!("task {} -> {}", task.id, task.state);
 
-    if !has_history || flags.contains_key("no-dispatch") {
+    if !has_history || args.no_dispatch {
         return Ok(out);
     }
     match dispatch::continue_dispatch(store, ctx, id, None, Some(&feedback)) {
@@ -760,18 +949,14 @@ fn reject_verb(
 /// it only stores the reported name. A `done` that leaves the task without a branch or summary
 /// *warns* rather than failing — planning and task-generation work produces
 /// neither — so both stay optional through the whole lifecycle.
-fn done_verb(
-    store: &mut Store,
-    pos: &[String],
-    flags: &HashMap<String, String>,
-) -> Result<String, String> {
-    let id = task_id(pos, 1)?;
-    let summary = summary_from(flags)?;
+fn done_verb(store: &mut Store, args: DoneArgs) -> Result<String, String> {
+    let id = args.task_id;
+    let summary = text_or_file(args.summary, args.summary_file)?;
     let task = store
         .apply(id, Action::Complete(summary))
         .map_err(|e| e.to_string())?;
     let mut out = format!("task {} -> {}", task.id, task.state);
-    if let Some(name) = flags.get("branch") {
+    if let Some(name) = &args.branch {
         store
             .set_branch(id, Some(name.trim()))
             .map_err(|e| e.to_string())?;
@@ -805,8 +990,7 @@ fn done_verb(
     Ok(out)
 }
 
-fn show_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
-    let id = task_id(pos, 1)?;
+fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
     let task = store.task(id).map_err(|e| e.to_string())?;
     let project = store.project(task.project_id).map_err(|e| e.to_string())?;
     let mut out = String::new();
@@ -872,12 +1056,12 @@ fn show_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     Ok(out)
 }
 
-fn list_verb(store: &mut Store, flags: &HashMap<String, String>) -> Result<String, String> {
-    let state_filter = match flags.get("state") {
+fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
+    let state_filter = match &args.state {
         Some(raw) => Some(TaskState::parse(raw).map_err(|e| e.to_string())?),
         None => None,
     };
-    let project_filter = match flags.get("project") {
+    let project_filter = match &args.project {
         Some(key) => Some(resolve_project(store, key)?.id),
         None => None,
     };
@@ -986,8 +1170,7 @@ fn incomplete_report_suffix(store: &Store, task_id: i64) -> &'static str {
     }
 }
 
-fn explain_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
-    let id = task_id(pos, 1)?;
+fn explain_verb(store: &mut Store, id: i64) -> Result<String, String> {
     let task = store.task(id).map_err(|e| e.to_string())?;
     let b = store.explain(id).map_err(|e| e.to_string())?;
     let mut out = String::new();
@@ -1025,31 +1208,6 @@ fn explain_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     Ok(out)
 }
 
-fn dispatch_verb(
-    store: &mut Store,
-    pos: &[String],
-    flags: &HashMap<String, String>,
-    ctx: &DispatchCtx,
-) -> Result<String, String> {
-    let id = task_id(pos, 1)?;
-    dispatch::dispatch(store, ctx, id, flags.get("agent").map(String::as_str))
-}
-
-/// `continue <task-id> [--agent NAME]`: spawn a fresh session on a task that
-/// is already `running`, without touching its state — the mechanics `answer`
-/// uses automatically for a previously-dispatched task, exposed directly so a
-/// continuation that failed (a dirty tree, a misconfigured agent) can be
-/// retried once fixed.
-fn continue_verb(
-    store: &mut Store,
-    pos: &[String],
-    flags: &HashMap<String, String>,
-    ctx: &DispatchCtx,
-) -> Result<String, String> {
-    let id = task_id(pos, 1)?;
-    dispatch::continue_dispatch(store, ctx, id, flags.get("agent").map(String::as_str), None)
-}
-
 /// `answer <task-id> TEXT [--no-dispatch]` (DESIGN.md §6): needs-input →
 /// running, answer appended to the body and logged — the transition alone
 /// always applies first. "fed to the session" then means dispatching a fresh
@@ -1059,14 +1217,9 @@ fn continue_verb(
 /// session history — one only ever started by hand has nothing to continue,
 /// and stays a plain transition, which is also what `--no-dispatch` forces
 /// even when history exists.
-fn answer_verb(
-    store: &mut Store,
-    pos: &[String],
-    flags: &HashMap<String, String>,
-    ctx: &DispatchCtx,
-) -> Result<String, String> {
-    let id = task_id(pos, 1)?;
-    let text = rest_text(pos, 2, "answer text")?;
+fn answer_verb(store: &mut Store, args: AnswerArgs, ctx: &DispatchCtx) -> Result<String, String> {
+    let id = args.task_id;
+    let text = joined(&args.text, "answer text")?;
     let has_history = !store
         .sessions_for(id)
         .map_err(|e| e.to_string())?
@@ -1077,7 +1230,7 @@ fn answer_verb(
         .map_err(|e| e.to_string())?;
     let out = format!("task {} -> {}", task.id, task.state);
 
-    if !has_history || flags.contains_key("no-dispatch") {
+    if !has_history || args.no_dispatch {
         return Ok(out);
     }
     match dispatch::continue_dispatch(store, ctx, id, None, Some(&text)) {
@@ -1088,24 +1241,14 @@ fn answer_verb(
     }
 }
 
-/// `open <task-id>` (DESIGN.md §8/§11a): run a configured viewer on a
-/// review/running task's checkout so its diff can be seen — the explicit
-/// spelling of `pr`'s viewer medium, kept for reaching the local diff even on
-/// a GitHub project. Spawning lives in the dispatch module beside the other
-/// process work; `voro-core` stays process-free.
-fn open_verb(store: &mut Store, pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
-    let id = task_id(pos, 1)?;
-    dispatch::open(store, ctx, id, None)
-}
-
 /// `viewer list` (DESIGN.md §8/§11a): the viewers `voro.toml` defines, with
 /// the default — the one used when neither a project's review action nor
 /// `default_viewer` names one — flagged. Like `agent`, this manages config
 /// that lives outside the database, so it takes no store.
-fn viewer_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
+fn viewer_verb(cmd: ViewerCmd, ctx: &DispatchCtx) -> Result<String, String> {
     let path = &ctx.agents_path;
-    match need(pos, 1, "viewer subcommand (list)")? {
-        "list" => {
+    match cmd {
+        ViewerCmd::List => {
             let config = AgentsConfig::load(path).map_err(|e| e.to_string())?;
             let names = config.viewer_names();
             let default = config.default_viewer_name();
@@ -1139,7 +1282,6 @@ fn viewer_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
             }
             Ok(out)
         }
-        other => Err(format!("unknown viewer subcommand '{other}'")),
     }
 }
 
@@ -1147,14 +1289,9 @@ fn viewer_verb(pos: &[String], ctx: &DispatchCtx) -> Result<String, String> {
 /// issue list` in the project's path (or `--repo owner/name` if the checkout
 /// itself doesn't name the repo to import from) and captures each issue as a
 /// `proposed` task, skipping ones already imported.
-fn import_verb(
-    store: &mut Store,
-    pos: &[String],
-    flags: &HashMap<String, String>,
-) -> Result<String, String> {
-    let project = resolve_project(store, need(pos, 1, "project")?)?;
-    let repo = flags.get("repo").map(String::as_str);
-    let json = import::fetch_issues(&project.path, repo)?;
+fn import_verb(store: &mut Store, args: ImportArgs) -> Result<String, String> {
+    let project = resolve_project(store, &args.project)?;
+    let json = import::fetch_issues(&project.path, args.repo.as_deref())?;
     let summary = import::import_issues(store, &project, &json)?;
     let mut out = String::new();
     for task in &summary.imported {
@@ -1170,46 +1307,23 @@ fn import_verb(
     Ok(out)
 }
 
-fn transition_verb(
-    store: &mut Store,
-    verb: &str,
-    pos: &[String],
-    flags: &HashMap<String, String>,
-) -> Result<String, String> {
-    let id = task_id(pos, 1)?;
-    let action = match verb {
-        "triage" => match need(pos, 2, "triage target (parked|ready|reject)")? {
-            "parked" => Action::Triage(Triage::Parked),
-            "ready" => Action::Triage(Triage::Ready),
-            "reject" => Action::Triage(Triage::Reject),
-            other => {
-                return Err(format!(
-                    "triage target must be parked|ready|reject, got '{other}'"
-                ));
-            }
-        },
-        "start" => Action::Start,
-        "ask" => {
-            let question = match flags.get("question") {
-                Some(q) => q.clone(),
-                None => rest_text(pos, 2, "question (--question TEXT)")?,
-            };
-            Action::Ask(question)
-        }
-        "accept" => Action::Accept,
-        "abort" => Action::Abort,
-        "park" => Action::Park,
-        "unpark" => Action::Unpark,
-        "abandon" => Action::Abandon,
-        _ => unreachable!("guarded by run()"),
+fn ask_verb(store: &mut Store, args: AskArgs) -> Result<String, String> {
+    let question = match args.question {
+        Some(q) => q,
+        None => joined(&args.text, "question (--question TEXT)")?,
     };
-    // The task closes worktree in tow (§8): `accept`/`abandon` are the terminal
-    // transitions that own the dispatch worktree's teardown. The transition is
-    // applied first and stands regardless of what the cleanup does.
+    apply_action(store, args.task_id, Action::Ask(question), false)
+}
+
+/// Apply a plain state-machine action. The task closes worktree in tow (§8):
+/// `accept`/`abandon` are the terminal transitions that own the dispatch
+/// worktree's teardown (`yes` skips its confirmation). The transition is
+/// applied first and stands regardless of what the cleanup does.
+fn apply_action(store: &mut Store, id: i64, action: Action, yes: bool) -> Result<String, String> {
     let closes = matches!(action, Action::Accept | Action::Abandon);
     let task = store.apply(id, action).map_err(|e| e.to_string())?;
     let mut out = format!("task {} -> {}", task.id, task.state);
-    if closes && let Some(line) = clean_up_worktree(store, &task, flags.contains_key("yes"))? {
+    if closes && let Some(line) = clean_up_worktree(store, &task, yes)? {
         out.push('\n');
         out.push_str(&line);
     }
@@ -1587,8 +1701,12 @@ mod tests {
     }
 
     fn propose(store: &mut Store, args: &[&str], env: Option<&str>) -> Result<String, String> {
-        let (pos, flags) = split_args(args.iter().map(|s| s.to_string()).collect())?;
-        propose_verb(store, &pos, &flags, env.map(str::to_string))
+        let cli = Cli::try_parse_from(std::iter::once("voro").chain(args.iter().copied()))
+            .map_err(|e| e.to_string())?;
+        let Verb::Propose(parsed) = cli.verb else {
+            panic!("{args:?} is not a propose invocation");
+        };
+        propose_verb(store, parsed, env.map(str::to_string))
     }
 
     #[test]
@@ -1735,7 +1853,7 @@ mod tests {
         assert!(!ok(&mut s, &["show", "1"]).contains("human-only"));
 
         let e = err(&mut s, &["set", "1", "--human", "--no-human"]);
-        assert!(e.contains("mutually exclusive"), "{e}");
+        assert!(e.contains("cannot be used with"), "{e}");
 
         // an existing override blocks --human until cleared in the same edit
         ok(&mut s, &["set", "1", "--agent", "codex"]);
@@ -1815,7 +1933,7 @@ mod tests {
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
         let e = err(&mut s, &["set", "1", "--pr", "acme/w#1", "--no-pr"]);
-        assert!(e.contains("mutually exclusive"), "{e}");
+        assert!(e.contains("cannot be used with"), "{e}");
     }
 
     /// `reject --from-pr` on a task with no tracked PR reports the missing
@@ -1867,7 +1985,7 @@ mod tests {
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
         let e = err(&mut s, &["set", "1", "--branch", "x", "--no-branch"]);
-        assert!(e.contains("mutually exclusive"), "{e}");
+        assert!(e.contains("cannot be used with"), "{e}");
     }
 
     #[test]
@@ -2179,7 +2297,7 @@ mod tests {
             &mut s,
             &["done", "1", "--summary", "x", "--summary-file", "/tmp/nope"],
         );
-        assert!(e.contains("mutually exclusive"), "{e}");
+        assert!(e.contains("cannot be used with"), "{e}");
     }
 
     #[test]
@@ -2347,7 +2465,7 @@ mod tests {
             &mut s,
             &["set", "1", "--summary", "x", "--summary-file", "/tmp/nope"],
         );
-        assert!(e.contains("mutually exclusive"), "{e}");
+        assert!(e.contains("cannot be used with"), "{e}");
     }
 
     #[test]
@@ -2403,9 +2521,9 @@ mod tests {
     #[test]
     fn errors_are_actionable() {
         let mut s = store();
-        assert!(err(&mut s, &["frobnicate"]).contains("unknown verb"));
+        assert!(err(&mut s, &["frobnicate"]).contains("unrecognized subcommand 'frobnicate'"));
         assert!(err(&mut s, &["weight", "nope", "3"]).contains("no project"));
-        assert!(err(&mut s, &["start"]).contains("task id"));
+        assert!(err(&mut s, &["start"]).contains("<TASK_ID>"));
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
         assert!(err(&mut s, &["accept", "1"]).contains("cannot accept"));
@@ -2420,6 +2538,60 @@ mod tests {
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
         err(&mut s, &["done", "1"]);
         assert!(ok(&mut s, &["show", "1"]).contains("#1 ready"));
+    }
+
+    // --- unknown-flag rejection (task #108) ---
+
+    /// A typo'd flag on a mutating verb is refused by name, before the verb
+    /// runs: no transition, no summary, no event.
+    #[test]
+    fn an_unknown_flag_on_a_mutating_verb_writes_nothing() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        let events_before = s.events_for(1).unwrap().len();
+
+        let e = err(&mut s, &["done", "1", "--sumary-file", "/tmp/x"]);
+        assert!(e.contains("unexpected argument '--sumary-file'"), "{e}");
+        assert!(
+            e.contains("a similar argument exists: '--summary-file'"),
+            "{e}"
+        );
+
+        assert!(ok(&mut s, &["show", "1"]).contains("#1 running"));
+        assert_eq!(s.latest_summary(1).unwrap(), None);
+        assert_eq!(s.events_for(1).unwrap().len(), events_before);
+    }
+
+    #[test]
+    fn an_unknown_flag_on_a_read_verb_is_refused() {
+        let mut s = store();
+        let e = err(&mut s, &["list", "--stat", "ready"]);
+        assert!(e.contains("unexpected argument '--stat'"), "{e}");
+        assert!(e.contains("a similar argument exists: '--state'"), "{e}");
+
+        // a flag valid on other verbs is still unknown on one without it
+        let e = err(&mut s, &["inbox", "--state", "ready"]);
+        assert!(e.contains("unexpected argument '--state'"), "{e}");
+    }
+
+    /// Boolean flags are covered too: a known boolean on the wrong verb, and a
+    /// misspelled one, both fail as unknown — and the check runs before the
+    /// handler, so the misplaced `--yes` typo never reaches the transition.
+    #[test]
+    fn boolean_flag_typos_are_refused() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+
+        let e = err(&mut s, &["done", "1", "--from-pr"]);
+        assert!(e.contains("unexpected argument '--from-pr'"), "{e}");
+
+        let e = err(&mut s, &["accept", "1", "--ys", "now"]);
+        assert!(e.contains("unexpected argument '--ys'"), "{e}");
+        assert!(ok(&mut s, &["show", "1"]).contains("#1 running"));
     }
 
     /// End to end (DESIGN.md §8): a task really dispatched, whose agent

@@ -8,3 +8,4 @@ repository.workspace = true
 [dependencies]
 voro-core = { path = "../voro-core" }
 ratatui.workspace = true
+clap = { version = "4.6.1", features = ["derive"] }
