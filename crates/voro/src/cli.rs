@@ -836,6 +836,9 @@ fn show_verb(store: &mut Store, pos: &[String]) -> Result<String, String> {
     if let Some(branch) = &task.branch {
         writeln!(out, "branch: {branch}").unwrap();
     }
+    if let Some(verb) = task.next_action() {
+        writeln!(out, "next: {verb}").unwrap();
+    }
     if store
         .incomplete_report_flag(id)
         .map_err(|e| e.to_string())?
@@ -894,26 +897,45 @@ fn list_verb(store: &mut Store, flags: &HashMap<String, String>) -> Result<Strin
             .find(|p| p.id == task.project_id)
             .map(|p| p.name.as_str())
             .unwrap_or("?");
-        writeln!(
-            out,
-            "{}{}",
-            task_line(&task, name),
-            incomplete_report_suffix(store, task.id)
-        )
-        .unwrap();
+        let incomplete = incomplete_report_suffix(store, task.id);
+        let suffix = if incomplete.is_empty() {
+            review_next_suffix(&task)
+        } else {
+            incomplete.to_string()
+        };
+        writeln!(out, "{}{}", task_line(&task, name), suffix).unwrap();
     }
     Ok(out)
+}
+
+/// A review row's next action as a browser suffix (`  next: pr` /
+/// `  next: review PR`), from the single derivation (DESIGN.md §3). The list
+/// shows state in its own column, so only `review` — whose verb reads the
+/// tracked PR, not the state alone — earns the suffix.
+fn review_next_suffix(task: &Task) -> String {
+    if task.state != TaskState::Review {
+        return String::new();
+    }
+    task.next_action()
+        .map_or_else(String::new, |verb| format!("  next: {verb}"))
 }
 
 fn inbox_verb(store: &mut Store) -> Result<String, String> {
     let candidates = store.candidates().map_err(|e| e.to_string())?;
     let mut out = String::new();
     for c in scheduler::queue(&candidates) {
+        // The queue row carries the verb instead of the state, mirroring the
+        // TUI queue: every inbox row is a next action, and the verb is the
+        // richer rendering of the same derivation (DESIGN.md §3).
         write!(
             out,
-            "{:5.1}  {}",
+            "{:5.1}  #{} {:10} {} {}: {}",
             c.score.total,
-            task_line(&c.task, &c.project_name)
+            c.task.id,
+            c.task.next_action().map_or("", |a| a.as_str()),
+            c.task.priority,
+            c.project_name,
+            c.task.title
         )
         .unwrap();
         if let Some(q) = &c.task.question {
@@ -1379,9 +1401,98 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "An idea"]);
-        assert!(ok(&mut s, &["inbox"]).contains("proposed P2 demo: An idea"));
+        assert!(ok(&mut s, &["inbox"]).contains("P2 demo: An idea"));
         ok(&mut s, &["triage", "1", "ready"]);
         assert!(ok(&mut s, &["next"]).contains("An idea"));
+    }
+
+    /// The inbox renders each row's next-action verb in place of the state,
+    /// mirroring the TUI queue — both from `Task::next_action()` (DESIGN.md §3).
+    #[test]
+    fn inbox_shows_the_next_action_verb_on_each_row() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "An idea"]);
+        ok(&mut s, &["add", "demo", "Startable", "--state", "ready"]);
+        ok(
+            &mut s,
+            &["add", "demo", "By hand", "--state", "ready", "--human"],
+        );
+        ok(&mut s, &["add", "demo", "Blocked", "--state", "ready"]);
+        ok(&mut s, &["start", "4"]);
+        ok(&mut s, &["ask", "4", "--question", "Schema A or B?"]);
+
+        let out = ok(&mut s, &["inbox"]);
+        assert!(out.contains("#1 triage"), "{out}");
+        assert!(out.contains("#2 dispatch"), "{out}");
+        assert!(out.contains("#3 do"), "{out}");
+        assert!(out.contains("#4 answer"), "{out}");
+    }
+
+    /// A review row's verb reads the tracked PR: `pr` without one, `review PR`
+    /// with — the same sub-state rendering as the TUI (DESIGN.md §6).
+    #[test]
+    fn inbox_review_verb_follows_the_tracked_pr() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        let id = review_task(&mut s, Some("feat/thing"), Some("did it"));
+        let out = ok(&mut s, &["inbox"]);
+        assert!(out.contains(&format!("#{id} pr ")), "{out}");
+
+        ok(&mut s, &["set", &id.to_string(), "--pr", "acme/widget#42"]);
+        let out = ok(&mut s, &["inbox"]);
+        assert!(out.contains("review PR"), "{out}");
+    }
+
+    /// `show` names the next action in its header whenever the task derives
+    /// one, and drops the line on states that ask nothing of the human.
+    #[test]
+    fn show_names_the_next_action() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "An idea"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("next: triage"));
+
+        ok(&mut s, &["triage", "1", "ready"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("next: dispatch"));
+
+        ok(&mut s, &["start", "1"]);
+        assert!(!ok(&mut s, &["show", "1"]).contains("next:"));
+
+        ok(&mut s, &["done", "1", "--summary", "did it"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("next: pr"));
+
+        ok(&mut s, &["set", "1", "--pr", "acme/widget#42"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("next: review PR"));
+
+        ok(&mut s, &["accept", "1"]);
+        assert!(!ok(&mut s, &["show", "1"]).contains("next:"));
+    }
+
+    /// `list` shows state in its own column, so only `review` earns a next
+    /// suffix — and the incomplete-report marker takes its place when the
+    /// report is half-finished, as in the TUI browser.
+    #[test]
+    fn list_suffixes_review_rows_with_the_next_action() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        let complete = review_task(&mut s, Some("feat/thing"), Some("did it"));
+        let half = review_task(&mut s, Some("feat/other"), None);
+        ok(&mut s, &["add", "demo", "Startable", "--state", "ready"]);
+
+        let out = ok(&mut s, &["list"]);
+        let line = |id: i64| {
+            out.lines()
+                .find(|l| l.starts_with(&format!("#{id} ")))
+                .unwrap_or_else(|| panic!("no row for #{id}: {out}"))
+        };
+        assert!(line(complete).ends_with("next: pr"), "{out}");
+        assert!(line(half).ends_with("[incomplete report]"), "{out}");
+        assert!(!line(3).contains("next:"), "{out}");
+
+        ok(&mut s, &["set", &complete.to_string(), "--pr", "acme/w#1"]);
+        let out = ok(&mut s, &["list"]);
+        assert!(out.contains("next: review PR"), "{out}");
     }
 
     #[test]
