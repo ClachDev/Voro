@@ -1,0 +1,18 @@
+# cargo-release configuration for the Voro workspace.
+#
+# `voro-core` and `voro` share one version and are released in lockstep: a
+# single commit and a single `v{version}` git tag, which the cargo-dist release
+# workflow (.github/workflows/release.yml) consumes to build and publish
+# binaries. Neither crate is published to crates.io.
+#
+# The operator drives a release from `main` with, e.g., `cargo release patch
+# --execute`; cargo-release does not push, leaving the operator to push the
+# commit and tag.
+
+shared-version = true
+consolidate-commits = true
+allow-branch = ["main"]
+publish = false
+push = false
+tag-name = "v{{version}}"
+pre-release-commit-message = "Release {{version}}"
