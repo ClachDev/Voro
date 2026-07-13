@@ -210,8 +210,8 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             if t.human {
                 lines.push(human_line());
             }
-            if let Some(session) = app.stalled_sessions.get(task_id) {
-                lines.extend(stalled_session_lines(session));
+            if let Some(session) = app.last_sessions.get(task_id) {
+                lines.extend(session_lines(session, t.state));
             }
             lines.extend(dep_lines(
                 app.deps.get(task_id).map_or(&[][..], |v| v),
@@ -485,33 +485,53 @@ fn review_next_span(task: &voro_core::Task) -> Option<Span<'static>> {
     ))
 }
 
-/// A stalled task's post-mortem (task #73): what the dead dispatch's session
-/// did (`failed` or `capped`, per reconcile — DESIGN.md §8), which agent, when
-/// it ended, and where its log is, so "what happened" is answerable from the
-/// detail views without dropping to the sessions table. `capped` is yellow —
-/// it clears on its own when the quota resets — while `failed` is red and
-/// wants its log read.
-fn stalled_session_lines(session: &Session) -> Vec<Line<'static>> {
-    let outcome_color = match session.outcome {
-        Some(SessionOutcome::Capped) => Color::Yellow,
-        _ => Color::Red,
-    };
-    let outcome = session
-        .outcome
-        .map(|o| o.to_string())
-        .unwrap_or_else(|| "unknown".into());
-    let ended = session.ended_at.as_deref().unwrap_or("?");
-    let mut lines = vec![Line::from(vec![
-        Span::raw("last session: "),
-        Span::styled(
-            outcome,
-            Style::new().fg(outcome_color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" · {} · ended {ended}", session.agent),
-            Style::new().dim(),
-        ),
-    ])];
+/// A task's newest session, rendered for the attention states (tasks #73/#110)
+/// so "what is/was this session doing?" is answerable from the detail views
+/// without dropping to the sessions table. A finished session is a post-mortem:
+/// its outcome (`capped` is yellow — it clears on its own when the quota
+/// resets — while `failed` is red and wants its log read), agent, and end
+/// time. An open one — the usual shape on `running`, `review`, and
+/// `needs-input`, whose session stays open (DESIGN.md §8) — shows the agent
+/// and start time. Both end on the log path the `l` key pages. States where
+/// the session is history rather than context (`done`, `rejected`, a
+/// redispatch-ready task) render nothing, keeping their panes clean.
+fn session_lines(session: &Session, state: TaskState) -> Vec<Line<'static>> {
+    if !matches!(
+        state,
+        TaskState::Stalled | TaskState::Running | TaskState::Review | TaskState::NeedsInput
+    ) {
+        return Vec::new();
+    }
+    let mut lines = vec![match &session.ended_at {
+        Some(ended) => {
+            let outcome_color = match session.outcome {
+                Some(SessionOutcome::Capped) => Color::Yellow,
+                _ => Color::Red,
+            };
+            let outcome = session
+                .outcome
+                .map(|o| o.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            Line::from(vec![
+                Span::raw("last session: "),
+                Span::styled(
+                    outcome,
+                    Style::new().fg(outcome_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" · {} · ended {ended}", session.agent),
+                    Style::new().dim(),
+                ),
+            ])
+        }
+        None => Line::from(vec![
+            Span::raw("session: "),
+            Span::styled(
+                format!("{} · started {}", session.agent, session.started_at),
+                Style::new().dim(),
+            ),
+        ]),
+    }];
     lines.push(match &session.log_path {
         Some(path) => Line::from(vec![
             Span::styled(format!("log: {path}"), Style::new().dim()),
@@ -659,8 +679,8 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     if task.human {
         lines.push(human_line());
     }
-    if let Some(session) = app.stalled_sessions.get(&task.id) {
-        lines.extend(stalled_session_lines(session));
+    if let Some(session) = app.last_sessions.get(&task.id) {
+        lines.extend(session_lines(session, task.state));
     }
     lines.extend(dep_lines(
         app.deps.get(&task.id).map_or(&[][..], |v| v),
@@ -957,7 +977,7 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 pairs.push(("x", "score"));
                 pairs.push(("h", "history"));
             }
-            if app.selected_stalled_log().is_some() {
+            if app.selected_session_log().is_some() {
                 pairs.push(("l", "log"));
             }
             pairs.push(("n", "new"));
@@ -969,7 +989,7 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         Screen::Tasks => {
             let mut pairs: Vec<(&'static str, &'static str)> = Vec::new();
             pairs.extend(enter);
-            if app.selected_stalled_log().is_some() {
+            if app.selected_session_log().is_some() {
                 pairs.push(("l", "log"));
             }
             pairs.push(("s", "state"));
@@ -1731,6 +1751,57 @@ mod tests {
         assert!(!rendered.contains("last session"), "{rendered}");
         let labels: Vec<&str> = key_hints(&clean).iter().map(|(_, l)| *l).collect();
         assert!(!labels.contains(&"log"), "{labels:?}");
+    }
+
+    /// A task whose session is still open — here needs-input, whose session
+    /// survives the transition (DESIGN.md §8) — shows the session's agent,
+    /// start time, and log path instead of a post-mortem (task #110), and the
+    /// key line advertises `l` there too.
+    #[test]
+    fn detail_pane_shows_an_open_session_on_a_needs_input_task() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store.set_weight(p.id, 3).unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "mid-flight".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+            })
+            .unwrap();
+        store
+            .record_dispatch(task.id, "claude", Some(1), Some("/tmp/voro/open.log"))
+            .unwrap();
+        store.apply(task.id, Action::Ask("A or B?".into())).unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let app = App::new(store, ctx).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("session: claude"), "{rendered}");
+        assert!(rendered.contains("started 2"), "{rendered}");
+        assert!(rendered.contains("log: /tmp/voro/open.log"), "{rendered}");
+        assert!(!rendered.contains("last session:"), "{rendered}");
+        let labels: Vec<&str> = key_hints(&app).iter().map(|(_, l)| *l).collect();
+        assert!(labels.contains(&"log"), "{labels:?}");
     }
 
     /// The cockpit key line only advertises the score/history toggles and the

@@ -567,6 +567,21 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Every task's newest session, keyed by task id, in one query — what the
+    /// TUI loads per refresh so the detail views and the log key can answer
+    /// "what is/was this session doing?" for any task without querying the
+    /// store mid-draw. Session ids are monotonic, so `max(id)` is the latest.
+    pub fn latest_sessions(&self) -> Result<std::collections::HashMap<i64, Session>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions s
+             WHERE s.id = (SELECT max(id) FROM sessions WHERE task_id = s.task_id)"
+        ))?;
+        let rows = stmt.query_map([], session_from_row)?;
+        rows.map(|r| r.map(|s| (s.task_id, s)))
+            .collect::<rusqlite::Result<_>>()
+            .map_err(Into::into)
+    }
+
     /// Sessions that have not yet ended, newest first.
     pub fn live_sessions(&self) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(&format!(
@@ -1740,6 +1755,32 @@ mod tests {
         assert_eq!(ended.outcome, Some(SessionOutcome::Completed));
 
         assert_eq!(s.session(opened.id).unwrap(), ended);
+    }
+
+    /// `latest_sessions` maps each task to its newest session only, and tasks
+    /// with no session history stay absent.
+    #[test]
+    fn latest_sessions_keeps_only_the_newest_per_task() {
+        let mut s = Store::open_in_memory().unwrap();
+        let with_history = task_fixture(&mut s);
+        let sessionless = task_fixture(&mut s);
+
+        let first = s
+            .create_session(with_history, "claude", None, Some("/var/log/first.log"))
+            .unwrap();
+        s.end_session(first.id, SessionOutcome::Failed).unwrap();
+        let second = s
+            .create_session(with_history, "codex", None, Some("/var/log/second.log"))
+            .unwrap();
+
+        let latest = s.latest_sessions().unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[&with_history].id, second.id);
+        assert_eq!(
+            latest[&with_history].log_path.as_deref(),
+            Some("/var/log/second.log")
+        );
+        assert!(!latest.contains_key(&sessionless));
     }
 
     #[test]
