@@ -571,8 +571,8 @@ impl App {
     }
 
     fn key_normal(&mut self, key: KeyEvent) {
-        // Navigation shared by every screen: quit, screen switching (tab
-        // cycles, `1`/`2`/`3` jump), and moving the selection.
+        // Navigation shared by every screen: quit, tab cycling, and moving the
+        // selection.
         match key.code {
             KeyCode::Char('q') => {
                 self.should_quit = true;
@@ -580,18 +580,6 @@ impl App {
             }
             KeyCode::Tab => {
                 self.toggle_screen();
-                return;
-            }
-            KeyCode::Char('1') => {
-                self.screen = Screen::Cockpit;
-                return;
-            }
-            KeyCode::Char('2') => {
-                self.screen = Screen::Tasks;
-                return;
-            }
-            KeyCode::Char('3') => {
-                self.screen = Screen::Projects;
                 return;
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -604,11 +592,28 @@ impl App {
             }
             _ => {}
         }
-        // The projects screen's keys (DESIGN.md §9) reinterpret keys that mean
-        // other things on the task-oriented screens.
+        // The projects screen's keys (DESIGN.md §9) reinterpret the digit keys
+        // as weights, so its handler gets first refusal before the global
+        // `1`/`2`/`3` screen jump below.
         if self.screen == Screen::Projects {
             self.key_projects(key);
             return;
+        }
+        // Direct screen jumps, on the screens where digits mean nothing else.
+        match key.code {
+            KeyCode::Char('1') => {
+                self.screen = Screen::Cockpit;
+                return;
+            }
+            KeyCode::Char('2') => {
+                self.screen = Screen::Tasks;
+                return;
+            }
+            KeyCode::Char('3') => {
+                self.screen = Screen::Projects;
+                return;
+            }
+            _ => {}
         }
         match key.code {
             KeyCode::Char('r') => {
@@ -1898,8 +1903,10 @@ mod tests {
 
     // --- projects screen (task, DESIGN.md §9) ---
 
-    /// Tab cycles cockpit → tasks → projects → cockpit, and `1`/`2`/`3` jump
-    /// to a screen directly regardless of where the cursor is.
+    /// Tab cycles cockpit → tasks → projects → cockpit, and `1`/`2`/`3` jump to
+    /// a screen directly from the task-oriented screens. On the projects screen
+    /// the digits set weight instead, so it is reached with `3` and left via
+    /// tab.
     #[test]
     fn tab_and_digits_move_between_the_three_screens() {
         let mut app = app_with(&[]);
@@ -1911,12 +1918,16 @@ mod tests {
         key(&mut app, KeyCode::Tab);
         assert_eq!(app.screen, Screen::Cockpit);
 
-        key(&mut app, KeyCode::Char('3'));
-        assert_eq!(app.screen, Screen::Projects);
-        key(&mut app, KeyCode::Char('1'));
-        assert_eq!(app.screen, Screen::Cockpit);
         key(&mut app, KeyCode::Char('2'));
         assert_eq!(app.screen, Screen::Tasks);
+        key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.screen, Screen::Cockpit);
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.screen, Screen::Projects);
+        // On the projects screen the digit jump is superseded by weight-setting;
+        // tab is the way back out.
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.screen, Screen::Cockpit);
     }
 
     /// The morning ritual: `0`–`5` on the projects screen sets the selected
@@ -1934,6 +1945,15 @@ mod tests {
 
         key(&mut app, KeyCode::Char('0'));
         assert_eq!(app.store.project(project_id).unwrap().weight, 0);
+
+        // `1`/`2`/`3` set weight here rather than jumping screens, so every
+        // value 0–5 is reachable.
+        for digit in ['1', '2', '3'] {
+            key(&mut app, KeyCode::Char(digit));
+            assert_eq!(app.screen, Screen::Projects);
+            let expected = digit.to_digit(10).unwrap() as i64;
+            assert_eq!(app.store.project(project_id).unwrap().weight, expected);
+        }
     }
 
     #[test]
