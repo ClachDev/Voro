@@ -205,6 +205,9 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             if let Some(branch) = &t.branch {
                 lines.push(Line::from(branch_span(branch)));
             }
+            if t.human {
+                lines.push(human_line());
+            }
             lines.extend(dep_lines(
                 app.deps.get(task_id).map_or(&[][..], |v| v),
                 app.dependents.get(task_id).map_or(&[][..], |v| v),
@@ -432,6 +435,21 @@ fn incomplete_report_span() -> Span<'static> {
     )
 }
 
+/// The human-only flag (task #100) rendered as a row marker: this task is
+/// never dispatched, only worked by the operator. A property of the task
+/// rather than an anomaly, so it stays dim where the warning flags shout.
+fn human_span() -> Span<'static> {
+    Span::styled("  [human]", Style::new().dim())
+}
+
+/// The same flag spelled out for a detail view, beside the branch/PR lines.
+fn human_line() -> Line<'static> {
+    Line::from(Span::styled(
+        "human-only — never dispatched",
+        Style::new().dim(),
+    ))
+}
+
 /// A tracked GitHub PR (DESIGN.md §11c) rendered for the detail pane, with the
 /// jump-to-PR key spelled out so the reviewer knows how to reach it.
 fn pr_span(url: &str) -> Span<'static> {
@@ -494,6 +512,9 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
                         style,
                     ),
                 ];
+                if c.task.human {
+                    spans.push(human_span());
+                }
                 if let Some(q) = &c.task.question {
                     spans.push(Span::styled(
                         format!("  — {q}"),
@@ -590,6 +611,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(branch) = &task.branch {
         lines.push(Line::from(branch_span(branch)));
+    }
+    if task.human {
+        lines.push(human_line());
     }
     lines.extend(dep_lines(
         app.deps.get(&task.id).map_or(&[][..], |v| v),
@@ -713,6 +737,9 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
                 ),
                 style,
             )];
+            if r.task.human {
+                spans.push(human_span());
+            }
             if app.incomplete_report.contains(&r.task.id) {
                 spans.push(incomplete_report_span());
             } else if let Some(span) = review_next_span(&r.task) {
@@ -1036,6 +1063,69 @@ mod tests {
             rendered.contains(&format!("blocked by #{}, #{}", open.id, closed.id)),
             "browser did not annotate the parked row with its blockers: {rendered}"
         );
+    }
+
+    /// End-to-end: a human-only task carries the `[human]` marker on its queue
+    /// and browser rows and the spelled-out line in the cockpit detail pane,
+    /// drawn dim rather than warning-coloured — a property, not an anomaly.
+    #[test]
+    fn human_only_flag_renders_in_queue_browser_and_detail() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "hands-on".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: true,
+            })
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        let render = |app: &App, terminal: &mut Terminal<TestBackend>| -> String {
+            terminal.draw(|f| draw(f, app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        let cockpit = render(&app, &mut terminal);
+        assert!(
+            cockpit.contains("[human]"),
+            "queue row should carry the marker: {cockpit}"
+        );
+        assert!(
+            cockpit.contains("human-only — never dispatched"),
+            "detail pane should spell the flag out: {cockpit}"
+        );
+
+        app.toggle_screen();
+        let browser = render(&app, &mut terminal);
+        assert!(
+            browser.contains("[human]"),
+            "browser row should carry the marker: {browser}"
+        );
+
+        let marker = human_span();
+        assert!(marker.style.add_modifier.contains(Modifier::DIM));
+        assert!(!marker.style.add_modifier.contains(Modifier::BOLD));
     }
 
     /// End-to-end: the projects screen renders one row per project showing its
