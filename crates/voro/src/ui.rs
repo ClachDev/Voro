@@ -425,9 +425,9 @@ fn score_span(total: f64) -> Span<'static> {
 
 /// The incomplete-report flag (DESIGN.md §8): a `review` task carrying only one
 /// of a branch and a summary — the half-finished done report a dispatched
-/// session left behind, which `pr` cannot open. Yellow to match the running
-/// strip's "no live session" warning, since both are anomalies needing the
-/// operator.
+/// session left behind, an anomaly on every review medium. Yellow to match the
+/// running strip's "no live session" warning, since both are anomalies needing
+/// the operator.
 fn incomplete_report_span() -> Span<'static> {
     Span::styled(
         "  [incomplete report]",
@@ -594,8 +594,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(pr) = &task.pr_url {
         lines.push(Line::from(pr_span(pr)));
-    }
-    if app.incomplete_report.contains(&task.id) {
+    } else if app.incomplete_report.contains(&task.id) {
         // A review task missing a branch or summary: `pr` would fail, so say
         // what is needed rather than the optimistic "next: pr".
         lines.push(Line::from(incomplete_report_span()));
