@@ -32,51 +32,19 @@ cargo run -p voro
 
 ## Dispatching to agents
 
-Voro dispatches a task by running a shell command template per agent. It ships
-with built-in `claude` and `codex` agents (see DESIGN.md §8), so with one of
-those on your `PATH` a fresh install dispatches with no configuration at all:
-`voro dispatch <task-id>` (or the dispatch key in the TUI) launches a headless
-session on a ready task, and `default_agent` resolves to the first built-in
-found on `PATH`.
+Voro dispatches a task by running a shell command template per agent, and ships
+with built-in `claude` and `codex` agents, so with one of those on your `PATH` a
+fresh install dispatches with no configuration: `voro dispatch <task-id>` (or the
+dispatch key in the TUI) launches a headless session on a ready task. The agent
+reports back through the return-path verbs (`voro ask/done/propose`), and its work
+lands in `review` where `voro open` or `voro pr` puts the diff in front of you.
 
-To extend or override the built-ins, layer a `~/.config/voro/voro.toml` on
-top:
-
-```bash
-voro agent list       # effective agents (built-in + user) with provenance; * marks the default
-voro agent init       # optional: write a voro.toml skeleton (won't overwrite)
-voro agent path       # print where dispatch looks for the file
-```
-
-Each `[agents.<name>]` table adds an agent or, when named `claude`/`codex`,
-replaces that built-in wholesale (so copy every verb you still want — `agent
-init` writes the built-ins commented out, ready to copy). `{prompt_file}` is
-replaced with a path to the task's prompt, and `default_agent` names the agent
-used when a task has no `--agent` override. A dispatched session runs
-unattended, so most agents need a non-interactive permission flag.
-
-A dispatched agent reports back through the return-path verbs (`voro ask/done/
-propose`). For the `CLAUDE.md`/`AGENTS.md` snippet that advertises them, and a
-sample Claude Code hooks configuration that reports for a session that forgets
-to, see [`docs/agent-integration.md`](docs/agent-integration.md).
-
-## Seeing a diff
-
-Once an agent finishes and its task lands in `review`, `voro open <task-id>`
-(or the open key in the TUI, on a review or running row) opens the task's
-checkout in a viewer so you can see the diff. Like agents, the viewer is a
-command template — add an optional `[viewer]` table to `voro.toml`:
-
-```toml
-[viewer]
-cmd = "zed {path}"        # or e.g. "git difftool -d"
-```
-
-`{path}` is replaced with the project's checkout path, and the command is run
-in that directory, so a viewer that operates on the current directory needs no
-placeholder. Prefer a viewer that opens its own window (an editor or a GUI
-difftool); with no `[viewer]` configured, the open action reports what to add
-rather than failing silently.
+To extend or override the built-in agents and viewers, layer a
+`~/.config/voro/voro.toml` on top (`voro agent init` writes a skeleton). The
+dispatch semantics, the review action, and the `voro.toml` format are covered in
+[`docs/DESIGN.md`](docs/DESIGN.md) §8; the `CLAUDE.md`/`AGENTS.md` return-path
+snippet and the Claude Code hooks configuration are in
+[`docs/agent-integration.md`](docs/agent-integration.md).
 
 ## License
 
