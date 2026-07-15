@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Core logic for Voro: the SQLite store, task state machine, scheduler, and scoring."
+readme = "../../README.md"
+keywords = ["tasks", "scheduler", "productivity", "sqlite"]
+categories = ["database", "data-structures"]
 
 [dependencies]
 rusqlite.workspace = true
