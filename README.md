@@ -35,7 +35,7 @@ your `PATH`.
 To build and install from source instead:
 
 ```bash
-cargo install --git https://github.com/ClachDev/Voro voro
+cargo install voro
 ```
 
 ## Quickstart
