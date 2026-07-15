@@ -398,6 +398,7 @@ fn counts_line(counts: &StateCounts) -> Line<'static> {
     );
     push("input", counts.needs_input, dim);
     push("review", counts.review, dim);
+    push("waiting", counts.waiting, dim);
     push("stalled", counts.stalled, dim);
     push("ready", counts.ready, dim);
     push("done", counts.done, dim);
@@ -470,7 +471,11 @@ fn review_next_span(task: &voro_core::Task) -> Option<Span<'static>> {
 fn session_lines(session: &Session, state: TaskState) -> Vec<Line<'static>> {
     if !matches!(
         state,
-        TaskState::Stalled | TaskState::Running | TaskState::Review | TaskState::NeedsInput
+        TaskState::Stalled
+            | TaskState::Running
+            | TaskState::Review
+            | TaskState::Waiting
+            | TaskState::NeedsInput
     ) {
         return Vec::new();
     }
@@ -945,6 +950,9 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             if app.selected_session_log().is_some() {
                 pairs.push(("l", "log"));
             }
+            if app.selected_can_hand_off() {
+                pairs.push(("w", "wait"));
+            }
             pairs.push(("n", "new"));
             pairs.push(("N", "plan"));
             pairs.push(("e", "edit"));
@@ -957,6 +965,9 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             pairs.extend(enter);
             if app.selected_session_log().is_some() {
                 pairs.push(("l", "log"));
+            }
+            if app.selected_can_hand_off() {
+                pairs.push(("w", "wait"));
             }
             pairs.push(("s", "state"));
             pairs.push(("n", "new"));
@@ -1835,6 +1846,7 @@ mod tests {
             running: 2,
             needs_input: 1,
             review: 0,
+            waiting: 0,
             stalled: 0,
             done: 0,
         };
@@ -1845,6 +1857,7 @@ mod tests {
         assert!(text.contains("input 1"), "{text}");
         // Zero-count states never render, and `running` is not a header stat.
         assert!(!text.contains("review"), "{text}");
+        assert!(!text.contains("waiting"), "{text}");
         assert!(!text.contains("stalled"), "{text}");
         assert!(!text.contains("done"), "{text}");
         assert!(!text.contains("running"), "{text}");

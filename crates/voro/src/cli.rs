@@ -71,7 +71,8 @@ tasks
   next                            the single highest-scoring ready task
   stats                           task counts by state — the triage backlog
                                   (§12) plus ready, running, needs-input,
-                                  review, done; excludes parked projects
+                                  review, waiting, stalled, done; excludes
+                                  parked projects
   explain <task-id>               score decomposition
   import <project> [--repo owner/name]
                                   import open GitHub issues as proposed
@@ -129,18 +130,25 @@ transitions
                                   PR description; --branch records the git branch
                                   the work landed on (agent return path). Warns
                                   but succeeds when branch or summary is absent
-  accept <task-id> [--yes]        review → done; then offers to remove the
-                                  task's dispatch worktree (--yes skips the
-                                  confirmation)
+  accept <task-id> [--yes]        review | waiting → done; then offers to
+                                  remove the task's dispatch worktree (--yes
+                                  skips the confirmation)
   reject <task-id> [TEXT] [--from-pr]
-                                  review → running; TEXT is the feedback, or
-                                  --from-pr pulls the tracked PR's review
-                                  comments as the feedback (TEXT appended)
+                                  review | waiting → running; TEXT is the
+                                  feedback, or --from-pr pulls the tracked PR's
+                                  review comments as the feedback (TEXT appended)
+  wait <task-id>                  review → waiting; hand the work off to an
+                                  external party (a PR awaiting someone else's
+                                  review or merge) — out of the queue until it
+                                  is your move again
+  reclaim <task-id>               waiting → review; pull handed-off work back
+                                  when it is your move again
   abort <task-id>                 running → ready
   park <task-id>                  ready → parked
   unpark <task-id>                parked → ready
-  abandon <task-id> [--yes]       parked|ready|needs-input|review → rejected;
-                                  then offers to remove the task's worktree
+  abandon <task-id> [--yes]       parked|ready|needs-input|review|waiting →
+                                  rejected; then offers to remove the task's
+                                  worktree
 ";
 
 #[derive(Parser)]
@@ -225,6 +233,12 @@ enum Verb {
         task_id: i64,
         #[arg(long)]
         yes: bool,
+    },
+    Wait {
+        task_id: i64,
+    },
+    Reclaim {
+        task_id: i64,
     },
     Abort {
         task_id: i64,
@@ -458,6 +472,8 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Start { task_id } => apply_action(store, task_id, Action::Start, false),
         Verb::Ask(args) => ask_verb(store, args),
         Verb::Accept { task_id, yes } => apply_action(store, task_id, Action::Accept, yes),
+        Verb::Wait { task_id } => apply_action(store, task_id, Action::HandOff, false),
+        Verb::Reclaim { task_id } => apply_action(store, task_id, Action::Reclaim, false),
         Verb::Abort { task_id } => apply_action(store, task_id, Action::Abort, false),
         Verb::Park { task_id } => apply_action(store, task_id, Action::Park, false),
         Verb::Unpark { task_id } => apply_action(store, task_id, Action::Unpark, false),
@@ -1113,6 +1129,7 @@ fn stats_verb(store: &mut Store) -> Result<String, String> {
         ("running", c.running),
         ("needs-input", c.needs_input),
         ("review", c.review),
+        ("waiting", c.waiting),
         ("stalled", c.stalled),
         ("done", c.done),
     ] {
@@ -1464,6 +1481,45 @@ mod tests {
         assert!(out.contains("-> done"), "{out}");
     }
 
+    /// `wait` hands a review task off to an external party and `reclaim` pulls
+    /// it back; `accept` then closes it (DESIGN.md §6).
+    #[test]
+    fn wait_reclaim_and_accept_from_waiting_through_the_cli() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "A task", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["done", "1"]);
+
+        let out = ok(&mut s, &["wait", "1"]);
+        assert!(out.contains("-> waiting"), "{out}");
+        // wait is refused once the task is no longer in review
+        assert!(err(&mut s, &["wait", "1"]).contains("hand off"));
+
+        let out = ok(&mut s, &["reclaim", "1"]);
+        assert!(out.contains("-> review"), "{out}");
+
+        ok(&mut s, &["wait", "1"]);
+        let out = ok(&mut s, &["accept", "1"]);
+        assert!(out.contains("-> done"), "{out}");
+    }
+
+    /// `reject` works from `waiting` as well as `review`, requeuing the task
+    /// with the feedback in hand (DESIGN.md §6/§8).
+    #[test]
+    fn reject_from_waiting_requeues_with_feedback() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "A task", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["done", "1"]);
+        ok(&mut s, &["wait", "1"]);
+
+        let out = ok(&mut s, &["reject", "1", "reviewer wants tests"]);
+        assert!(out.contains("-> running"), "{out}");
+        assert!(ok(&mut s, &["show", "1"]).contains("reviewer wants tests"));
+    }
+
     #[test]
     fn default_state_is_proposed_and_triage_works() {
         let mut s = store();
@@ -1570,6 +1626,11 @@ mod tests {
         ok(&mut s, &["add", "demo", "Idea one"]); // proposed by default
         ok(&mut s, &["add", "demo", "Idea two"]);
         ok(&mut s, &["add", "demo", "Ready one", "--state", "ready"]);
+        // A handed-off task is counted under waiting, not review.
+        ok(&mut s, &["add", "demo", "Handed off", "--state", "ready"]);
+        ok(&mut s, &["start", "4"]);
+        ok(&mut s, &["done", "4"]);
+        ok(&mut s, &["wait", "4"]);
         // A parked project's tasks stay out of the tally.
         ok(&mut s, &["project", "add", "snoozed", "/tmp"]);
         ok(&mut s, &["weight", "snoozed", "0"]);
@@ -1578,6 +1639,8 @@ mod tests {
         let out = ok(&mut s, &["stats"]);
         assert!(out.contains(&format!("{:<12}{}", "triage", 2)), "{out}");
         assert!(out.contains(&format!("{:<12}{}", "ready", 1)), "{out}");
+        assert!(out.contains(&format!("{:<12}{}", "review", 0)), "{out}");
+        assert!(out.contains(&format!("{:<12}{}", "waiting", 1)), "{out}");
         assert!(out.contains(&format!("{:<12}{}", "done", 0)), "{out}");
     }
 

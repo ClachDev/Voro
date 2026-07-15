@@ -179,6 +179,7 @@ impl Store {
                 TaskState::Running => counts.running = n,
                 TaskState::NeedsInput => counts.needs_input = n,
                 TaskState::Review => counts.review = n,
+                TaskState::Waiting => counts.waiting = n,
                 TaskState::Stalled => counts.stalled = n,
                 TaskState::Done => counts.done = n,
                 TaskState::Parked | TaskState::Rejected => {}
@@ -197,6 +198,7 @@ pub struct StateCounts {
     pub running: i64,
     pub needs_input: i64,
     pub review: i64,
+    pub waiting: i64,
     pub stalled: i64,
     pub done: i64,
 }
@@ -304,6 +306,12 @@ mod tests {
     fn to_stalled(s: &mut Store, id: i64) {
         let (_, session) = s.record_dispatch(id, "claude", Some(1), None).unwrap();
         s.reconcile_session(session.id, false, false).unwrap();
+    }
+
+    fn to_waiting(s: &mut Store, id: i64) {
+        s.apply(id, crate::Action::Start).unwrap();
+        s.apply(id, crate::Action::Complete(None)).unwrap();
+        s.apply(id, crate::Action::HandOff).unwrap();
     }
 
     fn add_proposed(s: &mut Store, project_id: i64, title: &str, priority: Priority) -> i64 {
@@ -463,6 +471,30 @@ mod tests {
         assert_eq!(focus(&candidates).unwrap().task.id, ready);
         let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
         assert_eq!(ids, vec![stalled, ready]);
+    }
+
+    #[test]
+    fn waiting_is_excluded_from_the_queue_and_earns_no_bonus() {
+        // `waiting` is out of the running like `parked` (DESIGN.md §6/§7): it
+        // earns no state bonus and never surfaces in the queue or focus, only
+        // in the state counts.
+        assert_eq!(state_bonus(TaskState::Waiting), 0.0);
+
+        let mut s = setup();
+        let p = add_project(&mut s, "p", 5);
+        let waiting = add_task(&mut s, p, "handed off", Priority::P0);
+        to_waiting(&mut s, waiting);
+        let ready = add_task(&mut s, p, "startable", Priority::P3);
+
+        let candidates = s.candidates().unwrap();
+        // even a P0 waiting task in a heavy project stays out of both views
+        assert!(candidates.iter().all(|c| c.task.id != waiting));
+        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
+        assert_eq!(ids, vec![ready]);
+        assert_eq!(focus(&candidates).unwrap().task.id, ready);
+
+        // but it is felt in the state counts
+        assert_eq!(s.state_counts().unwrap().waiting, 1);
     }
 
     #[test]

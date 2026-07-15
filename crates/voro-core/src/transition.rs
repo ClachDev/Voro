@@ -38,9 +38,16 @@ pub enum Action {
     /// summary, logged as a `summary` event. From `stalled` it reports a dead
     /// session's finished work on its behalf (DESIGN.md §8).
     Complete(Option<String>),
-    /// review → done
+    /// review → waiting; hand the work off to an external party (a PR awaiting
+    /// someone else's review or merge), asking nothing of the operator (§6).
+    HandOff,
+    /// waiting → review; pull the work back when it is the operator's move
+    /// again — the manual inverse of `HandOff` (§6).
+    Reclaim,
+    /// review | waiting → done
     Accept,
-    /// review → running; the string is the feedback, appended to the body
+    /// review | waiting → running; the string is the feedback, appended to the
+    /// body
     RejectWork(String),
     /// running → ready
     Abort,
@@ -48,7 +55,7 @@ pub enum Action {
     Park,
     /// parked → ready (manual unpark)
     Unpark,
-    /// parked | ready | needs-input | review | stalled → rejected
+    /// parked | ready | needs-input | review | waiting | stalled → rejected
     Abandon,
 }
 
@@ -60,6 +67,8 @@ impl Action {
             Action::Ask(_) => "ask",
             Action::Answer(_) => "answer",
             Action::Complete(_) => "complete",
+            Action::HandOff => "hand off",
+            Action::Reclaim => "reclaim",
             Action::Accept => "accept",
             Action::RejectWork(_) => "reject work on",
             Action::Abort => "abort",
@@ -97,6 +106,13 @@ impl Store {
             Review => vec![
                 Action::Accept,
                 Action::RejectWork(String::new()),
+                Action::HandOff,
+                Action::Abandon,
+            ],
+            Waiting => vec![
+                Action::Accept,
+                Action::RejectWork(String::new()),
+                Action::Reclaim,
                 Action::Abandon,
             ],
             Stalled => vec![
@@ -178,9 +194,9 @@ impl Store {
     ///   handed out by `voro next`; a late `done` lands it in `review` on the
     ///   dead session's behalf. A stalled task with an open blocker demotes to
     ///   `parked`.
-    /// - `needs-input`/`review`: the session stays open on purpose (reused by
-    ///   the continuation), so this leaves it alone (`Ok(None)`) regardless of
-    ///   liveness.
+    /// - `needs-input`/`review`/`waiting`: the session stays open on purpose
+    ///   (reused by the continuation), so this leaves it alone (`Ok(None)`)
+    ///   regardless of liveness.
     /// - task already closed or off the active path: the session is stale, so it
     ///   is finalised now (`completed` for `done`, else `aborted`) with no event.
     pub fn reconcile_session(
@@ -208,7 +224,9 @@ impl Store {
                 }
             }
             // The session is meant to stay open here; nothing to reconcile.
-            TaskState::NeedsInput | TaskState::Review => return Ok(None),
+            // `waiting` keeps it open like `review` so a reject-with-feedback
+            // can continue the same agent session (DESIGN.md §8).
+            TaskState::NeedsInput | TaskState::Review | TaskState::Waiting => return Ok(None),
             // Stale: a session still open on a task that has left the active
             // path. Close it with the outcome that fits where the task landed.
             TaskState::Done => SessionOutcome::Completed,
@@ -342,12 +360,17 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         // its behalf — the misfire case (§8). The session is already closed, so
         // only the state moves.
         (Running | Stalled, Action::Complete(_)) => Review,
-        (Review, Action::Accept) => Done,
-        (Review, Action::RejectWork(_)) => Running,
+        // Hand a finished review off to an external party and pull it back —
+        // `waiting` asks nothing of the operator while it is someone else's
+        // move (DESIGN.md §6). Only from `review` for now.
+        (Review, Action::HandOff) => Waiting,
+        (Waiting, Action::Reclaim) => Review,
+        (Review | Waiting, Action::Accept) => Done,
+        (Review | Waiting, Action::RejectWork(_)) => Running,
         (Running, Action::Abort) => Ready,
         (Ready | Stalled, Action::Park) => Parked,
         (Parked, Action::Unpark) => Ready,
-        (Parked | Ready | NeedsInput | Review | Stalled, Action::Abandon) => Rejected,
+        (Parked | Ready | NeedsInput | Review | Waiting | Stalled, Action::Abandon) => Rejected,
         _ => {
             return Err(Error::InvalidTransition {
                 from: task.state,
@@ -633,6 +656,11 @@ mod tests {
                 s.apply(id, Action::Complete(None)).unwrap();
                 id
             }
+            Waiting => {
+                let id = task_in_state(s, project_id, Review);
+                s.apply(id, Action::HandOff).unwrap();
+                id
+            }
             Stalled => {
                 let id = create(s, project_id, Ready);
                 let (_, session) = s.record_dispatch(id, "claude", Some(1), None).unwrap();
@@ -661,6 +689,8 @@ mod tests {
             Action::Ask("q?".into()),
             Action::Answer("a.".into()),
             Action::Complete(None),
+            Action::HandOff,
+            Action::Reclaim,
             Action::Accept,
             Action::RejectWork("redo".into()),
             Action::Abort,
@@ -685,9 +715,13 @@ mod tests {
             (Running | Stalled, Action::Complete(_)) => Some(Review),
             (Running, Action::Abort) => Some(Ready),
             (NeedsInput, Action::Answer(_)) => Some(Running),
-            (Review, Action::Accept) => Some(Done),
-            (Review, Action::RejectWork(_)) => Some(Running),
-            (Parked | Ready | NeedsInput | Review | Stalled, Action::Abandon) => Some(Rejected),
+            (Review, Action::HandOff) => Some(Waiting),
+            (Waiting, Action::Reclaim) => Some(Review),
+            (Review | Waiting, Action::Accept) => Some(Done),
+            (Review | Waiting, Action::RejectWork(_)) => Some(Running),
+            (Parked | Ready | NeedsInput | Review | Waiting | Stalled, Action::Abandon) => {
+                Some(Rejected)
+            }
             _ => None,
         }
     }
@@ -1423,6 +1457,144 @@ mod tests {
         assert!(live.ended_at.is_none(), "reject leaves the session open");
         assert_eq!(live.session_ref.as_deref(), Some("ref-1"));
         assert_eq!(s.task(id).unwrap().state, TaskState::Running);
+    }
+
+    // --- waiting (DESIGN.md §6/§8): work handed off to an external party ---
+
+    mod waiting {
+        use super::*;
+
+        #[test]
+        fn hand_off_keeps_the_session_open_for_a_later_continuation() {
+            // review → waiting must keep the session open exactly as review
+            // does, so a reject-with-feedback can continue the same agent
+            // session once the work becomes the operator's move again.
+            let (mut s, p) = store_with_project();
+            let id = create(&mut s, p, TaskState::Ready);
+            let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+            s.apply(id, Action::Complete(None)).unwrap();
+
+            let task = s.apply(id, Action::HandOff).unwrap();
+            assert_eq!(task.state, TaskState::Waiting);
+            assert!(
+                s.session(sess.id).unwrap().ended_at.is_none(),
+                "waiting keeps the session open"
+            );
+        }
+
+        #[test]
+        fn hand_off_is_refused_from_states_other_than_review() {
+            // Only review → waiting for now (DESIGN.md §6): a running task is
+            // not yet handed off, and every other state is nonsensical.
+            let (mut s, p) = store_with_project();
+            for state in [
+                TaskState::Proposed,
+                TaskState::Parked,
+                TaskState::Ready,
+                TaskState::Running,
+                TaskState::NeedsInput,
+                TaskState::Stalled,
+            ] {
+                let id = task_in_state(&mut s, p, state);
+                assert!(
+                    matches!(
+                        s.apply(id, Action::HandOff),
+                        Err(Error::InvalidTransition { .. })
+                    ),
+                    "hand off should be refused from {state}"
+                );
+            }
+        }
+
+        #[test]
+        fn accept_from_waiting_closes_the_session_completed() {
+            // The PR merged: accept closes the session `completed`, exactly as
+            // it does straight from review (DESIGN.md §8).
+            let (mut s, p) = store_with_project();
+            let id = create(&mut s, p, TaskState::Ready);
+            let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+            s.apply(id, Action::Complete(None)).unwrap();
+            s.apply(id, Action::HandOff).unwrap();
+
+            let task = s.apply(id, Action::Accept).unwrap();
+            assert_eq!(task.state, TaskState::Done);
+            assert!(task.closed_at.is_some());
+            let closed = s.session(sess.id).unwrap();
+            assert!(closed.ended_at.is_some());
+            assert_eq!(closed.outcome, Some(SessionOutcome::Completed));
+        }
+
+        #[test]
+        fn abandon_from_waiting_closes_the_session_aborted() {
+            let (mut s, p) = store_with_project();
+            let id = create(&mut s, p, TaskState::Ready);
+            let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+            s.apply(id, Action::Complete(None)).unwrap();
+            s.apply(id, Action::HandOff).unwrap();
+
+            let task = s.apply(id, Action::Abandon).unwrap();
+            assert_eq!(task.state, TaskState::Rejected);
+            assert_eq!(
+                s.session(sess.id).unwrap().outcome,
+                Some(SessionOutcome::Aborted)
+            );
+        }
+
+        #[test]
+        fn reclaim_pulls_the_work_back_to_review_keeping_the_session() {
+            let (mut s, p) = store_with_project();
+            let id = create(&mut s, p, TaskState::Ready);
+            let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+            s.apply(id, Action::Complete(None)).unwrap();
+            s.apply(id, Action::HandOff).unwrap();
+
+            let task = s.apply(id, Action::Reclaim).unwrap();
+            assert_eq!(task.state, TaskState::Review);
+            assert!(s.session(sess.id).unwrap().ended_at.is_none());
+        }
+
+        #[test]
+        fn reject_from_waiting_continues_the_same_session_with_feedback() {
+            // The acceptance path: review → wait → reject-with-feedback returns
+            // the task to running with its original session still open, and the
+            // feedback recorded, so a continuation reuses that agent session.
+            let (mut s, p) = store_with_project();
+            let id = create(&mut s, p, TaskState::Ready);
+            let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+            s.set_session_ref(sess.id, "ref-1").unwrap();
+            s.apply(id, Action::Complete(None)).unwrap();
+            s.apply(id, Action::HandOff).unwrap();
+
+            let task = s
+                .apply(id, Action::RejectWork("reviewer wants tests".into()))
+                .unwrap();
+            assert_eq!(task.state, TaskState::Running);
+            assert!(task.body.contains("## Feedback"));
+            assert!(task.body.contains("- reviewer wants tests"));
+
+            let live = s.session(sess.id).unwrap();
+            assert!(live.ended_at.is_none(), "reject keeps the session open");
+            assert_eq!(live.session_ref.as_deref(), Some("ref-1"));
+        }
+
+        #[test]
+        fn reconcile_leaves_a_waiting_session_untouched() {
+            // Like review, a waiting task's session stays open regardless of
+            // process liveness — nothing to reconcile (DESIGN.md §8).
+            let (mut s, p) = store_with_project();
+            let id = create(&mut s, p, TaskState::Ready);
+            let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+            s.apply(id, Action::Complete(None)).unwrap();
+            s.apply(id, Action::HandOff).unwrap();
+
+            assert!(
+                s.reconcile_session(sess.id, false, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(s.session(sess.id).unwrap().ended_at.is_none());
+            assert_eq!(s.task(id).unwrap().state, TaskState::Waiting);
+        }
     }
 
     #[test]

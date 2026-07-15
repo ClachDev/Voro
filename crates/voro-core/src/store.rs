@@ -19,6 +19,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0007_add_human.sql"),
     include_str!("../migrations/0008_add_stalled_state.sql"),
     include_str!("../migrations/0009_add_review_action.sql"),
+    include_str!("../migrations/0010_add_waiting_state.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -1305,6 +1306,11 @@ mod tests {
                 s.apply(id, Action::Complete(None)).unwrap();
                 id
             }
+            Waiting => {
+                let id = task_in_state(s, project_id, Review);
+                s.apply(id, Action::HandOff).unwrap();
+                id
+            }
             Stalled => {
                 let id = create(s, Ready);
                 let (_, session) = s.record_dispatch(id, "claude", Some(1), None).unwrap();
@@ -1498,6 +1504,55 @@ mod tests {
             .conn
             .execute("UPDATE tasks SET human = 2 WHERE id = 5", []);
         assert!(junk.is_err(), "the CHECK must reject values outside 0/1");
+    }
+
+    /// Migration 0010 must extend the state CHECK to admit 'waiting' while
+    /// carrying every existing task through the table rebuild untouched.
+    #[test]
+    fn migration_0010_admits_waiting_and_preserves_existing_tasks() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..9] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 9).unwrap();
+        conn.execute("INSERT INTO projects (name, path) VALUES ('p', '/tmp')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (project_id, title, state, agent, pr_url, branch, human,
+                                state_since, created_at)
+             VALUES (1, 'in review', 'review', 'claude', 'https://x/pull/1', 'feat/x', 1,
+                     datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let store = Store::from_connection(conn).unwrap();
+        // the pre-existing row survives the rebuild with every column intact
+        let task = store.task(1).unwrap();
+        assert_eq!(task.state, TaskState::Review);
+        assert_eq!(task.pr_url.as_deref(), Some("https://x/pull/1"));
+        assert_eq!(task.branch.as_deref(), Some("feat/x"));
+        assert!(task.human);
+
+        // the widened CHECK now admits 'waiting' and still rejects junk
+        assert!(
+            store
+                .conn
+                .execute("UPDATE tasks SET state = 'waiting' WHERE id = 1", [])
+                .is_ok()
+        );
+        assert!(
+            store
+                .conn
+                .execute("UPDATE tasks SET state = 'bogus' WHERE id = 1", [])
+                .is_err()
+        );
+
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
     /// A project + running task to hang sessions off of.
