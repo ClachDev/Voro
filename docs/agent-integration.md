@@ -67,11 +67,11 @@ agent init` writes the same built-ins into a fresh `voro.toml`, commented out.
 
 ```toml
 [agents.claude]
-dispatch = "claude --bg --name \"voro-{task_id}\" --permission-mode auto \"$(cat {prompt_file})\""
+dispatch = "claude --bg --name \"voro-{task_id}\" --permission-mode auto --model opus \"$(cat {prompt_file})\""
 sessions = "claude agents --json"
 attach   = "claude attach {session}"
 resume   = "claude --resume {session}"
-plan     = "claude --permission-mode auto \"$(cat {prompt_file})\""
+plan     = "claude --permission-mode auto --model fable \"$(cat {prompt_file})\""
 
 [agents.codex]
 dispatch = "codex exec \"$(cat {prompt_file})\""
@@ -97,6 +97,15 @@ continue = "codex exec resume {session} \"$(cat {prompt_file})\""
   the command owns the terminal until the conversation ends, so it must not
   background itself. It carries no `{session}` — a planning session belongs to
   no task and records no session row.
+
+The two claude verbs pick different models for their different jobs:
+`dispatch` runs `--model opus`, a workhorse for implementation, and `plan` runs
+`--model fable`, a stronger reasoning model for interactive planning. These are
+`claude` model *aliases*, not pinned model ids, so each resolves to the current
+model of its class and does not churn as models are released. Want other models?
+Override the agent wholesale in `voro.toml` — copy the block above and change
+the `--model` flags (a user `[agents.claude]` table replaces the built-in
+entirely, so keep every verb you still want).
 
 The dispatch template runs Claude in `auto` mode: it auto-approves the actions it
 judges safe — edits, a build, a commit — and pauses on genuinely risky ones, so
