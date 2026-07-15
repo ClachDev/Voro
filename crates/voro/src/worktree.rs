@@ -164,8 +164,12 @@ impl Cleanup {
 /// The worktree of `project_path` whose checked-out branch is `branch`, if any.
 /// The primary worktree (the project checkout itself, always listed first) is
 /// never a candidate — it is not a throwaway dispatch worktree, and git would
-/// refuse to remove it anyway.
-fn worktree_on_branch(project_path: &str, branch: &str) -> Result<Option<PathBuf>, String> {
+/// refuse to remove it anyway. Shared with `dispatch::open`, which opens a
+/// review diff in the same worktree cleanup later tears down (DESIGN.md §8).
+pub(crate) fn worktree_on_branch(
+    project_path: &str,
+    branch: &str,
+) -> Result<Option<PathBuf>, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(project_path)

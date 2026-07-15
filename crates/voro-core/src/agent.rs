@@ -34,9 +34,20 @@ pub const TASK_ID_PLACEHOLDER: &str = "{task_id}";
 pub const SESSION_PLACEHOLDER: &str = "{session}";
 
 /// The substitution in a viewer command template (DESIGN.md §11a): the checkout
-/// path of the task's project. Optional — a viewer that acts on the current
-/// directory (`git difftool -d`) needs no placeholder.
+/// path of the task's project — or the task's worktree, when it has a branch
+/// checked out in one (DESIGN.md §8). Optional — a viewer that acts on the
+/// current directory (`git difftool -d`) needs no placeholder.
 pub const VIEWER_PATH_PLACEHOLDER: &str = "{path}";
+
+/// The substitution in a viewer command template for the task's git branch, or
+/// empty when the task has none. Paired with [`VIEWER_BASE_PLACEHOLDER`] it lets
+/// a viewer express a diff range (`{base}...{branch}`) rather than a bare
+/// directory (DESIGN.md §8).
+pub const VIEWER_BRANCH_PLACEHOLDER: &str = "{branch}";
+
+/// The substitution in a viewer command template for the checkout's default
+/// branch — the base a task branch is diffed against (DESIGN.md §8).
+pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 
 /// The agents Voro ships with the binary, layered under any `voro.toml`
 /// (DESIGN.md §5/§8). Compiled in, so a binary upgrade upgrades the agents; a
@@ -104,8 +115,11 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #     Voro picks the first built-in found on PATH (claude, then codex).
 #   * set up viewers — [viewers.<name>] tables define how a task's diff is
 #     shown locally when `voro pr`/`voro open` resolve to the viewer medium
-#     (DESIGN.md §8). `default_viewer` names the one used when a project does
-#     not pick a viewer itself (`voro project action <p> viewer:<name>`); a
+#     (DESIGN.md §8). A viewer cmd may carry `{path}` (the task's worktree, or
+#     the project checkout when it has none), `{branch}` (the task's branch, or
+#     empty), and `{base}` (the checkout's default branch); `{base}...{branch}`
+#     spells a diff range. `default_viewer` names the one used when a project
+#     does not pick a viewer itself (`voro project action <p> viewer:<name>`); a
 #     single anonymous [viewer] table is the older, still-valid spelling of
 #     the default.
 "#;
@@ -143,7 +157,7 @@ fn starter_config() -> String {
          # [viewers.zed]\n\
          # cmd = \"zed {path}\"\n#\n\
          # [viewers.difftool]\n\
-         # cmd = \"git difftool -d\"\n",
+         # cmd = \"git -C {path} difftool -d {base}...{branch}\"\n",
     );
     out
 }
@@ -201,9 +215,11 @@ impl AgentTemplate {
 }
 
 /// A viewer command template from `voro.toml` (DESIGN.md §11a): a shell command
-/// run in a task's checkout to open its diff. Defined as a named
-/// `[viewers.<name>]` table or the anonymous `[viewer]` default. `{path}` is
-/// optional, so nothing is validated at parse time.
+/// run in a task's checkout — or its worktree — to open its diff. Defined as a
+/// named `[viewers.<name>]` table or the anonymous `[viewer]` default. The
+/// placeholders `{path}` (checkout/worktree dir), `{branch}` (the task's
+/// branch), and `{base}` (the checkout's default branch) are all optional, so
+/// nothing is validated at parse time.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewerTemplate {

@@ -21,7 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voro_core::{
     AgentsConfig, PROMPT_FILE_PLACEHOLDER, ReviewAction, SESSION_PLACEHOLDER, Session, Store,
-    TASK_ID_PLACEHOLDER, Task, TaskState, VIEWER_PATH_PLACEHOLDER, parse_sessions_json,
+    TASK_ID_PLACEHOLDER, Task, TaskState, VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER,
+    VIEWER_PATH_PLACEHOLDER, parse_sessions_json,
 };
 
 /// Prepended to every dispatched prompt so the agent learns the return-path
@@ -364,12 +365,17 @@ pub fn continue_dispatch(
     )
 }
 
-/// Open a `review` (or `running`) task's checkout in a viewer so its diff can
-/// be seen (DESIGN.md §11a): the viewer medium of the per-project review action
-/// (§8), run detached in the project's path. `viewer_override` names a
-/// `[viewers.<name>]` entry; `None` falls back to the project's review action or
-/// the config default. Opening never touches task state, so there is no
-/// clean-tree guard (the diff reviewed is often the uncommitted work itself).
+/// Open a `review` (or `running`) task's diff in a viewer (DESIGN.md §11a): the
+/// viewer medium of the per-project review action (§8). A dispatched agent works
+/// in a throwaway worktree on the task's branch, so the diff lives there, not in
+/// the primary checkout — the viewer is run in that worktree when the task has a
+/// live one, falling back to `project.path` when it has no branch or no worktree
+/// (§8). `viewer_override` names a `[viewers.<name>]` entry; `None` falls back to
+/// the project's review action or the config default. The viewer template gets
+/// `{path}` (the resolved dir), `{branch}` (the task's branch, empty when none),
+/// and `{base}` (the checkout's default branch) so it can express a diff range.
+/// Opening never touches task state, so there is no clean-tree guard (the diff
+/// reviewed is often the uncommitted work itself).
 pub fn open(
     store: &mut Store,
     ctx: &DispatchCtx,
@@ -398,10 +404,23 @@ pub fn open(
         .viewer_cmd(viewer_name.as_deref())
         .map_err(|e| e.to_string())?;
 
-    let command = viewer.replace(
-        VIEWER_PATH_PLACEHOLDER,
-        &shell_quote(Path::new(&project.path)),
-    );
+    // Run the viewer in the task's worktree when it has one — that is where the
+    // dispatched agent's diff lives — otherwise the primary checkout.
+    let viewer_dir = match task.branch.as_deref() {
+        Some(branch) => crate::worktree::worktree_on_branch(&project.path, branch)?
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| project.path.clone()),
+        None => project.path.clone(),
+    };
+    let base = default_base_branch(&project.path);
+    let branch = task.branch.clone().unwrap_or_default();
+    let command = viewer
+        .replace(
+            VIEWER_PATH_PLACEHOLDER,
+            &shell_quote(Path::new(&viewer_dir)),
+        )
+        .replace(VIEWER_BRANCH_PLACEHOLDER, &branch)
+        .replace(VIEWER_BASE_PLACEHOLDER, &base);
 
     // Redirect the detached viewer's output to the shared launch log so a
     // silent failure leaves a breadcrumb.
@@ -418,19 +437,19 @@ pub fn open(
         .map_err(|e| format!("cannot open launch log {}: {e}", launch_log.display()))?;
     append_launch_log(
         &launch_log,
-        &format!("viewer: {command} (cwd {})", project.path),
+        &format!("viewer: {command} (cwd {viewer_dir})"),
     );
 
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&command)
-        .current_dir(&project.path)
+        .current_dir(&viewer_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
         .process_group(0)
         .spawn()
-        .map_err(|e| format!("cannot spawn viewer in {}: {e}", project.path))?;
+        .map_err(|e| format!("cannot spawn viewer in {viewer_dir}: {e}"))?;
     let pid = i64::from(child.id());
 
     // Nothing waits on the viewer — reap it in a detached thread so an exited
@@ -772,6 +791,27 @@ fn guard_clean_tree(path: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The checkout's default branch — what a viewer template's `{base}` diffs a
+/// task branch against (DESIGN.md §8). Read from `refs/remotes/origin/HEAD`,
+/// whose `--short` form is `origin/<branch>`; the remote prefix is dropped. A
+/// checkout with no origin or no symbolic HEAD falls back to `main`.
+fn default_base_branch(project_path: &str) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_path)
+        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .stdin(Stdio::null())
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let head = String::from_utf8_lossy(&o.stdout);
+            let head = head.trim();
+            head.strip_prefix("origin/").unwrap_or(head).to_string()
+        }
+        _ => "main".to_string(),
+    }
 }
 
 /// Single-quote a path for safe substitution into the `sh -c` command line.
@@ -1325,6 +1365,141 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(marker.exists(), "the viewer should have run in the project");
+    }
+
+    /// Give the checkout one commit and a worktree on `branch` beside it, so
+    /// `open` has a real worktree to resolve. Returns the worktree path.
+    fn commit_and_worktree(project: &Path, branch: &str) -> PathBuf {
+        git(project, &["config", "user.email", "t@example.com"]);
+        git(project, &["config", "user.name", "Test"]);
+        std::fs::write(project.join("README"), "hi\n").unwrap();
+        git(project, &["add", "-A"]);
+        git(project, &["commit", "-q", "-m", "init"]);
+        let wt = project.parent().unwrap().join(format!("wt-{branch}"));
+        git(
+            project,
+            &["worktree", "add", "-q", "-b", branch, wt.to_str().unwrap()],
+        );
+        wt
+    }
+
+    #[test]
+    fn open_runs_the_viewer_in_the_tasks_worktree_and_falls_back_to_the_checkout() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        // a [viewer] whose command drops a marker at the substituted {path}
+        std::fs::write(
+            &ctx.agents_path,
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
+             [viewer]\ncmd = \"touch {path}/opened.marker\"\n",
+        )
+        .unwrap();
+        let wt = commit_and_worktree(&project, "feat");
+
+        // A task on `feat` has a live worktree, so the viewer opens there.
+        let with_wt = review_task(&mut store, &project);
+        store.set_branch(with_wt, Some("feat")).unwrap();
+        open(&mut store, &ctx, with_wt, None).unwrap();
+        let wt_marker = wt.join("opened.marker");
+        for _ in 0..50 {
+            if wt_marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            wt_marker.exists(),
+            "the viewer should have run in the worktree, not the checkout"
+        );
+
+        // A task on a branch with no worktree falls back to the checkout (a
+        // second task in the same project, since the project name is unique).
+        let project_id = store.task(with_wt).unwrap().project_id;
+        let no_wt = store
+            .create_task(NewTask {
+                project_id,
+                title: "No worktree".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+            })
+            .unwrap()
+            .id;
+        store.apply(no_wt, voro_core::Action::Start).unwrap();
+        store
+            .apply(no_wt, voro_core::Action::Complete(None))
+            .unwrap();
+        store.set_branch(no_wt, Some("ghost")).unwrap();
+        open(&mut store, &ctx, no_wt, None).unwrap();
+        let checkout_marker = project.join("opened.marker");
+        for _ in 0..50 {
+            if checkout_marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            checkout_marker.exists(),
+            "a branch with no worktree must fall back to the checkout"
+        );
+    }
+
+    #[test]
+    fn open_substitutes_the_branch_and_base_placeholders() {
+        // A viewer template using all three placeholders to spell a diff range;
+        // {base} has no origin here, so it falls back to `main`.
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        std::fs::write(
+            &ctx.agents_path,
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
+             [viewer]\ncmd = \"echo {base}...{branch} > {path}/range.txt\"\n",
+        )
+        .unwrap();
+        let wt = commit_and_worktree(&project, "feat");
+        let id = review_task(&mut store, &project);
+        store.set_branch(id, Some("feat")).unwrap();
+
+        open(&mut store, &ctx, id, None).unwrap();
+
+        // {path} resolved to the worktree, {base}...{branch} to `main...feat`.
+        let range = wt.join("range.txt");
+        for _ in 0..50 {
+            if range.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&range).unwrap().trim(),
+            "main...feat"
+        );
+    }
+
+    #[test]
+    fn open_ignores_new_placeholders_a_template_does_not_use() {
+        // A template that mentions neither {branch} nor {base} is substituted
+        // exactly as before — only {path} changes, and it lands unquoted-content
+        // in the checkout since the task carries no branch.
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        std::fs::write(
+            &ctx.agents_path,
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
+             [viewer]\ncmd = \"echo plain > {path}/plain.txt\"\n",
+        )
+        .unwrap();
+        let id = review_task(&mut store, &project); // no branch set
+
+        open(&mut store, &ctx, id, None).unwrap();
+
+        let plain = project.join("plain.txt");
+        for _ in 0..50 {
+            if plain.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(&plain).unwrap().trim(), "plain");
     }
 
     #[test]
