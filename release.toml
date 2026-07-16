@@ -15,6 +15,6 @@ shared-version = true
 consolidate-commits = true
 allow-branch = ["main"]
 publish = true
-push = false
+push = true
 tag-name = "v{{version}}"
 pre-release-commit-message = "Release {{version}}"

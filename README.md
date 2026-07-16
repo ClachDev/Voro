@@ -1,8 +1,14 @@
 # Voro
 
-A local command centre for AI-assisted development across many projects. Voro
-tracks tasks per project, weights each project by how much it matters *today*,
-and answers one question: **where should my attention go right now?**
+[![CI](https://github.com/ClachDev/Voro/actions/workflows/rust.yml/badge.svg)](https://github.com/ClachDev/Voro/actions/workflows/rust.yml)
+[![Crates.io](https://img.shields.io/crates/v/voro.svg)](https://crates.io/crates/voro)
+[![docs.rs](https://img.shields.io/docsrs/voro-core)](https://docs.rs/voro-core)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+
+An attention based session manager for AI-assisted development across many
+projects. Voro tracks tasks per project, weights each project by how much it
+matters *today*, and answers one question: **where should your attention go right
+now?**
 
 A single **next-action queue** drives everything: questions, reviews, and
 proposals that need a human first, then the highest-scoring ready tasks across
@@ -99,29 +105,8 @@ Rust workspace: `voro-core` (store, scheduler) and `voro` (ratatui TUI).
 ```bash
 cargo build --workspace
 cargo test --workspace
-cargo run -p voro
+cargo run
 ```
-
-## Releasing
-
-Releases are cut with [cargo-release](https://github.com/crate-ci/cargo-release)
-and built by [cargo-dist](https://github.com/axodotdev/cargo-dist). Both crates
-share one version and ship under a single `v{version}` tag; pushing that tag
-runs [`.github/workflows/release.yml`](.github/workflows/release.yml), which
-builds `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` tarballs with
-checksums and a `curl | sh` installer, then publishes a GitHub Release whose
-notes come from the matching [`CHANGELOG.md`](CHANGELOG.md) section.
-
-Record changes under the `Unreleased` heading in `CHANGELOG.md` as you go. To
-cut a release, from a clean `main` run `cargo release <level> --execute` (e.g.
-`patch`); cargo-release bumps the version, rolls `Unreleased` into a dated
-section, commits, tags, and publishes both crates to crates.io — `voro-core`
-first, then `voro` — which is what makes `cargo install voro` resolve. Publishing
-needs a crates.io token in the environment, so run `cargo login` (or set
-`CARGO_REGISTRY_TOKEN`) beforehand. cargo-release does not push, so review, then
-`git push --follow-tags` to trigger the binary build. The first `v0.1.0` release
-is special: the version is already `0.1.0`, so tag it directly with
-`git tag v0.1.0 && git push origin v0.1.0`.
 
 ## Dispatching to agents
 
@@ -131,6 +116,8 @@ fresh install dispatches with no configuration: `voro dispatch <task-id>` (or th
 dispatch key in the TUI) launches a headless session on a ready task. The agent
 reports back through the return-path verbs (`voro ask/done/propose`), and its work
 lands in `review` where `voro open` or `voro pr` puts the diff in front of you.
+
+![Claude with Voro in tmux showing sessions and tasks](docs/images/claude-voro.png)
 
 To extend or override the built-in agents and viewers, layer a
 `~/.config/voro/voro.toml` on top (`voro agent init` writes a skeleton). The
