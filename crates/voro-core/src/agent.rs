@@ -44,13 +44,20 @@ pub const VIEWER_PATH_PLACEHOLDER: &str = "{path}";
 /// `claude` launches attachably (`--bg`) with the full session verb set and
 /// plans interactively in the foreground; `codex` covers the headless-resume
 /// shape. Must parse and pass [`validate_agent`].
+///
+/// The claude verbs carry per-purpose `--model` defaults: `dispatch` a
+/// workhorse implementation model, `plan` a stronger reasoning model. They
+/// pass the `claude` model *aliases* (`opus`, `fable`), not pinned model ids,
+/// so they resolve to the current model of that class and do not churn with
+/// each release; an operator wanting other models overrides the agent
+/// wholesale in `voro.toml`.
 const BUILTIN_AGENTS: &str = "\
 [agents.claude]
-dispatch = \"claude --bg --name \\\"voro-{task_id}\\\" --permission-mode auto \\\"$(cat {prompt_file})\\\"\"
+dispatch = \"claude --bg --name \\\"voro-{task_id}\\\" --permission-mode auto --model opus \\\"$(cat {prompt_file})\\\"\"
 sessions = \"claude agents --json\"
 attach   = \"claude attach {session}\"
 resume   = \"claude --resume {session}\"
-plan     = \"claude --permission-mode auto \\\"$(cat {prompt_file})\\\"\"
+plan     = \"claude --permission-mode auto --model fable \\\"$(cat {prompt_file})\\\"\"
 
 [agents.codex]
 dispatch = \"codex exec \\\"$(cat {prompt_file})\\\"\"
@@ -1279,6 +1286,20 @@ mod tests {
         assert!(agents.contains_key("codex"));
         assert!(agents["claude"].sessions().is_some());
         assert!(agents["codex"].continue_cmd().is_some());
+    }
+
+    #[test]
+    fn builtin_claude_carries_per_purpose_model_defaults() {
+        let claude = &builtin_agents()["claude"];
+        // dispatch runs a workhorse implementation model, plan a stronger one;
+        // both via `claude` model aliases, so neither churns with a release.
+        assert!(
+            claude.dispatch().contains("--model opus"),
+            "{}",
+            claude.dispatch()
+        );
+        let plan = claude.plan().unwrap();
+        assert!(plan.contains("--model fable"), "{plan}");
     }
 
     #[test]
