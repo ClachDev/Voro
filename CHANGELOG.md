@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 
-## [Unreleased](https://github.com/ClachDev/Voro/compare/27b1105...HEAD) - ReleaseDate
+## [Unreleased](https://github.com/ClachDev/Voro/compare/v0.1.0...HEAD) - ReleaseDate
+
+## [0.1.0](https://github.com/ClachDev/Voro/compare/27b1105...v0.1.0) - 2026-07-16
 
 Initial release of Voro, a local, single-operator command centre that
 prioritises tasks across many projects and dispatches them to coding agents.
