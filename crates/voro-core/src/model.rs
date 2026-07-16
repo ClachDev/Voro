@@ -12,19 +12,21 @@ pub enum TaskState {
     Running,
     NeedsInput,
     Review,
+    Waiting,
     Stalled,
     Done,
     Rejected,
 }
 
 impl TaskState {
-    pub const ALL: [TaskState; 9] = [
+    pub const ALL: [TaskState; 10] = [
         TaskState::Proposed,
         TaskState::Parked,
         TaskState::Ready,
         TaskState::Running,
         TaskState::NeedsInput,
         TaskState::Review,
+        TaskState::Waiting,
         TaskState::Stalled,
         TaskState::Done,
         TaskState::Rejected,
@@ -38,6 +40,7 @@ impl TaskState {
             TaskState::Running => "running",
             TaskState::NeedsInput => "needs-input",
             TaskState::Review => "review",
+            TaskState::Waiting => "waiting",
             TaskState::Stalled => "stalled",
             TaskState::Done => "done",
             TaskState::Rejected => "rejected",
@@ -422,7 +425,8 @@ impl Task {
     /// next, from state × fields. `None` for states that ask nothing of the
     /// human — `running` belongs to the running strip, `parked`/`done`/`rejected`
     /// wait on nothing. `stalled` always means a dead agent dispatch, since
-    /// dispatch refuses human tasks.
+    /// dispatch refuses human tasks. `waiting` is handed off to an external
+    /// party (DESIGN.md §6) and asks nothing of the operator.
     pub fn next_action(&self) -> Option<NextAction> {
         match self.state {
             TaskState::Proposed => Some(NextAction::Triage),
@@ -432,7 +436,11 @@ impl Task {
             TaskState::Stalled => Some(NextAction::Redispatch),
             TaskState::Ready if self.human => Some(NextAction::Do),
             TaskState::Ready => Some(NextAction::Dispatch),
-            TaskState::Running | TaskState::Parked | TaskState::Done | TaskState::Rejected => None,
+            TaskState::Running
+            | TaskState::Waiting
+            | TaskState::Parked
+            | TaskState::Done
+            | TaskState::Rejected => None,
         }
     }
 }
@@ -563,6 +571,7 @@ mod tests {
                 Some(NextAction::Redispatch),
             ),
             (TaskState::Running, None, false, None),
+            (TaskState::Waiting, None, false, None),
             (TaskState::Parked, None, false, None),
             (TaskState::Done, None, false, None),
             (TaskState::Rejected, None, false, None),

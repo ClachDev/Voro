@@ -163,6 +163,8 @@ pub fn action_label(action: &Action) -> &'static str {
         Action::Ask(_) => "ask a question → needs-input",
         Action::Answer(_) => "answer the question → running",
         Action::Complete(_) => "complete → review",
+        Action::HandOff => "hand off → waiting",
+        Action::Reclaim => "reclaim → review",
         Action::Accept => "accept → done",
         Action::RejectWork(_) => "reject with feedback → running",
         Action::Abort => "abort → ready",
@@ -248,9 +250,10 @@ fn browse_order(state: TaskState) -> u8 {
         TaskState::Stalled => 3,
         TaskState::Ready => 4,
         TaskState::Running => 5,
-        TaskState::Parked => 6,
-        TaskState::Done => 7,
-        TaskState::Rejected => 8,
+        TaskState::Waiting => 6,
+        TaskState::Parked => 7,
+        TaskState::Done => 8,
+        TaskState::Rejected => 9,
     }
 }
 
@@ -674,8 +677,27 @@ impl App {
             KeyCode::Char('g') => self.open_selected_pr(),
             KeyCode::Char('a') => self.jump_into_session(),
             KeyCode::Char('l') => self.view_session_log(),
+            KeyCode::Char('w') => self.hand_off_selected(),
             _ => {}
         }
+    }
+
+    /// Hand a review task off to an external party (DESIGN.md §6): `w` on a
+    /// review row moves it `review → waiting`, out of the queue until it is the
+    /// operator's move again. A non-review selection reports why via the status
+    /// line, the same no-op-with-explanation style as the other action keys.
+    fn hand_off_selected(&mut self) {
+        let Some(task) = self.selected_task() else {
+            return;
+        };
+        if task.state != TaskState::Review {
+            self.status = Some(format!(
+                "task is {} — hand off works on a review task",
+                task.state
+            ));
+            return;
+        }
+        self.apply_and_refresh(task.id, Action::HandOff);
     }
 
     /// Page through the selected task's newest session log (tasks #73/#110), in
@@ -717,6 +739,13 @@ impl App {
     pub fn selected_session_log(&self) -> Option<&str> {
         let id = self.selected_task_id()?;
         self.last_sessions.get(&id)?.log_path.as_deref()
+    }
+
+    /// Whether the selection is a review task, so it can be handed off with
+    /// `w` — what gates that key's key-line hint.
+    pub fn selected_can_hand_off(&self) -> bool {
+        self.selected_task()
+            .is_some_and(|t| t.state == TaskState::Review)
     }
 
     /// Begin creating a task in one of the two flows (DESIGN.md §9): straight
