@@ -27,8 +27,15 @@ projects
   project list                    list projects with weights
   project rename <project> <name> rename a project (tasks reference it by id)
   project path <project> <path>   change a project's checkout path
+  project archive <project>       retire a project: hide it and all its tasks
+                                  from the cockpit (queue, stats, running
+                                  strip); tasks freeze in their states, and
+                                  `project list` keeps it, tagged [archived]
+  project unarchive <project>     restore an archived project and its tasks
+                                  exactly as they were
   project delete <project>        delete a project with no tasks — park it
-                                  (weight 0) instead to snooze one that has any
+                                  (weight 0) or archive it instead to retire
+                                  one that has any
   project action <project> <auto|pr|viewer[:NAME]>
                                   set how `pr` shows the project's review
                                   diffs: auto (GitHub when the checkout is a
@@ -262,6 +269,8 @@ enum ProjectCmd {
     List,
     Rename { project: String, name: String },
     Path { project: String, path: String },
+    Archive { project: String },
+    Unarchive { project: String },
     Delete { project: String },
     Action { project: String, action: String },
 }
@@ -574,9 +583,10 @@ fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
                     ReviewAction::Auto => String::new(),
                     other => format!("  [{other}]"),
                 };
+                let archived = if p.archived { "  [archived]" } else { "" };
                 writeln!(
                     out,
-                    "{:3}  w{}  {}  {}{action}",
+                    "{:3}  w{}  {}  {}{action}{archived}",
                     p.id, p.weight, p.name, p.path
                 )
                 .unwrap();
@@ -599,6 +609,27 @@ fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
                 .set_path(project.id, &path)
                 .map_err(|e| e.to_string())?;
             Ok(format!("project {} path -> {}", p.id, p.path))
+        }
+        ProjectCmd::Archive { project } => {
+            let project = resolve_project(store, &project)?;
+            let p = store
+                .set_archived(project.id, true)
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "project {} '{}' archived — hidden from the cockpit with all its tasks; \
+                 `voro project unarchive {}` restores them",
+                p.id, p.name, p.name
+            ))
+        }
+        ProjectCmd::Unarchive { project } => {
+            let project = resolve_project(store, &project)?;
+            let p = store
+                .set_archived(project.id, false)
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "project {} '{}' unarchived — its tasks are back in their prior states",
+                p.id, p.name
+            ))
         }
         ProjectCmd::Delete { project } => {
             let project = resolve_project(store, &project)?;
@@ -1444,6 +1475,49 @@ mod tests {
         assert!(e.contains("park") && e.contains("weight to 0"), "{e}");
         // the refusal must not have deleted anything
         assert!(ok(&mut s, &["project", "list"]).contains("demo"));
+    }
+
+    #[test]
+    fn project_archive_hides_the_cockpit_views_and_unarchive_restores_them() {
+        // The acceptance walk (task #136): a project with open and closed
+        // tasks leaves inbox/next/stats wholesale on archive, stays tagged on
+        // `project list`, and comes back exactly on unarchive.
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp/demo"]);
+        ok(&mut s, &["add", "demo", "Open task", "--state", "ready"]);
+        ok(&mut s, &["add", "demo", "Closed task", "--state", "ready"]);
+        ok(&mut s, &["start", "2"]);
+        ok(&mut s, &["done", "2"]);
+        ok(&mut s, &["accept", "2", "--yes"]);
+
+        let inbox_before = ok(&mut s, &["inbox"]);
+        assert!(inbox_before.contains("Open task"), "{inbox_before}");
+
+        let out = ok(&mut s, &["project", "archive", "demo"]);
+        assert!(out.contains("archived"), "{out}");
+        assert!(ok(&mut s, &["inbox"]).contains("nothing needs you"));
+        assert!(ok(&mut s, &["next"]).contains("no ready tasks"));
+        assert!(ok(&mut s, &["stats"]).contains("ready       0"));
+        let listed = ok(&mut s, &["project", "list"]);
+        assert!(
+            listed.contains("demo") && listed.contains("[archived]"),
+            "{listed}"
+        );
+
+        // side doors: no new work lands on an archived project
+        let e = err(&mut s, &["add", "demo", "Too late"]);
+        assert!(e.contains("archived"), "{e}");
+        let e = err(&mut s, &["propose", "demo", "Too late"]);
+        assert!(e.contains("archived"), "{e}");
+        // a second archive is heard, not absorbed
+        let e = err(&mut s, &["project", "archive", "demo"]);
+        assert!(e.contains("already archived"), "{e}");
+
+        let out = ok(&mut s, &["project", "unarchive", "demo"]);
+        assert!(out.contains("unarchived"), "{out}");
+        assert_eq!(ok(&mut s, &["inbox"]), inbox_before);
+        assert!(ok(&mut s, &["stats"]).contains("done        1"));
+        assert!(!ok(&mut s, &["project", "list"]).contains("[archived]"));
     }
 
     #[test]

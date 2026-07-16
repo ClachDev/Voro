@@ -17,9 +17,12 @@ pub enum Error {
 
     #[error(
         "project {id} has {count} task(s) and cannot be deleted — set its weight to 0 to park \
-         it instead, which snoozes it without losing history"
+         it, or `voro project archive` to retire it; both keep its history"
     )]
     ProjectHasTasks { id: i64, count: i64 },
+
+    #[error("project '{name}' is archived — `voro project unarchive {name}` first")]
+    ProjectArchived { name: String },
 
     #[error("session {0} not found")]
     SessionNotFound(i64),

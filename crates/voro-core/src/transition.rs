@@ -145,6 +145,7 @@ impl Store {
     ) -> Result<(Task, Session)> {
         let tx = self.conn.transaction()?;
         reject_human_dispatch(&tx, task_id)?;
+        reject_archived_dispatch(&tx, task_id)?;
         apply_action(&tx, task_id, Action::Start)?;
         let session_id = insert_session(&tx, task_id, agent, pid, log_path)?;
         tx.commit()?;
@@ -168,6 +169,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         let task = get_task(&tx, task_id)?.ok_or(Error::TaskNotFound(task_id))?;
         reject_human_dispatch(&tx, task_id)?;
+        reject_archived_dispatch(&tx, task_id)?;
         if task.state != TaskState::Running {
             return Err(Error::InvalidTransition {
                 from: task.state,
@@ -466,6 +468,23 @@ fn reject_human_dispatch(tx: &Connection, task_id: i64) -> Result<()> {
             id: task_id,
             reason: "no agent can execute it — start it by hand instead".into(),
         });
+    }
+    Ok(())
+}
+
+/// Refuse to open an agent session on a task in an archived project
+/// (DESIGN.md §5): the project has left the cockpit, so dispatch, redispatch,
+/// and continuation are all side doors. Like the human guard, this runs before
+/// any state change or session insert, so the refusal writes nothing.
+fn reject_archived_dispatch(tx: &Connection, task_id: i64) -> Result<()> {
+    let (name, archived): (String, bool) = tx.query_row(
+        "SELECT p.name, p.archived FROM projects p
+         JOIN tasks t ON t.project_id = p.id WHERE t.id = ?1",
+        [task_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if archived {
+        return Err(Error::ProjectArchived { name });
     }
     Ok(())
 }
@@ -1314,6 +1333,33 @@ mod tests {
         // the failed transaction must leave neither state change nor session
         assert_eq!(s.task(id).unwrap().state, TaskState::Proposed);
         assert!(s.sessions_for(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dispatch_and_continuation_refuse_a_task_in_an_archived_project() {
+        // An archived project's tasks freeze where they are (DESIGN.md §5):
+        // dispatch and continuation are side doors and must write nothing.
+        let (mut s, p) = store_with_project();
+        let ready = create(&mut s, p, TaskState::Ready);
+        let running = task_in_state(&mut s, p, TaskState::Running);
+        s.set_archived(p, true).unwrap();
+
+        let err = s
+            .record_dispatch(ready, "claude", Some(1), None)
+            .unwrap_err();
+        assert!(matches!(err, Error::ProjectArchived { .. }), "{err}");
+        assert_eq!(s.task(ready).unwrap().state, TaskState::Ready);
+        assert!(s.sessions_for(ready).unwrap().is_empty());
+
+        let err = s
+            .record_continuation(running, "claude", Some(1), None)
+            .unwrap_err();
+        assert!(matches!(err, Error::ProjectArchived { .. }), "{err}");
+        assert!(s.sessions_for(running).unwrap().is_empty());
+
+        // unarchiving reopens the door
+        s.set_archived(p, false).unwrap();
+        assert!(s.record_dispatch(ready, "claude", Some(1), None).is_ok());
     }
 
     // --- record_continuation (DESIGN.md §6/§8: answer → running → continue) ---

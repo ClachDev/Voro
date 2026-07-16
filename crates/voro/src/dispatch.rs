@@ -510,6 +510,14 @@ fn spawn_session(
         ));
     }
     let project = store.project(task.project_id).map_err(|e| e.to_string())?;
+    // Refused here so an archived project is heard before anything spawns;
+    // voro-core's record_dispatch/record_continuation are the backstop.
+    if project.archived {
+        return Err(format!(
+            "project '{}' is archived — `voro project unarchive {}` first",
+            project.name, project.name
+        ));
+    }
 
     let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     let agent = config

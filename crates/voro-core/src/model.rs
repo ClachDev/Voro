@@ -349,6 +349,11 @@ pub struct Project {
     pub weight: i64,
     /// How `pr` shows this project's review diffs (DESIGN.md §8/§11a).
     pub review_action: ReviewAction,
+    /// Retired (DESIGN.md §5): the project and all its tasks leave the cockpit
+    /// — queue, stats, running strip — until unarchived. Tasks freeze in
+    /// whatever state they hold; only the projects screen still shows the
+    /// project, tagged, so it can be found and unarchived.
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
