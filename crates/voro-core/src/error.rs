@@ -21,6 +21,12 @@ pub enum Error {
     )]
     ProjectHasTasks { id: i64, count: i64 },
 
+    #[error(
+        "project {id} has {count} running task(s) with an open agent session — reconcile or \
+         abort them before purging"
+    )]
+    ProjectHasOpenSessions { id: i64, count: i64 },
+
     #[error("session {0} not found")]
     SessionNotFound(i64),
 

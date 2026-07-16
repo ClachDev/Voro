@@ -27,8 +27,13 @@ projects
   project list                    list projects with weights
   project rename <project> <name> rename a project (tasks reference it by id)
   project path <project> <path>   change a project's checkout path
-  project delete <project>        delete a project with no tasks — park it
-                                  (weight 0) instead to snooze one that has any
+  project delete <project> [--with-tasks [--yes]]
+                                  delete a project with no tasks — park it
+                                  (weight 0) instead to snooze one that has any;
+                                  --with-tasks purges a mistake project outright
+                                  — its tasks, their sessions, dependency edges,
+                                  and event rows — after listing what goes and
+                                  confirming (--yes skips the confirmation)
   project action <project> <auto|pr|viewer[:NAME]>
                                   set how `pr` shows the project's review
                                   diffs: auto (GitHub when the checkout is a
@@ -258,12 +263,30 @@ enum Verb {
 
 #[derive(Subcommand)]
 enum ProjectCmd {
-    Add { name: String, path: String },
+    Add {
+        name: String,
+        path: String,
+    },
     List,
-    Rename { project: String, name: String },
-    Path { project: String, path: String },
-    Delete { project: String },
-    Action { project: String, action: String },
+    Rename {
+        project: String,
+        name: String,
+    },
+    Path {
+        project: String,
+        path: String,
+    },
+    Delete {
+        project: String,
+        #[arg(long)]
+        with_tasks: bool,
+        #[arg(long, requires = "with_tasks")]
+        yes: bool,
+    },
+    Action {
+        project: String,
+        action: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -600,12 +623,58 @@ fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
                 .map_err(|e| e.to_string())?;
             Ok(format!("project {} path -> {}", p.id, p.path))
         }
-        ProjectCmd::Delete { project } => {
+        ProjectCmd::Delete {
+            project,
+            with_tasks,
+            yes,
+        } => {
             let project = resolve_project(store, &project)?;
-            store
-                .delete_project(project.id)
-                .map_err(|e| e.to_string())?;
-            Ok(format!("project {} '{}' deleted", project.id, project.name))
+            if !with_tasks {
+                return match store.delete_project(project.id) {
+                    Ok(()) => Ok(format!("project {} '{}' deleted", project.id, project.name)),
+                    Err(e @ voro_core::Error::ProjectHasTasks { .. }) => Err(format!(
+                        "{e}; a mistake project is purged outright, tasks and all, with \
+                         `project delete {} --with-tasks`",
+                        project.name
+                    )),
+                    Err(e) => Err(e.to_string()),
+                };
+            }
+            let preview = store.purge_preview(project.id).map_err(|e| e.to_string())?;
+            let mut prompt = format!(
+                "purging project {} '{}' permanently removes:\n",
+                project.id, project.name
+            );
+            for (state, n) in &preview.tasks_by_state {
+                writeln!(prompt, "  {n:3} {state} task(s)").unwrap();
+            }
+            if preview.tasks_by_state.is_empty() {
+                prompt.push_str("  no tasks\n");
+            }
+            writeln!(
+                prompt,
+                "  plus {} session(s), {} event(s), {} dependency edge(s)",
+                preview.sessions, preview.events, preview.deps
+            )
+            .unwrap();
+            prompt.push_str("this cannot be undone — proceed?");
+            if !yes && !confirm(&prompt)? {
+                return Ok(format!(
+                    "cancelled — project '{}' and its tasks kept",
+                    project.name
+                ));
+            }
+            let removed = store.purge_project(project.id).map_err(|e| e.to_string())?;
+            Ok(format!(
+                "project {} '{}' purged — {} task(s), {} session(s), {} event(s), \
+                 {} dependency edge(s) removed",
+                project.id,
+                project.name,
+                removed.tasks(),
+                removed.sessions,
+                removed.events,
+                removed.deps
+            ))
         }
         ProjectCmd::Action { project, action } => {
             let project = resolve_project(store, &project)?;
@@ -1442,7 +1511,43 @@ mod tests {
         ok(&mut s, &["add", "demo", "T"]);
         let e = err(&mut s, &["project", "delete", "demo"]);
         assert!(e.contains("park") && e.contains("weight to 0"), "{e}");
+        assert!(e.contains("--with-tasks"), "{e}");
         // the refusal must not have deleted anything
+        assert!(ok(&mut s, &["project", "list"]).contains("demo"));
+    }
+
+    #[test]
+    fn project_delete_with_tasks_purges_project_and_tasks() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "keep", "/tmp/keep"]);
+        ok(&mut s, &["add", "keep", "K", "--state", "ready"]);
+        ok(&mut s, &["project", "add", "demo", "/tmp/demo"]);
+        ok(&mut s, &["add", "demo", "T"]);
+        ok(&mut s, &["triage", "2", "reject"]);
+
+        let out = ok(
+            &mut s,
+            &["project", "delete", "demo", "--with-tasks", "--yes"],
+        );
+        assert!(out.contains("purged"), "{out}");
+        assert!(out.contains("1 task(s)"), "{out}");
+
+        assert!(!ok(&mut s, &["project", "list"]).contains("demo"));
+        assert!(!ok(&mut s, &["list"]).contains("T"));
+        let e = err(&mut s, &["show", "2"]);
+        assert!(e.contains("not found"), "{e}");
+        // the other project's task is still there
+        assert!(ok(&mut s, &["list"]).contains("K"));
+    }
+
+    /// `--yes` only means anything alongside `--with-tasks`, so clap rejects
+    /// it on a plain delete rather than silently ignoring it.
+    #[test]
+    fn project_delete_yes_requires_with_tasks() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        let e = err(&mut s, &["project", "delete", "demo", "--yes"]);
+        assert!(e.contains("--with-tasks"), "{e}");
         assert!(ok(&mut s, &["project", "list"]).contains("demo"));
     }
 

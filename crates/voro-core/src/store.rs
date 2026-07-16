@@ -51,6 +51,25 @@ pub struct TaskEdit {
     pub human: bool,
 }
 
+/// What purging a project removes, counted per table: returned read-only by
+/// `Store::purge_preview` for the confirmation prompt, and by
+/// `Store::purge_project` as the receipt of what was deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgeSummary {
+    /// Task counts keyed by state, in `TaskState::ALL` order, zero-count
+    /// states omitted. Empty means the project has no tasks.
+    pub tasks_by_state: Vec<(TaskState, i64)>,
+    pub deps: i64,
+    pub sessions: i64,
+    pub events: i64,
+}
+
+impl PurgeSummary {
+    pub fn tasks(&self) -> i64 {
+        self.tasks_by_state.iter().map(|(_, n)| n).sum()
+    }
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         if let Some(dir) = path.parent() {
@@ -228,6 +247,61 @@ impl Store {
         self.conn
             .execute("DELETE FROM projects WHERE id = ?1", [project_id])?;
         Ok(())
+    }
+
+    /// Count what `purge_project` would remove, without removing anything —
+    /// the CLI shows this before asking for confirmation.
+    pub fn purge_preview(&self, project_id: i64) -> Result<PurgeSummary> {
+        self.project(project_id)?;
+        purge_summary(&self.conn, project_id)
+    }
+
+    /// Delete a mistake project outright: the project, its tasks, the
+    /// dependency edges touching those tasks (from either side — an edge from
+    /// another project's task would otherwise dangle), their sessions, and
+    /// their event rows, all in one transaction. The events table is
+    /// append-only everywhere else (DESIGN.md §5); this is the one deliberate
+    /// exception — a project that never should have existed has no history
+    /// worth protecting — and the deletes are scoped to the purged project's
+    /// tasks and nothing else. Refuses while any task is `running` with an
+    /// open session; reconcile or abort it first.
+    pub fn purge_project(&mut self, project_id: i64) -> Result<PurgeSummary> {
+        self.project(project_id)?;
+        let tx = self.conn.transaction()?;
+        let open: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM tasks t
+             JOIN sessions s ON s.task_id = t.id AND s.ended_at IS NULL
+             WHERE t.project_id = ?1 AND t.state = 'running'",
+            [project_id],
+            |r| r.get(0),
+        )?;
+        if open > 0 {
+            return Err(Error::ProjectHasOpenSessions {
+                id: project_id,
+                count: open,
+            });
+        }
+        let summary = purge_summary(&tx, project_id)?;
+        tx.execute(
+            "DELETE FROM events
+             WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?1)",
+            [project_id],
+        )?;
+        tx.execute(
+            "DELETE FROM sessions
+             WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?1)",
+            [project_id],
+        )?;
+        tx.execute(
+            "DELETE FROM deps
+             WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?1)
+                OR depends_on IN (SELECT id FROM tasks WHERE project_id = ?1)",
+            [project_id],
+        )?;
+        tx.execute("DELETE FROM tasks WHERE project_id = ?1", [project_id])?;
+        tx.execute("DELETE FROM projects WHERE id = ?1", [project_id])?;
+        tx.commit()?;
+        Ok(summary)
     }
 
     // --- tasks ---
@@ -785,6 +859,38 @@ pub(crate) fn set_session_outcome(
         "UPDATE sessions SET ended_at = datetime('now'), outcome = ?1 WHERE id = ?2",
         params![outcome, id],
     )?)
+}
+
+/// Count the rows a purge of `project_id` touches. Runs against the purge
+/// transaction as well as a plain connection, so the receipt `purge_project`
+/// returns is computed from the same snapshot it deletes.
+fn purge_summary(conn: &Connection, project_id: i64) -> Result<PurgeSummary> {
+    let mut stmt =
+        conn.prepare("SELECT state, COUNT(*) FROM tasks WHERE project_id = ?1 GROUP BY state")?;
+    let counts: HashMap<TaskState, i64> = stmt
+        .query_map([project_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let tasks_by_state = TaskState::ALL
+        .iter()
+        .filter_map(|s| counts.get(s).map(|n| (*s, *n)))
+        .collect();
+    let count = |sql: &str| -> Result<i64> { Ok(conn.query_row(sql, [project_id], |r| r.get(0))?) };
+    Ok(PurgeSummary {
+        tasks_by_state,
+        deps: count(
+            "SELECT COUNT(*) FROM deps
+             WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?1)
+                OR depends_on IN (SELECT id FROM tasks WHERE project_id = ?1)",
+        )?,
+        sessions: count(
+            "SELECT COUNT(*) FROM sessions
+             WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?1)",
+        )?,
+        events: count(
+            "SELECT COUNT(*) FROM events
+             WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?1)",
+        )?,
+    })
 }
 
 pub(crate) fn log_event(
@@ -1345,6 +1451,136 @@ mod tests {
             // the refusal must not have touched the project
             assert!(s.project(p.id).is_ok());
         }
+    }
+
+    /// Purge scope: the target project's tasks, their sessions and events,
+    /// and every dependency edge touching them — including edges from another
+    /// project's tasks, which would otherwise dangle — while the other
+    /// project's own rows survive untouched.
+    #[test]
+    fn purge_project_removes_the_project_and_everything_it_owns() {
+        let mut s = Store::open_in_memory().unwrap();
+        let keep = s.create_project("keep", "/tmp/keep").unwrap();
+        let purge = s.create_project("purge", "/tmp/purge").unwrap();
+
+        let kept = task_in_state(&mut s, keep.id, TaskState::Ready);
+        let doomed_done = task_in_state(&mut s, purge.id, TaskState::Done);
+        let doomed_stalled = task_in_state(&mut s, purge.id, TaskState::Stalled);
+        // a manually-started running task has no open session, so it purges
+        let doomed_running = task_in_state(&mut s, purge.id, TaskState::Running);
+        // edges crossing the project boundary in both directions
+        s.add_dep(kept, doomed_done, DepKind::Related).unwrap();
+        s.add_dep(doomed_stalled, kept, DepKind::DiscoveredFrom)
+            .unwrap();
+
+        let kept_events = format!("{:?}", s.events_for(kept).unwrap());
+        let kept_task = format!("{:?}", s.task(kept).unwrap());
+
+        let removed = s.purge_project(purge.id).unwrap();
+        assert_eq!(removed.tasks(), 3);
+        assert_eq!(removed.deps, 2);
+        assert_eq!(removed.sessions, 1);
+        assert!(removed.events > 0);
+
+        assert!(matches!(
+            s.project(purge.id),
+            Err(Error::ProjectNotFound(_))
+        ));
+        for id in [doomed_done, doomed_stalled, doomed_running] {
+            assert!(matches!(s.task(id), Err(Error::TaskNotFound(_))));
+        }
+        let orphans = |table: &str, column: &str| -> i64 {
+            s.conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table}
+                         WHERE {column} NOT IN (SELECT id FROM tasks)"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(orphans("events", "task_id"), 0);
+        assert_eq!(orphans("sessions", "task_id"), 0);
+        assert_eq!(orphans("deps", "task_id"), 0);
+        assert_eq!(orphans("deps", "depends_on"), 0);
+
+        // the kept project's rows are exactly what they were
+        assert!(s.project(keep.id).is_ok());
+        assert_eq!(format!("{:?}", s.task(kept).unwrap()), kept_task);
+        assert_eq!(format!("{:?}", s.events_for(kept).unwrap()), kept_events);
+    }
+
+    #[test]
+    fn purge_project_removes_an_empty_project() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("empty", "/tmp/empty").unwrap();
+        let removed = s.purge_project(p.id).unwrap();
+        assert!(removed.tasks_by_state.is_empty());
+        assert!(matches!(s.project(p.id), Err(Error::ProjectNotFound(_))));
+    }
+
+    #[test]
+    fn purge_project_rejects_unknown_id() {
+        let mut s = Store::open_in_memory().unwrap();
+        assert!(matches!(
+            s.purge_project(999),
+            Err(Error::ProjectNotFound(999))
+        ));
+        assert!(matches!(
+            s.purge_preview(999),
+            Err(Error::ProjectNotFound(999))
+        ));
+    }
+
+    #[test]
+    fn purge_project_refuses_a_running_task_with_an_open_session() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("proj", "/tmp/proj").unwrap();
+        let id = task_in_state(&mut s, p.id, TaskState::Ready);
+        s.record_dispatch(id, "claude", Some(1), None).unwrap();
+
+        let err = s.purge_project(p.id).unwrap_err();
+        assert!(
+            matches!(err, Error::ProjectHasOpenSessions { id, count } if id == p.id && count == 1),
+            "expected ProjectHasOpenSessions, got {err}"
+        );
+        // the refusal must not have touched anything
+        assert!(s.project(p.id).is_ok());
+        assert!(s.task(id).is_ok());
+        assert_eq!(s.sessions_for(id).unwrap().len(), 1);
+    }
+
+    /// The preview counts what a purge would remove without removing it, in
+    /// `TaskState::ALL` order with zero-count states omitted.
+    #[test]
+    fn purge_preview_counts_without_deleting() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("proj", "/tmp/proj").unwrap();
+        let done = task_in_state(&mut s, p.id, TaskState::Done);
+        task_in_state(&mut s, p.id, TaskState::Done);
+        task_in_state(&mut s, p.id, TaskState::Proposed);
+        let stalled = task_in_state(&mut s, p.id, TaskState::Stalled);
+        s.add_dep(stalled, done, DepKind::Related).unwrap();
+
+        let preview = s.purge_preview(p.id).unwrap();
+        assert_eq!(
+            preview.tasks_by_state,
+            vec![
+                (TaskState::Proposed, 1),
+                (TaskState::Stalled, 1),
+                (TaskState::Done, 2),
+            ]
+        );
+        assert_eq!(preview.tasks(), 4);
+        assert_eq!(preview.deps, 1);
+        assert_eq!(preview.sessions, 1);
+        assert!(preview.events > 0);
+
+        assert!(s.project(p.id).is_ok());
+        assert!(s.task(done).is_ok());
+        assert_eq!(s.purge_project(p.id).unwrap(), preview);
     }
 
     /// A database created at schema version 1 (state still named 'backlog')
