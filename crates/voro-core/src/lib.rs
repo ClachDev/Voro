@@ -8,6 +8,7 @@ mod error;
 mod import;
 mod model;
 mod pr;
+mod rebase;
 pub mod scheduler;
 mod store;
 mod transition;
@@ -24,6 +25,7 @@ pub use model::{
     RunningRow, Session, SessionOutcome, Task, TaskState,
 };
 pub use pr::{PrPlan, PrRef, format_review_feedback, plan_pr};
+pub use rebase::{RebasePlan, plan_rebase};
 pub use scheduler::{Candidate, ScoreBreakdown, StateCounts};
 pub use store::{NewTask, Store, TaskEdit};
 pub use transition::{Action, Triage};

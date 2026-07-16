@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use voro_core::{
     Action, AgentsConfig, DepKind, NewTask, PrRef, Priority, Project, ReviewAction, ReviewMedium,
-    Store, Task, TaskEdit, TaskState, Triage, scheduler,
+    Store, Task, TaskEdit, TaskState, Triage, plan_rebase, scheduler,
 };
 
 use crate::dispatch::{self, DispatchCtx};
@@ -137,6 +137,14 @@ transitions
                                   review | waiting → running; TEXT is the
                                   feedback, or --from-pr pulls the tracked PR's
                                   review comments as the feedback (TEXT appended)
+  rebase <task-id> [--yes]        review → running for a branch that now
+                                  conflicts with the moved base: pull the base
+                                  branch in the project checkout (never the
+                                  task's worktree), then continue the task's
+                                  agent session with canned feedback telling it
+                                  to rebase in its worktree, resolve the
+                                  conflicts, and re-report with `voro done`
+                                  (--yes skips the confirmation)
   wait <task-id>                  review → waiting; hand the work off to an
                                   external party (a PR awaiting someone else's
                                   review or merge) — out of the queue until it
@@ -218,6 +226,15 @@ enum Verb {
         yes: bool,
     },
     Reject(RejectArgs),
+    /// The conflict-resolution continuation (DESIGN.md §6/§8): pull the base
+    /// branch in the project checkout, then send the review task back to its
+    /// agent session through the reject-with-feedback path with a generated
+    /// body saying the branch now conflicts with the moved base.
+    Rebase {
+        task_id: i64,
+        #[arg(long)]
+        yes: bool,
+    },
     Done(DoneArgs),
     Answer(AnswerArgs),
     Import(ImportArgs),
@@ -463,6 +480,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Viewer { cmd } => viewer_verb(cmd, ctx),
         Verb::Pr { task_id, yes } => pr_verb(store, task_id, yes, ctx),
         Verb::Reject(args) => reject_verb(store, args, ctx),
+        Verb::Rebase { task_id, yes } => rebase_verb(store, task_id, yes, ctx),
         Verb::Done(args) => done_verb(store, args),
         Verb::Answer(args) => answer_verb(store, args, ctx),
         Verb::Import(args) => import_verb(store, args),
@@ -922,6 +940,50 @@ fn reject_verb(store: &mut Store, args: RejectArgs, ctx: &DispatchCtx) -> Result
         return Ok(out);
     }
     match dispatch::continue_dispatch(store, ctx, id, None, Some(&feedback)) {
+        Ok(summary) => Ok(format!("{out}; {summary}")),
+        Err(e) => Err(format!(
+            "{out}, but continuation dispatch failed: {e} — retry with 'voro continue {id}'"
+        )),
+    }
+}
+
+/// `rebase <task-id> [--yes]` (DESIGN.md §6/§8): the conflict-resolution
+/// continuation for a review task whose branch no longer merges cleanly with
+/// the moved base. Asserts eligibility first (`voro_core::plan_rebase`, so a
+/// task missing state or branch fails naming the gap), confirms before
+/// touching anything, updates the base branch in the primary checkout, and
+/// then rides the same reject-with-feedback path as `reject` — `RejectWork`
+/// with the generated feedback, continued into the same agent session. Like
+/// `reject`, a task with no session history takes the plain transition; the
+/// operator resolves the conflicts by hand from `running`.
+fn rebase_verb(store: &mut Store, id: i64, yes: bool, ctx: &DispatchCtx) -> Result<String, String> {
+    let task = store.task(id).map_err(|e| e.to_string())?;
+    let project = store.project(task.project_id).map_err(|e| e.to_string())?;
+    let base = dispatch::default_base_branch(&project.path);
+    let plan = plan_rebase(&task, &base).map_err(|e| e.to_string())?;
+    if !yes
+        && !confirm(&format!(
+            "pull `{base}` in {} and continue #{id}'s session to resolve conflicts on `{}`?",
+            project.path, plan.branch
+        ))?
+    {
+        return Ok(format!("cancelled — task {id} stays in review"));
+    }
+    let update_note = crate::rebase::update_base(&project.path, &base, &ctx.launch_log_path())?;
+    let has_history = !store
+        .sessions_for(id)
+        .map_err(|e| e.to_string())?
+        .is_empty();
+
+    let task = store
+        .apply(id, Action::RejectWork(plan.feedback.clone()))
+        .map_err(|e| e.to_string())?;
+    let out = format!("{update_note}\ntask {} -> {}", task.id, task.state);
+
+    if !has_history {
+        return Ok(out);
+    }
+    match dispatch::continue_dispatch(store, ctx, id, None, Some(&plan.feedback)) {
         Ok(summary) => Ok(format!("{out}; {summary}")),
         Err(e) => Err(format!(
             "{out}, but continuation dispatch failed: {e} — retry with 'voro continue {id}'"
@@ -2978,5 +3040,168 @@ mod tests {
         assert_eq!(store.sessions_for(id).unwrap().len(), 1, "no continuation");
 
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+
+    // --- rebase (DESIGN.md §6/§8: the conflict-resolution continuation) ---
+
+    #[test]
+    fn rebase_refusals_name_the_gap_and_move_nothing() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "A task", "--state", "ready"]);
+        // not in review yet
+        let e = err(&mut s, &["rebase", "1", "--yes"]);
+        assert!(e.contains("review"), "{e}");
+
+        // in review, but no branch recorded
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["done", "1"]);
+        let e = err(&mut s, &["rebase", "1", "--yes"]);
+        assert!(e.contains("no branch"), "{e}");
+        assert_eq!(s.task(1).unwrap().state, TaskState::Review);
+
+        // a human task is refused before anything runs (§6)
+        ok(
+            &mut s,
+            &["add", "demo", "Hands-on", "--state", "ready", "--human"],
+        );
+        let e = err(&mut s, &["rebase", "2", "--yes"]);
+        assert!(e.contains("human-only"), "{e}");
+    }
+
+    fn fixture_git(dir: &std::path::Path, args: &[&str]) {
+        use std::process::{Command, Stdio};
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    fn rev(dir: &std::path::Path, what: &str) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", what])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "rev-parse {what} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Acceptance (task #111): from a review task with a branch and a session
+    /// on record, one verb updates the base in the primary checkout, moves the
+    /// task `review → running` through the transition API, and continues the
+    /// agent session with the conflict feedback.
+    #[test]
+    fn rebase_updates_the_base_requeues_and_continues_the_session() {
+        let root = std::env::temp_dir().join(format!(
+            "voro-cli-rebase-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // A bare origin seeded with one commit, the project checkout cloned
+        // from it, and the base moved on origin afterwards — the exact "main
+        // moved while the task sat in review" shape.
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        let checkout = root.join("project");
+        std::fs::create_dir_all(&origin).unwrap();
+        fixture_git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        std::fs::create_dir_all(&seed).unwrap();
+        fixture_git(&seed, &["init", "-q", "-b", "main"]);
+        fixture_git(&seed, &["config", "user.email", "t@example.com"]);
+        fixture_git(&seed, &["config", "user.name", "t"]);
+        std::fs::write(seed.join("a.txt"), "one\n").unwrap();
+        fixture_git(&seed, &["add", "."]);
+        fixture_git(&seed, &["commit", "-q", "-m", "one"]);
+        fixture_git(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        fixture_git(&seed, &["push", "-q", "origin", "main"]);
+        fixture_git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(seed.join("a.txt"), "two\n").unwrap();
+        fixture_git(&seed, &["commit", "-qam", "two"]);
+        fixture_git(&seed, &["push", "-q", "origin", "main"]);
+
+        let db_path = root.join("voro.db");
+        let agents_path = root.join("voro.toml");
+        std::fs::write(
+            &agents_path,
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n",
+        )
+        .unwrap();
+        let mut s = Store::open(&db_path).unwrap();
+        let ctx = DispatchCtx {
+            db_path,
+            agents_path,
+            runtime_dir: root.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
+        };
+        let call = |s: &mut Store, args: &[&str]| {
+            run(s, args.iter().map(|x| x.to_string()).collect(), &ctx)
+        };
+
+        call(
+            &mut s,
+            &["project", "add", "demo", checkout.to_str().unwrap()],
+        )
+        .unwrap();
+        call(&mut s, &["add", "demo", "T", "--state", "ready"]).unwrap();
+        call(&mut s, &["dispatch", "1"]).unwrap();
+        call(
+            &mut s,
+            &["done", "1", "--branch", "feat/x", "--summary", "did it"],
+        )
+        .unwrap();
+        assert_eq!(s.task(1).unwrap().state, TaskState::Review);
+        let base_before = rev(&checkout, "main");
+
+        let out = call(&mut s, &["rebase", "1", "--yes"]).unwrap();
+        assert!(out.contains("updated `main`"), "{out}");
+        assert!(out.contains("task 1 -> running"), "{out}");
+        assert!(out.contains("continued task 1"), "{out}");
+
+        // the base advanced in the primary checkout
+        assert_ne!(rev(&checkout, "main"), base_before);
+        // the transition API recorded the feedback and its events
+        let task = s.task(1).unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert!(task.body.contains("merge conflicts"), "{}", task.body);
+        assert!(
+            s.events_for(1)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "feedback"),
+            "a feedback event must be logged"
+        );
+        // the original session plus the continuation's
+        assert_eq!(s.sessions_for(1).unwrap().len(), 2);
+        // the continuation prompt carries the conflict feedback
+        let prompts = prompt_files(&ctx);
+        assert!(
+            prompts.iter().any(|p| std::fs::read_to_string(p)
+                .unwrap()
+                .contains("merge conflicts")),
+            "the continuation prompt must carry the conflict feedback"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -99,6 +99,15 @@ pub enum Mode {
         branch: String,
         title: String,
     },
+    /// Confirming the conflict-resolution continuation (DESIGN.md §6/§8): pull
+    /// the base branch in the project checkout, then send the review task back
+    /// to its agent session through the reject-with-feedback path with the
+    /// canned conflict body. Confirming runs the same steps as `voro rebase`.
+    ConfirmRebase {
+        task_id: i64,
+        branch: String,
+        base: String,
+    },
     Detail {
         task_id: i64,
         scroll: u16,
@@ -557,6 +566,11 @@ impl App {
                 branch,
                 title,
             } => self.key_confirm_pr(key, task_id, branch, title),
+            Mode::ConfirmRebase {
+                task_id,
+                branch,
+                base,
+            } => self.key_confirm_rebase(key, task_id, branch, base),
             Mode::Detail { task_id, scroll } => self.key_detail(key, task_id, scroll),
             Mode::AgentPicker {
                 task_id,
@@ -678,8 +692,96 @@ impl App {
             KeyCode::Char('a') => self.jump_into_session(),
             KeyCode::Char('l') => self.view_session_log(),
             KeyCode::Char('w') => self.hand_off_selected(),
+            KeyCode::Char('R') => self.rebase_selected(),
             _ => {}
         }
+    }
+
+    /// The conflict-resolution key (DESIGN.md §6/§8): `R` on a review row opens
+    /// a confirmation modal to pull the base branch and continue the task's
+    /// session with the canned conflict feedback — the TUI spelling of `voro
+    /// rebase`. An ineligible selection (state, missing branch, human) reports
+    /// why via the status line, like the other action keys.
+    fn rebase_selected(&mut self) {
+        let Some(task) = self.selected_task().cloned() else {
+            return;
+        };
+        let project = match self.store.project(task.project_id) {
+            Ok(project) => project,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        let base = crate::dispatch::default_base_branch(&project.path);
+        match voro_core::plan_rebase(&task, &base) {
+            Ok(plan) => {
+                self.mode = Mode::ConfirmRebase {
+                    task_id: task.id,
+                    branch: plan.branch,
+                    base,
+                }
+            }
+            Err(e) => self.status = Some(e.to_string()),
+        }
+    }
+
+    /// Drive the conflict-resolution confirmation modal (DESIGN.md §6/§8).
+    /// Enter (or `y`) updates the base branch in the primary checkout and, only
+    /// once that succeeds, applies the reject-with-feedback transition whose
+    /// continuation reuses the task's session — the same steps as `voro
+    /// rebase`. Esc (or `n`) cancels without touching anything.
+    fn key_confirm_rebase(&mut self, key: KeyEvent, task_id: i64, branch: String, base: String) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.run_rebase(task_id, &base);
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.status = Some(format!("cancelled — task {task_id} stays in review"));
+            }
+            _ => {
+                self.mode = Mode::ConfirmRebase {
+                    task_id,
+                    branch,
+                    base,
+                };
+            }
+        }
+    }
+
+    /// The confirmed half of the rebase action. The plan is re-derived at
+    /// confirm time, so a task that changed under the modal still meets the
+    /// precondition when the action actually runs; a git failure surfaces and
+    /// stops the action with the task untouched in `review`.
+    fn run_rebase(&mut self, task_id: i64, base: &str) {
+        let task = match self.store.task(task_id) {
+            Ok(task) => task,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        let project = match self.store.project(task.project_id) {
+            Ok(project) => project,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        let plan = match voro_core::plan_rebase(&task, base) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        if let Err(e) =
+            crate::rebase::update_base(&project.path, base, &self.dispatch_ctx.launch_log_path())
+        {
+            self.status = Some(e);
+            return;
+        }
+        self.apply_and_refresh(task_id, Action::RejectWork(plan.feedback));
     }
 
     /// Hand a review task off to an external party (DESIGN.md §6): `w` on a
@@ -746,6 +848,14 @@ impl App {
     pub fn selected_can_hand_off(&self) -> bool {
         self.selected_task()
             .is_some_and(|t| t.state == TaskState::Review)
+    }
+
+    /// Whether the selection can take the conflict-resolution continuation
+    /// (DESIGN.md §6/§8) — an agent-executed review task carrying a branch —
+    /// which gates the `R` key's key-line hint.
+    pub fn selected_can_rebase(&self) -> bool {
+        self.selected_task()
+            .is_some_and(|t| t.state == TaskState::Review && t.branch.is_some() && !t.human)
     }
 
     /// Begin creating a task in one of the two flows (DESIGN.md §9): straight
@@ -2657,6 +2767,63 @@ mod tests {
             } => assert!(buffer.is_empty(), "buffer was {buffer:?}"),
             _ => panic!("expected an empty reject prompt"),
         }
+    }
+
+    // --- the rebase key (DESIGN.md §6/§8: the conflict-resolution continuation) ---
+
+    #[test]
+    fn rebase_key_on_a_non_review_task_reports_why() {
+        let mut app = app_with(&[TaskState::Ready]);
+        key(&mut app, KeyCode::Char('R'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("review"),
+            "{:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn rebase_key_on_a_branchless_review_task_reports_and_does_not_open() {
+        let mut app = app_with(&[TaskState::Review]);
+        assert!(!app.selected_can_rebase());
+        key(&mut app, KeyCode::Char('R'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("no branch"),
+            "{:?}",
+            app.status
+        );
+        assert_eq!(app.store.task(1).unwrap().state, TaskState::Review);
+    }
+
+    #[test]
+    fn rebase_key_opens_the_confirm_modal_and_esc_cancels() {
+        let mut app = app_with(&[TaskState::Review]);
+        app.store.set_branch(1, Some("feat/x")).unwrap();
+        app.refresh().unwrap();
+        assert!(app.selected_can_rebase());
+
+        key(&mut app, KeyCode::Char('R'));
+        match &app.mode {
+            Mode::ConfirmRebase {
+                task_id, branch, ..
+            } => {
+                assert_eq!(*task_id, 1);
+                assert_eq!(branch, "feat/x");
+            }
+            _ => panic!("expected the rebase confirmation modal"),
+        }
+
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("cancelled"),
+            "{:?}",
+            app.status
+        );
+        // cancelling touched nothing
+        assert_eq!(app.store.task(1).unwrap().state, TaskState::Review);
     }
 
     /// `D` shares the same readiness precondition as `d`.

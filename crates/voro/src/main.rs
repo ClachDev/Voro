@@ -4,6 +4,7 @@ mod dispatch;
 mod editor;
 mod import;
 mod pr;
+mod rebase;
 mod reconcile;
 mod ui;
 mod worktree;

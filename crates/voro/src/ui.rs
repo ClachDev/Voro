@@ -156,6 +156,36 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             );
             frame.render_widget(para, area);
         }
+        Mode::ConfirmRebase {
+            task_id,
+            branch,
+            base,
+        } => {
+            let lines = vec![
+                Line::from(vec![
+                    Span::raw("pull "),
+                    Span::styled(format!("`{base}`"), Style::new().fg(Color::Green)),
+                    Span::raw(" into the project checkout"),
+                ]),
+                Line::from(vec![
+                    Span::raw("continue the task's session to rebase "),
+                    Span::styled(format!("`{branch}`"), Style::new().fg(Color::Blue)),
+                    Span::raw(" and resolve its conflicts"),
+                ]),
+                Line::default(),
+                Line::from(Span::styled(
+                    "⏎/y confirm · esc/n cancel",
+                    Style::new().dim(),
+                )),
+            ];
+            let area = popup_area(frame, 72, lines.len() as u16 + 2);
+            let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("Resolve conflicts on #{task_id}?")),
+            );
+            frame.render_widget(para, area);
+        }
         Mode::Detail { task_id, scroll } => {
             let Some(row) = app.all.iter().find(|r| r.task.id == *task_id) else {
                 return;
@@ -953,6 +983,9 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             if app.selected_can_hand_off() {
                 pairs.push(("w", "wait"));
             }
+            if app.selected_can_rebase() {
+                pairs.push(("R", "rebase"));
+            }
             pairs.push(("n", "new"));
             pairs.push(("N", "plan"));
             pairs.push(("e", "edit"));
@@ -968,6 +1001,9 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             }
             if app.selected_can_hand_off() {
                 pairs.push(("w", "wait"));
+            }
+            if app.selected_can_rebase() {
+                pairs.push(("R", "rebase"));
             }
             pairs.push(("s", "state"));
             pairs.push(("n", "new"));

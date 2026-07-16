@@ -797,7 +797,7 @@ fn guard_clean_tree(path: &str) -> Result<(), String> {
 /// task branch against (DESIGN.md §8). Read from `refs/remotes/origin/HEAD`,
 /// whose `--short` form is `origin/<branch>`; the remote prefix is dropped. A
 /// checkout with no origin or no symbolic HEAD falls back to `main`.
-fn default_base_branch(project_path: &str) -> String {
+pub(crate) fn default_base_branch(project_path: &str) -> String {
     let output = Command::new("git")
         .arg("-C")
         .arg(project_path)
