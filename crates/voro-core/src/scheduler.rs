@@ -114,7 +114,8 @@ fn state_rank(state: TaskState) -> u8 {
 
 impl Store {
     /// Scheduler input: every task in a scored state, joined with its
-    /// project, excluding weight-0 (parked) projects entirely (§7).
+    /// project, excluding weight-0 (parked) and archived projects entirely
+    /// (§5/§7).
     pub fn candidates(&self) -> Result<Vec<Candidate>> {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.project_id, t.title, t.body, t.priority, t.state, t.agent,
@@ -122,7 +123,7 @@ impl Store {
                     t.human, p.name, p.weight,
                     julianday('now') - julianday(t.state_since)
              FROM tasks t JOIN projects p ON p.id = t.project_id
-             WHERE p.weight > 0
+             WHERE p.weight > 0 AND p.archived = 0
                AND t.state IN ('ready','needs-input','review','stalled','proposed')",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -155,19 +156,19 @@ impl Store {
         Ok(score(weight, priority, state, age_days))
     }
 
-    /// Count of untriaged tasks. Parked (weight-0) projects are hidden
-    /// here too.
+    /// Count of untriaged tasks. Parked (weight-0) and archived projects are
+    /// hidden here too.
     pub fn proposed_count(&self) -> Result<i64> {
         Ok(self.state_counts()?.proposed)
     }
 
     /// Task counts by state for the header indicator (DESIGN.md §12), so a
     /// backlog stays felt even when a low-scoring row falls past the queue's
-    /// cap (§7). Parked (weight-0) projects are excluded.
+    /// cap (§7). Parked (weight-0) and archived projects are excluded.
     pub fn state_counts(&self) -> Result<StateCounts> {
         let mut stmt = self.conn.prepare(
             "SELECT t.state, COUNT(*) FROM tasks t JOIN projects p ON p.id = t.project_id
-             WHERE p.weight > 0 GROUP BY t.state",
+             WHERE p.weight > 0 AND p.archived = 0 GROUP BY t.state",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, TaskState>(0)?, r.get::<_, i64>(1)?)))?;
         let mut counts = StateCounts::default();
@@ -577,6 +578,48 @@ mod tests {
         assert_eq!(ids, vec![visible]);
         assert_eq!(focus(&candidates).unwrap().task.id, visible);
         assert_eq!(s.proposed_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn archived_projects_are_hidden_from_queue_focus_and_counts() {
+        // An archived project leaves the cockpit with all its tasks, whatever
+        // their state (DESIGN.md §5); unarchiving restores the exact
+        // pre-archive view, since nothing about the tasks was touched.
+        let mut s = setup();
+        let retiring = add_project(&mut s, "retiring", 5);
+        let active = add_project(&mut s, "active", 1);
+
+        let question = add_task(&mut s, retiring, "question", Priority::P0);
+        to_needs_input(&mut s, question);
+        let ready = add_task(&mut s, retiring, "ready", Priority::P0);
+        let idea = add_proposed(&mut s, retiring, "idea", Priority::P2);
+        let done = add_task(&mut s, retiring, "done", Priority::P2);
+        s.apply(done, crate::Action::Start).unwrap();
+        s.apply(done, crate::Action::Complete(None)).unwrap();
+        s.apply(done, crate::Action::Accept).unwrap();
+        let visible = add_task(&mut s, active, "visible", Priority::P3);
+
+        let before = s.candidates().unwrap();
+        let before_ids: Vec<i64> = queue(&before).iter().map(|c| c.task.id).collect();
+        assert_eq!(before_ids, vec![question, ready, idea, visible]);
+
+        s.set_archived(retiring, true).unwrap();
+        let candidates = s.candidates().unwrap();
+        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
+        assert_eq!(ids, vec![visible]);
+        assert_eq!(focus(&candidates).unwrap().task.id, visible);
+        let counts = s.state_counts().unwrap();
+        assert_eq!(counts.needs_input, 0);
+        assert_eq!(counts.ready, 1);
+        assert_eq!(counts.done, 0);
+        assert_eq!(s.proposed_count().unwrap(), 0);
+
+        // Unarchive: everything is back exactly as before.
+        s.set_archived(retiring, false).unwrap();
+        let restored = s.candidates().unwrap();
+        let restored_ids: Vec<i64> = queue(&restored).iter().map(|c| c.task.id).collect();
+        assert_eq!(restored_ids, before_ids);
+        assert_eq!(s.state_counts().unwrap().done, 1);
     }
 
     #[test]

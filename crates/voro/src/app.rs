@@ -1139,8 +1139,9 @@ impl App {
     /// The projects screen's local keys (DESIGN.md §9). `0`–`5` sets the
     /// selected project's weight; `r` opens the AddProject form pre-filled to
     /// rename/re-path, `a` opens it blank, `d` deletes behind the store's own
-    /// guard (only projects with no tasks), `v` picks the review action.
-    /// Movement and screen switching are handled by `key_normal`.
+    /// guard (only projects with no tasks), `v` picks the review action, `A`
+    /// toggles archived (DESIGN.md §5). Movement and screen switching are
+    /// handled by `key_normal`.
     fn key_projects(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c @ '0'..='5') => {
@@ -1184,6 +1185,19 @@ impl App {
                 if let Some(project) = self.projects.get(self.projects_sel) {
                     let (id, current) = (project.id, project.review_action.clone());
                     self.open_review_action_picker(id, current);
+                }
+            }
+            KeyCode::Char('A') => {
+                if let Some(project) = self.projects.get(self.projects_sel) {
+                    let (id, name, to) = (project.id, project.name.clone(), !project.archived);
+                    let result = self.store.set_archived(id, to).and_then(|_| self.refresh());
+                    if self.report(result).is_some() {
+                        self.status = Some(if to {
+                            format!("'{name}' archived — hidden from the cockpit with its tasks")
+                        } else {
+                            format!("'{name}' unarchived — its tasks are back as they were")
+                        });
+                    }
                 }
             }
             _ => {}
@@ -2052,6 +2066,31 @@ mod tests {
             }
             _ => panic!("a on the projects screen should open a blank AddProject form"),
         }
+    }
+
+    /// `A` on the projects screen toggles archived (DESIGN.md §5): the
+    /// project's tasks leave the queue and counts wholesale, states untouched,
+    /// and toggle back exactly as they were.
+    #[test]
+    fn projects_screen_archive_toggles_and_the_cockpit_empties() {
+        let mut app = app_with(&[TaskState::Ready, TaskState::NeedsInput]);
+        let project_id = app.projects[0].id;
+        assert_eq!(app.queue.len(), 2);
+        key(&mut app, KeyCode::Char('3'));
+
+        key(&mut app, KeyCode::Char('A'));
+        assert!(app.store.project(project_id).unwrap().archived);
+        assert!(app.projects[0].archived);
+        assert!(app.queue.is_empty());
+        assert_eq!(app.counts.ready, 0);
+        assert_eq!(app.counts.needs_input, 0);
+        // the tasks froze rather than transitioned
+        assert_eq!(app.all[0].task.state, TaskState::NeedsInput);
+
+        key(&mut app, KeyCode::Char('A'));
+        assert!(!app.store.project(project_id).unwrap().archived);
+        assert_eq!(app.queue.len(), 2);
+        assert_eq!(app.counts.needs_input, 1);
     }
 
     #[test]

@@ -357,7 +357,9 @@ fn draw_cockpit(frame: &mut Frame, app: &App) {
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![Span::styled("voro", Style::new().bold()), Span::raw("  ")];
-    for p in &app.projects {
+    // Archived projects have left the cockpit (DESIGN.md §5); the projects
+    // screen is where they remain visible.
+    for p in app.projects.iter().filter(|p| !p.archived) {
         let style = if p.weight == 0 {
             Style::new().dim()
         } else {
@@ -856,6 +858,8 @@ fn blocker_spans(row: &TaskRow) -> Vec<Span<'static>> {
 /// The projects screen (DESIGN.md §9): one row per project — weight, name,
 /// path, open task count, and the review action when one is pinned (§8). The
 /// open count is the project's non-terminal tasks, from the loaded task list.
+/// An archived project stays on this screen, dim and tagged, so it can be
+/// found and unarchived (§5).
 fn draw_projects(frame: &mut Frame, app: &App) {
     let [list_area, status] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
@@ -869,7 +873,7 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                 .iter()
                 .filter(|r| r.task.project_id == p.id && !r.task.state.is_terminal())
                 .count();
-            let style = if p.weight == 0 {
+            let style = if p.weight == 0 || p.archived {
                 Style::new().dim()
             } else {
                 Style::new()
@@ -878,9 +882,10 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                 voro_core::ReviewAction::Auto => String::new(),
                 other => format!("  [{other}]"),
             };
+            let archived = if p.archived { "  [archived]" } else { "" };
             ListItem::new(Line::from(Span::styled(
                 format!(
-                    "{:>2}  {:14} {:28} {} open{action}",
+                    "{:>2}  {:14} {:28} {} open{action}{archived}",
                     p.weight, p.name, p.path, open
                 ),
                 style,
@@ -981,6 +986,7 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("0-5", "weight"),
             ("r", "rename"),
             ("a", "add"),
+            ("A", "archive"),
             ("d", "delete"),
             ("v", "review action"),
             ("tab", "cockpit"),

@@ -20,6 +20,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0008_add_stalled_state.sql"),
     include_str!("../migrations/0009_add_review_action.sql"),
     include_str!("../migrations/0010_add_waiting_state.sql"),
+    include_str!("../migrations/0011_add_archived.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -142,7 +143,7 @@ impl Store {
     pub fn project(&self, id: i64) -> Result<Project> {
         self.conn
             .query_row(
-                "SELECT id, name, path, weight, review_action FROM projects WHERE id = ?1",
+                &format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"),
                 [id],
                 project_from_row,
             )
@@ -151,9 +152,9 @@ impl Store {
     }
 
     pub fn projects(&self) -> Result<Vec<Project>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, name, path, weight, review_action FROM projects ORDER BY name")?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM projects ORDER BY name"
+        ))?;
         let rows = stmt.query_map([], project_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -182,6 +183,27 @@ impl Store {
         if changed == 0 {
             return Err(Error::ProjectNotFound(project_id));
         }
+        self.project(project_id)
+    }
+
+    /// Archive or unarchive a project (DESIGN.md §5). Archiving hides the
+    /// project and all of its tasks from the cockpit views; the tasks
+    /// themselves are not touched — no state change, no event — so unarchiving
+    /// restores the pre-archive view exactly. Refuses a no-op so a typo'd
+    /// second archive is heard rather than silently absorbed.
+    pub fn set_archived(&mut self, project_id: i64, archived: bool) -> Result<Project> {
+        let project = self.project(project_id)?;
+        if project.archived == archived {
+            return Err(Error::Invalid(format!(
+                "project '{}' is {} archived",
+                project.name,
+                if archived { "already" } else { "not" }
+            )));
+        }
+        self.conn.execute(
+            "UPDATE projects SET archived = ?1 WHERE id = ?2",
+            params![archived, project_id],
+        )?;
         self.project(project_id)
     }
 
@@ -248,6 +270,12 @@ impl Store {
                  selects a dispatch agent, and no agent can execute the task"
                     .into(),
             ));
+        }
+        // An archived project accepts no new work through any door — `add`,
+        // `propose`, and import all create through here (DESIGN.md §5).
+        let project = self.project(new.project_id)?;
+        if project.archived {
+            return Err(Error::ProjectArchived { name: project.name });
         }
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -603,6 +631,7 @@ impl Store {
     /// appear. A hand-started task with no session shows with `session_id`/
     /// `agent` `NULL`. The one-open-session invariant (§8) bounds the join to one
     /// row per task; elapsed is computed in SQL so the TUI only formats it.
+    /// Archived projects leave the cockpit entirely (§5), the strip included.
     pub fn running_rows(&self) -> Result<Vec<RunningRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id AS session_id, t.id, t.title, t.state, s.agent,
@@ -610,8 +639,9 @@ impl Store {
                     CAST(strftime('%s', 'now')
                          - strftime('%s', COALESCE(s.started_at, t.state_since)) AS INTEGER)
              FROM tasks t
+             JOIN projects p ON p.id = t.project_id
              LEFT JOIN sessions s ON s.task_id = t.id AND s.ended_at IS NULL
-             WHERE t.state = 'running'
+             WHERE t.state = 'running' AND p.archived = 0
              ORDER BY (s.id IS NULL), s.id DESC, t.id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -726,6 +756,8 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     })
 }
 
+pub(crate) const PROJECT_COLUMNS: &str = "id, name, path, weight, review_action, archived";
+
 fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
         id: row.get(0)?,
@@ -733,6 +765,7 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         path: row.get(2)?,
         weight: row.get(3)?,
         review_action: row.get(4)?,
+        archived: row.get(5)?,
     })
 }
 
@@ -1345,6 +1378,141 @@ mod tests {
             // the refusal must not have touched the project
             assert!(s.project(p.id).is_ok());
         }
+    }
+
+    // --- archiving a project (DESIGN.md §5) ---
+
+    #[test]
+    fn set_archived_round_trips_and_refuses_noops() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("retiring", "/tmp/retiring").unwrap();
+        assert!(!p.archived);
+
+        let archived = s.set_archived(p.id, true).unwrap();
+        assert!(archived.archived);
+        assert!(s.projects().unwrap()[0].archived);
+
+        // a second archive is heard, not absorbed
+        let err = s.set_archived(p.id, true).unwrap_err();
+        assert!(err.to_string().contains("already archived"), "{err}");
+
+        let restored = s.set_archived(p.id, false).unwrap();
+        assert!(!restored.archived);
+        let err = s.set_archived(p.id, false).unwrap_err();
+        assert!(err.to_string().contains("not archived"), "{err}");
+
+        assert!(matches!(
+            s.set_archived(999, true),
+            Err(Error::ProjectNotFound(999))
+        ));
+    }
+
+    #[test]
+    fn create_task_refuses_an_archived_project() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("retired", "/tmp/retired").unwrap();
+        s.set_archived(p.id, true).unwrap();
+
+        // every creation door — add, propose, import — routes through here
+        for state in [TaskState::Proposed, TaskState::Parked, TaskState::Ready] {
+            let err = s
+                .create_task(NewTask {
+                    project_id: p.id,
+                    title: "too late".into(),
+                    body: String::new(),
+                    priority: Priority::P2,
+                    state,
+                    agent: None,
+                    human: false,
+                })
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::ProjectArchived { name } if name == "retired"),
+                "{state}: {err}"
+            );
+        }
+        assert!(s.tasks().unwrap().is_empty());
+
+        s.set_archived(p.id, false).unwrap();
+        assert!(
+            s.create_task(NewTask {
+                project_id: p.id,
+                title: "welcome back".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn archive_freezes_task_states_and_history_and_unarchive_restores_them() {
+        // Archiving transitions nothing: every task keeps its state, question,
+        // and event log, so unarchiving restores the pre-archive view exactly.
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("retiring", "/tmp/retiring").unwrap();
+        let tasks: Vec<i64> = TaskState::ALL
+            .iter()
+            .map(|state| task_in_state(&mut s, p.id, *state))
+            .collect();
+        let before: Vec<Task> = tasks.iter().map(|id| s.task(*id).unwrap()).collect();
+        let events_before: Vec<usize> = tasks
+            .iter()
+            .map(|id| s.events_for(*id).unwrap().len())
+            .collect();
+
+        s.set_archived(p.id, true).unwrap();
+        let frozen: Vec<Task> = tasks.iter().map(|id| s.task(*id).unwrap()).collect();
+        assert_eq!(frozen, before);
+
+        s.set_archived(p.id, false).unwrap();
+        let after: Vec<Task> = tasks.iter().map(|id| s.task(*id).unwrap()).collect();
+        assert_eq!(after, before);
+        let events_after: Vec<usize> = tasks
+            .iter()
+            .map(|id| s.events_for(*id).unwrap().len())
+            .collect();
+        assert_eq!(events_after, events_before);
+    }
+
+    #[test]
+    fn running_rows_exclude_archived_projects() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("retiring", "/tmp/retiring").unwrap();
+        let id = task_in_state(&mut s, p.id, TaskState::Running);
+        assert_eq!(s.running_rows().unwrap().len(), 1);
+
+        // archiving hides the strip row; the task itself stays running
+        s.set_archived(p.id, true).unwrap();
+        assert!(s.running_rows().unwrap().is_empty());
+        assert_eq!(s.task(id).unwrap().state, TaskState::Running);
+
+        s.set_archived(p.id, false).unwrap();
+        assert_eq!(s.running_rows().unwrap()[0].task_id, id);
+    }
+
+    /// A database from before migration 0011 must open with every existing
+    /// project active (`archived = 0`), and the CHECK must reject junk.
+    #[test]
+    fn migration_0011_defaults_existing_projects_to_active() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..10] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 10).unwrap();
+        conn.execute("INSERT INTO projects (name, path) VALUES ('p', '/tmp')", [])
+            .unwrap();
+
+        let store = Store::from_connection(conn).unwrap();
+        assert!(!store.project(1).unwrap().archived);
+
+        let junk = store
+            .conn
+            .execute("UPDATE projects SET archived = 2 WHERE id = 1", []);
+        assert!(junk.is_err(), "the CHECK must reject values outside 0/1");
     }
 
     /// A database created at schema version 1 (state still named 'backlog')
