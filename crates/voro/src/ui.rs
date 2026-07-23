@@ -434,6 +434,17 @@ fn incomplete_report_span() -> Span<'static> {
     )
 }
 
+/// The stale-branch marker (DESIGN.md §8): a review task whose tracked PR
+/// reports a merge conflict, probed on demand for the selected task. Purely
+/// informational — it flags that the branch needs resolving before it can
+/// merge — the same shout as `[incomplete report]`.
+fn conflict_span() -> Span<'static> {
+    Span::styled(
+        "  [branch conflicts]",
+        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )
+}
+
 /// The human-only flag (task #100) rendered as a row marker. A property of the
 /// task rather than an anomaly, so it stays dim where the warning flags shout.
 fn human_span() -> Span<'static> {
@@ -659,6 +670,14 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(pr) = &task.pr_url {
         lines.push(Line::from(pr_span(pr)));
+        // A review branch that no longer merges with the base (DESIGN.md §8):
+        // the on-demand probe for this selection, shown beside its PR link.
+        if app
+            .conflict_selected
+            .is_some_and(|(cid, conflicts)| cid == task.id && conflicts)
+        {
+            lines.push(Line::from(conflict_span()));
+        }
     } else if app.incomplete_report.contains(&task.id) {
         // A review task missing a branch or summary: `pr` would fail, so say
         // what is needed rather than the optimistic "next: pr".

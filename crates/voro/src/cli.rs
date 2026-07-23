@@ -1007,6 +1007,21 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
         )
         .unwrap();
     }
+    // The stale-branch marker (DESIGN.md §8): one on-demand `gh` probe of the
+    // tracked PR's mergeability, only for a review task that has one. Purely
+    // informational — a CONFLICTING verdict flags that the branch needs
+    // resolving before it can merge; MERGEABLE, UNKNOWN, and a missing `gh`
+    // all show nothing.
+    if task.state == TaskState::Review
+        && task.pr_url.is_some()
+        && crate::pr::conflict_status(store, id).conflicts()
+    {
+        writeln!(
+            out,
+            "conflicts: branch no longer merges with the base — resolve before merging"
+        )
+        .unwrap();
+    }
     let deps = store.deps_of(id).map_err(|e| e.to_string())?;
     for dep in &deps {
         // `deps(task_id, depends_on, 'blocks')` means this task is blocked

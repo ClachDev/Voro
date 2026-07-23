@@ -58,6 +58,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut terminal = ratatui::init();
     let result = loop {
+        // Probe the selected review task's PR mergeability before drawing — a
+        // no-op unless the selection moved, so the one `gh` call fires on demand
+        // (DESIGN.md §8) rather than per frame or per row.
+        app.probe_selected_conflict();
         if let Err(e) = terminal.draw(|frame| ui::draw(frame, &app)) {
             break Err(e.into());
         }
