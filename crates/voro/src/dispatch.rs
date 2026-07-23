@@ -233,6 +233,11 @@ pub struct DispatchCtx {
     /// agent that defines a `sessions` verb, before giving up (the ref stays
     /// NULL and the summary says so). Zero means a single attempt.
     pub ref_capture_timeout: Duration,
+    /// The `VORO_TASK_ID` a dispatched session runs under, if any — the default
+    /// discovered-from source for `propose`. Read from the environment only at
+    /// the real `main` entry point so the CLI never reaches for ambient session
+    /// state itself; tests leave it `None` and stay hermetic.
+    pub session_task_id: Option<String>,
 }
 
 impl DispatchCtx {
@@ -249,6 +254,7 @@ impl DispatchCtx {
             agents_path: AgentsConfig::default_path(),
             runtime_dir,
             ref_capture_timeout: Duration::from_secs(5),
+            session_task_id: None,
         }
     }
 
@@ -750,6 +756,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: Duration::ZERO,
+            session_task_id: None,
         };
         (store, ctx, project)
     }
@@ -1130,6 +1137,7 @@ mod tests {
         // give the stub time to write the line before capture's single poll
         let ctx = DispatchCtx {
             ref_capture_timeout: Duration::from_secs(3),
+            session_task_id: None,
             ..ctx
         };
         let summary = dispatch(&mut store, &ctx, id, None).unwrap();

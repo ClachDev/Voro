@@ -427,7 +427,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Project { cmd } => project_verb(store, cmd),
         Verb::Weight { project, weight } => weight_verb(store, &project, weight),
         Verb::Add(args) => add_verb(store, args),
-        Verb::Propose(args) => propose_verb(store, args, std::env::var("VORO_TASK_ID").ok()),
+        Verb::Propose(args) => propose_verb(store, args, ctx.session_task_id.clone()),
         Verb::Set(args) => set_verb(store, args),
         Verb::Show { task_id } => show_verb(store, task_id),
         Verb::List(args) => list_verb(store, &args),
@@ -1364,6 +1364,7 @@ mod tests {
             agents_path: agents_path.clone(),
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            session_task_id: None,
         };
         let mut s = store();
         let call = |s: &mut Store, args: &[&str]| {
@@ -1904,6 +1905,44 @@ mod tests {
     }
 
     #[test]
+    fn run_sources_propose_default_from_ctx_not_ambient_env() {
+        // `run` must take propose's discovered-from default from the dispatch
+        // context, never by reading VORO_TASK_ID itself — otherwise the test
+        // suite becomes non-deterministic when run inside a dispatched session.
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Source", "--state", "ready"]);
+
+        let mut session_ctx = ctx();
+        session_ctx.session_task_id = Some("1".into());
+        run(
+            &mut s,
+            ["propose", "demo", "Follow-up"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            &session_ctx,
+        )
+        .unwrap();
+        assert!(ok(&mut s, &["show", "2"]).contains("dep: discovered-from 1"));
+
+        // With no session task in the context, propose links nothing — proving
+        // the plumbing ignores whatever VORO_TASK_ID the environment carries.
+        let mut none_ctx = ctx();
+        none_ctx.session_task_id = None;
+        run(
+            &mut s,
+            ["propose", "demo", "Orphan"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            &none_ctx,
+        )
+        .unwrap();
+        assert!(s.deps_of(3).unwrap().is_empty());
+    }
+
+    #[test]
     fn propose_rejects_an_unknown_source_without_creating() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
@@ -2315,6 +2354,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            session_task_id: None,
         }
     }
 
@@ -2772,6 +2812,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            session_task_id: None,
         };
         ok(
             &mut store,
@@ -2851,6 +2892,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            session_task_id: None,
         };
         (store, ctx, project)
     }

@@ -38,7 +38,8 @@ fn split_db(args: Vec<String>) -> (PathBuf, Vec<String>) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (path, verb_args) = split_db(std::env::args().skip(1).collect());
     let mut store = Store::open(&path)?;
-    let ctx = dispatch::DispatchCtx::from_db_path(&path);
+    let mut ctx = dispatch::DispatchCtx::from_db_path(&path);
+    ctx.session_task_id = std::env::var("VORO_TASK_ID").ok();
 
     if !verb_args.is_empty() {
         match cli::run(&mut store, verb_args, &ctx) {

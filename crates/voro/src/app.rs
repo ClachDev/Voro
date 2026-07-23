@@ -1635,6 +1635,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            session_task_id: None,
         };
         (store, ctx, project_path)
     }
@@ -1686,6 +1687,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            session_task_id: None,
         };
         let project = store
             .create_project("demo", project_path.to_str().unwrap())
@@ -2699,6 +2701,7 @@ mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            session_task_id: None,
         };
         app
     }
