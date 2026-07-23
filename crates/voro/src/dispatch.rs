@@ -63,18 +63,25 @@ const BRANCH_REGISTER_SENTENCE: &str = "register it with `voro set {task_id}{db}
      tracks the real branch while the task runs";
 
 /// The `{branch}` block for a task that carries an intended git branch (task
-/// #81): the agent is told the name, to check it out itself, to register it
-/// early via [`BRANCH_REGISTER_SENTENCE`], and to confirm it at completion.
+/// #81): the agent is told the name, to do its work in a throwaway worktree on
+/// it (never the primary checkout), to register it early via
+/// [`BRANCH_REGISTER_SENTENCE`], and to confirm it at completion.
 const ASSIGNED_BRANCH_TEMPLATE: &str = "\n\n\
-This task is assigned the git branch `{name}`. Create or check it out yourself
-before making changes — Voro runs no git — and {register}. Confirm the branch your
-work landed on with `voro done {task_id}{db} --branch {name}`.";
+This task is assigned the git branch `{name}`. You are spawned in the project
+checkout — never modify it. Create a throwaway git worktree of the checkout on
+this branch (e.g. `git worktree add <path> -b {name}`) and do all your work
+inside that worktree — Voro runs no git, so the branch and its worktree are yours
+to make — and {register}. Confirm the branch your work landed on with
+`voro done {task_id}{db} --branch {name}`.";
 
 /// The `{branch}` block when no branch is assigned: the agent picks its own name
 /// and must still register it early via [`BRANCH_REGISTER_SENTENCE`], so Voro
 /// learns the branch while the task runs rather than only at `done`.
 const UNASSIGNED_BRANCH_TEMPLATE: &str = "\n\n\
-Pick a git branch for this work, create or check it out — Voro runs no git — and
+Pick a git branch for this work. You are spawned in the project checkout — never
+modify it. Create a throwaway git worktree of the checkout on that branch (e.g.
+`git worktree add <path> -b <branch>`) and do all your work inside that worktree
+— Voro runs no git, so the branch and its worktree are yours to make — and
 {register}; `<name>` is the name you choose.";
 
 /// Rendered per planning session (DESIGN.md §8) and written as the whole
@@ -172,7 +179,8 @@ pub struct PlanLaunch {
 /// session row is recorded and no task state changes — the session's
 /// deliverable is a `proposed` task the agent creates through `voro add`, so
 /// one that exits without creating anything has simply done nothing. There is
-/// deliberately no dirty-tree guard: planning writes nothing to the tree.
+/// deliberately no dispatch-style guard: planning only reads the checkout and
+/// writes nothing to it.
 pub fn plan_session(
     store: &Store,
     ctx: &DispatchCtx,
@@ -219,7 +227,7 @@ pub struct DispatchCtx {
     /// The config-file location dispatch reads (`voro.toml`).
     pub agents_path: PathBuf,
     /// Directory for prompt and log files — never inside a project checkout,
-    /// so writing the prompt does not itself dirty the tree.
+    /// so prompt and log files do not pollute the operator's working copy.
     pub runtime_dir: PathBuf,
     /// How long to keep polling for a session reference after spawning an
     /// agent that defines a `sessions` verb, before giving up (the ref stays
@@ -651,11 +659,14 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Refuse to dispatch into a checkout with uncommitted changes (the v1 guard,
-/// DESIGN.md §8 and §11): the agent's work must land on a clean base so its
-/// diff is reviewable. A path that is not a git repository can't be verified
-/// as clean, so it is refused for the same reason. The error names the path.
-fn guard_clean_tree(path: &str) -> Result<(), String> {
+/// Refuse to dispatch into a path that is not a git repository (DESIGN.md §8):
+/// the dispatched agent does its work in a git worktree of the checkout, which a
+/// non-repo cannot provide, and Voro's on-close cleanup resolves worktrees
+/// through git. A path where `git status` cannot run or fails is refused, and
+/// the error names the path. The working tree's cleanliness is not inspected:
+/// `git worktree add` snapshots HEAD, so the operator's uncommitted changes
+/// never enter the agent's diff.
+fn guard_git_repo(path: &str) -> Result<(), String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
@@ -666,15 +677,10 @@ fn guard_clean_tree(path: &str) -> Result<(), String> {
         let detail = String::from_utf8_lossy(&output.stderr);
         let detail = detail.trim();
         return Err(if detail.is_empty() {
-            format!("cannot verify {path} is clean: git status failed")
+            format!("cannot verify {path} is a git repository: git status failed")
         } else {
-            format!("cannot verify {path} is clean: {detail}")
+            format!("cannot verify {path} is a git repository: {detail}")
         });
-    }
-    if !output.stdout.is_empty() {
-        return Err(format!(
-            "{path} has uncommitted changes; commit or stash before dispatching"
-        ));
     }
     Ok(())
 }
@@ -872,12 +878,22 @@ mod tests {
         assert!(plain.contains("voro set 62 --branch <name>"), "{plain}");
         assert!(!plain.contains("voro done 62 --branch"), "{plain}");
         assert!(plain.contains("Voro runs no git"), "{plain}");
+        // and the mandatory worktree instruction: work in a throwaway worktree,
+        // never in the primary checkout.
+        assert!(plain.contains("git worktree add"), "{plain}");
+        assert!(plain.contains("never\nmodify it"), "{plain}");
 
         // with a branch: the agent is told to use it, register it, and confirm
         // it at completion.
         let branched = render_preamble(62, &Store::default_db_path(), Some("feat/parser"));
         assert!(branched.contains("git branch `feat/parser`"), "{branched}");
         assert!(branched.contains("Voro runs no git"), "{branched}");
+        // the worktree instruction carries the assigned branch name.
+        assert!(
+            branched.contains("git worktree add <path> -b feat/parser"),
+            "{branched}"
+        );
+        assert!(branched.contains("never modify it"), "{branched}");
         assert!(
             branched.contains("voro set 62 --branch feat/parser"),
             "{branched}"
@@ -965,13 +981,29 @@ mod tests {
     }
 
     #[test]
-    fn dirty_tree_is_refused_naming_the_path() {
+    fn a_dirty_checkout_dispatches() {
+        // The dispatched agent works in a throwaway worktree that snapshots
+        // HEAD, so uncommitted changes in the primary checkout do not block
+        // dispatch: it proceeds and records the session.
         let (mut store, ctx, project) = fixture("cat {prompt_file}");
         let id = ready_task(&mut store, &project);
         std::fs::write(project.join("scratch.txt"), "uncommitted").unwrap();
 
+        let summary = dispatch(&mut store, &ctx, id, None).unwrap();
+        assert!(summary.contains("dispatched task"), "{summary}");
+        assert_eq!(store.task(id).unwrap().state, TaskState::Running);
+        assert_eq!(store.sessions_for(id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_non_git_path_is_refused_naming_the_path() {
+        // A path that is not a git repository is refused, with the path in the
+        // error.
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let id = ready_task(&mut store, &project);
+        std::fs::remove_dir_all(project.join(".git")).unwrap();
+
         let err = dispatch(&mut store, &ctx, id, None).unwrap_err();
-        assert!(err.contains("uncommitted"), "{err}");
         assert!(err.contains(project.to_str().unwrap()), "{err}");
         // nothing was dispatched
         assert_eq!(store.task(id).unwrap().state, TaskState::Ready);
@@ -1427,7 +1459,7 @@ mod tests {
         let p = store
             .create_project("proj", project.to_str().unwrap())
             .unwrap();
-        // planning writes nothing to the tree, so a dirty checkout is fine
+        // a dirty checkout is fine for planning
         std::fs::write(project.join("scratch.txt"), "uncommitted").unwrap();
 
         let launch = plan_session(&store, &ctx, p.id).unwrap();
