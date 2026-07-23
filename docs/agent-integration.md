@@ -144,6 +144,18 @@ conversation, and then runs `voro resume` (or presses Enter on the inbox row) to
 move the task back to `running`. Voro never records the answer text — the
 exchange lives in the session transcript (DESIGN.md §6/§8).
 
+The same jump-in resolves a **stale review branch**. A task can sit in `review`
+while other work merges, leaving its branch in conflict with the moved base
+(Voro surfaces this as the `[branch conflicts]` marker, DESIGN.md §8). Rather
+than have Voro rebase on the operator's behalf, the operator attaches to the
+task's still-open agent session and asks it to fix the branch. The dispatch
+preamble already tells the agent how: if its branch conflicts with the base, it
+runs `git fetch origin <base>` from inside its own worktree and rebases or merges
+onto `origin/<base>` there. Fetching only updates remote-tracking refs and
+touches no working tree — including the primary checkout — so it leaves the trust
+model intact: a dispatched agent still cannot push. The task never leaves
+`review`; the PR simply updates.
+
 Every verb degrades gracefully when absent: no `attach`/`resume` disables the
 jump-in key for that agent, no `sessions` keeps pid-liveness reconciliation, no
 `plan` turns the TUI's planning key into a status line saying what to configure.

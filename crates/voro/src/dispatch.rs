@@ -62,27 +62,39 @@ bypass the state machine and event log.{branch}
 const BRANCH_REGISTER_SENTENCE: &str = "register it with `voro set {task_id}{db} --branch {name}` as you do, so Voro \
      tracks the real branch while the task runs";
 
+/// Shared by both branch blocks so the stale-branch instruction cannot drift:
+/// if the base moved while the task sat in review, the agent resolves the
+/// conflict itself, inside its own worktree, touching neither the primary
+/// checkout nor the remote. Fetching only updates remote-tracking refs, so it
+/// leaves the trust model — dispatched agents cannot push — intact (DESIGN.md §8).
+const BRANCH_REBASE_SENTENCE: &str = "If the branch conflicts with the project's base branch (typically because the \
+     base moved while the task sat in review), run `git fetch origin <base>` from \
+     inside the worktree and rebase or merge onto `origin/<base>`, resolving the \
+     conflicts there — never modify the primary checkout, and never push.";
+
 /// The `{branch}` block for a task that carries an intended git branch (task
 /// #81): the agent is told the name, to do its work in a throwaway worktree on
 /// it (never the primary checkout), to register it early via
-/// [`BRANCH_REGISTER_SENTENCE`], and to confirm it at completion.
+/// [`BRANCH_REGISTER_SENTENCE`], to confirm it at completion, and to self-serve
+/// a rebase onto a moved base via [`BRANCH_REBASE_SENTENCE`].
 const ASSIGNED_BRANCH_TEMPLATE: &str = "\n\n\
 This task is assigned the git branch `{name}`. You are spawned in the project
 checkout — never modify it. Create a throwaway git worktree of the checkout on
 this branch (e.g. `git worktree add <path> -b {name}`) and do all your work
 inside that worktree — Voro runs no git, so the branch and its worktree are yours
 to make — and {register}. Confirm the branch your work landed on with
-`voro done {task_id}{db} --branch {name}`.";
+`voro done {task_id}{db} --branch {name}`. {rebase}";
 
 /// The `{branch}` block when no branch is assigned: the agent picks its own name
 /// and must still register it early via [`BRANCH_REGISTER_SENTENCE`], so Voro
-/// learns the branch while the task runs rather than only at `done`.
+/// learns the branch while the task runs rather than only at `done`, and
+/// self-serve a rebase onto a moved base via [`BRANCH_REBASE_SENTENCE`].
 const UNASSIGNED_BRANCH_TEMPLATE: &str = "\n\n\
 Pick a git branch for this work. You are spawned in the project checkout — never
 modify it. Create a throwaway git worktree of the checkout on that branch (e.g.
 `git worktree add <path> -b <branch>`) and do all your work inside that worktree
 — Voro runs no git, so the branch and its worktree are yours to make — and
-{register}; `<name>` is the name you choose.";
+{register}; `<name>` is the name you choose. {rebase}";
 
 /// Rendered per planning session (DESIGN.md §8) and written as the whole
 /// prompt — unlike dispatch there is no task body to prepend it to, because
@@ -138,8 +150,11 @@ fn render_preamble(task_id: i64, db_path: &Path, branch: Option<&str>) -> String
     let branch_block = match branch {
         Some(name) => ASSIGNED_BRANCH_TEMPLATE
             .replace("{register}", &register)
+            .replace("{rebase}", BRANCH_REBASE_SENTENCE)
             .replace("{name}", name),
-        None => UNASSIGNED_BRANCH_TEMPLATE.replace("{register}", &register),
+        None => UNASSIGNED_BRANCH_TEMPLATE
+            .replace("{register}", &register)
+            .replace("{rebase}", BRANCH_REBASE_SENTENCE),
     };
     RETURN_PATH_PREAMBLE_TEMPLATE
         .replace("{branch}", &branch_block)
@@ -889,12 +904,20 @@ mod tests {
         // never in the primary checkout.
         assert!(plain.contains("git worktree add"), "{plain}");
         assert!(plain.contains("never\nmodify it"), "{plain}");
+        // stale-branch self-serve: fetch the base and rebase onto it, no push.
+        assert!(plain.contains("git fetch origin <base>"), "{plain}");
+        assert!(plain.contains("origin/<base>"), "{plain}");
+        assert!(plain.contains("never push"), "{plain}");
 
         // with a branch: the agent is told to use it, register it, and confirm
         // it at completion.
         let branched = render_preamble(62, &Store::default_db_path(), Some("feat/parser"));
         assert!(branched.contains("git branch `feat/parser`"), "{branched}");
         assert!(branched.contains("Voro runs no git"), "{branched}");
+        // the assigned case carries the same stale-branch self-serve instruction.
+        assert!(branched.contains("git fetch origin <base>"), "{branched}");
+        assert!(branched.contains("origin/<base>"), "{branched}");
+        assert!(branched.contains("never push"), "{branched}");
         // the worktree instruction carries the assigned branch name.
         assert!(
             branched.contains("git worktree add <path> -b feat/parser"),
