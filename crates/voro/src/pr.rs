@@ -7,7 +7,10 @@
 
 use std::process::{Command, Stdio};
 
-use voro_core::{PrPlan, PrRef, Project, ReviewMedium, Store, format_review_feedback, plan_pr};
+use voro_core::{
+    Mergeability, PrPlan, PrRef, Project, ReviewMedium, Store, format_review_feedback,
+    parse_mergeable, plan_pr,
+};
 
 /// Resolve a task's tracked PR, erroring with a fix-it hint when none is set.
 fn tracked_pr(store: &Store, task_id: i64) -> Result<PrRef, String> {
@@ -80,6 +83,35 @@ pub fn create(store: &mut Store, task_id: i64) -> Result<String, String> {
         .set_pr(task_id, Some(&pr.url))
         .map_err(|e| e.to_string())?;
     Ok(format!("opened {} for task {task_id}", pr.url))
+}
+
+/// Ask GitHub whether a review task's tracked PR still merges cleanly with its
+/// base (DESIGN.md §8) — a purely informational signal that the branch has gone
+/// stale. One `gh pr view <url> --json mergeable` call for the one task, run
+/// on demand from `voro show` and the TUI detail pane, never per rendered row.
+/// The URL carries the host, so an enterprise instance is reached without
+/// `--hostname`. A task with no tracked PR, an unparseable URL, or any `gh`
+/// failure (missing, unauthenticated, network) degrades to
+/// [`Mergeability::Unknown`]: no signal, so the marker shows only on a definite
+/// `CONFLICTING`. The verdict itself is decided by `voro_core::parse_mergeable`.
+pub fn conflict_status(store: &Store, task_id: i64) -> Mergeability {
+    let Ok(task) = store.task(task_id) else {
+        return Mergeability::Unknown;
+    };
+    let Some(url) = task.pr_url.as_deref() else {
+        return Mergeability::Unknown;
+    };
+    let Ok(pr) = PrRef::parse(url) else {
+        return Mergeability::Unknown;
+    };
+    let output = Command::new("gh")
+        .args(["pr", "view", &pr.url, "--json", "mergeable"])
+        .stdin(Stdio::null())
+        .output();
+    match output {
+        Ok(o) if o.status.success() => parse_mergeable(&String::from_utf8_lossy(&o.stdout)),
+        _ => Mergeability::Unknown,
+    }
 }
 
 /// Resolve a project's review medium (DESIGN.md §8). The decision is

@@ -109,6 +109,54 @@ fn parse_number(raw: &str) -> Result<u64> {
         .map_err(|_| Error::Invalid(format!("'{raw}' is not a PR number")))
 }
 
+/// GitHub's mergeability verdict for a tracked PR (`gh pr view --json
+/// mergeable`, DESIGN.md §8): whether a review task's branch still merges
+/// cleanly with its base. Read fresh and never stored — the same
+/// rendered-not-stored shape as the incomplete-report flag — it is what turns a
+/// `CONFLICTING` PR into the informational `[branch conflicts]` marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mergeability {
+    /// The branch merges cleanly into its base — no marker.
+    Mergeable,
+    /// The branch conflicts with the moved base — surface the marker so the
+    /// operator knows to resolve it before merging.
+    Conflicting,
+    /// GitHub has not finished computing it, or gave no usable answer — no
+    /// signal. Never treated as a conflict.
+    Unknown,
+}
+
+impl Mergeability {
+    /// Whether to surface the conflict marker. Only a definite `Conflicting`
+    /// verdict does; `Mergeable` and `Unknown` show nothing, so a PR GitHub is
+    /// still recomputing never flickers a false conflict.
+    pub fn conflicts(self) -> bool {
+        matches!(self, Mergeability::Conflicting)
+    }
+}
+
+/// Read GitHub's mergeability verdict out of `gh pr view --json mergeable`
+/// output (`{"mergeable":"CONFLICTING"}`). Only the two definite verdicts map
+/// to themselves; anything else — `UNKNOWN`, a missing field, malformed JSON,
+/// or the empty string a missing or unauthenticated `gh` leaves behind —
+/// degrades to [`Mergeability::Unknown`], so no signal is ever mistaken for a
+/// conflict. Pure of I/O; the `gh` call lives in the `voro` crate.
+pub fn parse_mergeable(json: &str) -> Mergeability {
+    #[derive(Deserialize)]
+    struct View {
+        #[serde(default)]
+        mergeable: String,
+    }
+    match serde_json::from_str::<View>(json) {
+        Ok(view) => match view.mergeable.as_str() {
+            "MERGEABLE" => Mergeability::Mergeable,
+            "CONFLICTING" => Mergeability::Conflicting,
+            _ => Mergeability::Unknown,
+        },
+        Err(_) => Mergeability::Unknown,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct GhUser {
     #[serde(default)]
@@ -347,6 +395,43 @@ mod tests {
     fn rejects_malformed_json() {
         assert!(format_review_feedback(&pr(), "not json", "[]").is_err());
         assert!(format_review_feedback(&pr(), "[]", "not json").is_err());
+    }
+
+    // --- parse_mergeable (DESIGN.md §8: detecting a stale review branch) ---
+
+    #[test]
+    fn conflicting_is_the_only_verdict_that_marks() {
+        assert_eq!(
+            parse_mergeable(r#"{"mergeable":"CONFLICTING"}"#),
+            Mergeability::Conflicting
+        );
+        assert!(parse_mergeable(r#"{"mergeable":"CONFLICTING"}"#).conflicts());
+        assert_eq!(
+            parse_mergeable(r#"{"mergeable":"MERGEABLE"}"#),
+            Mergeability::Mergeable
+        );
+        assert!(!parse_mergeable(r#"{"mergeable":"MERGEABLE"}"#).conflicts());
+    }
+
+    #[test]
+    fn unknown_and_unusable_answers_give_no_signal() {
+        // GitHub still recomputing
+        assert_eq!(
+            parse_mergeable(r#"{"mergeable":"UNKNOWN"}"#),
+            Mergeability::Unknown
+        );
+        // an unexpected value, a missing field, malformed JSON, and the empty
+        // string a missing/unauthenticated `gh` leaves all read as no signal
+        for raw in [
+            r#"{"mergeable":"WHATEVER"}"#,
+            r#"{"mergeable":""}"#,
+            "{}",
+            "not json",
+            "",
+        ] {
+            assert_eq!(parse_mergeable(raw), Mergeability::Unknown, "{raw}");
+            assert!(!parse_mergeable(raw).conflicts(), "{raw}");
+        }
     }
 
     // --- plan_pr (DESIGN.md §8: opening a PR from a review task's summary) ---

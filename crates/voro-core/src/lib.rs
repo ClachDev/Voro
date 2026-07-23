@@ -23,7 +23,7 @@ pub use model::{
     Dep, DepKind, DepRef, Event, NextAction, Priority, Project, ReviewAction, ReviewMedium,
     RunningRow, Session, SessionOutcome, Task, TaskState,
 };
-pub use pr::{PrPlan, PrRef, format_review_feedback, plan_pr};
+pub use pr::{Mergeability, PrPlan, PrRef, format_review_feedback, parse_mergeable, plan_pr};
 pub use scheduler::{Candidate, ScoreBreakdown, StateCounts};
 pub use store::{NewTask, Store, TaskEdit};
 pub use transition::{Action, Triage};

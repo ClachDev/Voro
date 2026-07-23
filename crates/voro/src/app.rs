@@ -205,6 +205,13 @@ pub struct App {
     /// open session's agent and log — and what gates the `l` log key. Loaded per
     /// refresh like the dependency maps, so the render path never queries the store.
     pub last_sessions: std::collections::HashMap<i64, voro_core::Session>,
+    /// The stale-branch probe for the *currently selected* task (DESIGN.md §8):
+    /// its id and whether its tracked PR reports a merge conflict. Filled by one
+    /// on-demand `gh` call the moment the selection lands on a review task with
+    /// a PR, and held until the selection moves — never a per-row sweep, so the
+    /// queue stays unannotated and the network is touched at most once per
+    /// selection. Re-selecting the row picks up a fresh verdict.
+    pub conflict_selected: Option<(i64, bool)>,
 
     pub cockpit_rows: Vec<CockpitRow>,
     pub cockpit_sel: usize,
@@ -271,6 +278,7 @@ impl App {
             deps: std::collections::HashMap::new(),
             dependents: std::collections::HashMap::new(),
             last_sessions: std::collections::HashMap::new(),
+            conflict_selected: None,
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
             tasks_sel: 0,
@@ -390,6 +398,30 @@ impl App {
             Screen::Tasks => Some(self.all.get(self.tasks_sel)?.task.id),
             Screen::Projects => None,
         }
+    }
+
+    /// Probe the selected task's PR mergeability if it is a review task with a
+    /// tracked PR the current selection has not been probed for (DESIGN.md §8).
+    /// One `gh` call, on demand, cached against the selected id — so the detail
+    /// pane can render `[branch conflicts]` without the render path, the
+    /// queue, or a refresh ever touching the network. Called from the event
+    /// loop each tick; a no-op unless the selection landed somewhere new, which
+    /// is what makes re-selecting a row re-probe for a fresh verdict.
+    pub fn probe_selected_conflict(&mut self) {
+        let Some(id) = self.selected_task_id() else {
+            self.conflict_selected = None;
+            return;
+        };
+        if self.conflict_selected.is_some_and(|(cid, _)| cid == id) {
+            return;
+        }
+        let is_review_pr = self
+            .all
+            .iter()
+            .find(|r| r.task.id == id)
+            .is_some_and(|r| r.task.state == TaskState::Review && r.task.pr_url.is_some());
+        let conflicts = is_review_pr && crate::pr::conflict_status(&self.store, id).conflicts();
+        self.conflict_selected = Some((id, conflicts));
     }
 
     pub fn move_selection(&mut self, delta: i64) {
