@@ -37,15 +37,15 @@ editing that database yourself:
     voro ask {task_id}{db} --question \"...\"     # blocked on a human decision (-> needs-input)
     voro resume {task_id}{db}                     # question answered in this session, carry on (-> running)
     voro done {task_id}{db} --summary \"...\"      # work finished, await review (-> review)
-    voro propose <project> \"<title>\"{db} --body-file <path>   # file a follow-up task (-> proposed)
+    voro propose <project> \"<title>\"{db} --from {task_id} --body-file <path>   # file a follow-up task (-> proposed)
 
 Run these commands exactly as shown: they name task {task_id} explicitly, so they
 work from anywhere without any environment variable being set. After you `ask`,
 the operator answers right here in this session — so when your question has been
 answered, run `voro resume {task_id}` before continuing, to move the task back to
 running (Voro records no answer text; the exchange is already in this transcript).
-`propose` uses task {task_id} as the discovered-from source when `--from` is
-omitted. Finish
+The `--from {task_id}` on `propose` links each follow-up discovered-from this
+task; drop it for a proposal that stands on its own. Finish
 with your work committed on a branch and a PR-ready `--summary` on `done` — what
 changed, why, and how you verified it — since `voro pr` opens the pull request
 straight from that summary. Never modify the database with raw SQL, which would
@@ -233,11 +233,6 @@ pub struct DispatchCtx {
     /// agent that defines a `sessions` verb, before giving up (the ref stays
     /// NULL and the summary says so). Zero means a single attempt.
     pub ref_capture_timeout: Duration,
-    /// The `VORO_TASK_ID` a dispatched session runs under, if any — the default
-    /// discovered-from source for `propose`. Read from the environment only at
-    /// the real `main` entry point so the CLI never reaches for ambient session
-    /// state itself; tests leave it `None` and stay hermetic.
-    pub session_task_id: Option<String>,
 }
 
 impl DispatchCtx {
@@ -254,7 +249,6 @@ impl DispatchCtx {
             agents_path: AgentsConfig::default_path(),
             runtime_dir,
             ref_capture_timeout: Duration::from_secs(5),
-            session_task_id: None,
         }
     }
 
@@ -756,7 +750,6 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: Duration::ZERO,
-            session_task_id: None,
         };
         (store, ctx, project)
     }
@@ -832,7 +825,10 @@ mod tests {
         assert!(prompt.contains(&format!("voro ask {id}")), "{prompt}");
         assert!(prompt.contains(&format!("voro resume {id}")), "{prompt}");
         assert!(prompt.contains(&format!("voro done {id}")), "{prompt}");
+        // propose carries the literal --from so a mid-session proposal links
+        // back to this task without leaning on an inherited env var
         assert!(prompt.contains("voro propose"), "{prompt}");
+        assert!(prompt.contains(&format!("--from {id}")), "{prompt}");
         assert!(!prompt.contains("VORO_TASK_ID"), "{prompt}");
         // even with no assigned branch, the agent is told to register the branch
         // it picks (`voro set` and `--branch <name>` asserted apart, since a
@@ -1137,7 +1133,6 @@ mod tests {
         // give the stub time to write the line before capture's single poll
         let ctx = DispatchCtx {
             ref_capture_timeout: Duration::from_secs(3),
-            session_task_id: None,
             ..ctx
         };
         let summary = dispatch(&mut store, &ctx, id, None).unwrap();

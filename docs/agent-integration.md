@@ -32,7 +32,7 @@ points, run the matching command — Voro surfaces it in the operator's queue:
     voro ask "$VORO_TASK_ID" --question "Schema A or B? Trade-offs: ..."
     voro resume "$VORO_TASK_ID"
     voro done "$VORO_TASK_ID" --branch "$(git rev-parse --abbrev-ref HEAD)" --summary "Implemented X, tests pass"
-    voro propose <project> "Follow-up title" --body-file plan.md
+    voro propose <project> "Follow-up title" --from "$VORO_TASK_ID" --body-file plan.md
 
 - `ask` when you are blocked on a human decision and cannot proceed.
 - `resume` once that question is answered here in this session, to move the task
@@ -47,7 +47,9 @@ points, run the matching command — Voro surfaces it in the operator's queue:
   for a task that produced no code (planning, triage). If the task named an
   intended branch, you were told which one in the dispatch preamble — create or
   check it out yourself.
-- `propose` to record follow-up work you noticed; it links back to this task.
+- `propose` to record follow-up work you noticed; `--from "$VORO_TASK_ID"` links
+  it back to this task (`voro` reads no environment on its own — pass the id, as
+  every verb here does).
 
 `VORO_TASK_ID` and `VORO_DB` are already in your environment — do not set them.
 ```

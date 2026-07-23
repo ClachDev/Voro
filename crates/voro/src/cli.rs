@@ -55,8 +55,9 @@ tasks
                                   never dispatched, worked by hand, and its
                                   completion goes straight to done
   propose <project> <title> [--body TEXT | --body-file PATH] [--from TASK-ID]
-                                  create a proposed task; --from (default
-                                  $VORO_TASK_ID) links it discovered-from
+                                  create a proposed task; --from links it
+                                  discovered-from that task (dispatch renders
+                                  the flag with the running task's id)
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
       [--body TEXT | --body-file PATH] [--blocked-by IDS] [--blocks IDS]
       [--pr URL | --no-pr] [--branch NAME | --no-branch] [--human | --no-human]
@@ -427,7 +428,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Project { cmd } => project_verb(store, cmd),
         Verb::Weight { project, weight } => weight_verb(store, &project, weight),
         Verb::Add(args) => add_verb(store, args),
-        Verb::Propose(args) => propose_verb(store, args, ctx.session_task_id.clone()),
+        Verb::Propose(args) => propose_verb(store, args),
         Verb::Set(args) => set_verb(store, args),
         Verb::Show { task_id } => show_verb(store, task_id),
         Verb::List(args) => list_verb(store, &args),
@@ -747,27 +748,17 @@ fn add_verb(store: &mut Store, args: AddArgs) -> Result<String, String> {
 }
 
 /// The agent return-path form of `add` (DESIGN.md §8): always lands in
-/// `proposed`, and links the new task discovered-from its source — `--from`
-/// explicitly, or the `VORO_TASK_ID` a dispatched session runs under.
-fn propose_verb(
-    store: &mut Store,
-    args: ProposeArgs,
-    env_source: Option<String>,
-) -> Result<String, String> {
+/// `proposed`, and links the new task discovered-from the `--from` task when
+/// one is given. The source is only ever the explicit flag — `run` reads no
+/// ambient `VORO_TASK_ID`; a dispatched session gets the flag rendered into its
+/// preamble with the running task's id instead.
+fn propose_verb(store: &mut Store, args: ProposeArgs) -> Result<String, String> {
     if args.state.is_some() {
         return Err("propose always creates 'proposed' tasks — use 'add --state' instead".into());
     }
     let project = resolve_project(store, &args.project)?;
     let title = joined(&args.title, "title")?;
-    let source_id = match (args.from, env_source) {
-        (Some(id), _) => Some(id),
-        (None, Some(raw)) => Some(
-            raw.parse()
-                .map_err(|_| format!("'{raw}' is not a task id"))?,
-        ),
-        (None, None) => None,
-    };
-    let source = match source_id {
+    let source = match args.from {
         Some(id) => Some(store.task(id).map_err(|e| e.to_string())?),
         None => None,
     };
@@ -1379,7 +1370,6 @@ mod tests {
             agents_path: agents_path.clone(),
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            session_task_id: None,
         };
         let mut s = store();
         let call = |s: &mut Store, args: &[&str]| {
@@ -1847,20 +1837,20 @@ mod tests {
         assert!(e.contains("cycle"), "{e}");
     }
 
-    fn propose(store: &mut Store, args: &[&str], env: Option<&str>) -> Result<String, String> {
+    fn propose(store: &mut Store, args: &[&str]) -> Result<String, String> {
         let cli = Cli::try_parse_from(std::iter::once("voro").chain(args.iter().copied()))
             .map_err(|e| e.to_string())?;
         let Verb::Propose(parsed) = cli.verb else {
             panic!("{args:?} is not a propose invocation");
         };
-        propose_verb(store, parsed, env.map(str::to_string))
+        propose_verb(store, parsed)
     }
 
     #[test]
     fn propose_lands_proposed() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        let out = propose(&mut s, &["propose", "demo", "An idea"], None).unwrap();
+        let out = propose(&mut s, &["propose", "demo", "An idea"]).unwrap();
         assert!(out.contains("task 1 'An idea' proposed"), "{out}");
         assert!(ok(&mut s, &["show", "1"]).contains("#1 proposed"));
         assert!(s.deps_of(1).unwrap().is_empty());
@@ -1870,12 +1860,7 @@ mod tests {
     fn propose_cannot_specify_a_state() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        let e = propose(
-            &mut s,
-            &["propose", "demo", "An idea", "--state", "ready"],
-            None,
-        )
-        .unwrap_err();
+        let e = propose(&mut s, &["propose", "demo", "An idea", "--state", "ready"]).unwrap_err();
         assert!(e.contains("proposed"), "{e}");
         assert!(ok(&mut s, &["list"]).is_empty());
     }
@@ -1885,84 +1870,38 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "Source", "--state", "ready"]);
-        propose(
-            &mut s,
-            &["propose", "demo", "Follow-up", "--from", "1"],
-            None,
-        )
-        .unwrap();
+        propose(&mut s, &["propose", "demo", "Follow-up", "--from", "1"]).unwrap();
         assert!(ok(&mut s, &["show", "2"]).contains("dep: discovered-from 1"));
         assert!(ok(&mut s, &["show", "2"]).contains("#2 proposed"));
     }
 
     #[test]
-    fn propose_falls_back_to_the_dispatch_env_task() {
-        let mut s = store();
-        ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        ok(&mut s, &["add", "demo", "Source", "--state", "ready"]);
-        propose(&mut s, &["propose", "demo", "Follow-up"], Some("1")).unwrap();
-        assert!(ok(&mut s, &["show", "2"]).contains("dep: discovered-from 1"));
-    }
-
-    #[test]
-    fn propose_from_flag_wins_over_env() {
-        let mut s = store();
-        ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        ok(&mut s, &["add", "demo", "A", "--state", "ready"]);
-        ok(&mut s, &["add", "demo", "B", "--state", "ready"]);
-        propose(
-            &mut s,
-            &["propose", "demo", "Follow-up", "--from", "2"],
-            Some("1"),
-        )
-        .unwrap();
-        assert!(ok(&mut s, &["show", "3"]).contains("dep: discovered-from 2"));
-    }
-
-    #[test]
-    fn run_sources_propose_default_from_ctx_not_ambient_env() {
-        // `run` must take propose's discovered-from default from the dispatch
-        // context, never by reading VORO_TASK_ID itself — otherwise the test
-        // suite becomes non-deterministic when run inside a dispatched session.
+    fn run_propose_without_from_links_nothing() {
+        // `run` consults no environment: a bare `propose` never picks up an
+        // ambient VORO_TASK_ID, so the discovered-from link comes only from an
+        // explicit `--from`. This keeps the suite deterministic when it runs
+        // inside a dispatched session (which exports VORO_TASK_ID).
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "Source", "--state", "ready"]);
 
-        let mut session_ctx = ctx();
-        session_ctx.session_task_id = Some("1".into());
-        run(
-            &mut s,
-            ["propose", "demo", "Follow-up"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            &session_ctx,
-        )
-        .unwrap();
-        assert!(ok(&mut s, &["show", "2"]).contains("dep: discovered-from 1"));
-
-        // With no session task in the context, propose links nothing — proving
-        // the plumbing ignores whatever VORO_TASK_ID the environment carries.
-        let mut none_ctx = ctx();
-        none_ctx.session_task_id = None;
         run(
             &mut s,
             ["propose", "demo", "Orphan"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            &none_ctx,
+            &ctx(),
         )
         .unwrap();
-        assert!(s.deps_of(3).unwrap().is_empty());
+        assert!(s.deps_of(2).unwrap().is_empty());
     }
 
     #[test]
     fn propose_rejects_an_unknown_source_without_creating() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        propose(&mut s, &["propose", "demo", "Orphan", "--from", "99"], None).unwrap_err();
-        propose(&mut s, &["propose", "demo", "Orphan"], Some("nonsense")).unwrap_err();
+        propose(&mut s, &["propose", "demo", "Orphan", "--from", "99"]).unwrap_err();
         assert!(ok(&mut s, &["list"]).is_empty());
     }
 
@@ -2369,7 +2308,6 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            session_task_id: None,
         }
     }
 
@@ -2827,7 +2765,6 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            session_task_id: None,
         };
         ok(
             &mut store,
@@ -2907,7 +2844,6 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            session_task_id: None,
         };
         (store, ctx, project)
     }
