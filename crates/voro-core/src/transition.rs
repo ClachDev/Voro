@@ -32,8 +32,10 @@ pub enum Action {
     Start,
     /// running → needs-input; the string is the question
     Ask(String),
-    /// needs-input → running; the answer is appended to the body and logged
-    Answer(String),
+    /// needs-input → running; the question was answered in the agent's own
+    /// session, so this only moves the state — no answer text is recorded, the
+    /// exchange lives in the session transcript (DESIGN.md §6/§8).
+    Resume,
     /// running | stalled → review; the optional string is the completion
     /// summary, logged as a `summary` event. From `stalled` it reports a dead
     /// session's finished work on its behalf (DESIGN.md §8).
@@ -65,7 +67,7 @@ impl Action {
             Action::Triage(_) => "triage",
             Action::Start => "start",
             Action::Ask(_) => "ask",
-            Action::Answer(_) => "answer",
+            Action::Resume => "resume",
             Action::Complete(_) => "complete",
             Action::HandOff => "hand off",
             Action::Reclaim => "reclaim",
@@ -102,7 +104,7 @@ impl Store {
                 Action::Complete(None),
                 Action::Abort,
             ],
-            NeedsInput => vec![Action::Answer(String::new()), Action::Abandon],
+            NeedsInput => vec![Action::Resume, Action::Abandon],
             Review => vec![
                 Action::Accept,
                 Action::RejectWork(String::new()),
@@ -152,35 +154,6 @@ impl Store {
         Ok((self.task(task_id)?, self.session(session_id)?))
     }
 
-    /// Record a continuation session (DESIGN.md §6/§8): the answer to a
-    /// `needs-input` question is fed back not through a live pipe but by
-    /// dispatching a fresh session over the task body, now carrying the appended
-    /// `## Answers` section. Unlike [`record_dispatch`](Store::record_dispatch),
-    /// this asserts the task is *already* `running`, so it never weakens the
-    /// ready-only rule — it only adds a session to a task the transition API
-    /// already moved.
-    pub fn record_continuation(
-        &mut self,
-        task_id: i64,
-        agent: &str,
-        pid: Option<i64>,
-        log_path: Option<&str>,
-    ) -> Result<(Task, Session)> {
-        let tx = self.conn.transaction()?;
-        let task = get_task(&tx, task_id)?.ok_or(Error::TaskNotFound(task_id))?;
-        reject_human_dispatch(&tx, task_id)?;
-        reject_archived_dispatch(&tx, task_id)?;
-        if task.state != TaskState::Running {
-            return Err(Error::InvalidTransition {
-                from: task.state,
-                action: "continue".to_string(),
-            });
-        }
-        let session_id = insert_session(&tx, task_id, agent, pid, log_path)?;
-        tx.commit()?;
-        Ok((self.task(task_id)?, self.session(session_id)?))
-    }
-
     /// Reconcile an open session against its task's state (DESIGN.md §8). The
     /// session's life follows the task, not the process listing, so the terminal
     /// transitions close healthy sessions; reconciliation only catches a crash
@@ -197,8 +170,8 @@ impl Store {
     ///   dead session's behalf. A stalled task with an open blocker demotes to
     ///   `parked`.
     /// - `needs-input`/`review`/`waiting`: the session stays open on purpose
-    ///   (reused by the continuation), so this leaves it alone (`Ok(None)`)
-    ///   regardless of liveness.
+    ///   (the operator answers in it, or a reject returns the work to it), so
+    ///   this leaves it alone (`Ok(None)`) regardless of liveness.
     /// - task already closed or off the active path: the session is stale, so it
     ///   is finalised now (`completed` for `done`, else `aborted`) with no event.
     pub fn reconcile_session(
@@ -354,7 +327,7 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
             });
         }
         (Running, Action::Ask(_)) => NeedsInput,
-        (NeedsInput, Action::Answer(_)) => Running,
+        (NeedsInput, Action::Resume) => Running,
         // Completing a human task skips `review`: the human is both executor
         // and acceptor, so there is no one left to accept the work (§6).
         (Running | Stalled, Action::Complete(_)) if task.human => Done,
@@ -385,9 +358,6 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         Action::Ask(q) if q.trim().is_empty() => {
             return Err(Error::Invalid("a question is required".into()));
         }
-        Action::Answer(a) if a.trim().is_empty() => {
-            return Err(Error::Invalid("an answer is required".into()));
-        }
         Action::RejectWork(f) if f.trim().is_empty() => {
             return Err(Error::Invalid("rejection feedback is required".into()));
         }
@@ -412,10 +382,6 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
     )?;
 
     match &action {
-        Action::Answer(a) => {
-            append_section(tx, task_id, "Answers", a.trim())?;
-            log_event(tx, task_id, "answer", Some(a.trim()))?;
-        }
         Action::RejectWork(f) => {
             append_section(tx, task_id, "Feedback", f.trim())?;
             log_event(tx, task_id, "feedback", Some(f.trim()))?;
@@ -428,8 +394,9 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
 
     // The session's life follows the task (DESIGN.md §8): terminal transitions
     // close the task's open session in the same transaction, while
-    // Ask/Complete/Answer/RejectWork deliberately leave it open for reuse across
-    // needs-input/review.
+    // Ask/Resume/Complete/RejectWork deliberately leave it open — so the
+    // operator can answer a question, or address rejection feedback, in the same
+    // agent session across needs-input/review.
     match &action {
         Action::Accept => {
             close_open_session(tx, task_id, SessionOutcome::Completed)?;
@@ -459,8 +426,8 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
 }
 
 /// Refuse to open an agent session on a human-only task (DESIGN.md §6/§8):
-/// dispatch, redispatch, and continuation all route through here, before any
-/// state change or session insert, so the refusal writes nothing.
+/// dispatch and redispatch both route through here, before any state change or
+/// session insert, so the refusal writes nothing.
 fn reject_human_dispatch(tx: &Connection, task_id: i64) -> Result<()> {
     let task = get_task(tx, task_id)?.ok_or(Error::TaskNotFound(task_id))?;
     if task.human {
@@ -473,9 +440,9 @@ fn reject_human_dispatch(tx: &Connection, task_id: i64) -> Result<()> {
 }
 
 /// Refuse to open an agent session on a task in an archived project
-/// (DESIGN.md §5): the project has left the cockpit, so dispatch, redispatch,
-/// and continuation are all side doors. Like the human guard, this runs before
-/// any state change or session insert, so the refusal writes nothing.
+/// (DESIGN.md §5): the project has left the cockpit, so dispatch and redispatch
+/// are both side doors. Like the human guard, this runs before any state change
+/// or session insert, so the refusal writes nothing.
 fn reject_archived_dispatch(tx: &Connection, task_id: i64) -> Result<()> {
     let (name, archived): (String, bool) = tx.query_row(
         "SELECT p.name, p.archived FROM projects p
@@ -706,7 +673,7 @@ mod tests {
             Action::Triage(Triage::Reject),
             Action::Start,
             Action::Ask("q?".into()),
-            Action::Answer("a.".into()),
+            Action::Resume,
             Action::Complete(None),
             Action::HandOff,
             Action::Reclaim,
@@ -733,7 +700,7 @@ mod tests {
             (Running, Action::Ask(_)) => Some(NeedsInput),
             (Running | Stalled, Action::Complete(_)) => Some(Review),
             (Running, Action::Abort) => Some(Ready),
-            (NeedsInput, Action::Answer(_)) => Some(Running),
+            (NeedsInput, Action::Resume) => Some(Running),
             (Review, Action::HandOff) => Some(Waiting),
             (Waiting, Action::Reclaim) => Some(Review),
             (Review | Waiting, Action::Accept) => Some(Done),
@@ -870,20 +837,6 @@ mod tests {
         }
 
         #[test]
-        fn record_continuation_is_refused() {
-            let (mut s, p) = store_with_project();
-            let id = create_human(&mut s, p, TaskState::Ready);
-            s.apply(id, Action::Start).unwrap();
-
-            let err = s.record_continuation(id, "claude", None, None).unwrap_err();
-            assert!(
-                matches!(err, Error::HumanTask { id: e, .. } if e == id),
-                "expected a human-only refusal, got {err}"
-            );
-            assert!(s.sessions_for(id).unwrap().is_empty());
-        }
-
-        #[test]
         fn completion_unblocks_dependants() {
             // running → done is terminal, so it must cascade readiness exactly
             // as an accept does.
@@ -996,7 +949,7 @@ mod tests {
         let id = task_in_state(&mut s, p, TaskState::Running);
         let task = s.apply(id, Action::Ask("  A or B?  ".into())).unwrap();
         assert_eq!(task.question.as_deref(), Some("A or B?"));
-        let task = s.apply(id, Action::Answer("B".into())).unwrap();
+        let task = s.apply(id, Action::Resume).unwrap();
         assert_eq!(task.state, TaskState::Running);
         assert!(task.question.is_none());
 
@@ -1006,42 +959,77 @@ mod tests {
     }
 
     #[test]
-    fn empty_question_answer_feedback_are_rejected() {
+    fn empty_question_and_feedback_are_rejected() {
         let (mut s, p) = store_with_project();
         let running = task_in_state(&mut s, p, TaskState::Running);
         assert!(s.apply(running, Action::Ask("  ".into())).is_err());
-        let waiting = task_in_state(&mut s, p, TaskState::NeedsInput);
-        assert!(s.apply(waiting, Action::Answer("".into())).is_err());
         let review = task_in_state(&mut s, p, TaskState::Review);
         assert!(s.apply(review, Action::RejectWork(" ".into())).is_err());
-        // failed applies must not have changed anything
-        assert_eq!(s.task(waiting).unwrap().state, TaskState::NeedsInput);
+        // a failed apply must not have changed anything
+        assert_eq!(s.task(review).unwrap().state, TaskState::Review);
+    }
+
+    /// `resume` moves needs-input → running without recording any answer text —
+    /// the exchange lives in the session transcript (DESIGN.md §6/§8), so the
+    /// body is untouched and only a transition event is logged.
+    #[test]
+    fn resume_records_no_answer_and_leaves_the_body_untouched() {
+        let (mut s, p) = store_with_project();
+        let id = task_in_state(&mut s, p, TaskState::NeedsInput);
+        let before = s.task(id).unwrap().body;
+
+        let task = s.apply(id, Action::Resume).unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(task.body, before, "resume must not append to the body");
+        assert!(task.question.is_none());
+
+        let events = s.events_for(id).unwrap();
+        assert!(
+            events.iter().all(|e| e.kind != "answer"),
+            "no answer event is logged: {events:?}"
+        );
+        assert_eq!(
+            events.last().unwrap().detail.as_deref(),
+            Some("needs-input -> running")
+        );
+    }
+
+    /// `resume` is refused from every state but `needs-input`.
+    #[test]
+    fn resume_is_refused_outside_needs_input() {
+        use TaskState::*;
+        for state in [Ready, Running, Review, Waiting, Stalled] {
+            let (mut s, p) = store_with_project();
+            let id = task_in_state(&mut s, p, state);
+            assert!(
+                matches!(
+                    s.apply(id, Action::Resume),
+                    Err(Error::InvalidTransition { .. })
+                ),
+                "resume should be refused from {state}"
+            );
+        }
     }
 
     #[test]
-    fn answers_and_feedback_accumulate_in_body() {
+    fn feedback_accumulates_in_body() {
         let (mut s, p) = store_with_project();
-        let id = task_in_state(&mut s, p, TaskState::NeedsInput);
-        let task = s.apply(id, Action::Answer("Schema B".into())).unwrap();
-        assert!(task.body.contains("## Answers"));
-        assert!(task.body.contains("- Schema B"));
-
-        s.apply(id, Action::Ask("and the index?".into())).unwrap();
-        let task = s.apply(id, Action::Answer("covering".into())).unwrap();
-        assert_eq!(task.body.matches("## Answers").count(), 1);
-        assert!(task.body.contains("- covering"));
-
-        s.apply(id, Action::Complete(None)).unwrap();
+        let id = task_in_state(&mut s, p, TaskState::Review);
         let task = s
             .apply(id, Action::RejectWork("tests missing".into()))
             .unwrap();
         assert!(task.body.contains("## Feedback"));
         assert!(task.body.contains("- tests missing"));
+
+        s.apply(id, Action::Complete(None)).unwrap();
+        let task = s.apply(id, Action::RejectWork("also lint".into())).unwrap();
+        assert_eq!(task.body.matches("## Feedback").count(), 1);
+        assert!(task.body.contains("- also lint"));
         assert_eq!(
             s.events_for(id)
                 .unwrap()
                 .iter()
-                .filter(|e| e.kind == "answer")
+                .filter(|e| e.kind == "feedback")
                 .count(),
             2
         );
@@ -1336,12 +1324,11 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_and_continuation_refuse_a_task_in_an_archived_project() {
+    fn dispatch_refuses_a_task_in_an_archived_project() {
         // An archived project's tasks freeze where they are (DESIGN.md §5):
-        // dispatch and continuation are side doors and must write nothing.
+        // dispatch is a side door and must write nothing.
         let (mut s, p) = store_with_project();
         let ready = create(&mut s, p, TaskState::Ready);
-        let running = task_in_state(&mut s, p, TaskState::Running);
         s.set_archived(p, true).unwrap();
 
         let err = s
@@ -1351,62 +1338,9 @@ mod tests {
         assert_eq!(s.task(ready).unwrap().state, TaskState::Ready);
         assert!(s.sessions_for(ready).unwrap().is_empty());
 
-        let err = s
-            .record_continuation(running, "claude", Some(1), None)
-            .unwrap_err();
-        assert!(matches!(err, Error::ProjectArchived { .. }), "{err}");
-        assert!(s.sessions_for(running).unwrap().is_empty());
-
         // unarchiving reopens the door
         s.set_archived(p, false).unwrap();
         assert!(s.record_dispatch(ready, "claude", Some(1), None).is_ok());
-    }
-
-    // --- record_continuation (DESIGN.md §6/§8: answer → running → continue) ---
-
-    #[test]
-    fn record_continuation_adds_a_session_without_touching_state() {
-        let (mut s, p) = store_with_project();
-        let id = task_in_state(&mut s, p, TaskState::NeedsInput);
-        s.apply(id, Action::Answer("B, with a covering index".into()))
-            .unwrap();
-        assert_eq!(s.task(id).unwrap().state, TaskState::Running);
-
-        let (task, session) = s
-            .record_continuation(id, "claude", Some(777), Some("/var/log/31.log"))
-            .unwrap();
-        assert_eq!(task.state, TaskState::Running);
-        assert_eq!(session.task_id, id);
-        assert_eq!(session.agent, "claude");
-        assert_eq!(session.pid, Some(777));
-        assert_eq!(session.log_path.as_deref(), Some("/var/log/31.log"));
-        assert!(session.ended_at.is_none());
-        assert_eq!(s.sessions_for(id).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn record_continuation_refuses_a_task_that_is_not_running() {
-        let (mut s, p) = store_with_project();
-        for state in [
-            TaskState::Proposed,
-            TaskState::Parked,
-            TaskState::Ready,
-            TaskState::NeedsInput,
-            TaskState::Review,
-            TaskState::Done,
-            TaskState::Rejected,
-        ] {
-            let id = task_in_state(&mut s, p, state);
-            assert!(
-                matches!(
-                    s.record_continuation(id, "claude", None, None),
-                    Err(Error::InvalidTransition { .. })
-                ),
-                "continuation should be refused from {state}"
-            );
-            // refusal must not create a session
-            assert!(s.sessions_for(id).unwrap().is_empty());
-        }
     }
 
     // --- session lifecycle: one open session, closed by terminal transitions ---
@@ -1459,38 +1393,29 @@ mod tests {
     }
 
     #[test]
-    fn a_continuation_ends_the_predecessor_open_session() {
+    fn ask_and_resume_keep_the_session_open_across_needs_input() {
+        // A question and its answer leave the dispatched session open across
+        // needs-input -> running, so the operator answers in that same agent
+        // session and `resume` only moves the state (DESIGN.md §6/§8).
         let (mut s, p) = store_with_project();
         let id = create(&mut s, p, TaskState::Ready);
-        let first = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+        let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
 
-        // ask/answer leave the session open across needs-input -> running...
         s.apply(id, Action::Ask("A or B?".into())).unwrap();
-        s.apply(id, Action::Answer("B".into())).unwrap();
-        assert!(s.session(first.id).unwrap().ended_at.is_none());
-
-        // ...then a continuation supersedes it: the predecessor is closed and
-        // the new session is the only one open (the invariant).
-        let second = s
-            .record_continuation(id, "claude", Some(2), None)
-            .unwrap()
-            .1;
-        assert!(s.session(first.id).unwrap().ended_at.is_some());
-        let open: Vec<i64> = s
-            .sessions_for(id)
-            .unwrap()
-            .into_iter()
-            .filter(|x| x.ended_at.is_none())
-            .map(|x| x.id)
-            .collect();
-        assert_eq!(open, vec![second.id]);
+        assert!(s.session(sess.id).unwrap().ended_at.is_none());
+        s.apply(id, Action::Resume).unwrap();
+        assert!(
+            s.session(sess.id).unwrap().ended_at.is_none(),
+            "resume keeps the session open"
+        );
+        assert_eq!(s.task(id).unwrap().state, TaskState::Running);
     }
 
     #[test]
     fn rejecting_a_review_keeps_the_same_session_open_with_its_ref() {
         // Rejecting with feedback returns the task to running with its session
-        // still open, so a continuation reuses the same agent session — the
-        // ref survives until the task actually closes (DESIGN.md §8).
+        // still open, so the operator addresses the feedback in that same agent
+        // session — the ref survives until the task actually closes (DESIGN.md §8).
         let (mut s, p) = store_with_project();
         let id = create(&mut s, p, TaskState::Ready);
         let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
@@ -1511,10 +1436,10 @@ mod tests {
         use super::*;
 
         #[test]
-        fn hand_off_keeps_the_session_open_for_a_later_continuation() {
+        fn hand_off_keeps_the_session_open_for_a_later_reject() {
             // review → waiting must keep the session open exactly as review
-            // does, so a reject-with-feedback can continue the same agent
-            // session once the work becomes the operator's move again.
+            // does, so a reject-with-feedback returns to the same agent session
+            // once the work becomes the operator's move again.
             let (mut s, p) = store_with_project();
             let id = create(&mut s, p, TaskState::Ready);
             let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
@@ -1600,10 +1525,11 @@ mod tests {
         }
 
         #[test]
-        fn reject_from_waiting_continues_the_same_session_with_feedback() {
+        fn reject_from_waiting_reuses_the_same_session_with_feedback() {
             // The acceptance path: review → wait → reject-with-feedback returns
             // the task to running with its original session still open, and the
-            // feedback recorded, so a continuation reuses that agent session.
+            // feedback recorded, so the operator addresses it in that same
+            // agent session.
             let (mut s, p) = store_with_project();
             let id = create(&mut s, p, TaskState::Ready);
             let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;

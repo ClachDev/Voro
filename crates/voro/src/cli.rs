@@ -96,14 +96,6 @@ dispatch
   dispatch <task-id> [--agent NAME]
                                   spawn a headless agent session on a ready
                                   task; --agent overrides the resolved agent
-  continue <task-id> [--agent NAME]
-                                  continue an already-running task without
-                                  changing its state — via the agent's
-                                  `continue` verb when its session was
-                                  captured, else a fresh session; what
-                                  `answer` does automatically for a
-                                  previously-dispatched task, exposed to retry
-                                  a continuation that failed
   viewer list                     list the viewers voro.toml defines; * marks
                                   the default used when nothing names one
   open <task-id>                  open a review/running task's checkout in a
@@ -123,11 +115,8 @@ transitions
   triage <task-id> <parked|ready|reject>
   start <task-id>                 ready → running
   ask <task-id> --question TEXT   running → needs-input
-  answer <task-id> TEXT [--no-dispatch]
-                                  needs-input → running; if the task has ever
-                                  been dispatched, also starts a continuation
-                                  session with the answer in the prompt body
-                                  (--no-dispatch skips that)
+  resume <task-id>                needs-input → running, once you have answered
+                                  the question in the agent's own session
   done <task-id> [--summary TEXT | --summary-file PATH] [--branch NAME]
                                   running | stalled → review (from stalled:
                                   reporting a dead session's finished work on
@@ -201,14 +190,6 @@ enum Verb {
         #[arg(long)]
         agent: Option<String>,
     },
-    /// Spawn a fresh session on a task that is already `running`, without
-    /// touching its state — the mechanics `answer` uses automatically, exposed
-    /// directly so a continuation that failed can be retried once fixed.
-    Continue {
-        task_id: i64,
-        #[arg(long)]
-        agent: Option<String>,
-    },
     /// Run a configured viewer on a review/running task's checkout so its diff
     /// can be seen (DESIGN.md §8/§11a) — the explicit spelling of `pr`'s viewer
     /// medium, reaching the local diff even on a GitHub project.
@@ -226,7 +207,6 @@ enum Verb {
     },
     Reject(RejectArgs),
     Done(DoneArgs),
-    Answer(AnswerArgs),
     Import(ImportArgs),
     Triage {
         task_id: i64,
@@ -236,6 +216,11 @@ enum Verb {
         task_id: i64,
     },
     Ask(AskArgs),
+    /// needs-input → running: the operator answered the question in the
+    /// agent's own session (DESIGN.md §6/§8), so this only moves the state.
+    Resume {
+        task_id: i64,
+    },
     Accept {
         task_id: i64,
         #[arg(long)]
@@ -379,8 +364,6 @@ struct RejectArgs {
     text: Vec<String>,
     #[arg(long)]
     from_pr: bool,
-    #[arg(long)]
-    no_dispatch: bool,
 }
 
 #[derive(Args)]
@@ -392,15 +375,6 @@ struct DoneArgs {
     summary_file: Option<String>,
     #[arg(long)]
     branch: Option<String>,
-}
-
-#[derive(Args)]
-struct AnswerArgs {
-    task_id: i64,
-    #[arg(value_name = "TEXT")]
-    text: Vec<String>,
-    #[arg(long)]
-    no_dispatch: bool,
 }
 
 #[derive(Args)]
@@ -465,21 +439,18 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Dispatch { task_id, agent } => {
             dispatch::dispatch(store, ctx, task_id, agent.as_deref())
         }
-        Verb::Continue { task_id, agent } => {
-            dispatch::continue_dispatch(store, ctx, task_id, agent.as_deref(), None)
-        }
         Verb::Open { task_id } => dispatch::open(store, ctx, task_id, None),
         Verb::Viewer { cmd } => viewer_verb(cmd, ctx),
         Verb::Pr { task_id, yes } => pr_verb(store, task_id, yes, ctx),
-        Verb::Reject(args) => reject_verb(store, args, ctx),
+        Verb::Reject(args) => reject_verb(store, args),
         Verb::Done(args) => done_verb(store, args),
-        Verb::Answer(args) => answer_verb(store, args, ctx),
         Verb::Import(args) => import_verb(store, args),
         Verb::Triage { task_id, target } => {
             apply_action(store, task_id, Action::Triage(target.into()), false)
         }
         Verb::Start { task_id } => apply_action(store, task_id, Action::Start, false),
         Verb::Ask(args) => ask_verb(store, args),
+        Verb::Resume { task_id } => apply_action(store, task_id, Action::Resume, false),
         Verb::Accept { task_id, yes } => apply_action(store, task_id, Action::Accept, yes),
         Verb::Wait { task_id } => apply_action(store, task_id, Action::HandOff, false),
         Verb::Reclaim { task_id } => apply_action(store, task_id, Action::Reclaim, false),
@@ -680,7 +651,6 @@ fn agent_verb(cmd: AgentCmd, ctx: &DispatchCtx) -> Result<String, String> {
                     ("sessions", template.sessions()),
                     ("attach", template.attach()),
                     ("resume", template.resume()),
-                    ("continue", template.continue_cmd()),
                     ("plan", template.plan()),
                 ]
                 .into_iter()
@@ -921,12 +891,13 @@ fn confirm(question: &str) -> Result<bool, String> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes"))
 }
 
-/// `reject <task-id> [TEXT] [--from-pr] [--no-dispatch]` (DESIGN.md §6/§8/§11c):
-/// review → running with feedback. `--from-pr` pulls the tracked PR's review
-/// comments as that feedback, with any extra TEXT appended; otherwise TEXT is
-/// the feedback. Like `answer`, a task with prior session history then continues
-/// the work with the feedback in hand; `--no-dispatch` forces the plain transition.
-fn reject_verb(store: &mut Store, args: RejectArgs, ctx: &DispatchCtx) -> Result<String, String> {
+/// `reject <task-id> [TEXT] [--from-pr]` (DESIGN.md §6/§8/§11c): review |
+/// waiting → running with feedback appended to the body. `--from-pr` pulls the
+/// tracked PR's review comments as that feedback, with any extra TEXT appended;
+/// otherwise TEXT is the feedback. Because `review`/`waiting` keep the session
+/// open (§8), the task returns to `running` with its agent session still live —
+/// the operator addresses the feedback in that same session (§6/§8).
+fn reject_verb(store: &mut Store, args: RejectArgs) -> Result<String, String> {
     let id = args.task_id;
     let feedback = if args.from_pr {
         let pulled = crate::pr::pull_review_feedback(store, id)?;
@@ -939,25 +910,11 @@ fn reject_verb(store: &mut Store, args: RejectArgs, ctx: &DispatchCtx) -> Result
     } else {
         joined(&args.text, "rejection feedback")?
     };
-    let has_history = !store
-        .sessions_for(id)
-        .map_err(|e| e.to_string())?
-        .is_empty();
 
     let task = store
-        .apply(id, Action::RejectWork(feedback.clone()))
+        .apply(id, Action::RejectWork(feedback))
         .map_err(|e| e.to_string())?;
-    let out = format!("task {} -> {}", task.id, task.state);
-
-    if !has_history || args.no_dispatch {
-        return Ok(out);
-    }
-    match dispatch::continue_dispatch(store, ctx, id, None, Some(&feedback)) {
-        Ok(summary) => Ok(format!("{out}; {summary}")),
-        Err(e) => Err(format!(
-            "{out}, but continuation dispatch failed: {e} — retry with 'voro continue {id}'"
-        )),
-    }
+    Ok(format!("task {} -> {}", task.id, task.state))
 }
 
 /// `done <task-id> [--summary TEXT | --summary-file PATH] [--branch NAME]`
@@ -1240,36 +1197,6 @@ fn explain_verb(store: &mut Store, id: i64) -> Result<String, String> {
     Ok(out)
 }
 
-/// `answer <task-id> TEXT [--no-dispatch]` (DESIGN.md §6): needs-input →
-/// running, answer appended to the body — the transition applies first. It then
-/// dispatches a fresh continuation whose prompt carries the `## Answers` section
-/// (the asking session has typically exited by the time a human answers). That
-/// only fires for a task with prior session history; `--no-dispatch` forces the
-/// plain transition even when history exists.
-fn answer_verb(store: &mut Store, args: AnswerArgs, ctx: &DispatchCtx) -> Result<String, String> {
-    let id = args.task_id;
-    let text = joined(&args.text, "answer text")?;
-    let has_history = !store
-        .sessions_for(id)
-        .map_err(|e| e.to_string())?
-        .is_empty();
-
-    let task = store
-        .apply(id, Action::Answer(text.clone()))
-        .map_err(|e| e.to_string())?;
-    let out = format!("task {} -> {}", task.id, task.state);
-
-    if !has_history || args.no_dispatch {
-        return Ok(out);
-    }
-    match dispatch::continue_dispatch(store, ctx, id, None, Some(&text)) {
-        Ok(summary) => Ok(format!("{out}; {summary}")),
-        Err(e) => Err(format!(
-            "{out}, but continuation dispatch failed: {e} — retry with 'voro continue {id}'"
-        )),
-    }
-}
-
 /// `viewer list` (DESIGN.md §8/§11a): the viewers `voro.toml` defines, with the
 /// default flagged. Like `agent`, config outside the database, so no store.
 fn viewer_verb(cmd: ViewerCmd, ctx: &DispatchCtx) -> Result<String, String> {
@@ -1545,8 +1472,10 @@ mod tests {
         ok(&mut s, &["ask", "1", "--question", "Schema A or B?"]);
         assert!(ok(&mut s, &["inbox"]).contains("Schema A or B?"));
 
-        ok(&mut s, &["answer", "1", "B, with a covering index"]);
-        assert!(ok(&mut s, &["show", "1"]).contains("covering index"));
+        let out = ok(&mut s, &["resume", "1"]);
+        assert!(out.contains("-> running"), "{out}");
+        // the question is cleared once the task resumes
+        assert!(!ok(&mut s, &["show", "1"]).contains("Schema A or B?"));
 
         ok(&mut s, &["done", "1"]);
         ok(&mut s, &["reject", "1", "tests missing"]);
@@ -2878,7 +2807,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // --- answer → continuation (task #31, DESIGN.md §6/§8) ---
+    // --- resume: the operator answers in-session, Voro only signposts
+    // (DESIGN.md §6/§8) ---
 
     /// A scratch database, a freshly-`git init`ed clean project, and an
     /// `voro.toml` whose one agent is a stub command — the same shape as
@@ -2965,50 +2895,31 @@ mod tests {
         task.id
     }
 
-    /// Acceptance case one: a task with prior session history gets a
-    /// continuation dispatched automatically, and that continuation's prompt
-    /// carries the `## Answers` section the answer just appended.
+    /// `voro resume` on a dispatched task moves needs-input → running without
+    /// spawning anything: the operator answered in the agent's own session, so
+    /// the original session stays open and no new prompt is written.
     #[test]
-    fn answering_a_previously_dispatched_task_starts_a_continuation() {
+    fn resuming_a_dispatched_task_moves_to_running_without_a_new_session() {
         let (mut store, ctx, project) = scratch_env("cat {prompt_file}");
         let id = dispatched_and_asked(&mut store, &ctx, &project);
+        assert_eq!(store.sessions_for(id).unwrap().len(), 1);
 
-        let out = run(
-            &mut store,
-            vec![
-                "answer".into(),
-                id.to_string(),
-                "Schema B, with a covering index".into(),
-            ],
-            &ctx,
-        )
-        .unwrap();
-        assert!(out.contains("-> running"), "{out}");
-        assert!(out.contains(&format!("continued task {id}")), "{out}");
+        let out = run(&mut store, vec!["resume".into(), id.to_string()], &ctx).unwrap();
+        assert_eq!(out, format!("task {id} -> running"));
         assert_eq!(store.task(id).unwrap().state, TaskState::Running);
 
-        // the original dispatch's session plus the continuation's
-        let sessions = store.sessions_for(id).unwrap();
-        assert_eq!(sessions.len(), 2, "{sessions:?}");
-
-        // the continuation's prompt is the task body, now carrying the answer
-        let prompts = prompt_files(&ctx);
-        assert_eq!(prompts.len(), 2);
-        assert!(
-            prompts.iter().any(|p| std::fs::read_to_string(p)
-                .unwrap()
-                .contains("Schema B, with a covering index")),
-            "the continuation prompt must carry the answer"
-        );
+        // no continuation is spawned: still the single dispatch session and its
+        // one prompt file, the exchange having happened in the live session.
+        assert_eq!(store.sessions_for(id).unwrap().len(), 1, "no new session");
+        assert_eq!(prompt_files(&ctx).len(), 1, "no new prompt written");
 
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
     }
 
-    /// Acceptance case two: a task that was only ever started by hand — no
-    /// dispatch, no session — still answers as a plain transition; nothing
-    /// tries to spawn a continuation for it.
+    /// `voro resume` on a task only ever started by hand — no dispatch, no
+    /// session — is a plain transition.
     #[test]
-    fn answering_a_never_dispatched_task_is_a_plain_transition() {
+    fn resuming_a_never_dispatched_task_is_a_plain_transition() {
         let mut store = Store::open_in_memory().unwrap();
         let ctx = ctx();
         ok(&mut store, &["project", "add", "demo", "/tmp/demo"]);
@@ -3020,37 +2931,9 @@ mod tests {
         ok(&mut store, &["ask", "1", "--question", "A or B?"]);
         assert!(store.sessions_for(1).unwrap().is_empty());
 
-        let out = run(
-            &mut store,
-            vec!["answer".into(), "1".into(), "B".into()],
-            &ctx,
-        )
-        .unwrap();
+        let out = run(&mut store, vec!["resume".into(), "1".into()], &ctx).unwrap();
         assert_eq!(out, "task 1 -> running");
         assert_eq!(store.task(1).unwrap().state, TaskState::Running);
         assert!(store.sessions_for(1).unwrap().is_empty());
-    }
-
-    /// `--no-dispatch` opts out of continuation even when history exists.
-    #[test]
-    fn no_dispatch_flag_skips_continuation_despite_history() {
-        let (mut store, ctx, project) = scratch_env("cat {prompt_file}");
-        let id = dispatched_and_asked(&mut store, &ctx, &project);
-
-        let out = run(
-            &mut store,
-            vec![
-                "answer".into(),
-                id.to_string(),
-                "--no-dispatch".into(),
-                "B".into(),
-            ],
-            &ctx,
-        )
-        .unwrap();
-        assert_eq!(out, format!("task {id} -> running"));
-        assert_eq!(store.sessions_for(id).unwrap().len(), 1, "no continuation");
-
-        let _ = std::fs::remove_dir_all(project.parent().unwrap());
     }
 }

@@ -1,16 +1,14 @@
-//! Dispatching a ready task to a headless agent session (DESIGN.md §8), and
-//! continuing an already-`running` one after a human answers a question
-//! (DESIGN.md §6). Both are the I/O half of dispatch — resolving the agent,
-//! guarding against a dirty checkout, writing the prompt, and spawning the
-//! process detached — kept out of voro-core, which stays pure of process and
-//! filesystem I/O. The atomic state-plus-session writes are voro-core's
-//! `Store::record_dispatch` and `Store::record_continuation`.
+//! Dispatching a ready (or stalled) task to a headless agent session (DESIGN.md
+//! §8): the I/O half of dispatch — resolving the agent, guarding against a dirty
+//! checkout, writing the prompt, and spawning the process detached — kept out of
+//! voro-core, which stays pure of process and filesystem I/O. The atomic
+//! state-plus-session write is voro-core's `Store::record_dispatch`.
 //!
 //! For agents that define a `sessions` verb (task #75), dispatch additionally
 //! captures the agent's own session reference after launch — by polling the
 //! `sessions` listing for a session started in this project since the spawn,
 //! falling back to the `backgrounded · <id>` line launchers print into the
-//! log — and records it on the session row for later attach/resume/continue.
+//! log — and records it on the session row for later attach/resume.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -20,9 +18,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voro_core::{
-    AgentsConfig, PROMPT_FILE_PLACEHOLDER, ReviewAction, SESSION_PLACEHOLDER, Session, Store,
-    TASK_ID_PLACEHOLDER, Task, TaskState, VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER,
-    VIEWER_PATH_PLACEHOLDER, parse_sessions_json,
+    AgentsConfig, PROMPT_FILE_PLACEHOLDER, ReviewAction, Store, TASK_ID_PLACEHOLDER, TaskState,
+    VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER,
+    parse_sessions_json,
 };
 
 /// Prepended to every dispatched prompt so the agent learns the return-path
@@ -37,12 +35,17 @@ local SQLite database; report progress through these CLI verbs rather than
 editing that database yourself:
 
     voro ask {task_id}{db} --question \"...\"     # blocked on a human decision (-> needs-input)
+    voro resume {task_id}{db}                     # question answered in this session, carry on (-> running)
     voro done {task_id}{db} --summary \"...\"      # work finished, await review (-> review)
     voro propose <project> \"<title>\"{db} --body-file <path>   # file a follow-up task (-> proposed)
 
 Run these commands exactly as shown: they name task {task_id} explicitly, so they
-work from anywhere without any environment variable being set. `propose` uses
-task {task_id} as the discovered-from source when `--from` is omitted. Finish
+work from anywhere without any environment variable being set. After you `ask`,
+the operator answers right here in this session — so when your question has been
+answered, run `voro resume {task_id}` before continuing, to move the task back to
+running (Voro records no answer text; the exchange is already in this transcript).
+`propose` uses task {task_id} as the discovered-from source when `--from` is
+omitted. Finish
 with your work committed on a branch and a PR-ready `--summary` on `done` — what
 changed, why, and how you verified it — since `voro pr` opens the pull request
 straight from that summary. Never modify the database with raw SQL, which would
@@ -207,65 +210,6 @@ pub fn plan_session(
     })
 }
 
-/// Which of the two flows `spawn_session` is performing: they share every
-/// mechanic and differ only in the required starting state and which `Store`
-/// method records the result.
-#[derive(Clone, Copy)]
-enum SpawnKind {
-    /// The task must be `ready` or `stalled` (redispatch, DESIGN.md §6/§8);
-    /// recording it performs the transition to `running`.
-    Fresh,
-    /// The task must already be `running` (`answer` just put it there), so
-    /// recording it only opens a session, never changes state.
-    Continuation,
-}
-
-impl SpawnKind {
-    fn accepts_state(self, state: TaskState) -> bool {
-        match self {
-            SpawnKind::Fresh => matches!(state, TaskState::Ready | TaskState::Stalled),
-            SpawnKind::Continuation => state == TaskState::Running,
-        }
-    }
-
-    /// The states `accepts_state` allows, for the rejection message.
-    fn accepted_states(self) -> &'static str {
-        match self {
-            SpawnKind::Fresh => "ready or stalled",
-            SpawnKind::Continuation => "running",
-        }
-    }
-
-    /// Past tense, for both the rejection message and the success summary.
-    fn verb_past(self) -> &'static str {
-        match self {
-            SpawnKind::Fresh => "dispatched",
-            SpawnKind::Continuation => "continued",
-        }
-    }
-
-    fn preposition(self) -> &'static str {
-        match self {
-            SpawnKind::Fresh => "to",
-            SpawnKind::Continuation => "on",
-        }
-    }
-
-    fn record(
-        self,
-        store: &mut Store,
-        task_id: i64,
-        agent: &str,
-        pid: Option<i64>,
-        log_path: Option<&str>,
-    ) -> voro_core::Result<(Task, Session)> {
-        match self {
-            SpawnKind::Fresh => store.record_dispatch(task_id, agent, pid, log_path),
-            SpawnKind::Continuation => store.record_continuation(task_id, agent, pid, log_path),
-        }
-    }
-}
-
 /// Where dispatch finds its inputs and puts its artefacts. Built from the
 /// database path in `main`; constructed directly in tests.
 pub struct DispatchCtx {
@@ -337,32 +281,7 @@ pub fn dispatch(
     task_id: i64,
     agent_override: Option<&str>,
 ) -> Result<String, String> {
-    spawn_session(store, ctx, task_id, agent_override, SpawnKind::Fresh, None)
-}
-
-/// Continue a task that `answer` just moved `needs-input → running` (DESIGN.md
-/// §6). When the agent defines a `continue` verb and the task's last session
-/// has a captured reference, the answer (`new_input`) is fed to *that session*
-/// headless; otherwise it falls back to a fresh spawn of the task body, now
-/// carrying the `## Answers` section the answer appended. Unlike [`dispatch`],
-/// `record_continuation` asserts the task is already `running` rather than
-/// performing the transition, so this cannot smuggle a task into `running`
-/// outside the transition API.
-pub fn continue_dispatch(
-    store: &mut Store,
-    ctx: &DispatchCtx,
-    task_id: i64,
-    agent_override: Option<&str>,
-    new_input: Option<&str>,
-) -> Result<String, String> {
-    spawn_session(
-        store,
-        ctx,
-        task_id,
-        agent_override,
-        SpawnKind::Continuation,
-        new_input,
-    )
+    spawn_session(store, ctx, task_id, agent_override)
 }
 
 /// Open a `review` (or `running`) task's diff in a viewer (DESIGN.md §11a): the
@@ -475,8 +394,7 @@ pub fn open(
 /// How the session reference on the freshly-recorded session row came to be,
 /// for the summary line.
 enum RefOutcome {
-    /// Captured from the `sessions` listing or the log, or inherited from the
-    /// prior session on a `continue`-verb continuation.
+    /// Captured from the `sessions` listing or the log.
     Captured(String),
     /// The agent defines `sessions` but the reference never showed up.
     NotCaptured,
@@ -489,29 +407,25 @@ fn spawn_session(
     ctx: &DispatchCtx,
     task_id: i64,
     agent_override: Option<&str>,
-    kind: SpawnKind,
-    new_input: Option<&str>,
 ) -> Result<String, String> {
     let task = store.task(task_id).map_err(|e| e.to_string())?;
     // Checked here so a human-only task is refused before anything spawns;
-    // voro-core's record_dispatch/record_continuation are the backstop.
+    // voro-core's record_dispatch is the backstop.
     if task.human {
         return Err(format!(
             "task {task_id} is human-only — no agent can execute it; work it by hand \
              (`voro start {task_id}`, then `voro done {task_id}`)"
         ));
     }
-    if !kind.accepts_state(task.state) {
+    if !matches!(task.state, TaskState::Ready | TaskState::Stalled) {
         return Err(format!(
-            "only {} tasks can be {}; task {task_id} is {}",
-            kind.accepted_states(),
-            kind.verb_past(),
+            "only ready or stalled tasks can be dispatched; task {task_id} is {}",
             task.state
         ));
     }
     let project = store.project(task.project_id).map_err(|e| e.to_string())?;
     // Refused here so an archived project is heard before anything spawns;
-    // voro-core's record_dispatch/record_continuation are the backstop.
+    // voro-core's record_dispatch is the backstop.
     if project.archived {
         return Err(format!(
             "project '{}' is archived — `voro project unarchive {}` first",
@@ -523,18 +437,6 @@ fn spawn_session(
     let agent = config
         .resolve(agent_override.or(task.agent.as_deref()))
         .map_err(|e| e.to_string())?;
-
-    // A continuation reuses the prior session when the agent knows how to
-    // (`continue` verb) and the session can be addressed (captured ref);
-    // otherwise it degrades to a fresh spawn of the dispatch template.
-    let continue_ref = match kind {
-        SpawnKind::Continuation if agent.continue_cmd.is_some() => store
-            .sessions_for(task_id)
-            .map_err(|e| e.to_string())?
-            .first()
-            .and_then(|s| s.session_ref.clone()),
-        _ => None,
-    };
 
     guard_clean_tree(&project.path)?;
 
@@ -554,17 +456,10 @@ fn spawn_session(
     } else {
         format!("# {}\n\n{}\n", task.title, task.body.trim_end())
     };
-    // A continued session already carries the preamble and the task from its
-    // first prompt, so it gets only the new input (the answer); everything
-    // else gets the full preamble + body.
-    let prompt = match (&continue_ref, new_input) {
-        (Some(_), Some(input)) => format!("{input}\n"),
-        (Some(_), None) => body,
-        (None, _) => format!(
-            "{}{body}",
-            render_preamble(task_id, &ctx.db_path, task.branch.as_deref())
-        ),
-    };
+    let prompt = format!(
+        "{}{body}",
+        render_preamble(task_id, &ctx.db_path, task.branch.as_deref())
+    );
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("cannot write prompt {}: {e}", prompt_path.display()))?;
 
@@ -575,18 +470,10 @@ fn spawn_session(
         .try_clone()
         .map_err(|e| format!("cannot open log {}: {e}", log_path.display()))?;
 
-    let command = match &continue_ref {
-        Some(session_ref) => agent
-            .continue_cmd
-            .as_deref()
-            .expect("continue_ref is only set when the verb exists")
-            .replace(SESSION_PLACEHOLDER, &shell_quote(Path::new(session_ref)))
-            .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path)),
-        None => agent
-            .dispatch
-            .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path))
-            .replace(TASK_ID_PLACEHOLDER, &task_id.to_string()),
-    };
+    let command = agent
+        .dispatch
+        .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path))
+        .replace(TASK_ID_PLACEHOLDER, &task_id.to_string());
     let spawn_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -605,8 +492,7 @@ fn spawn_session(
         .map_err(|e| format!("cannot spawn agent '{}': {e}", agent.name))?;
     let pid = i64::from(child.id());
 
-    let recorded = kind.record(
-        store,
+    let recorded = store.record_dispatch(
         task_id,
         &agent.name,
         Some(pid),
@@ -638,14 +524,8 @@ fn spawn_session(
         let _ = child.wait();
     });
 
-    let ref_outcome = match (continue_ref, &agent.sessions) {
-        // A continuation addressed the prior session; the new row keeps its ref.
-        (Some(session_ref), _) => {
-            let result = store.set_session_ref(session.id, &session_ref);
-            result.map_err(|e| e.to_string())?;
-            RefOutcome::Captured(session_ref)
-        }
-        (None, Some(sessions_cmd)) => {
+    let ref_outcome = match &agent.sessions {
+        Some(sessions_cmd) => {
             match capture_session_ref(
                 sessions_cmd,
                 &project.path,
@@ -662,7 +542,7 @@ fn spawn_session(
                 None => RefOutcome::NotCaptured,
             }
         }
-        (None, None) => RefOutcome::NotApplicable,
+        None => RefOutcome::NotApplicable,
     };
     let ref_note = match &ref_outcome {
         RefOutcome::Captured(session_ref) => format!(", ref {session_ref}"),
@@ -671,10 +551,8 @@ fn spawn_session(
     };
 
     Ok(format!(
-        "{} task {} {} {} (session {}, pid {}{}) — log {}",
-        kind.verb_past(),
+        "dispatched task {} to {} (session {}, pid {}{}) — log {}",
         task.id,
-        kind.preposition(),
         session.agent,
         session.id,
         pid,
@@ -937,8 +815,9 @@ mod tests {
         dispatch(&mut store, &ctx, id, None).unwrap();
 
         let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
-        // all three return-path verbs name the literal task id, no env var
+        // the return-path verbs name the literal task id, no env var
         assert!(prompt.contains(&format!("voro ask {id}")), "{prompt}");
+        assert!(prompt.contains(&format!("voro resume {id}")), "{prompt}");
         assert!(prompt.contains(&format!("voro done {id}")), "{prompt}");
         assert!(prompt.contains("voro propose"), "{prompt}");
         assert!(!prompt.contains("VORO_TASK_ID"), "{prompt}");
@@ -1243,101 +1122,6 @@ mod tests {
         .unwrap();
         assert_eq!(log_backgrounded_ref(&log).as_deref(), Some("cafe1234"));
         std::fs::remove_file(&log).unwrap();
-    }
-
-    // --- continue-verb continuation (task #75) ---
-
-    /// A task dispatched and left `running`, its session's ref set as if
-    /// capture had recorded it.
-    fn dispatched_with_ref(store: &mut Store, ctx: &DispatchCtx, project: &Path) -> i64 {
-        let id = ready_task(store, project);
-        dispatch(store, ctx, id, None).unwrap();
-        let session_id = store.sessions_for(id).unwrap()[0].id;
-        store.set_session_ref(session_id, "ref-123").unwrap();
-        id
-    }
-
-    #[test]
-    fn continuation_reuses_the_session_via_the_continue_verb() {
-        let (mut store, ctx, project) = fixture_toml("placeholder — rewritten below");
-        let root = project.parent().unwrap().to_path_buf();
-        let ref_out = root.join("cont-ref.txt");
-        let prompt_out = root.join("cont-prompt.txt");
-        std::fs::write(
-            &ctx.agents_path,
-            format!(
-                "default_agent = \"stub\"\n\n[agents.stub]\n\
-                 dispatch = \"cat {{prompt_file}}\"\n\
-                 continue = \"cp {{prompt_file}} '{}' && echo {{session}} > '{}'\"\n",
-                prompt_out.display(),
-                ref_out.display()
-            ),
-        )
-        .unwrap();
-        let id = dispatched_with_ref(&mut store, &ctx, &project);
-
-        let summary =
-            continue_dispatch(&mut store, &ctx, id, None, Some("Schema B, then.")).unwrap();
-        assert!(summary.contains("continued task"), "{summary}");
-        assert!(summary.contains("ref ref-123"), "{summary}");
-
-        // the continue template ran with the prior session's ref substituted
-        for _ in 0..50 {
-            if ref_out.exists() && prompt_out.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(std::fs::read_to_string(&ref_out).unwrap().trim(), "ref-123");
-        // the prompt fed to the continuation is the answer, not the re-sent
-        // task body — the session already has the task
-        let prompt = std::fs::read_to_string(&prompt_out).unwrap();
-        assert_eq!(prompt.trim(), "Schema B, then.");
-        assert!(!prompt.contains("voro done"), "no preamble on a continue");
-
-        // the continuation's session row inherits the ref it addressed
-        let sessions = store.sessions_for(id).unwrap();
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].session_ref.as_deref(), Some("ref-123"));
-    }
-
-    #[test]
-    fn continuation_without_a_ref_falls_back_to_a_fresh_spawn() {
-        let (mut store, ctx, project) = fixture_toml(
-            "default_agent = \"stub\"\n\n[agents.stub]\n\
-             dispatch = \"cat {prompt_file}\"\n\
-             continue = \"true {session} {prompt_file}\"\n",
-        );
-        let id = ready_task(&mut store, &project);
-        dispatch(&mut store, &ctx, id, None).unwrap();
-        // no set_session_ref: capture never happened for this agent
-
-        continue_dispatch(&mut store, &ctx, id, None, Some("B")).unwrap();
-
-        let sessions = store.sessions_for(id).unwrap();
-        assert_eq!(sessions.len(), 2);
-        assert!(sessions[0].session_ref.is_none());
-        // the fresh spawn re-sends the full prompt: preamble plus task body
-        let mut prompts = prompt_files(&ctx);
-        prompts.sort();
-        let continuation_prompt = std::fs::read_to_string(prompts.last().unwrap()).unwrap();
-        assert!(continuation_prompt.contains("voro done"), "preamble");
-        assert!(continuation_prompt.contains("Do the thing"), "task body");
-    }
-
-    #[test]
-    fn continuation_without_a_continue_verb_ignores_prior_refs() {
-        let (mut store, ctx, project) = fixture("cat {prompt_file}");
-        let id = dispatched_with_ref(&mut store, &ctx, &project);
-
-        continue_dispatch(&mut store, &ctx, id, None, Some("B")).unwrap();
-
-        let sessions = store.sessions_for(id).unwrap();
-        assert_eq!(sessions.len(), 2);
-        assert!(
-            sessions[0].session_ref.is_none(),
-            "a fresh spawn does not inherit the old session's ref"
-        );
     }
 
     /// A ready task moved into `review` through the transition machine, so

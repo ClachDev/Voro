@@ -770,7 +770,7 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 }
 
 /// Insert a session row, stamping `started_at`, and return its id. Shared by
-/// [`Store::create_session`] and the dispatch/continuation transactions.
+/// [`Store::create_session`] and the dispatch transaction.
 /// Enforces the one-open-session invariant (DESIGN.md §8): opening a new session
 /// first closes any predecessor still open (stamped `aborted`). The partial
 /// unique index is the schema-level backstop.
@@ -1768,19 +1768,13 @@ mod tests {
             .unwrap();
         s.apply(task.id, Action::Start).unwrap();
         s.apply(task.id, Action::Ask("A or B?".into())).unwrap();
-        s.apply(task.id, Action::Answer("B".into())).unwrap();
+        s.apply(task.id, Action::Resume).unwrap();
 
         let events = s.events_for(task.id).unwrap();
         let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
         assert_eq!(
             kinds,
-            vec![
-                "created",
-                "transition",
-                "transition",
-                "transition",
-                "answer"
-            ]
+            vec!["created", "transition", "transition", "transition"]
         );
         // ids strictly increase with insertion order
         assert!(events.windows(2).all(|w| w[0].id < w[1].id));

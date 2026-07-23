@@ -4,9 +4,9 @@
 //! resolves which agent a task dispatches with.
 //!
 //! An agent is a set of verb templates; only `dispatch` is required (`cmd` is
-//! an accepted alias). The optional `sessions`/`attach`/`resume`/`continue`
-//! verbs unlock session-aware dispatch and `plan` unlocks the TUI's interactive
-//! planning sessions (DESIGN.md §8); each degrades gracefully when absent
+//! an accepted alias). The optional `sessions`/`attach`/`resume` verbs unlock
+//! session-aware dispatch and `plan` unlocks the TUI's interactive planning
+//! sessions (DESIGN.md §8); each degrades gracefully when absent
 //! (docs/agent-integration.md). Config is layered: built-ins under `voro.toml`,
 //! which may add agents, override a built-in wholesale, and set `default_agent`
 //! and viewers. A missing file is not an error.
@@ -19,8 +19,8 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 
-/// The prompt-file substitution in `dispatch` and `continue` templates. The
-/// working directory is handled by the spawner, not the template.
+/// The prompt-file substitution in the `dispatch` template. The working
+/// directory is handled by the spawner, not the template.
 pub const PROMPT_FILE_PLACEHOLDER: &str = "{prompt_file}";
 
 /// The task-id substitution in the `dispatch` template, the numeric id of the
@@ -28,9 +28,9 @@ pub const PROMPT_FILE_PLACEHOLDER: &str = "{prompt_file}";
 /// with a session-naming flag can tie the session back to its task.
 pub const TASK_ID_PLACEHOLDER: &str = "{task_id}";
 
-/// The session-reference substitution in `attach`, `resume`, and `continue`
-/// templates: the agent-opaque reference captured at dispatch (a Claude
-/// session UUID, a Codex session id, a tmux session name).
+/// The session-reference substitution in the `attach` and `resume` templates:
+/// the agent-opaque reference captured at dispatch (a Claude session UUID, a
+/// Codex session id, a tmux session name).
 pub const SESSION_PLACEHOLDER: &str = "{session}";
 
 /// The substitution in a viewer command template (DESIGN.md §11a): the checkout
@@ -73,7 +73,6 @@ plan     = \"claude --permission-mode auto --model fable \\\"$(cat {prompt_file}
 [agents.codex]
 dispatch = \"codex exec \\\"$(cat {prompt_file})\\\"\"
 resume   = \"codex resume {session}\"
-continue = \"codex exec resume {session} \\\"$(cat {prompt_file})\\\"\"
 ";
 
 /// The order the built-in agents are probed against PATH when no `default` is
@@ -112,7 +111,6 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #       sessions  list the agent's sessions as JSON (liveness + ref capture)
 #       attach    open a running session interactively    ({session})
 #       resume    reopen a finished session interactively  ({session})
-#       continue  feed a session new input headless        ({session} {prompt_file})
 #       plan      run an interactive foreground planning session ({prompt_file})
 #     See docs/agent-integration.md for the full contract.
 #   * override a built-in — a table named `claude` or `codex` REPLACES that
@@ -182,8 +180,6 @@ pub struct AgentTemplate {
     sessions: Option<String>,
     attach: Option<String>,
     resume: Option<String>,
-    #[serde(rename = "continue")]
-    continue_: Option<String>,
     /// An interactive foreground command carrying [`PROMPT_FILE_PLACEHOLDER`],
     /// run by the TUI's planning flow (DESIGN.md §8) — no `{session}`, since a
     /// planning session belongs to no task or session row.
@@ -210,10 +206,6 @@ impl AgentTemplate {
 
     pub fn resume(&self) -> Option<&str> {
         self.resume.as_deref()
-    }
-
-    pub fn continue_cmd(&self) -> Option<&str> {
-        self.continue_.as_deref()
     }
 
     pub fn plan(&self) -> Option<&str> {
@@ -304,11 +296,7 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
             "agent '{name}' cmd is missing the {PROMPT_FILE_PLACEHOLDER} placeholder"
         )));
     }
-    for (verb, template) in [
-        ("attach", &agent.attach),
-        ("resume", &agent.resume),
-        ("continue", &agent.continue_),
-    ] {
+    for (verb, template) in [("attach", &agent.attach), ("resume", &agent.resume)] {
         if let Some(template) = template
             && !template.contains(SESSION_PLACEHOLDER)
         {
@@ -316,13 +304,6 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
                 "agent '{name}' {verb} is missing the {SESSION_PLACEHOLDER} placeholder"
             )));
         }
-    }
-    if let Some(template) = &agent.continue_
-        && !template.contains(PROMPT_FILE_PLACEHOLDER)
-    {
-        return Err(invalid(format!(
-            "agent '{name}' continue is missing the {PROMPT_FILE_PLACEHOLDER} placeholder"
-        )));
     }
     if let Some(template) = &agent.plan
         && !template.contains(PROMPT_FILE_PLACEHOLDER)
@@ -354,7 +335,6 @@ pub struct ResolvedAgent {
     pub sessions: Option<String>,
     pub attach: Option<String>,
     pub resume: Option<String>,
-    pub continue_cmd: Option<String>,
     pub plan: Option<String>,
 }
 
@@ -514,7 +494,6 @@ impl AgentsConfig {
             sessions: agent.sessions.clone(),
             attach: agent.attach.clone(),
             resume: agent.resume.clone(),
-            continue_cmd: agent.continue_.clone(),
             plan: agent.plan.clone(),
         })
     }
@@ -638,11 +617,6 @@ impl AgentsConfig {
             ),
             ("attach", builtin.attach.is_some(), user.attach.is_some()),
             ("resume", builtin.resume.is_some(), user.resume.is_some()),
-            (
-                "continue",
-                builtin.continue_.is_some(),
-                user.continue_.is_some(),
-            ),
             ("plan", builtin.plan.is_some(), user.plan.is_some()),
         ]
         .into_iter()
@@ -935,7 +909,6 @@ mod tests {
         [agents.codex]
         dispatch = "codex exec {prompt_file}"
         resume   = "codex resume {session}"
-        continue = "codex exec resume {session} \"$(cat {prompt_file})\""
     "#;
 
     #[test]
@@ -945,15 +918,11 @@ mod tests {
         assert_eq!(claude.sessions.as_deref(), Some("claude agents --json"));
         assert_eq!(claude.attach.as_deref(), Some("claude attach {session}"));
         assert_eq!(claude.resume.as_deref(), Some("claude --resume {session}"));
-        assert_eq!(claude.continue_cmd, None);
 
         let codex = config.resolve(Some("codex")).unwrap();
         assert_eq!(codex.sessions, None);
         assert_eq!(codex.attach, None);
-        assert_eq!(
-            codex.continue_cmd.as_deref(),
-            Some("codex exec resume {session} \"$(cat {prompt_file})\"")
-        );
+        assert_eq!(codex.resume.as_deref(), Some("codex resume {session}"));
     }
 
     #[test]
@@ -966,7 +935,6 @@ mod tests {
         assert_eq!(resolved.sessions, None);
         assert_eq!(resolved.attach, None);
         assert_eq!(resolved.resume, None);
-        assert_eq!(resolved.continue_cmd, None);
     }
 
     #[test]
@@ -999,8 +967,8 @@ mod tests {
     }
 
     #[test]
-    fn attach_resume_continue_require_the_session_placeholder() {
-        for verb in ["attach", "resume", "continue"] {
+    fn attach_and_resume_require_the_session_placeholder() {
+        for verb in ["attach", "resume"] {
             let text = format!(
                 "default_agent = \"a\"\n\n[agents.a]\ndispatch = \"run {{prompt_file}}\"\n\
                  {verb} = \"reopen {{prompt_file}}\"\n"
@@ -1076,20 +1044,19 @@ mod tests {
         );
     }
 
+    /// A stale `continue` line — from a pre-pivot config or the old codex
+    /// built-in — is now an unknown field, so the config is refused rather than
+    /// silently honouring a verb Voro no longer runs (DESIGN.md §6/§8).
     #[test]
-    fn continue_requires_the_prompt_file_placeholder() {
+    fn a_continue_verb_is_now_an_unknown_field() {
         let text = r#"
             default_agent = "a"
 
             [agents.a]
             dispatch = "run {prompt_file}"
-            continue = "reopen {session}"
+            continue = "reopen {session} {prompt_file}"
         "#;
-        let message = AgentsConfig::parse(text, Path::new("/tmp/voro.toml"))
-            .unwrap_err()
-            .to_string();
-        assert!(message.contains("{prompt_file}"), "{message}");
-        assert!(message.contains("continue"), "{message}");
+        assert!(AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).is_err());
     }
 
     #[test]
@@ -1301,7 +1268,7 @@ mod tests {
         assert!(agents.contains_key("claude"));
         assert!(agents.contains_key("codex"));
         assert!(agents["claude"].sessions().is_some());
-        assert!(agents["codex"].continue_cmd().is_some());
+        assert!(agents["codex"].resume().is_some());
     }
 
     #[test]
