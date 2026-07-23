@@ -8,7 +8,7 @@ use voro_core::{
     DepKind, DepRef, Event, ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
 };
 
-use crate::app::{App, CockpitRow, Mode, Screen, TaskRow};
+use crate::app::{App, CockpitRow, Mode, ReviewActionOption, Screen, TaskRow};
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
@@ -35,6 +35,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Cockpit => draw_cockpit(frame, app),
         Screen::Tasks => draw_tasks(frame, app),
         Screen::Projects => draw_projects(frame, app),
+        Screen::Config => draw_config(frame, app),
     }
     draw_mode(frame, app);
 }
@@ -263,12 +264,15 @@ fn draw_mode(frame: &mut Frame, app: &App) {
         } => {
             let items: Vec<ListItem> = options
                 .iter()
-                .map(|o| {
-                    if o == current {
-                        ListItem::new(format!("{o}  (current)"))
-                    } else {
-                        ListItem::new(o.to_string())
+                .map(|o| match o {
+                    ReviewActionOption::Action(a) if a == current => {
+                        ListItem::new(format!("{a}  (current)"))
                     }
+                    ReviewActionOption::Action(a) => ListItem::new(a.to_string()),
+                    ReviewActionOption::NewViewer => ListItem::new(Line::from(Span::styled(
+                        "new viewer…",
+                        Style::new().fg(Color::Blue),
+                    ))),
                 })
                 .collect();
             let height = items.len() as u16 + 2;
@@ -279,6 +283,82 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                     Block::default()
                         .borders(Borders::ALL)
                         .title("Review action — ⏎ set, esc cancel"),
+                )
+                .highlight_style(SELECTED);
+            frame.render_stateful_widget(list, area, &mut state);
+        }
+        Mode::ViewerForm {
+            name,
+            cmd,
+            on_cmd,
+            editing,
+            ..
+        } => {
+            let field = |label: &str, value: &str, active: bool| {
+                let style = if active {
+                    Style::new().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::new()
+                };
+                Line::from(vec![
+                    Span::raw(format!("{label:>7}: ")),
+                    Span::styled(format!("{value}▏"), style),
+                ])
+            };
+            let area = popup_area(frame, 72, 5);
+            let title = if *editing {
+                format!("Edit viewer '{name}' — ⏎ to save, esc to cancel")
+            } else {
+                "New viewer — tab to switch, ⏎ to advance/save, esc to cancel".to_string()
+            };
+            // The name field is inert on an edit, so dim it to say so.
+            let name_line = if *editing {
+                Line::from(vec![
+                    Span::raw("   name: "),
+                    Span::styled(name.clone(), Style::new().dim()),
+                ])
+            } else {
+                field("name", name, !*on_cmd)
+            };
+            let para = Paragraph::new(vec![
+                name_line,
+                field("command", cmd, *on_cmd),
+                Line::from(Span::styled(
+                    "{path} = checkout/worktree · {branch} · {base}",
+                    Style::new().dim(),
+                )),
+            ])
+            .block(Block::default().borders(Borders::ALL).title(title));
+            frame.render_widget(para, area);
+        }
+        Mode::DefaultPicker {
+            kind,
+            names,
+            current,
+            sel,
+        } => {
+            let items: Vec<ListItem> = names
+                .iter()
+                .map(|n| {
+                    if Some(n) == current.as_ref() {
+                        ListItem::new(format!("{n}  (current)"))
+                    } else {
+                        ListItem::new(n.clone())
+                    }
+                })
+                .collect();
+            let height = items.len() as u16 + 2;
+            let area = popup_area(frame, 44, height.max(3));
+            let mut state = ListState::default().with_selected(Some(*sel));
+            let what = match kind {
+                crate::app::DefaultKind::Agent => "default agent",
+                crate::app::DefaultKind::Viewer => "default viewer",
+            };
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!("Pick {what} — ⏎ set, esc cancel")),
                 )
                 .highlight_style(SELECTED);
             frame.render_stateful_widget(list, area, &mut state);
@@ -930,6 +1010,131 @@ fn draw_projects(frame: &mut Frame, app: &App) {
     draw_status(frame, app, status);
 }
 
+/// The Config screen (DESIGN.md §5): the effective `voro.toml` surface. Agents
+/// (read-only) with provenance and the default marked, over the editable named
+/// viewers, with the legacy anonymous `[viewer]` shown read-only beneath them. A
+/// file that failed to parse is surfaced here rather than rendering empty.
+fn draw_config(frame: &mut Frame, app: &App) {
+    let [main, status] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+
+    if let Some(err) = &app.config_error {
+        let para = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "voro.toml could not be read:",
+                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw(err.clone())),
+            Line::from(Span::styled(
+                format!("path: {}", app.config_path().display()),
+                Style::new().dim(),
+            )),
+        ])
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title("Config"));
+        frame.render_widget(para, main);
+        draw_status(frame, app, status);
+        return;
+    }
+
+    // Agents: one line each (default starred, verbs listed), plus a warning line
+    // where an override drops built-in verbs (DESIGN.md §8).
+    let mut agent_lines: Vec<Line> = Vec::new();
+    for a in &app.config_agents {
+        let marker = if a.is_default { "* " } else { "  " };
+        let verbs = if a.verbs.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", a.verbs.join(" "))
+        };
+        agent_lines.push(Line::from(vec![
+            Span::raw(marker),
+            Span::styled(format!("{:<10}", a.name), Style::new().bold()),
+            Span::styled(format!(" {:<14}", a.provenance), Style::new().dim()),
+            Span::raw(verbs),
+        ]));
+        // The dispatch command on a dim continuation line (clipped to the pane),
+        // so the row shows what each agent actually runs.
+        agent_lines.push(Line::from(Span::styled(
+            format!("    {}", a.dispatch),
+            Style::new().dim(),
+        )));
+        if !a.missing_verbs.is_empty() {
+            agent_lines.push(Line::from(Span::styled(
+                format!("    ! override drops: {}", a.missing_verbs.join(", ")),
+                Style::new().fg(Color::Yellow),
+            )));
+        }
+    }
+    if agent_lines.is_empty() {
+        agent_lines.push(Line::from(Span::styled(
+            "no agents configured",
+            Style::new().dim(),
+        )));
+    }
+
+    let agents_h = (agent_lines.len() as u16 + 2).clamp(3, 14);
+    let [agents_area, viewers_area] =
+        Layout::vertical([Constraint::Length(agents_h), Constraint::Min(3)]).areas(main);
+
+    let agents = Paragraph::new(agent_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Agents (read-only — * default)"),
+    );
+    frame.render_widget(agents, agents_area);
+
+    // Viewers: the editable named entries, the default starred, then the
+    // anonymous [viewer] as a read-only trailing note when present.
+    let mut viewer_items: Vec<ListItem> = Vec::new();
+    for v in &app.config_viewers {
+        let marker = if v.is_default { "* " } else { "  " };
+        viewer_items.push(ListItem::new(Line::from(vec![
+            Span::raw(marker),
+            Span::raw(format!("{:<14}", v.name)),
+            Span::styled(v.cmd.clone(), Style::new().dim()),
+        ])));
+    }
+    let named = app.config_viewers.len();
+    if let Some(cmd) = &app.config_anon_viewer {
+        viewer_items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!("  {:<14}", "[viewer]"), Style::new().dim()),
+            Span::styled(
+                format!("{cmd}  (anonymous — name it in voro.toml to edit)"),
+                Style::new().dim(),
+            ),
+        ])));
+    }
+    let empty = viewer_items.is_empty();
+    // The selection only ever lands on a named viewer, never the anonymous note.
+    let selected = if named == 0 {
+        None
+    } else {
+        Some(app.config_sel)
+    };
+    let mut state = ListState::default().with_selected(selected);
+    let viewers = List::new(viewer_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Viewers — a add · e edit · d delete · V default · A default agent")
+                .title_bottom(
+                    Line::from(format!(" {} ", app.config_path().display())).right_aligned(),
+                ),
+        )
+        .highlight_style(SELECTED);
+    frame.render_stateful_widget(viewers, viewers_area, &mut state);
+    if empty {
+        let inner = viewers_area.inner(ratatui::layout::Margin::new(1, 1));
+        frame.render_widget(
+            Paragraph::new("no viewers yet — press a to add one").dim(),
+            inner,
+        );
+    }
+
+    draw_status(frame, app, status);
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     // A red status message overrides the key line, as before.
     if let Some(msg) = &app.status {
@@ -1010,9 +1215,21 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("A", "archive"),
             ("d", "delete"),
             ("v", "review action"),
-            ("tab", "cockpit"),
+            ("tab", "config"),
             ("q", "quit"),
         ],
+        Screen::Config => {
+            let mut pairs: Vec<(&'static str, &'static str)> = vec![("a", "add viewer")];
+            if !app.config_viewers.is_empty() {
+                pairs.push(("e", "edit"));
+                pairs.push(("d", "delete"));
+                pairs.push(("V", "default viewer"));
+            }
+            pairs.push(("A", "default agent"));
+            pairs.push(("tab", "cockpit"));
+            pairs.push(("q", "quit"));
+            pairs
+        }
     }
 }
 
@@ -1033,6 +1250,61 @@ pub fn popup_area(frame: &mut Frame, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use voro_core::{Priority, Task, TaskState};
+
+    /// End-to-end: the Config screen renders the read-only agents (with the
+    /// default marked) over the editable named viewers, drawn through the real
+    /// screen draw path (DESIGN.md §5).
+    #[test]
+    fn config_screen_renders_agents_and_viewers() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        use voro_core::Store;
+
+        let dir = std::env::temp_dir().join(format!(
+            "voro-ui-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agents_path = dir.join("voro.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&agents_path, "[viewers.zed]\ncmd = \"zed {path}\"\n").unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+        let ctx = crate::dispatch::DispatchCtx {
+            db_path: dir.join("voro.db"),
+            agents_path,
+            runtime_dir: dir.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
+            session_task_id: None,
+        };
+        let mut app = App::new(store, ctx).unwrap();
+        app.on_key(KeyEvent::from(KeyCode::Char('4')));
+        assert_eq!(app.screen, Screen::Config);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Agents"), "{rendered}");
+        assert!(rendered.contains("claude"), "{rendered}");
+        assert!(rendered.contains("Viewers"), "{rendered}");
+        assert!(
+            rendered.contains("zed") && rendered.contains("zed {path}"),
+            "{rendered}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn row(state: TaskState, blockers: Vec<DepRef>) -> TaskRow {
         TaskRow {

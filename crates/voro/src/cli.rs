@@ -98,6 +98,11 @@ dispatch
                                   task; --agent overrides the resolved agent
   viewer list                     list the viewers voro.toml defines; * marks
                                   the default used when nothing names one
+  viewer add <name> <cmd>         define a [viewers.NAME] entry in voro.toml
+                                  (comment-preserving); cmd may carry {path},
+                                  {branch}, {base} (e.g. 'zed {path}')
+  viewer remove <name>            delete a viewer; refused while a project's
+                                  review action still names it
   open <task-id>                  open a review/running task's checkout in a
                                   voro.toml viewer to see its diff — the
                                   explicit spelling of pr's viewer medium;
@@ -270,6 +275,8 @@ enum AgentCmd {
 #[derive(Subcommand)]
 enum ViewerCmd {
     List,
+    Add { name: String, cmd: String },
+    Remove { name: String },
 }
 
 #[derive(Args)]
@@ -440,7 +447,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
             dispatch::dispatch(store, ctx, task_id, agent.as_deref())
         }
         Verb::Open { task_id } => dispatch::open(store, ctx, task_id, None),
-        Verb::Viewer { cmd } => viewer_verb(cmd, ctx),
+        Verb::Viewer { cmd } => viewer_verb(store, cmd, ctx),
         Verb::Pr { task_id, yes } => pr_verb(store, task_id, yes, ctx),
         Verb::Reject(args) => reject_verb(store, args),
         Verb::Done(args) => done_verb(store, args),
@@ -1197,11 +1204,44 @@ fn explain_verb(store: &mut Store, id: i64) -> Result<String, String> {
     Ok(out)
 }
 
-/// `viewer list` (DESIGN.md §8/§11a): the viewers `voro.toml` defines, with the
-/// default flagged. Like `agent`, config outside the database, so no store.
-fn viewer_verb(cmd: ViewerCmd, ctx: &DispatchCtx) -> Result<String, String> {
+/// `viewer list/add/remove` (DESIGN.md §8/§11a): read and edit the viewers
+/// `voro.toml` defines. `add`/`remove` route through the same comment-preserving
+/// write helper the TUI Config screen uses; `remove` needs the store to refuse
+/// deleting a viewer a project's review action still names.
+fn viewer_verb(store: &mut Store, cmd: ViewerCmd, ctx: &DispatchCtx) -> Result<String, String> {
     let path = &ctx.agents_path;
     match cmd {
+        ViewerCmd::Add { name, cmd } => {
+            voro_core::config_edit::add_viewer(path, &name, &cmd).map_err(|e| e.to_string())?;
+            let mut out = format!("viewer '{name}' added: {cmd}");
+            if voro_core::config_edit::missing_path_placeholder(&cmd) {
+                out.push_str(
+                    "\nnote: the command has no {path} placeholder, so it will run in the \
+                     checkout directory itself",
+                );
+            }
+            Ok(out)
+        }
+        ViewerCmd::Remove { name } => {
+            let projects = store.projects().map_err(|e| e.to_string())?;
+            let referencing = voro_core::config_edit::projects_referencing_viewer(&projects, &name);
+            if !referencing.is_empty() {
+                let names: Vec<&str> = referencing.iter().map(|p| p.name.as_str()).collect();
+                return Err(format!(
+                    "viewer '{name}' is the review action of {} — repoint {} with `voro project \
+                     action <project> <auto|pr|viewer:NAME>` before removing it",
+                    names.join(", "),
+                    if referencing.len() == 1 { "it" } else { "them" }
+                ));
+            }
+            let cleared =
+                voro_core::config_edit::delete_viewer(path, &name).map_err(|e| e.to_string())?;
+            let mut out = format!("viewer '{name}' removed");
+            if cleared {
+                out.push_str(" — it was the default, so default_viewer is now unset");
+            }
+            Ok(out)
+        }
         ViewerCmd::List => {
             let config = AgentsConfig::load(path).map_err(|e| e.to_string())?;
             let names = config.viewer_names();
@@ -1390,6 +1430,67 @@ mod tests {
         // a second init refuses rather than clobbering
         let e = call(&mut s, &["agent", "init"]).unwrap_err();
         assert!(e.contains("already exists"), "{e}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn viewer_add_remove_round_trip_through_the_cli() {
+        let dir = std::env::temp_dir().join(format!(
+            "voro-cli-viewers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agents_path = dir.join("voro/voro.toml");
+        let ctx = DispatchCtx {
+            db_path: dir.join("voro.db"),
+            agents_path,
+            runtime_dir: dir.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
+            session_task_id: None,
+        };
+        let mut s = store();
+        let call = |s: &mut Store, args: &[&str]| {
+            run(s, args.iter().map(|x| x.to_string()).collect(), &ctx)
+        };
+
+        // add then list shows it — `viewer list` gains its inverse
+        let out = call(&mut s, &["viewer", "add", "zed", "zed {path}"]).unwrap();
+        assert!(out.contains("zed"), "{out}");
+        let listed = call(&mut s, &["viewer", "list"]).unwrap();
+        assert!(
+            listed.contains("zed") && listed.contains("zed {path}"),
+            "{listed}"
+        );
+
+        // a duplicate name is refused
+        let e = call(&mut s, &["viewer", "add", "zed", "zed ."]).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+
+        // an empty command is refused
+        let e = call(&mut s, &["viewer", "add", "emacs", "   "]).unwrap_err();
+        assert!(e.contains("command is required"), "{e}");
+
+        // a command with no {path} succeeds but warns
+        let out = call(&mut s, &["viewer", "add", "difftool", "git difftool -d"]).unwrap();
+        assert!(out.contains("{path}"), "{out}");
+
+        // a project pinned to viewer:zed blocks its removal, naming the project
+        call(&mut s, &["project", "add", "demo", "/tmp/demo"]).unwrap();
+        call(&mut s, &["project", "action", "demo", "viewer:zed"]).unwrap();
+        let e = call(&mut s, &["viewer", "remove", "zed"]).unwrap_err();
+        assert!(e.contains("demo") && e.contains("review action"), "{e}");
+
+        // repoint the project, then removal succeeds and list loses it
+        call(&mut s, &["project", "action", "demo", "auto"]).unwrap();
+        let out = call(&mut s, &["viewer", "remove", "zed"]).unwrap();
+        assert!(out.contains("removed"), "{out}");
+        let listed = call(&mut s, &["viewer", "list"]).unwrap();
+        assert!(!listed.contains("zed"), "{listed}");
+        assert!(listed.contains("difftool"), "{listed}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

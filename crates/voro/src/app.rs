@@ -14,6 +14,45 @@ pub enum Screen {
     Cockpit,
     Tasks,
     Projects,
+    Config,
+}
+
+/// Which global default a [`Mode::DefaultPicker`] is setting (DESIGN.md §5):
+/// `default_agent` or `default_viewer`, both pick-from-list on the Config screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultKind {
+    Agent,
+    Viewer,
+}
+
+/// One option in the review-action picker (DESIGN.md §8/§11a). Beyond the real
+/// [`ReviewAction`] choices, the trailing `NewViewer` entry opens the add-viewer
+/// form and pins the project to the viewer it creates — first-time viewer setup
+/// without a detour through the Config screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewActionOption {
+    Action(ReviewAction),
+    NewViewer,
+}
+
+/// An agent row on the Config screen (DESIGN.md §5): the effective set with
+/// provenance and the default marked, read-only in this cut.
+#[derive(Debug, Clone)]
+pub struct ConfigAgentRow {
+    pub name: String,
+    pub dispatch: String,
+    pub provenance: &'static str,
+    pub is_default: bool,
+    pub verbs: Vec<&'static str>,
+    pub missing_verbs: Vec<&'static str>,
+}
+
+/// A named viewer row on the Config screen — the editable half of the page.
+#[derive(Debug, Clone)]
+pub struct ConfigViewerRow {
+    pub name: String,
+    pub cmd: String,
+    pub is_default: bool,
 }
 
 /// One selectable row on the cockpit; indices point into the App caches.
@@ -112,14 +151,34 @@ pub enum Mode {
         sel: usize,
     },
     /// Picking a project's review action on the projects screen (DESIGN.md
-    /// §8/§11a): auto, pr, the default viewer, and each named viewer from
-    /// `voro.toml`, loaded fresh so a just-added viewer shows up.
+    /// §8/§11a): auto, pr, the default viewer, each named viewer from
+    /// `voro.toml`, and a trailing "new viewer…" that opens the add-viewer form.
+    /// Loaded fresh so a just-added viewer shows up.
     ReviewActionPicker {
         project_id: i64,
-        options: Vec<ReviewAction>,
+        options: Vec<ReviewActionOption>,
         /// The project's action as stored, flagged in the list independently
         /// of cursor position.
         current: ReviewAction,
+        sel: usize,
+    },
+    /// The add/edit-viewer form on the Config screen (DESIGN.md §5): a name and
+    /// a command template. Both paths — the Config screen and the review-action
+    /// picker's "new viewer…" — share it. `editing` locks the name to an update;
+    /// `review_project` pins that project to the viewer once it is created.
+    ViewerForm {
+        name: String,
+        cmd: String,
+        on_cmd: bool,
+        editing: bool,
+        review_project: Option<i64>,
+    },
+    /// Picking `default_agent` or `default_viewer` from the configured set
+    /// (DESIGN.md §5), on the Config screen.
+    DefaultPicker {
+        kind: DefaultKind,
+        names: Vec<String>,
+        current: Option<String>,
         sel: usize,
     },
 }
@@ -211,6 +270,19 @@ pub struct App {
     pub tasks_sel: usize,
     pub projects_sel: usize,
 
+    /// The Config screen's view of `voro.toml` (DESIGN.md §5), reloaded every
+    /// refresh so an edit — from either this screen or a dispatch — is reflected
+    /// immediately. Agents are read-only; the named viewers are what `config_sel`
+    /// selects for edit/delete.
+    pub config_agents: Vec<ConfigAgentRow>,
+    pub config_viewers: Vec<ConfigViewerRow>,
+    /// The legacy anonymous `[viewer]` table's command, shown read-only.
+    pub config_anon_viewer: Option<String>,
+    /// A `voro.toml` that failed to parse, surfaced on the screen rather than
+    /// silently rendering an empty config.
+    pub config_error: Option<String>,
+    pub config_sel: usize,
+
     pub mode: Mode,
     /// Whether the detail views fold the score decomposition (DESIGN.md §7) and
     /// the event history in — toggled by `x` and `h`. Held per app-state so the
@@ -275,6 +347,11 @@ impl App {
             cockpit_sel: 0,
             tasks_sel: 0,
             projects_sel: 0,
+            config_agents: Vec::new(),
+            config_viewers: Vec::new(),
+            config_anon_viewer: None,
+            config_error: None,
+            config_sel: 0,
             mode: Mode::Normal,
             show_score: false,
             show_history: false,
@@ -295,6 +372,12 @@ impl App {
     /// failing attach leaves a breadcrumb the TUI cannot paint over.
     pub fn launch_log_path(&self) -> std::path::PathBuf {
         self.dispatch_ctx.launch_log_path()
+    }
+
+    /// The `voro.toml` the Config screen views and edits (DESIGN.md §5), for
+    /// the screen to show the operator which file is in play.
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.dispatch_ctx.agents_path
     }
 
     /// Refresh if another process has committed since the last check. Cheap
@@ -373,12 +456,75 @@ impl App {
         self.cockpit_rows
             .extend((0..self.running.len()).map(CockpitRow::Running));
 
+        self.load_config_view();
+
         self.cockpit_sel = self
             .cockpit_sel
             .min(self.cockpit_rows.len().saturating_sub(1));
         self.tasks_sel = self.tasks_sel.min(self.all.len().saturating_sub(1));
         self.projects_sel = self.projects_sel.min(self.projects.len().saturating_sub(1));
+        self.config_sel = self
+            .config_sel
+            .min(self.config_viewers.len().saturating_sub(1));
         Ok(())
+    }
+
+    /// Reload the Config screen's `voro.toml` view (DESIGN.md §5). A parse
+    /// failure is held in `config_error` and shown on the screen; the agent and
+    /// dispatch paths load the file independently, so this only feeds rendering.
+    fn load_config_view(&mut self) {
+        let config = match AgentsConfig::load(&self.dispatch_ctx.agents_path) {
+            Ok(config) => config,
+            Err(e) => {
+                self.config_agents.clear();
+                self.config_viewers.clear();
+                self.config_anon_viewer = None;
+                self.config_error = Some(e.to_string());
+                return;
+            }
+        };
+        let default_agent = config.default_name();
+        self.config_agents = config
+            .entries()
+            .map(|(name, template, provenance)| {
+                let verbs = [
+                    ("sessions", template.sessions()),
+                    ("attach", template.attach()),
+                    ("resume", template.resume()),
+                    ("plan", template.plan()),
+                ]
+                .into_iter()
+                .filter_map(|(verb, defined)| defined.map(|_| verb))
+                .collect();
+                ConfigAgentRow {
+                    name: name.to_string(),
+                    dispatch: template.dispatch().to_string(),
+                    provenance: provenance.label(),
+                    is_default: Some(name) == default_agent.as_deref(),
+                    verbs,
+                    missing_verbs: config.override_missing_verbs(name),
+                }
+            })
+            .collect();
+        let default_viewer = config.default_viewer_name();
+        self.config_viewers = config
+            .viewer_names()
+            .into_iter()
+            .map(|name| {
+                let is_default = Some(name.as_str()) == default_viewer.as_deref();
+                let cmd = config
+                    .named_viewer_cmd(&name)
+                    .unwrap_or_default()
+                    .to_string();
+                ConfigViewerRow {
+                    name,
+                    cmd,
+                    is_default,
+                }
+            })
+            .collect();
+        self.config_anon_viewer = config.anonymous_viewer_cmd().map(str::to_string);
+        self.config_error = None;
     }
 
     pub fn selected_task_id(&self) -> Option<i64> {
@@ -388,7 +534,7 @@ impl App {
                 CockpitRow::Running(i) => Some(self.running.get(*i)?.task_id),
             },
             Screen::Tasks => Some(self.all.get(self.tasks_sel)?.task.id),
-            Screen::Projects => None,
+            Screen::Projects | Screen::Config => None,
         }
     }
 
@@ -397,6 +543,7 @@ impl App {
             Screen::Cockpit => (&mut self.cockpit_sel, self.cockpit_rows.len()),
             Screen::Tasks => (&mut self.tasks_sel, self.all.len()),
             Screen::Projects => (&mut self.projects_sel, self.projects.len()),
+            Screen::Config => (&mut self.config_sel, self.config_viewers.len()),
         };
         if len == 0 {
             return;
@@ -413,13 +560,14 @@ impl App {
         self.detail_scroll = (self.detail_scroll as i64 + delta).clamp(0, max) as u16;
     }
 
-    /// Tab cycles cockpit → tasks → projects → cockpit; `1`/`2`/`3` jump
-    /// directly (DESIGN.md §9).
+    /// Tab cycles cockpit → tasks → projects → config → cockpit; `1`/`2`/`3`/`4`
+    /// jump directly (DESIGN.md §9).
     pub fn toggle_screen(&mut self) {
         self.screen = match self.screen {
             Screen::Cockpit => Screen::Tasks,
             Screen::Tasks => Screen::Projects,
-            Screen::Projects => Screen::Cockpit,
+            Screen::Projects => Screen::Config,
+            Screen::Config => Screen::Cockpit,
         };
     }
 
@@ -457,6 +605,7 @@ impl App {
     pub fn enter_hint(&self) -> Option<&'static str> {
         match self.screen {
             Screen::Projects => None,
+            Screen::Config => self.config_viewers.get(self.config_sel).map(|_| "⏎ edit"),
             Screen::Tasks => self.all.get(self.tasks_sel).map(|_| "⏎ view"),
             Screen::Cockpit => match self.cockpit_rows.get(self.cockpit_sel)? {
                 CockpitRow::Queue(i) => match self.queue.get(*i)?.task.state {
@@ -540,6 +689,19 @@ impl App {
                 current,
                 sel,
             } => self.key_review_action_picker(key, project_id, options, current, sel),
+            Mode::ViewerForm {
+                name,
+                cmd,
+                on_cmd,
+                editing,
+                review_project,
+            } => self.key_viewer_form(key, name, cmd, on_cmd, editing, review_project),
+            Mode::DefaultPicker {
+                kind,
+                names,
+                current,
+                sel,
+            } => self.key_default_picker(key, kind, names, current, sel),
         }
     }
 
@@ -572,6 +734,13 @@ impl App {
             self.key_projects(key);
             return;
         }
+        // The Config screen has its own letter actions that would collide with
+        // the global ones (`a`, `d`, `e`), so it too intercepts before the match
+        // below; it keeps the digit jumps, which mean nothing else there.
+        if self.screen == Screen::Config {
+            self.key_config(key);
+            return;
+        }
         // Direct screen jumps, on the screens where digits mean nothing else.
         match key.code {
             KeyCode::Char('1') => {
@@ -584,6 +753,10 @@ impl App {
             }
             KeyCode::Char('3') => {
                 self.screen = Screen::Projects;
+                return;
+            }
+            KeyCode::Char('4') => {
+                self.screen = Screen::Config;
                 return;
             }
             _ => {}
@@ -1187,17 +1360,23 @@ impl App {
             }
         };
         let mut options = vec![
-            ReviewAction::Auto,
-            ReviewAction::Pr,
-            ReviewAction::Viewer(None),
+            ReviewActionOption::Action(ReviewAction::Auto),
+            ReviewActionOption::Action(ReviewAction::Pr),
+            ReviewActionOption::Action(ReviewAction::Viewer(None)),
         ];
         options.extend(
             config
                 .viewer_names()
                 .into_iter()
-                .map(|name| ReviewAction::Viewer(Some(name))),
+                .map(|name| ReviewActionOption::Action(ReviewAction::Viewer(Some(name)))),
         );
-        let sel = options.iter().position(|o| *o == current).unwrap_or(0);
+        // The quick path (DESIGN.md §5): a trailing entry that opens the
+        // add-viewer form and pins this project to the viewer it creates.
+        options.push(ReviewActionOption::NewViewer);
+        let sel = options
+            .iter()
+            .position(|o| matches!(o, ReviewActionOption::Action(a) if *a == current))
+            .unwrap_or(0);
         self.mode = Mode::ReviewActionPicker {
             project_id,
             options,
@@ -1213,7 +1392,7 @@ impl App {
         &mut self,
         key: KeyEvent,
         project_id: i64,
-        options: Vec<ReviewAction>,
+        options: Vec<ReviewActionOption>,
         current: ReviewAction,
         mut sel: usize,
     ) {
@@ -1224,14 +1403,23 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => sel = sel.saturating_sub(1),
             KeyCode::Enter => {
-                if let Some(action) = options.get(sel) {
-                    let result = self
-                        .store
-                        .set_review_action(project_id, action)
-                        .and_then(|_| self.refresh());
-                    if self.report(result).is_some() {
-                        self.status = Some(format!("review action -> {action}"));
+                match options.get(sel) {
+                    Some(ReviewActionOption::Action(action)) => {
+                        let action = action.clone();
+                        let result = self
+                            .store
+                            .set_review_action(project_id, &action)
+                            .and_then(|_| self.refresh());
+                        if self.report(result).is_some() {
+                            self.status = Some(format!("review action -> {action}"));
+                        }
                     }
+                    // Open the shared add-viewer form; on success it pins this
+                    // project to the new viewer (DESIGN.md §5).
+                    Some(ReviewActionOption::NewViewer) => {
+                        self.open_viewer_form(None, Some(project_id));
+                    }
+                    None => {}
                 }
                 return;
             }
@@ -1240,6 +1428,281 @@ impl App {
         self.mode = Mode::ReviewActionPicker {
             project_id,
             options,
+            current,
+            sel,
+        };
+    }
+
+    /// The Config screen's local keys (DESIGN.md §5): `a` adds a viewer, `e`/⏎
+    /// edits the selected one's command, `d` deletes it, `V`/`A` pick the default
+    /// viewer/agent. Digits still jump screens; movement is `key_normal`'s.
+    fn key_config(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('1') => self.screen = Screen::Cockpit,
+            KeyCode::Char('2') => self.screen = Screen::Tasks,
+            KeyCode::Char('3') => self.screen = Screen::Projects,
+            KeyCode::Char('a') => self.open_viewer_form(None, None),
+            KeyCode::Char('e') | KeyCode::Enter => self.edit_selected_viewer(),
+            KeyCode::Char('d') => self.delete_selected_viewer(),
+            KeyCode::Char('V') => self.open_default_picker(DefaultKind::Viewer),
+            KeyCode::Char('A') => self.open_default_picker(DefaultKind::Agent),
+            _ => {}
+        }
+    }
+
+    /// Open the add/edit-viewer form. `existing` pre-fills it for an edit (name
+    /// locked); `review_project` threads through the quick path so a viewer
+    /// created from the review-action picker becomes that project's action.
+    fn open_viewer_form(
+        &mut self,
+        existing: Option<(String, String)>,
+        review_project: Option<i64>,
+    ) {
+        let (name, cmd, editing) = match existing {
+            Some((name, cmd)) => (name, cmd, true),
+            None => (String::new(), String::new(), false),
+        };
+        self.mode = Mode::ViewerForm {
+            name,
+            cmd,
+            // An edit starts on the command field, since the name is fixed.
+            on_cmd: editing,
+            editing,
+            review_project,
+        };
+    }
+
+    fn edit_selected_viewer(&mut self) {
+        match self.config_viewers.get(self.config_sel) {
+            Some(v) => {
+                let existing = (v.name.clone(), v.cmd.clone());
+                self.open_viewer_form(Some(existing), None);
+            }
+            None => self.status = Some("no viewer selected — press a to add one".into()),
+        }
+    }
+
+    /// Delete the selected viewer, refusing when a project's review action still
+    /// names it (DESIGN.md §5) — the same refusal as `voro viewer remove`, with
+    /// the offending projects named. Deleting the default clears `default_viewer`.
+    fn delete_selected_viewer(&mut self) {
+        let Some(viewer) = self.config_viewers.get(self.config_sel) else {
+            self.status = Some("no viewer selected".into());
+            return;
+        };
+        let name = viewer.name.clone();
+        let referencing =
+            voro_core::config_edit::projects_referencing_viewer(&self.projects, &name);
+        if !referencing.is_empty() {
+            let names: Vec<&str> = referencing.iter().map(|p| p.name.as_str()).collect();
+            self.status = Some(format!(
+                "'{name}' is the review action of {} — repoint it first (v on the projects screen)",
+                names.join(", ")
+            ));
+            return;
+        }
+        match voro_core::config_edit::delete_viewer(&self.dispatch_ctx.agents_path, &name) {
+            Ok(cleared) => {
+                self.status = Some(if cleared {
+                    format!("viewer '{name}' deleted — was the default, default_viewer cleared")
+                } else {
+                    format!("viewer '{name}' deleted")
+                });
+                let result = self.refresh();
+                self.report(result);
+            }
+            Err(e) => self.status = Some(e.to_string()),
+        }
+    }
+
+    /// Open the default-agent/viewer picker (DESIGN.md §5), loading `voro.toml`
+    /// fresh so a just-added viewer is offered. An empty set reports what to do.
+    fn open_default_picker(&mut self, kind: DefaultKind) {
+        let config = match AgentsConfig::load(&self.dispatch_ctx.agents_path) {
+            Ok(config) => config,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        let (names, current) = match kind {
+            DefaultKind::Agent => (config.agent_names(), config.default_name()),
+            DefaultKind::Viewer => (config.viewer_names(), config.default_viewer_name()),
+        };
+        if names.is_empty() {
+            self.status = Some(match kind {
+                DefaultKind::Agent => "no agents are configured".into(),
+                DefaultKind::Viewer => "no viewers to pick from — add one with a".into(),
+            });
+            return;
+        }
+        let sel = current
+            .as_ref()
+            .and_then(|c| names.iter().position(|n| n == c))
+            .unwrap_or(0);
+        self.mode = Mode::DefaultPicker {
+            kind,
+            names,
+            current,
+            sel,
+        };
+    }
+
+    /// Drive the add/edit-viewer form. Tab toggles fields (an edit stays on the
+    /// command, its name locked); ⏎ advances name → command on an add, then
+    /// submits. A failed write keeps the form open with the error on the status
+    /// line so a typo is fixable without retyping.
+    fn key_viewer_form(
+        &mut self,
+        key: KeyEvent,
+        mut name: String,
+        mut cmd: String,
+        on_cmd: bool,
+        editing: bool,
+        review_project: Option<i64>,
+    ) {
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Tab => {
+                let on_cmd = if editing { true } else { !on_cmd };
+                self.mode = Mode::ViewerForm {
+                    name,
+                    cmd,
+                    on_cmd,
+                    editing,
+                    review_project,
+                };
+                return;
+            }
+            KeyCode::Enter => {
+                if !on_cmd && !editing {
+                    self.mode = Mode::ViewerForm {
+                        name,
+                        cmd,
+                        on_cmd: true,
+                        editing,
+                        review_project,
+                    };
+                    return;
+                }
+                self.submit_viewer_form(name, cmd, editing, review_project);
+                return;
+            }
+            KeyCode::Backspace => {
+                if on_cmd {
+                    cmd.pop();
+                } else {
+                    name.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if on_cmd {
+                    cmd.push(c);
+                } else if !editing {
+                    name.push(c);
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::ViewerForm {
+            name,
+            cmd,
+            on_cmd,
+            editing,
+            review_project,
+        };
+    }
+
+    /// Write the viewer through the shared helper, then — for the quick path —
+    /// pin the originating project to it, and refresh.
+    fn submit_viewer_form(
+        &mut self,
+        name: String,
+        cmd: String,
+        editing: bool,
+        review_project: Option<i64>,
+    ) {
+        let path = &self.dispatch_ctx.agents_path;
+        let result = if editing {
+            voro_core::config_edit::edit_viewer(path, &name, &cmd)
+        } else {
+            voro_core::config_edit::add_viewer(path, &name, &cmd)
+        };
+        if let Err(e) = result {
+            self.status = Some(e.to_string());
+            self.mode = Mode::ViewerForm {
+                name,
+                cmd,
+                on_cmd: true,
+                editing,
+                review_project,
+            };
+            return;
+        }
+        let trimmed = name.trim().to_string();
+        let mut msg = if editing {
+            format!("viewer '{trimmed}' updated")
+        } else {
+            format!("viewer '{trimmed}' added")
+        };
+        if voro_core::config_edit::missing_path_placeholder(&cmd) {
+            msg.push_str(" (no {path} — runs in the checkout dir)");
+        }
+        if let Some(project_id) = review_project {
+            let action = voro_core::ReviewAction::Viewer(Some(trimmed.clone()));
+            match self.store.set_review_action(project_id, &action) {
+                Ok(_) => msg.push_str(" — set as this project's review action"),
+                Err(e) => msg = e.to_string(),
+            }
+        }
+        self.status = Some(msg);
+        let result = self.refresh();
+        self.report(result);
+    }
+
+    /// Drive the default-agent/viewer picker: ⏎ writes the choice through the
+    /// shared helper and refreshes; esc cancels.
+    fn key_default_picker(
+        &mut self,
+        key: KeyEvent,
+        kind: DefaultKind,
+        names: Vec<String>,
+        current: Option<String>,
+        mut sel: usize,
+    ) {
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Char('j') | KeyCode::Down => {
+                sel = (sel + 1).min(names.len().saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => sel = sel.saturating_sub(1),
+            KeyCode::Enter => {
+                let chosen = names[sel].clone();
+                let path = &self.dispatch_ctx.agents_path;
+                let result = match kind {
+                    DefaultKind::Agent => voro_core::config_edit::set_default_agent(path, &chosen),
+                    DefaultKind::Viewer => {
+                        voro_core::config_edit::set_default_viewer(path, &chosen)
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        self.status = Some(match kind {
+                            DefaultKind::Agent => format!("default agent -> {chosen}"),
+                            DefaultKind::Viewer => format!("default viewer -> {chosen}"),
+                        });
+                        let result = self.refresh();
+                        self.report(result);
+                    }
+                    Err(e) => self.status = Some(e.to_string()),
+                }
+                return;
+            }
+            _ => {}
+        }
+        self.mode = Mode::DefaultPicker {
+            kind,
+            names,
             current,
             sel,
         };
@@ -1913,7 +2376,7 @@ mod tests {
     /// the digits set weight instead, so it is reached with `3` and left via
     /// tab.
     #[test]
-    fn tab_and_digits_move_between_the_three_screens() {
+    fn tab_and_digits_move_between_the_four_screens() {
         let mut app = app_with(&[]);
         assert_eq!(app.screen, Screen::Cockpit);
         key(&mut app, KeyCode::Tab);
@@ -1921,18 +2384,188 @@ mod tests {
         key(&mut app, KeyCode::Tab);
         assert_eq!(app.screen, Screen::Projects);
         key(&mut app, KeyCode::Tab);
+        assert_eq!(app.screen, Screen::Config);
+        key(&mut app, KeyCode::Tab);
         assert_eq!(app.screen, Screen::Cockpit);
 
         key(&mut app, KeyCode::Char('2'));
         assert_eq!(app.screen, Screen::Tasks);
         key(&mut app, KeyCode::Char('1'));
         assert_eq!(app.screen, Screen::Cockpit);
+        key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.screen, Screen::Config);
+        // The config screen's letter keys are its own, but the digit jumps still
+        // work and tab cycles on.
         key(&mut app, KeyCode::Char('3'));
         assert_eq!(app.screen, Screen::Projects);
         // On the projects screen the digit jump is superseded by weight-setting;
         // tab is the way back out.
         key(&mut app, KeyCode::Tab);
+        assert_eq!(app.screen, Screen::Config);
+        key(&mut app, KeyCode::Tab);
         assert_eq!(app.screen, Screen::Cockpit);
+    }
+
+    /// Type each character of `s` as a `Char` key press.
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            key(app, KeyCode::Char(c));
+        }
+    }
+
+    /// The Config screen (DESIGN.md §5): add, edit, set-default, and delete a
+    /// viewer entirely through the TUI, each edit landing in `voro.toml` and
+    /// reflected on the next refresh.
+    #[test]
+    fn config_screen_adds_edits_defaults_and_deletes_a_viewer() {
+        let (store, ctx, _project) = scratch_env("config-crud", None);
+        let path = ctx.agents_path.clone();
+        let mut app = App::new(store, ctx).unwrap();
+
+        key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.screen, Screen::Config);
+        assert!(app.config_viewers.is_empty());
+        // the built-in agents are listed read-only
+        assert!(app.config_agents.iter().any(|a| a.name == "claude"));
+
+        // add: a opens the form, name → Enter → command → Enter submits
+        key(&mut app, KeyCode::Char('a'));
+        assert!(matches!(app.mode, Mode::ViewerForm { editing: false, .. }));
+        type_str(&mut app, "zed");
+        key(&mut app, KeyCode::Enter);
+        type_str(&mut app, "zed {path}");
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.config_viewers.len(), 1);
+        assert_eq!(app.config_viewers[0].name, "zed");
+        assert_eq!(app.config_viewers[0].cmd, "zed {path}");
+        assert_eq!(
+            AgentsConfig::load(&path)
+                .unwrap()
+                .viewer_cmd(Some("zed"))
+                .unwrap(),
+            "zed {path}"
+        );
+
+        // edit: e opens the form with the name locked; append to the command
+        key(&mut app, KeyCode::Char('e'));
+        assert!(matches!(app.mode, Mode::ViewerForm { editing: true, .. }));
+        type_str(&mut app, " --wait");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.config_viewers[0].cmd, "zed {path} --wait");
+
+        // default: V opens the picker; Enter sets zed as default_viewer
+        key(&mut app, KeyCode::Char('V'));
+        assert!(matches!(app.mode, Mode::DefaultPicker { .. }));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.config_viewers[0].is_default);
+        assert_eq!(
+            AgentsConfig::load(&path)
+                .unwrap()
+                .default_viewer_name()
+                .as_deref(),
+            Some("zed")
+        );
+
+        // delete: d removes it and clears the now-dangling default
+        key(&mut app, KeyCode::Char('d'));
+        assert!(app.config_viewers.is_empty());
+        let config = AgentsConfig::load(&path).unwrap();
+        assert!(config.viewer_names().is_empty());
+        assert_eq!(config.default_viewer_name(), None);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Deleting a viewer a project's review action still names is refused on the
+    /// Config screen too, naming the project (DESIGN.md §5).
+    #[test]
+    fn config_screen_refuses_to_delete_a_referenced_viewer() {
+        let toml = "[viewers.zed]\ncmd = \"zed {path}\"\n";
+        let (mut store, ctx, _project) = scratch_env("config-ref", Some(toml));
+        let project = store.create_project("demo2", "/tmp/demo2").unwrap();
+        store
+            .set_review_action(
+                project.id,
+                &voro_core::ReviewAction::Viewer(Some("zed".into())),
+            )
+            .unwrap();
+        let path = ctx.agents_path.clone();
+        let mut app = App::new(store, ctx).unwrap();
+
+        key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.config_viewers.len(), 1);
+        key(&mut app, KeyCode::Char('d'));
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("demo2"),
+            "refusal should name the project: {:?}",
+            app.status
+        );
+        // still there, in the file and the view
+        assert_eq!(app.config_viewers.len(), 1);
+        assert!(
+            AgentsConfig::load(&path)
+                .unwrap()
+                .viewer_names()
+                .contains(&"zed".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The quick path (DESIGN.md §5): the projects screen's review-action picker
+    /// grows a "new viewer…" entry that opens the add-viewer form and, on
+    /// success, pins the project to the viewer it created.
+    #[test]
+    fn review_action_picker_new_viewer_creates_and_pins_it() {
+        let (mut store, ctx, project_path) = scratch_env("config-quickpath", None);
+        let project = store
+            .create_project("demo", project_path.to_str().unwrap())
+            .unwrap();
+        let path = ctx.agents_path.clone();
+        let mut app = App::new(store, ctx).unwrap();
+
+        // onto the projects screen, open the review-action picker
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.screen, Screen::Projects);
+        key(&mut app, KeyCode::Char('v'));
+        let n = match &app.mode {
+            Mode::ReviewActionPicker { options, .. } => options.len(),
+            _ => panic!("expected the review-action picker to open"),
+        };
+        // the last option is "new viewer…"; move to it and select
+        for _ in 0..n {
+            key(&mut app, KeyCode::Char('j'));
+        }
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(
+                app.mode,
+                Mode::ViewerForm {
+                    review_project: Some(_),
+                    ..
+                }
+            ),
+            "new viewer… should open the form carrying the project"
+        );
+        type_str(&mut app, "emacs");
+        key(&mut app, KeyCode::Enter);
+        type_str(&mut app, "emacsclient {path}");
+        key(&mut app, KeyCode::Enter);
+
+        // the viewer exists and the project is now pinned to it
+        assert!(
+            AgentsConfig::load(&path)
+                .unwrap()
+                .viewer_names()
+                .contains(&"emacs".to_string())
+        );
+        assert_eq!(
+            app.store.project(project.id).unwrap().review_action,
+            voro_core::ReviewAction::Viewer(Some("emacs".into()))
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// The morning ritual: `0`–`5` on the projects screen sets the selected
