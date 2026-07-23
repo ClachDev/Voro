@@ -1,8 +1,8 @@
 //! Dispatching a ready (or stalled) task to a headless agent session (DESIGN.md
-//! §8): the I/O half of dispatch — resolving the agent, guarding against a dirty
-//! checkout, writing the prompt, and spawning the process detached — kept out of
-//! voro-core, which stays pure of process and filesystem I/O. The atomic
-//! state-plus-session write is voro-core's `Store::record_dispatch`.
+//! §8): the I/O half of dispatch — resolving the agent, guarding that the
+//! checkout is a git repository, writing the prompt, and spawning the process
+//! detached — kept out of voro-core, which stays pure of process and filesystem
+//! I/O. The atomic state-plus-session write is voro-core's `Store::record_dispatch`.
 //!
 //! For agents that define a `sessions` verb (task #75), dispatch additionally
 //! captures the agent's own session reference after launch — by polling the
@@ -446,7 +446,7 @@ fn spawn_session(
         .resolve(agent_override.or(task.agent.as_deref()))
         .map_err(|e| e.to_string())?;
 
-    guard_clean_tree(&project.path)?;
+    guard_git_repo(&project.path)?;
 
     std::fs::create_dir_all(&ctx.runtime_dir)
         .map_err(|e| format!("cannot create {}: {e}", ctx.runtime_dir.display()))?;
