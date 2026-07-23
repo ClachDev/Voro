@@ -20,6 +20,9 @@ and say so explicitly.
   decomposition view and DESIGN.md §7 in the same change.
 - Prefer boring dependencies: rusqlite, ratatui, crossterm, serde, thiserror.
   Justify anything beyond that in the PR description.
+- The `voro-cli` skill ships from the Claude Code plugin at `plugins/voro/`
+  (registered by `.claude-plugin/marketplace.json`) and is installed globally,
+  not picked up from `.claude/skills/`; edit the plugin copy, not a project one.
 
 ## Commands
 
