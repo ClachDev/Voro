@@ -126,6 +126,31 @@ dispatch semantics, the review action, and the `voro.toml` format are covered in
 snippet and the Claude Code hooks configuration are in
 [`docs/agent-integration.md`](docs/agent-integration.md).
 
+## Claude Code plugin
+
+Voro ships a Claude Code plugin — the `voro-cli` skill — so any coding session
+can create, propose, and transition Voro tasks through the CLI. Register this
+repo as a plugin marketplace once, then install the plugin:
+
+```bash
+claude plugin marketplace add ClachDev/Voro
+claude plugin install voro
+```
+
+The skill then activates in **any** project you open in Claude Code, not just a
+Voro checkout — it teaches the agent the read/write verbs, the database
+resolution rules, and how to file follow-up tasks against the right project. The
+`@marketplace` suffix (`claude plugin install voro@voro`) is only for
+disambiguation when several marketplaces expose a plugin named `voro`; the plain
+name works here.
+
+Contributors working from a local clone can point the marketplace at the
+checkout instead of GitHub:
+
+```bash
+claude plugin marketplace add /path/to/Voro
+```
+
 ## License
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or

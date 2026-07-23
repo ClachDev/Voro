@@ -1,0 +1,17 @@
+{
+  "name": "voro",
+  "owner": {
+    "name": "ClachDev",
+    "url": "https://github.com/ClachDev/Voro"
+  },
+  "metadata": {
+    "description": "Voro — an attention-based session manager that prioritises tasks across projects and dispatches them to coding agents.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "voro",
+      "source": "./plugins/voro"
+    }
+  ]
+}

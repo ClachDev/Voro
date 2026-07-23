@@ -1,0 +1,22 @@
+{
+  "name": "voro",
+  "description": "Manage Voro tasks and projects from Claude Code: create and propose tasks, check the inbox, record questions and completion, and drive the agent lifecycle — without ever touching the SQLite database directly.",
+  "version": "0.1.0",
+  "author": {
+    "name": "ClachDev",
+    "url": "https://github.com/ClachDev/Voro"
+  },
+  "homepage": "https://github.com/ClachDev/Voro",
+  "repository": "https://github.com/ClachDev/Voro",
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "voro",
+    "task-management",
+    "productivity",
+    "agents",
+    "cli",
+    "workflow"
+  ],
+  "category": "workflow",
+  "skills": ["./skills/voro-cli"]
+}
