@@ -30,10 +30,14 @@ You were dispatched by Voro on task $VORO_TASK_ID. When you reach one of these
 points, run the matching command — Voro surfaces it in the operator's queue:
 
     voro ask "$VORO_TASK_ID" --question "Schema A or B? Trade-offs: ..."
+    voro resume "$VORO_TASK_ID"
     voro done "$VORO_TASK_ID" --branch "$(git rev-parse --abbrev-ref HEAD)" --summary "Implemented X, tests pass"
     voro propose <project> "Follow-up title" --body-file plan.md
 
 - `ask` when you are blocked on a human decision and cannot proceed.
+- `resume` once that question is answered here in this session, to move the task
+  back to `running` and carry on — Voro records no answer text, the exchange is
+  already in this transcript.
 - `done` when the work is complete and ready for review. Record **both** flags on
   the one call: `--branch` is the git branch your work landed on and `--summary`
   is a PR-ready account of what changed, why, and how you verified it — on a
@@ -48,9 +52,9 @@ points, run the matching command — Voro surfaces it in the operator's queue:
 `VORO_TASK_ID` and `VORO_DB` are already in your environment — do not set them.
 ```
 
-`ask` moves the task to `needs-input`, `done` to `review`, and `propose` files a
-`proposed` task discovered-from this one. See DESIGN.md §8 for why the surface is
-this small.
+`ask` moves the task to `needs-input`, `resume` back to `running`, `done` to
+`review`, and `propose` files a `proposed` task discovered-from this one. See
+DESIGN.md §8 for why the surface is this small.
 
 ## Session verbs: attachable dispatch
 
@@ -76,7 +80,6 @@ plan     = "claude --permission-mode auto --model fable \"$(cat {prompt_file})\"
 [agents.codex]
 dispatch = "codex exec \"$(cat {prompt_file})\""
 resume   = "codex resume {session}"
-continue = "codex exec resume {session} \"$(cat {prompt_file})\""
 ```
 
 - `dispatch` may also carry `{task_id}`, replaced with the task's numeric id.
@@ -90,8 +93,6 @@ continue = "codex exec resume {session} \"$(cat {prompt_file})\""
 - `attach` opens the *running* session interactively; `{session}` is replaced
   with the reference Voro captured at dispatch.
 - `resume` reopens a *finished* session interactively.
-- `continue` feeds a session new input headless — `{prompt_file}` holds the
-  input (an answer), `{session}` addresses the session.
 - `plan` runs an interactive *foreground* session for the TUI's agent-assisted
   task creation (DESIGN.md §8): `{prompt_file}` holds the planning brief, and
   the command owns the terminal until the conversation ends, so it must not
@@ -137,15 +138,17 @@ alone.
 **Jump-in.** In the TUI, `a` on a running task runs the agent's `attach` command
 with the TUI suspended — the real session, full control, including answering
 permission prompts; on a review or stalled task it runs `resume` instead,
-reopening the finished session. `answer` prefers the `continue` verb when it
-exists and the session has a ref — the answer goes to the *same* session, context
-intact — and otherwise spawns a fresh session re-sent the whole task body.
+reopening the finished session. This is also how a `needs-input` question is
+answered: the operator jumps into the agent's own session, answers in the
+conversation, and then runs `voro resume` (or presses Enter on the inbox row) to
+move the task back to `running`. Voro never records the answer text — the
+exchange lives in the session transcript (DESIGN.md §6/§8).
 
 Every verb degrades gracefully when absent: no `attach`/`resume` disables the
 jump-in key for that agent, no `sessions` keeps pid-liveness reconciliation, no
-`continue` keeps fresh-spawn continuation, no `plan` turns the TUI's planning key
-into a status line saying what to configure. An agent defining only
-`dispatch`/`cmd` behaves exactly as before the verbs existed.
+`plan` turns the TUI's planning key into a status line saying what to configure.
+An agent defining only `dispatch`/`cmd` behaves exactly as before the verbs
+existed.
 
 ### tmux as a universal fallback
 
@@ -164,8 +167,8 @@ attach   = "tmux attach -t {session}"
 A tmux session vanishes from `list-sessions` when its command exits, which is
 exactly the drop-out the reconciler treats as finished-without-reporting — it
 finalises the session and lands the task in `stalled` (DESIGN.md §8), where
-redispatch is one key away. There is no honest `resume`/`continue` for a dead
-tmux session, so leave those verbs off and let redispatch handle it.
+redispatch is one key away. There is no honest `resume` for a dead tmux
+session, so leave that verb off and let redispatch handle it.
 
 ## Hooks as a fallback
 

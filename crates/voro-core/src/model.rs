@@ -378,9 +378,9 @@ pub struct Task {
     pub created_at: String,
     pub closed_at: Option<String>,
     /// Marks a task no agent can execute — hands-on work at real hardware, say
-    /// (DESIGN.md §3/§6). Dispatch, continuation, `ask`, and the agent override
-    /// refuse it; completion goes `running → done` directly. Default `false`
-    /// means dispatchable.
+    /// (DESIGN.md §3/§6). Dispatch, `ask`, and the agent override refuse it;
+    /// completion goes `running → done` directly. Default `false` means
+    /// dispatchable.
     pub human: bool,
 }
 

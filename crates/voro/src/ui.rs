@@ -17,6 +17,19 @@ fn task_ref(id: i64) -> String {
     format!("{:>4}", format!("#{id}"))
 }
 
+/// A compact one-line rendering of a possibly multi-line question, for the row
+/// summaries where only a single line fits: the first line, with a trailing `…`
+/// when there is more (the full text reads in the cockpit detail pane).
+fn question_summary(question: &str) -> String {
+    let mut lines = question.lines();
+    let first = lines.next().unwrap_or("");
+    if lines.next().is_some() {
+        format!("{first}…")
+    } else {
+        first.to_string()
+    }
+}
+
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
         Screen::Cockpit => draw_cockpit(frame, app),
@@ -177,7 +190,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             ];
             if let Some(q) = &t.question {
                 lines.push(Line::from(Span::styled(
-                    format!("question: {q}"),
+                    format!("question: {}", question_summary(q)),
                     Style::new().fg(Color::Cyan),
                 )));
             }
@@ -561,7 +574,7 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 if let Some(q) = &c.task.question {
                     spans.push(Span::styled(
-                        format!("  — {q}"),
+                        format!("  — {}", question_summary(q)),
                         Style::new().fg(Color::Cyan),
                     ));
                 }
@@ -631,10 +644,18 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(meta),
     ];
     if let Some(q) = &task.question {
-        lines.push(Line::from(Span::styled(
-            format!("question: {q}"),
-            Style::new().fg(Color::Cyan),
-        )));
+        // One `Line` per line of the question: ratatui does not break lines
+        // inside a `Span`, so a multi-line question rendered as a single span
+        // would collapse to one line. The detail pane is where the operator
+        // reads the full question before answering it in-session (DESIGN.md §6).
+        for (i, qline) in q.lines().enumerate() {
+            let text = if i == 0 {
+                format!("question: {qline}")
+            } else {
+                qline.to_string()
+            };
+            lines.push(Line::from(Span::styled(text, Style::new().fg(Color::Cyan))));
+        }
     }
     if let Some(pr) = &task.pr_url {
         lines.push(Line::from(pr_span(pr)));
@@ -1052,6 +1073,18 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn question_summary_collapses_a_multi_line_question_to_its_first_line() {
+        // a single-line question is unchanged
+        assert_eq!(question_summary("Schema A or B?"), "Schema A or B?");
+        // a multi-line one collapses to the first line with a trailing ellipsis,
+        // the marker that there is more to read in the detail pane
+        assert_eq!(
+            question_summary("Which schema?\nA: normalised\nB: flat"),
+            "Which schema?…"
+        );
     }
 
     #[test]
@@ -1786,6 +1819,64 @@ mod tests {
         assert!(!rendered.contains("last session:"), "{rendered}");
         let labels: Vec<&str> = key_hints(&app).iter().map(|(_, l)| *l).collect();
         assert!(labels.contains(&"log"), "{labels:?}");
+    }
+
+    /// A multi-line question renders across multiple lines in the cockpit
+    /// detail pane (DESIGN.md §6) — ratatui does not break a `Span` on a
+    /// newline, so each line of the question is its own `Line`.
+    #[test]
+    fn detail_pane_renders_a_multi_line_question_across_lines() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store.set_weight(p.id, 3).unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                title: "mid-flight".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+            })
+            .unwrap();
+        store
+            .record_dispatch(task.id, "claude", Some(1), Some("/tmp/voro/open.log"))
+            .unwrap();
+        store
+            .apply(
+                task.id,
+                Action::Ask("Pick a schema:\nAlpha option\nBravo option".into()),
+            )
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let app = App::new(store, ctx).unwrap();
+        let width: u16 = 100;
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        // Reassemble the buffer into rows so each question line is checked on
+        // its own terminal row — a single-span rendering would collapse them.
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("question: Pick a schema:")),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("Alpha option")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("Bravo option")), "{rows:?}");
     }
 
     /// The cockpit key line only advertises the score/history toggles and the

@@ -38,7 +38,6 @@ pub struct TaskRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     Ask,
-    Answer,
     RejectWork,
 }
 
@@ -46,7 +45,6 @@ impl PromptKind {
     pub fn title(self) -> &'static str {
         match self {
             PromptKind::Ask => "Question",
-            PromptKind::Answer => "Answer",
             PromptKind::RejectWork => "Rejection feedback",
         }
     }
@@ -54,7 +52,6 @@ impl PromptKind {
     fn action(self, text: String) -> Action {
         match self {
             PromptKind::Ask => Action::Ask(text),
-            PromptKind::Answer => Action::Answer(text),
             PromptKind::RejectWork => Action::RejectWork(text),
         }
     }
@@ -161,7 +158,7 @@ pub fn action_label(action: &Action) -> &'static str {
         Action::Triage(Triage::Reject) => "triage → rejected",
         Action::Start => "start → running",
         Action::Ask(_) => "ask a question → needs-input",
-        Action::Answer(_) => "answer the question → running",
+        Action::Resume => "resume (answered in-session) → running",
         Action::Complete(_) => "complete → review",
         Action::HandOff => "hand off → waiting",
         Action::Reclaim => "reclaim → review",
@@ -176,8 +173,8 @@ pub fn action_label(action: &Action) -> &'static str {
 
 pub struct App {
     pub store: Store,
-    /// The dispatch context a continuation dispatch (DESIGN.md §6) uses — the
-    /// same one the CLI verbs use, so the TUI's answer action behaves identically.
+    /// The dispatch context the TUI's dispatch/redispatch, planning, and
+    /// attach/resume actions use — the same one the CLI verbs use.
     dispatch_ctx: crate::dispatch::DispatchCtx,
     pub screen: Screen,
     pub should_quit: bool,
@@ -428,8 +425,9 @@ impl App {
 
     /// The primary action of the current selection. On the Tasks screen every
     /// row opens its detail view. On the cockpit — where the detail pane
-    /// already shows the body — a needs-input task opens the answer prompt
-    /// directly and any other task opens its transition menu.
+    /// already shows the body — a needs-input task resumes directly (the
+    /// operator has answered the question in the agent's own session, DESIGN.md
+    /// §6/§8) and any other task opens its transition menu.
     fn activate_selection(&mut self) {
         if self.screen == Screen::Tasks {
             if let Some(task_id) = self.selected_task_id() {
@@ -439,11 +437,8 @@ impl App {
         }
         if let Some(task) = self.selected_task() {
             if task.state == TaskState::NeedsInput {
-                self.mode = Mode::Prompt {
-                    task_id: task.id,
-                    kind: PromptKind::Answer,
-                    buffer: String::new(),
-                };
+                let id = task.id;
+                self.apply_and_refresh(id, Action::Resume);
             } else {
                 let actions = Store::legal_actions(task.state, task.human);
                 if !actions.is_empty() {
@@ -465,7 +460,7 @@ impl App {
             Screen::Tasks => self.all.get(self.tasks_sel).map(|_| "⏎ view"),
             Screen::Cockpit => match self.cockpit_rows.get(self.cockpit_sel)? {
                 CockpitRow::Queue(i) => match self.queue.get(*i)?.task.state {
-                    TaskState::NeedsInput => Some("⏎ answer"),
+                    TaskState::NeedsInput => Some("⏎ resume"),
                     TaskState::Proposed => Some("⏎ triage"),
                     TaskState::Review => Some("⏎ review"),
                     _ => Some("⏎ act"),
@@ -490,38 +485,13 @@ impl App {
         self.all.iter().map(|r| &r.task).find(|t| t.id == id)
     }
 
-    /// Apply a transition and refresh. An `Answer` or `RejectWork` on a task
-    /// with prior session history additionally triggers a continuation dispatch
-    /// (DESIGN.md §6/§8), the same rule and mechanics `voro answer`/`voro reject`
-    /// use. A task only ever started by hand has no history and the transition
-    /// stands alone.
+    /// Apply a transition and refresh. `resume` (needs-input → running) and
+    /// reject-with-feedback (review → running) both leave the agent's session
+    /// open, so the operator answers the question or addresses the feedback in
+    /// that same session — Voro only moves the state (DESIGN.md §6/§8).
     fn apply_and_refresh(&mut self, task_id: i64, action: Action) {
-        let continuation_input = match &action {
-            Action::Answer(text) | Action::RejectWork(text) => Some(text.clone()),
-            _ => None,
-        };
-        let has_history = continuation_input.is_some()
-            && self
-                .store
-                .sessions_for(task_id)
-                .is_ok_and(|sessions| !sessions.is_empty());
         let result = self.store.apply(task_id, action);
         if self.report(result).is_some() {
-            if has_history {
-                match crate::dispatch::continue_dispatch(
-                    &mut self.store,
-                    &self.dispatch_ctx,
-                    task_id,
-                    None,
-                    continuation_input.as_deref(),
-                ) {
-                    Ok(summary) => self.status = Some(summary),
-                    Err(e) => {
-                        self.status =
-                            Some(format!("transition applied, but continuation failed: {e}"))
-                    }
-                }
-            }
             let result = self.refresh();
             self.report(result);
         }
@@ -1394,7 +1364,6 @@ impl App {
                 let action = actions[sel].clone();
                 let kind = match action {
                     Action::Ask(_) => Some(PromptKind::Ask),
-                    Action::Answer(_) => Some(PromptKind::Answer),
                     Action::RejectWork(_) => Some(PromptKind::RejectWork),
                     _ => None,
                 };
@@ -1546,8 +1515,7 @@ mod tests {
     }
 
     /// A `DispatchCtx` that is never actually used to spawn anything in these
-    /// tests — none of them build up session history on a task before
-    /// answering it, so `apply_and_refresh`'s continuation path never fires.
+    /// tests — the transitions they drive (`resume`, reject) only move state.
     fn dummy_ctx() -> crate::dispatch::DispatchCtx {
         crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new("/nonexistent/voro.db"))
     }
@@ -1603,27 +1571,24 @@ mod tests {
         App::new(store, dummy_ctx()).unwrap()
     }
 
+    /// Enter on a needs-input inbox row resumes the task directly — the
+    /// operator answered in the agent's own session, so there is no answer
+    /// prompt (DESIGN.md §6/§8), just the `needs-input → running` transition.
     #[test]
-    fn enter_on_needs_input_row_answers_and_requeues() {
+    fn enter_on_needs_input_row_resumes_and_requeues() {
         let mut app = app_with(&[TaskState::NeedsInput]);
         assert!(matches!(
             app.cockpit_rows[app.cockpit_sel],
             CockpitRow::Queue(_)
         ));
-        assert_eq!(app.enter_hint(), Some("⏎ answer"));
+        assert_eq!(app.enter_hint(), Some("⏎ resume"));
+        let task_id = app.queue[0].task.id;
 
         key(&mut app, KeyCode::Enter);
-        let task_id = match app.mode {
-            Mode::Prompt {
-                task_id,
-                kind: PromptKind::Answer,
-                ..
-            } => task_id,
-            _ => panic!("enter on a needs-input row should open the answer prompt"),
-        };
-
-        key(&mut app, KeyCode::Char('B'));
-        key(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "resume applies directly, opening no prompt"
+        );
         assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
         assert!(app.queue.is_empty());
     }
@@ -1674,15 +1639,16 @@ mod tests {
         (store, ctx, project_path)
     }
 
-    /// The TUI's answer action is the CLI's `voro answer` under a different
-    /// keybinding (task #31, DESIGN.md §6): a task with prior session history
-    /// gets a continuation dispatched automatically when answered here too.
+    /// Resuming a dispatched task from the cockpit keeps its live agent session
+    /// — the operator answered in that session, so no continuation is spawned
+    /// (DESIGN.md §6/§8): the task returns to `running` on the one session it
+    /// already had.
     #[test]
-    fn answering_a_task_with_session_history_triggers_a_continuation() {
+    fn resuming_a_task_with_a_live_session_spawns_no_continuation() {
         use std::process::{Command, Stdio};
 
         let root = std::env::temp_dir().join(format!(
-            "voro-app-answer-{}-{}",
+            "voro-app-resume-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1703,11 +1669,11 @@ mod tests {
 
         let db_path = root.join("voro.db");
         let agents_path = root.join("voro.toml");
-        // The continuation this test triggers must still be alive when
-        // `apply_and_refresh`'s own `self.refresh()` reconciles-on-read
-        // immediately afterwards — an instantly-exiting stub (`cat`, as
-        // `dispatch.rs`'s tests use) would otherwise race that read and get
-        // finalised as a failed session before the assertions below run.
+        // The dispatched session must still be alive when `apply_and_refresh`'s
+        // own `self.refresh()` reconciles-on-read immediately after the resume —
+        // an instantly-exiting stub (`cat`) would race that read and get
+        // finalised as a failed session, stalling the task before the
+        // assertions below run.
         std::fs::write(
             &agents_path,
             "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"sleep 1 && cat {prompt_file}\"\n",
@@ -1740,18 +1706,12 @@ mod tests {
 
         let mut app = App::new(store, ctx).unwrap();
         key(&mut app, KeyCode::Enter);
-        key(&mut app, KeyCode::Char('B'));
-        key(&mut app, KeyCode::Enter);
 
         assert_eq!(app.store.task(task.id).unwrap().state, TaskState::Running);
-        assert_eq!(app.store.sessions_for(task.id).unwrap().len(), 2);
-        assert!(
-            app.status
-                .as_deref()
-                .unwrap_or("")
-                .contains("continued task"),
-            "{:?}",
-            app.status
+        assert_eq!(
+            app.store.sessions_for(task.id).unwrap().len(),
+            1,
+            "resume must not spawn a second session"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2121,8 +2081,8 @@ mod tests {
         // `sleep 1 &&` keeps the stub process alive past `dispatch_task`'s own
         // `refresh()`, whose reconcile-on-read would otherwise race an
         // instantly-exiting stub and finalise the session as failed/ready
-        // before the assertions below run (see the answer-continuation test
-        // above for the same race).
+        // before the assertions below run (see the resume test above for the
+        // same race).
         let (mut store, ctx, project_path) = scratch_env(
             "dispatch",
             Some(
