@@ -120,7 +120,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.project_id, t.title, t.body, t.priority, t.state, t.agent,
                     t.question, t.pr_url, t.branch, t.state_since, t.created_at, t.closed_at,
-                    t.human, p.name, p.weight,
+                    t.human, t.repo_id, p.name, p.weight,
                     julianday('now') - julianday(t.state_since)
              FROM tasks t JOIN projects p ON p.id = t.project_id
              WHERE p.weight > 0 AND p.archived = 0
@@ -128,9 +128,9 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |row| {
             let task = task_from_row(row)?;
-            let project_name: String = row.get(14)?;
-            let weight: i64 = row.get(15)?;
-            let age_days: f64 = row.get(16)?;
+            let project_name: String = row.get(15)?;
+            let weight: i64 = row.get(16)?;
+            let age_days: f64 = row.get(17)?;
             let score = score(weight, task.priority, task.state, age_days);
             Ok(Candidate {
                 task,
@@ -283,6 +283,7 @@ mod tests {
     fn add_task(s: &mut Store, project_id: i64, title: &str, priority: Priority) -> i64 {
         s.create_task(NewTask {
             project_id,
+            repo_id: None,
             title: title.into(),
             body: String::new(),
             priority,
@@ -318,6 +319,7 @@ mod tests {
     fn add_proposed(s: &mut Store, project_id: i64, title: &str, priority: Priority) -> i64 {
         s.create_task(NewTask {
             project_id,
+            repo_id: None,
             title: title.into(),
             body: String::new(),
             priority,
@@ -563,6 +565,7 @@ mod tests {
         add_task(&mut s, parked, "hidden ready", Priority::P0);
         s.create_task(NewTask {
             project_id: parked,
+            repo_id: None,
             title: "hidden proposed".into(),
             body: String::new(),
             priority: Priority::P2,
@@ -632,6 +635,7 @@ mod tests {
         add_task(&mut s, active, "r2", Priority::P2);
         s.create_task(NewTask {
             project_id: active,
+            repo_id: None,
             title: "idea".into(),
             body: String::new(),
             priority: Priority::P2,
@@ -652,6 +656,7 @@ mod tests {
         add_task(&mut s, parked, "hidden ready", Priority::P2);
         s.create_task(NewTask {
             project_id: parked,
+            repo_id: None,
             title: "hidden idea".into(),
             body: String::new(),
             priority: Priority::P2,

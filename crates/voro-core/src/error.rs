@@ -24,6 +24,34 @@ pub enum Error {
     #[error("project '{name}' is archived — `voro project unarchive {name}` first")]
     ProjectArchived { name: String },
 
+    #[error("no repo named '{name}' in project '{project}'; its repos: {known}")]
+    RepoNotFound {
+        project: String,
+        name: String,
+        known: String,
+    },
+
+    #[error("repo {0} not found")]
+    RepoIdNotFound(i64),
+
+    #[error(
+        "repo '{name}' is the only repo in project '{project}' — a project always has a \
+         checkout, so add another repo before removing this one"
+    )]
+    LastRepo { project: String, name: String },
+
+    #[error(
+        "repo '{name}' is the default repo of project '{project}' — `voro repo default \
+         {project} <other>` first, so tasks without a repo still resolve"
+    )]
+    DefaultRepo { project: String, name: String },
+
+    #[error(
+        "repo '{name}' is used by {count} task(s) — re-point them with `voro set <task-id> \
+         --repo <other>` before removing it"
+    )]
+    RepoInUse { name: String, count: i64 },
+
     #[error("session {0} not found")]
     SessionNotFound(i64),
 

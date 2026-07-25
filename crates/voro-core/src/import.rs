@@ -44,10 +44,13 @@ pub fn issue_task_body(issue: &GithubIssue) -> String {
 
 /// An issue mapped to a task, always landing in `proposed`: imports are
 /// untriaged like any other machine-generated task, and priority is not
-/// guessed from labels in v1 — triage assigns it.
-pub fn issue_new_task(project_id: i64, issue: &GithubIssue) -> NewTask {
+/// guessed from labels in v1 — triage assigns it. `repo_id` carries the repo
+/// the issues were fetched from, so an imported task dispatches into the
+/// checkout it came from rather than the project default.
+pub fn issue_new_task(project_id: i64, repo_id: Option<i64>, issue: &GithubIssue) -> NewTask {
     NewTask {
         project_id,
+        repo_id,
         title: issue.title.clone(),
         body: issue_task_body(issue),
         priority: Priority::P2,
@@ -131,8 +134,9 @@ mod tests {
     #[test]
     fn new_task_lands_proposed_with_no_guessed_priority_or_agent() {
         let issues = GithubIssue::parse_list(CANNED).unwrap();
-        let task = issue_new_task(9, &issues[0]);
+        let task = issue_new_task(9, Some(4), &issues[0]);
         assert_eq!(task.project_id, 9);
+        assert_eq!(task.repo_id, Some(4));
         assert_eq!(task.title, "Crash on empty input");
         assert_eq!(task.state, TaskState::Proposed);
         assert_eq!(task.priority, Priority::P2);

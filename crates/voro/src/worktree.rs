@@ -291,6 +291,7 @@ mod tests {
         let id = store
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "t".into(),
                 body: "b".into(),
                 priority: Priority::P1,

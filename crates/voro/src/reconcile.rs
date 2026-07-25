@@ -181,6 +181,7 @@ mod tests {
         let t = s
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "task".into(),
                 body: String::new(),
                 priority: Priority::P1,

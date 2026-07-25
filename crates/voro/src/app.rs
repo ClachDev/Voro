@@ -708,9 +708,8 @@ impl App {
     /// down around it, like attach/resume. Missing pieces report via the status
     /// line.
     fn view_session_log(&mut self) {
-        let (task_id, project_id) = match self.selected_task() {
-            Some(task) => (task.id, task.project_id),
-            None => return,
+        let Some(task_id) = self.selected_task().map(|t| t.id) else {
+            return;
         };
         let Some(session) = self.last_sessions.get(&task_id) else {
             self.status = Some(format!("task {task_id} has no session on record"));
@@ -720,8 +719,8 @@ impl App {
             self.status = Some(format!("session {} recorded no log path", session.id));
             return;
         };
-        let project = match self.store.project(project_id) {
-            Ok(project) => project,
+        let cwd = match self.task_checkout(task_id) {
+            Ok(path) => path,
             Err(e) => {
                 self.status = Some(e.to_string());
                 return;
@@ -732,8 +731,41 @@ impl App {
                 "${{PAGER:-less}} {}",
                 crate::dispatch::shell_quote(std::path::Path::new(&log_path))
             ),
-            cwd: project.path,
+            cwd,
         });
+    }
+
+    /// The checkout a task's work lives in (DESIGN.md §8): its resolved repo's
+    /// path. Every TUI action that needs a working directory for a task —
+    /// paging its log, attaching to its session, resolving its review medium
+    /// — comes here rather than reading a project path.
+    fn task_checkout(&self, task_id: i64) -> voro_core::Result<String> {
+        let task = self.store.task(task_id)?;
+        Ok(self.store.repo_for_task(&task)?.path)
+    }
+
+    /// The repo a task names, as (name, path), or `None` when it runs in its
+    /// project's default — the detail pane renders the line only when it says
+    /// something the project row does not.
+    pub fn task_repo(&self, task: &voro_core::Task) -> Option<(String, String)> {
+        task.repo_id?;
+        let repo = self.store.repo_for_task(task).ok()?;
+        Some((repo.name, repo.path))
+    }
+
+    /// A project's default repo path, for the projects screen's path column
+    /// and its rename/re-path form. An unreadable repo yields `""` so a render
+    /// never surfaces an error mid-frame.
+    pub fn project_path(&self, project_id: i64) -> String {
+        self.store
+            .default_repo(project_id)
+            .map(|r| r.path)
+            .unwrap_or_default()
+    }
+
+    /// How many repos a project has, for the projects screen's `+N repos` tag.
+    pub fn repo_count(&self, project_id: i64) -> usize {
+        self.store.repos(project_id).map(|r| r.len()).unwrap_or(1)
     }
 
     /// The selected task's newest-session log path, whatever its state — what
@@ -787,8 +819,8 @@ impl App {
     /// missing piece (state, session, captured ref, verb) reports via the
     /// status line.
     fn jump_into_session(&mut self) {
-        let (task_id, state, project_id) = match self.selected_task() {
-            Some(task) => (task.id, task.state, task.project_id),
+        let (task_id, state) = match self.selected_task() {
+            Some(task) => (task.id, task.state),
             None => return,
         };
         let attach = match state {
@@ -842,8 +874,8 @@ impl App {
             ));
             return;
         };
-        let project = match self.store.project(project_id) {
-            Ok(project) => project,
+        let cwd = match self.task_checkout(task_id) {
+            Ok(path) => path,
             Err(e) => {
                 self.status = Some(e.to_string());
                 return;
@@ -854,7 +886,7 @@ impl App {
                 voro_core::SESSION_PLACEHOLDER,
                 &crate::dispatch::shell_quote(std::path::Path::new(&session_ref)),
             ),
-            cwd: project.path,
+            cwd,
         });
     }
 
@@ -959,7 +991,14 @@ impl App {
                 return;
             }
         };
-        if let ReviewMedium::Viewer(viewer) = crate::pr::resolve_medium(&project) {
+        let checkout = match self.task_checkout(id) {
+            Ok(path) => path,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        if let ReviewMedium::Viewer(viewer) = crate::pr::resolve_medium(&project, &checkout) {
             let result =
                 crate::dispatch::open(&mut self.store, &self.dispatch_ctx, id, viewer.as_deref());
             match result {
@@ -1160,7 +1199,7 @@ impl App {
                 if let Some(project) = self.projects.get(self.projects_sel) {
                     self.mode = Mode::AddProject {
                         name: project.name.clone(),
-                        path: project.path.clone(),
+                        path: self.project_path(project.id).to_string(),
                         on_path: false,
                         editing: Some(project.id),
                     };
@@ -1320,7 +1359,8 @@ impl App {
                     Some(id) => self
                         .store
                         .rename_project(id, name.trim())
-                        .and_then(|_| self.store.set_path(id, path.trim()))
+                        .and_then(|_| self.store.set_default_repo_path(id, path.trim()))
+                        .map(|_| ())
                         .and_then(|_| self.refresh()),
                     None => self
                         .store
@@ -1504,6 +1544,7 @@ impl App {
         }
         let task = self.store.create_task(voro_core::NewTask {
             project_id,
+            repo_id: None,
             title: form.title,
             body: form.body,
             priority: form.priority,
@@ -1566,6 +1607,7 @@ mod tests {
             let task = store
                 .create_task(NewTask {
                     project_id: project.id,
+                    repo_id: None,
                     title: format!("{state} task"),
                     body: String::new(),
                     priority: Priority::P1,
@@ -1725,6 +1767,7 @@ mod tests {
         let task = store
             .create_task(NewTask {
                 project_id: project.id,
+                repo_id: None,
                 title: "Do the thing".into(),
                 body: "Detailed prompt.".into(),
                 priority: Priority::P1,
@@ -2032,11 +2075,14 @@ mod tests {
         assert_eq!(app.projects[0].id, project_id);
         assert_eq!(app.projects[0].name, "renamed");
         // the same form re-paths in one save
-        assert_eq!(app.projects[0].path, "/tmp/moved");
+        assert_eq!(app.project_path(project_id), "/tmp/moved");
         // tasks reference the project by id, so renaming leaves them intact
         let stored = app.store.project(project_id).unwrap();
         assert_eq!(stored.name, "renamed");
-        assert_eq!(stored.path, "/tmp/moved");
+        assert_eq!(
+            app.store.default_repo(project_id).unwrap().path,
+            "/tmp/moved"
+        );
     }
 
     /// `a` opens a blank AddProject form to add a new project.
@@ -2127,6 +2173,7 @@ mod tests {
         let task = store
             .create_task(NewTask {
                 project_id: project.id,
+                repo_id: None,
                 title: "Do the thing".into(),
                 body: "Detailed prompt.".into(),
                 priority: Priority::P1,
@@ -2198,6 +2245,7 @@ mod tests {
         let task = store
             .create_task(NewTask {
                 project_id: project.id,
+                repo_id: None,
                 title: "Do the thing".into(),
                 body: String::new(),
                 priority: Priority::P1,
@@ -2266,6 +2314,7 @@ mod tests {
         store
             .create_task(NewTask {
                 project_id: project.id,
+                repo_id: None,
                 title: "Do the thing".into(),
                 body: String::new(),
                 priority: Priority::P1,
@@ -2314,6 +2363,7 @@ mod tests {
         let task = store
             .create_task(NewTask {
                 project_id: project.id,
+                repo_id: None,
                 title: "Do the thing".into(),
                 body: String::new(),
                 priority: Priority::P1,
@@ -2384,6 +2434,7 @@ mod tests {
         let task = store
             .create_task(NewTask {
                 project_id: project.id,
+                repo_id: None,
                 title: "Do the thing".into(),
                 body: String::new(),
                 priority: Priority::P1,
@@ -2469,6 +2520,7 @@ mod tests {
         let task = store
             .create_task(NewTask {
                 project_id: project.id,
+                repo_id: None,
                 title: "mid-flight".into(),
                 body: String::new(),
                 priority: Priority::P1,
@@ -2520,6 +2572,7 @@ mod tests {
         let task = store
             .create_task(NewTask {
                 project_id: project.id,
+                repo_id: None,
                 title: "died without a log".into(),
                 body: String::new(),
                 priority: Priority::P1,
@@ -2563,6 +2616,7 @@ mod tests {
         let task = store
             .create_task(NewTask {
                 project_id: project.id,
+                repo_id: None,
                 title: "Do the thing".into(),
                 body: String::new(),
                 priority: Priority::P1,
