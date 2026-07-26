@@ -290,6 +290,7 @@ mod tests {
         let task = Task {
             id: 4,
             project_id: 1,
+            repo_id: None,
             title: "Fix parser".into(),
             body: "Body text.".into(),
             priority: Priority::P1,

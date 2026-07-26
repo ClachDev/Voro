@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    Dep, DepKind, DepRef, Event, Priority, Project, ReviewAction, RunningRow, Session,
+    Dep, DepKind, DepRef, Event, Priority, Project, Repo, ReviewAction, RunningRow, Session,
     SessionOutcome, Task, TaskState,
 };
 
@@ -21,6 +21,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0009_add_review_action.sql"),
     include_str!("../migrations/0010_add_waiting_state.sql"),
     include_str!("../migrations/0011_add_archived.sql"),
+    include_str!("../migrations/0012_repos.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -34,6 +35,8 @@ pub struct Store {
 #[derive(Debug, Clone)]
 pub struct NewTask {
     pub project_id: i64,
+    /// The repo the task runs in; `None` resolves to the project's default.
+    pub repo_id: Option<i64>,
     pub title: String,
     pub body: String,
     pub priority: Priority,
@@ -132,12 +135,20 @@ impl Store {
 
     // --- projects ---
 
+    /// Create a project and its default repo in one transaction, so a project
+    /// with no checkout is never observable (DESIGN.md §5). The repo is named
+    /// after the project; `voro repo` renames nothing, but `repo add` puts
+    /// further checkouts beside it.
     pub fn create_project(&mut self, name: &str, path: &str) -> Result<Project> {
-        self.conn.execute(
-            "INSERT INTO projects (name, path) VALUES (?1, ?2)",
-            params![name, path],
+        let tx = self.conn.transaction()?;
+        tx.execute("INSERT INTO projects (name) VALUES (?1)", params![name])?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO repos (project_id, name, path, is_default) VALUES (?1, ?2, ?3, 1)",
+            params![id, name, path],
         )?;
-        self.project(self.conn.last_insert_rowid())
+        tx.commit()?;
+        self.project(id)
     }
 
     pub fn project(&self, id: i64) -> Result<Project> {
@@ -220,20 +231,18 @@ impl Store {
         self.project(project_id)
     }
 
-    pub fn set_path(&mut self, project_id: i64, path: &str) -> Result<Project> {
-        let changed = self.conn.execute(
-            "UPDATE projects SET path = ?1 WHERE id = ?2",
-            params![path, project_id],
-        )?;
-        if changed == 0 {
-            return Err(Error::ProjectNotFound(project_id));
-        }
-        self.project(project_id)
+    /// Re-point a project's *default* repo. This is what `voro project path`
+    /// and the projects screen's path field edit — the single-repo spelling of
+    /// `repo path`, kept because a one-repo project is still the common case.
+    pub fn set_default_repo_path(&mut self, project_id: i64, path: &str) -> Result<Repo> {
+        let repo = self.default_repo(project_id)?;
+        self.set_repo_path(repo.id, path)
     }
 
     /// Delete a project outright — only safe when it has no tasks, since tasks
     /// reference their project by id and deleting would orphan history. A project
     /// with tasks in any state refuses; weight 0 snoozes without losing history.
+    /// Its repos go with it: no task references them, so nothing is orphaned.
     pub fn delete_project(&mut self, project_id: i64) -> Result<()> {
         self.project(project_id)?;
         let task_count: i64 = self.conn.query_row(
@@ -247,9 +256,198 @@ impl Store {
                 count: task_count,
             });
         }
-        self.conn
-            .execute("DELETE FROM projects WHERE id = ?1", [project_id])?;
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM repos WHERE project_id = ?1", [project_id])?;
+        tx.execute("DELETE FROM projects WHERE id = ?1", [project_id])?;
+        tx.commit()?;
         Ok(())
+    }
+
+    // --- repos ---
+    //
+    // A project owns at least one repo, exactly one of which is its default
+    // (DESIGN.md §3/§5). The at-most-one-default half is schema-enforced by a
+    // partial unique index; the rest — never zero repos, no deleting the
+    // default or a referenced one — lives here, the same place the state
+    // machine's invariants live, so no interface can bypass them.
+
+    /// A project's repos, default first, then by name.
+    pub fn repos(&self, project_id: i64) -> Result<Vec<Repo>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {REPO_COLUMNS} FROM repos WHERE project_id = ?1
+             ORDER BY is_default DESC, name"
+        ))?;
+        let rows = stmt.query_map([project_id], repo_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn repo(&self, id: i64) -> Result<Repo> {
+        self.conn
+            .query_row(
+                &format!("SELECT {REPO_COLUMNS} FROM repos WHERE id = ?1"),
+                [id],
+                repo_from_row,
+            )
+            .optional()?
+            .ok_or(Error::RepoIdNotFound(id))
+    }
+
+    /// A project's repo by name. An unknown name errors listing the project's
+    /// repos, so a filing agent gets a correction rather than a wrong checkout.
+    pub fn repo_by_name(&self, project_id: i64, name: &str) -> Result<Repo> {
+        let repos = self.repos(project_id)?;
+        repos
+            .into_iter()
+            .find(|r| r.name == name)
+            .ok_or_else(|| Error::RepoNotFound {
+                project: self.project(project_id).map(|p| p.name).unwrap_or_default(),
+                name: name.to_string(),
+                known: self.repo_names(project_id),
+            })
+    }
+
+    pub fn default_repo(&self, project_id: i64) -> Result<Repo> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {REPO_COLUMNS} FROM repos WHERE project_id = ?1 AND is_default = 1"
+                ),
+                [project_id],
+                repo_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| match self.project(project_id) {
+                // A project always has a default repo — `create_project` makes
+                // it in the same transaction — so the only way here is an id
+                // that names no project at all.
+                Err(e) => e,
+                Ok(_) => Error::Invalid(format!("project {project_id} has no default repo")),
+            })
+    }
+
+    /// The checkout a task's work runs in (DESIGN.md §8): its own repo when it
+    /// names one, else its project's default. The single resolution point —
+    /// dispatch, `pr`/`open`, worktree cleanup, and `import` all come here
+    /// rather than reading `repo_id` themselves.
+    pub fn repo_for_task(&self, task: &Task) -> Result<Repo> {
+        match task.repo_id {
+            Some(id) => self.repo(id),
+            None => self.default_repo(task.project_id),
+        }
+    }
+
+    /// Add a repo to a project. The first repo of a project is made by
+    /// `create_project`, so one added here is never the default; `set_default`
+    /// promotes it.
+    pub fn add_repo(&mut self, project_id: i64, name: &str, path: &str) -> Result<Repo> {
+        self.project(project_id)?;
+        if name.trim().is_empty() {
+            return Err(Error::Invalid("a repo name is required".into()));
+        }
+        if self.repos(project_id)?.iter().any(|r| r.name == name) {
+            return Err(Error::Invalid(format!(
+                "project already has a repo named '{name}'"
+            )));
+        }
+        self.conn.execute(
+            "INSERT INTO repos (project_id, name, path, is_default) VALUES (?1, ?2, ?3, 0)",
+            params![project_id, name, path],
+        )?;
+        self.repo(self.conn.last_insert_rowid())
+    }
+
+    pub fn set_repo_path(&mut self, repo_id: i64, path: &str) -> Result<Repo> {
+        let changed = self.conn.execute(
+            "UPDATE repos SET path = ?1 WHERE id = ?2",
+            params![path, repo_id],
+        )?;
+        if changed == 0 {
+            return Err(Error::RepoIdNotFound(repo_id));
+        }
+        self.repo(repo_id)
+    }
+
+    /// Make a repo its project's default. Clearing the old default and setting
+    /// the new one share a transaction, because the partial unique index would
+    /// otherwise refuse the intermediate state.
+    pub fn set_default_repo(&mut self, repo_id: i64) -> Result<Repo> {
+        let repo = self.repo(repo_id)?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE repos SET is_default = 0 WHERE project_id = ?1",
+            [repo.project_id],
+        )?;
+        tx.execute("UPDATE repos SET is_default = 1 WHERE id = ?1", [repo_id])?;
+        tx.commit()?;
+        self.repo(repo_id)
+    }
+
+    /// Remove a repo, refusing the three ways it would leave the store
+    /// inconsistent: the project's last repo (a project always has a
+    /// checkout), its default while others remain (set a new one first), and
+    /// one any task still names (re-point those tasks first).
+    pub fn delete_repo(&mut self, repo_id: i64) -> Result<()> {
+        let repo = self.repo(repo_id)?;
+        let project = self.project(repo.project_id)?;
+        if self.repos(repo.project_id)?.len() == 1 {
+            return Err(Error::LastRepo {
+                project: project.name,
+                name: repo.name,
+            });
+        }
+        if repo.is_default {
+            return Err(Error::DefaultRepo {
+                project: project.name,
+                name: repo.name,
+            });
+        }
+        let used: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE repo_id = ?1",
+            [repo_id],
+            |r| r.get(0),
+        )?;
+        if used > 0 {
+            return Err(Error::RepoInUse {
+                name: repo.name,
+                count: used,
+            });
+        }
+        self.conn
+            .execute("DELETE FROM repos WHERE id = ?1", [repo_id])?;
+        Ok(())
+    }
+
+    /// Re-point a task at a repo of its own project, or back at the default
+    /// with `None`. A repo belonging to another project is refused — a task's
+    /// checkout is chosen from its project's repos, not from every repo.
+    pub fn set_task_repo(&mut self, task_id: i64, repo_id: Option<i64>) -> Result<Task> {
+        let task = self.task(task_id)?;
+        if let Some(id) = repo_id {
+            let repo = self.repo(id)?;
+            if repo.project_id != task.project_id {
+                return Err(Error::Invalid(format!(
+                    "repo '{}' belongs to another project",
+                    repo.name
+                )));
+            }
+        }
+        self.conn.execute(
+            "UPDATE tasks SET repo_id = ?1 WHERE id = ?2",
+            params![repo_id, task_id],
+        )?;
+        self.task(task_id)
+    }
+
+    fn repo_names(&self, project_id: i64) -> String {
+        self.repos(project_id)
+            .map(|repos| {
+                repos
+                    .into_iter()
+                    .map(|r| r.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
     }
 
     // --- tasks ---
@@ -277,13 +475,25 @@ impl Store {
         if project.archived {
             return Err(Error::ProjectArchived { name: project.name });
         }
+        // A task's checkout is chosen from its own project's repos; NULL means
+        // the project default, which is what every task created without one gets.
+        if let Some(repo_id) = new.repo_id {
+            let repo = self.repo(repo_id)?;
+            if repo.project_id != new.project_id {
+                return Err(Error::Invalid(format!(
+                    "repo '{}' belongs to another project",
+                    repo.name
+                )));
+            }
+        }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO tasks (project_id, title, body, priority, state, agent, human,
+            "INSERT INTO tasks (project_id, repo_id, title, body, priority, state, agent, human,
                                 state_since, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), datetime('now'))",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'), datetime('now'))",
             params![
                 new.project_id,
+                new.repo_id,
                 new.title,
                 new.body,
                 new.priority,
@@ -698,7 +908,7 @@ impl Store {
 
 pub(crate) const TASK_COLUMNS: &str = "id, project_id, title, body, priority, state, agent, \
                                        question, pr_url, branch, state_since, created_at, \
-                                       closed_at, human";
+                                       closed_at, human, repo_id";
 
 pub(crate) fn get_task(conn: &Connection, id: i64) -> Result<Option<Task>> {
     Ok(conn
@@ -726,6 +936,7 @@ pub(crate) fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         created_at: row.get(11)?,
         closed_at: row.get(12)?,
         human: row.get(13)?,
+        repo_id: row.get(14)?,
     })
 }
 
@@ -756,16 +967,27 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     })
 }
 
-pub(crate) const PROJECT_COLUMNS: &str = "id, name, path, weight, review_action, archived";
+pub(crate) const PROJECT_COLUMNS: &str = "id, name, weight, review_action, archived";
 
 fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
         id: row.get(0)?,
         name: row.get(1)?,
-        path: row.get(2)?,
-        weight: row.get(3)?,
-        review_action: row.get(4)?,
-        archived: row.get(5)?,
+        weight: row.get(2)?,
+        review_action: row.get(3)?,
+        archived: row.get(4)?,
+    })
+}
+
+pub(crate) const REPO_COLUMNS: &str = "id, project_id, name, path, is_default";
+
+fn repo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Repo> {
+    Ok(Repo {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        name: row.get(2)?,
+        path: row.get(3)?,
+        is_default: row.get(4)?,
     })
 }
 
@@ -838,6 +1060,19 @@ mod tests {
     use super::*;
     use crate::transition::{Action, Triage};
 
+    fn new_ready(project_id: i64) -> NewTask {
+        NewTask {
+            project_id,
+            repo_id: None,
+            title: "t".into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state: TaskState::Ready,
+            agent: None,
+            human: false,
+        }
+    }
+
     #[test]
     fn rename_project_updates_name_and_leaves_task_references_intact() {
         let mut s = Store::open_in_memory().unwrap();
@@ -845,6 +1080,7 @@ mod tests {
         let task = s
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "t".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -912,6 +1148,7 @@ mod tests {
         let t = s
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "review me".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -948,6 +1185,7 @@ mod tests {
         let t = s
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "reprioritise me".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -980,6 +1218,7 @@ mod tests {
         let t = s
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "branch me".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -1023,6 +1262,7 @@ mod tests {
     fn new_with(project_id: i64, agent: Option<&str>, human: bool) -> NewTask {
         NewTask {
             project_id,
+            repo_id: None,
             title: "hands-on".into(),
             body: String::new(),
             priority: Priority::P2,
@@ -1175,6 +1415,7 @@ mod tests {
         let t = s
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "summarise me".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -1219,6 +1460,7 @@ mod tests {
         let t = s
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "half a report".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -1245,6 +1487,7 @@ mod tests {
         let t = s
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "not yet".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -1269,20 +1512,163 @@ mod tests {
         ));
     }
 
+    // --- repos (DESIGN.md §3/§5) ---
+
     #[test]
-    fn set_path_updates_path() {
+    fn creating_a_project_creates_its_default_repo() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let repos = s.repos(p.id).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].name, "voro");
+        assert_eq!(repos[0].path, "/tmp/voro");
+        assert!(repos[0].is_default);
+        assert_eq!(s.default_repo(p.id).unwrap().id, repos[0].id);
+    }
+
+    #[test]
+    fn added_repos_are_not_default_and_names_are_unique_per_project() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("odm", "/tmp/odm").unwrap();
+        let oats = s.add_repo(p.id, "oats", "/tmp/oats").unwrap();
+        assert!(!oats.is_default);
+        assert!(s.add_repo(p.id, "oats", "/tmp/elsewhere").is_err());
+        assert!(s.add_repo(p.id, "  ", "/tmp/blank").is_err());
+        // The same repo name under a different project is fine.
+        let other = s.create_project("voro", "/tmp/voro").unwrap();
+        assert!(s.add_repo(other.id, "oats", "/tmp/oats").is_ok());
+        // Default first, then by name.
+        let names: Vec<_> = s.repos(p.id).unwrap().into_iter().map(|r| r.name).collect();
+        assert_eq!(names, vec!["odm", "oats"]);
+    }
+
+    #[test]
+    fn only_one_repo_is_ever_default() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("odm", "/tmp/odm").unwrap();
+        let oats = s.add_repo(p.id, "oats", "/tmp/oats").unwrap();
+        let promoted = s.set_default_repo(oats.id).unwrap();
+        assert!(promoted.is_default);
+        let defaults = s
+            .repos(p.id)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.is_default)
+            .count();
+        assert_eq!(defaults, 1);
+        assert_eq!(s.default_repo(p.id).unwrap().name, "oats");
+    }
+
+    #[test]
+    fn a_projects_last_repo_cannot_be_deleted() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("odm", "/tmp/odm").unwrap();
+        let only = s.default_repo(p.id).unwrap();
+        assert!(matches!(
+            s.delete_repo(only.id),
+            Err(Error::LastRepo { .. })
+        ));
+    }
+
+    #[test]
+    fn the_default_repo_cannot_be_deleted_while_others_remain() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("odm", "/tmp/odm").unwrap();
+        let oats = s.add_repo(p.id, "oats", "/tmp/oats").unwrap();
+        let default = s.default_repo(p.id).unwrap();
+        assert!(matches!(
+            s.delete_repo(default.id),
+            Err(Error::DefaultRepo { .. })
+        ));
+        // Promoting the other one first clears the way.
+        s.set_default_repo(oats.id).unwrap();
+        s.delete_repo(default.id).unwrap();
+        assert_eq!(s.repos(p.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_repo_a_task_names_cannot_be_deleted() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("odm", "/tmp/odm").unwrap();
+        let oats = s.add_repo(p.id, "oats", "/tmp/oats").unwrap();
+        let mut new = new_ready(p.id);
+        new.repo_id = Some(oats.id);
+        let t = s.create_task(new).unwrap();
+        assert!(matches!(
+            s.delete_repo(oats.id),
+            Err(Error::RepoInUse { count: 1, .. })
+        ));
+        // Re-pointing the task at the default frees the repo.
+        s.set_task_repo(t.id, None).unwrap();
+        s.delete_repo(oats.id).unwrap();
+    }
+
+    #[test]
+    fn a_task_resolves_its_own_repo_then_the_project_default() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("odm", "/tmp/odm").unwrap();
+        let oats = s.add_repo(p.id, "oats", "/tmp/oats").unwrap();
+        let plain = s.create_task(new_ready(p.id)).unwrap();
+        assert_eq!(s.repo_for_task(&plain).unwrap().path, "/tmp/odm");
+
+        let pointed = s.set_task_repo(plain.id, Some(oats.id)).unwrap();
+        assert_eq!(pointed.repo_id, Some(oats.id));
+        assert_eq!(s.repo_for_task(&pointed).unwrap().path, "/tmp/oats");
+
+        // The fallback follows the default, not the original checkout.
+        let back = s.set_task_repo(plain.id, None).unwrap();
+        s.set_default_repo(oats.id).unwrap();
+        assert_eq!(s.repo_for_task(&back).unwrap().path, "/tmp/oats");
+    }
+
+    #[test]
+    fn a_task_cannot_name_another_projects_repo() {
+        let mut s = Store::open_in_memory().unwrap();
+        let odm = s.create_project("odm", "/tmp/odm").unwrap();
+        let voro = s.create_project("voro", "/tmp/voro").unwrap();
+        let foreign = s.default_repo(voro.id).unwrap();
+        let mut new = new_ready(odm.id);
+        new.repo_id = Some(foreign.id);
+        assert!(s.create_task(new).is_err());
+
+        let t = s.create_task(new_ready(odm.id)).unwrap();
+        assert!(s.set_task_repo(t.id, Some(foreign.id)).is_err());
+    }
+
+    #[test]
+    fn an_unknown_repo_name_errors_listing_the_projects_repos() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("odm", "/tmp/odm").unwrap();
+        s.add_repo(p.id, "oats", "/tmp/oats").unwrap();
+        let err = s.repo_by_name(p.id, "nope").unwrap_err().to_string();
+        assert!(err.contains("odm"), "{err}");
+        assert!(err.contains("oats"), "{err}");
+    }
+
+    #[test]
+    fn deleting_a_project_takes_its_repos_with_it() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("odm", "/tmp/odm").unwrap();
+        s.add_repo(p.id, "oats", "/tmp/oats").unwrap();
+        s.delete_project(p.id).unwrap();
+        assert!(s.repos(p.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_path_updates_the_default_repo() {
         let mut s = Store::open_in_memory().unwrap();
         let p = s.create_project("proj", "/tmp/old").unwrap();
-        let updated = s.set_path(p.id, "/tmp/new").unwrap();
+        let updated = s.set_default_repo_path(p.id, "/tmp/new").unwrap();
         assert_eq!(updated.path, "/tmp/new");
-        assert_eq!(s.project(p.id).unwrap().path, "/tmp/new");
+        assert!(updated.is_default);
+        assert_eq!(s.default_repo(p.id).unwrap().path, "/tmp/new");
     }
 
     #[test]
     fn set_path_rejects_unknown_id() {
         let mut s = Store::open_in_memory().unwrap();
         assert!(matches!(
-            s.set_path(999, "/tmp"),
+            s.set_default_repo_path(999, "/tmp"),
             Err(Error::ProjectNotFound(999))
         ));
     }
@@ -1312,6 +1698,7 @@ mod tests {
         let create = |s: &mut Store, state| {
             s.create_task(NewTask {
                 project_id,
+                repo_id: None,
                 title: format!("task in {state}"),
                 body: String::new(),
                 priority: Priority::P1,
@@ -1418,6 +1805,7 @@ mod tests {
             let err = s
                 .create_task(NewTask {
                     project_id: p.id,
+                    repo_id: None,
                     title: "too late".into(),
                     body: String::new(),
                     priority: Priority::P2,
@@ -1437,6 +1825,7 @@ mod tests {
         assert!(
             s.create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "welcome back".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -1513,6 +1902,63 @@ mod tests {
             .conn
             .execute("UPDATE projects SET archived = 2 WHERE id = 1", []);
         assert!(junk.is_err(), "the CHECK must reject values outside 0/1");
+    }
+
+    /// A database from before migration 0012 must convert in place: every
+    /// project's old `path` reappears as its default repo, `projects.path` is
+    /// gone, and existing tasks (all `repo_id` NULL) resolve to exactly the
+    /// checkouts they had before (DESIGN.md §3/§5).
+    #[test]
+    fn migration_0012_turns_each_project_path_into_its_default_repo() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..11] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        conn.execute(
+            "INSERT INTO projects (name, path) VALUES ('odm', '/tmp/odm'), ('voro', '/tmp/voro')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (project_id, title, state, state_since, created_at)
+             VALUES (1, 'old', 'ready', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let store = Store::from_connection(conn).unwrap();
+        for (id, name, path) in [(1, "odm", "/tmp/odm"), (2, "voro", "/tmp/voro")] {
+            let repos = store.repos(id).unwrap();
+            assert_eq!(repos.len(), 1);
+            assert_eq!(repos[0].name, name);
+            assert_eq!(repos[0].path, path);
+            assert!(repos[0].is_default);
+        }
+        // The task kept its checkout without naming a repo.
+        let task = store.task(1).unwrap();
+        assert_eq!(task.repo_id, None);
+        assert_eq!(store.repo_for_task(&task).unwrap().path, "/tmp/odm");
+
+        // The column is gone, not merely unread.
+        assert!(
+            store
+                .conn
+                .query_row("SELECT path FROM projects WHERE id = 1", [], |r| r
+                    .get::<_, String>(0))
+                .is_err()
+        );
+        // The one-default invariant is schema-enforced from here on.
+        assert!(
+            store
+                .conn
+                .execute(
+                    "INSERT INTO repos (project_id, name, path, is_default)
+                     VALUES (1, 'second', '/tmp/second', 1)",
+                    [],
+                )
+                .is_err()
+        );
     }
 
     /// A database created at schema version 1 (state still named 'backlog')
@@ -1726,10 +2172,7 @@ mod tests {
     /// A project + running task to hang sessions off of.
     fn task_fixture(s: &mut Store) -> i64 {
         s.conn
-            .execute(
-                "INSERT OR IGNORE INTO projects (name, path) VALUES ('voro', '/tmp/voro')",
-                [],
-            )
+            .execute("INSERT OR IGNORE INTO projects (name) VALUES ('voro')", [])
             .unwrap();
         let project_id: i64 = s
             .conn
@@ -1758,6 +2201,7 @@ mod tests {
         let task = s
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "trace me".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -1789,6 +2233,7 @@ mod tests {
         let t = s
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "summary me".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -1828,6 +2273,7 @@ mod tests {
             let t = s
                 .create_task(NewTask {
                     project_id: p.id,
+                    repo_id: None,
                     title: "report me".into(),
                     body: String::new(),
                     priority: Priority::P2,
@@ -1875,6 +2321,7 @@ mod tests {
         let t = s
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "in flight".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -2144,6 +2591,7 @@ mod tests {
         let p = s.create_project("voro", "/tmp/voro").unwrap();
         let new = |title: &str| NewTask {
             project_id: p.id,
+            repo_id: None,
             title: title.into(),
             body: String::new(),
             priority: Priority::P2,
@@ -2239,6 +2687,7 @@ mod tests {
         let p = s.create_project("voro", "/tmp/voro").unwrap();
         let new = |title: &str| NewTask {
             project_id: p.id,
+            repo_id: None,
             title: title.into(),
             body: String::new(),
             priority: Priority::P2,

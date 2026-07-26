@@ -35,10 +35,11 @@ voro explain <id>       # score decomposition (weight × priority + age bonus)
 
 ```
 voro add <project> <title> --body-file plan.md [--priority 0-3]
-         [--blocked-by 3,7] [--blocks 9]
+         [--blocked-by 3,7] [--blocks 9] [--repo NAME]
 voro set <id> [--title T] [--priority N] [--body-file F]
               [--blocked-by IDS] [--blocks IDS]
               [--branch NAME]        # intended git branch dispatch injects
+              [--repo NAME | --no-repo]   # which checkout the task runs in
 voro project add <name> <path>
 voro weight <project> <0-5>          # 0 parks/hides the project
 ```
@@ -55,21 +56,44 @@ untriaged. Write the body as a **dispatchable prompt** — self-contained
 enough that an agent could execute the task from the body alone (name files,
 state the acceptance criteria).
 
+## Projects and repos
+
+A **project** allocates attention (name, weight, one queue); a **repo** locates
+a checkout. A project owns one or more repos, exactly one of which is its
+default, and a task runs in the repo it names — or the project's default when
+it names none. One stream of work spanning several repositories is therefore
+*one* project with several repos, not several projects.
+
+```
+voro repo list [project]              # every repo; * marks each project's default
+voro repo add <project> <name> <path>
+voro repo path <project> <name> <path>
+voro repo default <project> <name>    # the repo tasks that name none run in
+voro repo remove <project> <name>
+```
+
+`repo remove` refuses a project's last repo, its default while others remain,
+and one any task still names — the message says which and what to do first.
+
 ## Working from an arbitrary project directory
 
-Voro tracks projects by name and checkout path, independent of where you invoke
-the CLI. To find which registered project the current directory belongs to,
-list the projects and match your cwd against their paths:
+Voro tracks checkouts by repo, independent of where you invoke the CLI. To find
+which registered project *and repo* the current directory belongs to, list the
+repos and match your cwd against their paths:
 
 ```
-voro project list       # id, weight, name, path — one line per project
+voro repo list          # project, repo name, path — one line per repo
 ```
 
-Match the cwd (or its enclosing repo root) to a listed path; that project's
-name is what `add`, `propose`, `list --project`, and `weight` expect. If no
-listed path contains the cwd, the project is unregistered — add it with
-`voro project add <name> <path>` (pointing at the checkout root) before filing
-tasks against it.
+Match the cwd (or its enclosing repo root) to a listed path. That row's project
+name is what `add`, `propose`, `list --project`, and `weight` expect, and its
+repo name is what `--repo` expects. **If the matched repo is not the project's
+default (no `*`), pass `--repo <name>` when filing the task** — otherwise it
+will dispatch into the project's default checkout, which is the wrong one. If
+no listed path contains the cwd, the checkout is unregistered: add it to the
+project it belongs to with `voro repo add <project> <name> <path>`, or register
+a whole new project with `voro project add <name> <path>` if it is genuinely a
+separate stream of work.
 
 Propose follow-up work discovered here against the matched project:
 
@@ -78,7 +102,9 @@ voro propose <project> <title> --body-file plan.md [--from <task-id>]
 ```
 
 `propose` creates a `proposed` task; `--from` links it discovered-from the task
-you were working on (it defaults to `$VORO_TASK_ID` when set).
+you were working on (dispatch renders the flag with the running task's id).
+`propose` takes no `--repo` — a proposal is untriaged, so name the repo in the
+body and let triage set it with `voro set <id> --repo NAME`.
 
 ## Transitions
 

@@ -13,16 +13,17 @@ pub struct ImportSummary {
     pub skipped: usize,
 }
 
-/// Run `gh issue list --json number,title,body,url` in `project_path`,
-/// scoped to `repo` if given. This is the only place Voro invokes `gh` — the
-/// human runs the verb; nothing else may trigger it.
-pub fn fetch_issues(project_path: &str, repo: Option<&str>) -> Result<String, String> {
+/// Run `gh issue list --json number,title,body,url` in `checkout` — the repo
+/// the import runs against — scoped to `gh_repo` if given. This is the only
+/// place Voro invokes `gh` — the human runs the verb; nothing else may
+/// trigger it.
+pub fn fetch_issues(checkout: &str, gh_repo: Option<&str>) -> Result<String, String> {
     let mut cmd = Command::new("gh");
     cmd.args(["issue", "list", "--json", "number,title,body,url"]);
-    if let Some(repo) = repo {
-        cmd.args(["-R", repo]);
+    if let Some(gh_repo) = gh_repo {
+        cmd.args(["-R", gh_repo]);
     }
-    cmd.current_dir(project_path);
+    cmd.current_dir(checkout);
     let output = cmd
         .output()
         .map_err(|e| format!("failed to run `gh issue list`: {e}"))?;
@@ -39,10 +40,13 @@ pub fn fetch_issues(project_path: &str, repo: Option<&str>) -> Result<String, St
 /// not already imported. Idempotent: an issue already captured (its URL
 /// appears in an existing task's body, this project's or a prior run's) is
 /// skipped rather than duplicated. Takes no dependency on `gh` itself, so it
-/// is fully testable against canned JSON.
+/// is fully testable against canned JSON. `repo_id` is the repo the issues
+/// were fetched from — carried onto each imported task so it dispatches into
+/// that checkout — or `None` for the project's default.
 pub fn import_issues(
     store: &mut Store,
     project: &Project,
+    repo_id: Option<i64>,
     json: &str,
 ) -> Result<ImportSummary, String> {
     let issues = GithubIssue::parse_list(json).map_err(|e| e.to_string())?;
@@ -62,7 +66,7 @@ pub fn import_issues(
             continue;
         }
         let task = store
-            .create_task(issue_new_task(project.id, issue))
+            .create_task(issue_new_task(project.id, repo_id, issue))
             .map_err(|e| e.to_string())?;
         bodies.push(task.body.clone());
         imported.push(task);
@@ -97,7 +101,7 @@ mod tests {
     fn imports_each_issue_as_a_proposed_task() {
         let mut s = Store::open_in_memory().unwrap();
         let p = project(&mut s);
-        let summary = import_issues(&mut s, &p, CANNED).unwrap();
+        let summary = import_issues(&mut s, &p, None, CANNED).unwrap();
         assert_eq!(summary.imported.len(), 2);
         assert_eq!(summary.skipped, 0);
         for task in &summary.imported {
@@ -111,8 +115,8 @@ mod tests {
     fn importing_twice_is_idempotent() {
         let mut s = Store::open_in_memory().unwrap();
         let p = project(&mut s);
-        import_issues(&mut s, &p, CANNED).unwrap();
-        let second = import_issues(&mut s, &p, CANNED).unwrap();
+        import_issues(&mut s, &p, None, CANNED).unwrap();
+        let second = import_issues(&mut s, &p, None, CANNED).unwrap();
         assert_eq!(second.imported.len(), 0);
         assert_eq!(second.skipped, 2);
         assert_eq!(s.tasks().unwrap().len(), 2);
@@ -137,7 +141,7 @@ mod tests {
     fn duplicate_issues_within_one_batch_are_only_imported_once() {
         let mut s = Store::open_in_memory().unwrap();
         let p = project(&mut s);
-        let summary = import_issues(&mut s, &p, DOUBLED).unwrap();
+        let summary = import_issues(&mut s, &p, None, DOUBLED).unwrap();
         assert_eq!(summary.imported.len(), 1);
         assert_eq!(summary.skipped, 1);
     }
@@ -147,8 +151,8 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         let a = project(&mut s);
         let b = s.create_project("other", "/tmp/other").unwrap();
-        import_issues(&mut s, &a, CANNED).unwrap();
-        let summary = import_issues(&mut s, &b, CANNED).unwrap();
+        import_issues(&mut s, &a, None, CANNED).unwrap();
+        let summary = import_issues(&mut s, &b, None, CANNED).unwrap();
         assert_eq!(
             summary.imported.len(),
             2,

@@ -201,6 +201,9 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             if let Some(branch) = &t.branch {
                 lines.push(Line::from(branch_span(branch)));
             }
+            if let Some((name, path)) = app.task_repo(t) {
+                lines.push(Line::from(repo_span(&name, &path)));
+            }
             if t.human {
                 lines.push(human_line());
             }
@@ -554,6 +557,16 @@ fn branch_span(branch: &str) -> Span<'static> {
     Span::styled(format!("branch: {branch}"), Style::new().fg(Color::Green))
 }
 
+/// The checkout a task runs in (DESIGN.md §3), rendered only when the task
+/// names a repo of its own — a task on the project default reads as it always
+/// did, so the line appears exactly when it carries information.
+fn repo_span(name: &str, path: &str) -> Span<'static> {
+    Span::styled(
+        format!("repo: {name} ({path})"),
+        Style::new().fg(Color::Green),
+    )
+}
+
 /// A review row's next action rendered as a browser suffix (DESIGN.md §3). The
 /// browser shows state in its own column, so only `review` — whose verb reads
 /// the tracked PR, not the state alone — earns the suffix.
@@ -774,6 +787,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(branch) = &task.branch {
         lines.push(Line::from(branch_span(branch)));
+    }
+    if let Some((name, path)) = app.task_repo(task) {
+        lines.push(Line::from(repo_span(&name, &path)));
     }
     if task.human {
         lines.push(human_line());
@@ -1003,10 +1019,19 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                 other => format!("  [{other}]"),
             };
             let archived = if p.archived { "  [archived]" } else { "" };
+            // The path column shows the default repo, so a single-repo project
+            // reads as it always did; extra checkouts are tagged (DESIGN.md §3).
+            let extra = match app.repo_count(p.id) {
+                0 | 1 => String::new(),
+                n => format!("  [+{} repo(s)]", n - 1),
+            };
             ListItem::new(Line::from(Span::styled(
                 format!(
-                    "{:>2}  {:14} {:28} {} open{action}{archived}",
-                    p.weight, p.name, p.path, open
+                    "{:>2}  {:14} {:28} {} open{extra}{action}{archived}",
+                    p.weight,
+                    p.name,
+                    app.project_path(p.id),
+                    open
                 ),
                 style,
             )))
@@ -1329,6 +1354,7 @@ mod tests {
             task: Task {
                 id: 9,
                 project_id: 1,
+                repo_id: None,
                 title: "waiting".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -1406,6 +1432,7 @@ mod tests {
         let p = store.create_project("voro", "/tmp/voro").unwrap();
         let new = |title: &str| NewTask {
             project_id: p.id,
+            repo_id: None,
             title: title.into(),
             body: String::new(),
             priority: Priority::P2,
@@ -1460,6 +1487,7 @@ mod tests {
         store
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "hands-on".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -1523,6 +1551,7 @@ mod tests {
         // one open task and one terminal task — only the open one is counted
         let new = |title: &str, state: TaskState| NewTask {
             project_id: p.id,
+            repo_id: None,
             title: title.into(),
             body: String::new(),
             priority: Priority::P2,
@@ -1587,6 +1616,7 @@ mod tests {
         store
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "a task".into(),
                 body: "body".into(),
                 priority: Priority::P2,
@@ -1678,6 +1708,7 @@ mod tests {
         let p = store.create_project("voro", "/tmp/voro").unwrap();
         let new = |title: &str, priority| NewTask {
             project_id: p.id,
+            repo_id: None,
             title: title.into(),
             body: String::new(),
             priority,
@@ -1767,6 +1798,7 @@ mod tests {
         store.set_weight(p.id, 3).unwrap();
         let new = |title: &str, state, human| NewTask {
             project_id: p.id,
+            repo_id: None,
             title: title.into(),
             body: String::new(),
             priority: Priority::P2,
@@ -1865,6 +1897,7 @@ mod tests {
         store
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "a long task".into(),
                 body,
                 priority: Priority::P2,
@@ -1942,6 +1975,7 @@ mod tests {
         store
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "a task".into(),
                 body: "body".into(),
                 priority: Priority::P2,
@@ -2001,6 +2035,7 @@ mod tests {
             let task = store
                 .create_task(NewTask {
                     project_id: p.id,
+                    repo_id: None,
                     title: "went quiet".into(),
                     body: String::new(),
                     priority: Priority::P2,
@@ -2045,6 +2080,7 @@ mod tests {
         store
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "fresh".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -2077,6 +2113,7 @@ mod tests {
         let task = store
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "mid-flight".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -2127,6 +2164,7 @@ mod tests {
         let task = store
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "mid-flight".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -2198,6 +2236,7 @@ mod tests {
         store
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "a task".into(),
                 body: String::new(),
                 priority: Priority::P2,
@@ -2265,6 +2304,7 @@ mod tests {
         store.set_weight(p.id, 3).unwrap();
         let new = |title: &str, state: TaskState| NewTask {
             project_id: p.id,
+            repo_id: None,
             title: title.into(),
             body: String::new(),
             priority: Priority::P2,

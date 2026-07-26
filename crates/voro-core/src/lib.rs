@@ -21,7 +21,7 @@ pub use agent::{
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};
 pub use model::{
-    Dep, DepKind, DepRef, Event, NextAction, Priority, Project, ReviewAction, ReviewMedium,
+    Dep, DepKind, DepRef, Event, NextAction, Priority, Project, Repo, ReviewAction, ReviewMedium,
     RunningRow, Session, SessionOutcome, Task, TaskState,
 };
 pub use pr::{Mergeability, PrPlan, PrRef, format_review_feedback, parse_mergeable, plan_pr};
@@ -40,6 +40,7 @@ mod tests {
     fn new_task(project_id: i64, title: &str, state: TaskState) -> NewTask {
         NewTask {
             project_id,
+            repo_id: None,
             title: title.into(),
             body: String::new(),
             priority: Priority::P2,

@@ -9,8 +9,8 @@ use std::fmt::Write as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use voro_core::{
-    Action, AgentsConfig, DepKind, NewTask, PrRef, Priority, Project, ReviewAction, ReviewMedium,
-    Store, Task, TaskEdit, TaskState, Triage, scheduler,
+    Action, AgentsConfig, DepKind, NewTask, PrRef, Priority, Project, Repo, ReviewAction,
+    ReviewMedium, Store, Task, TaskEdit, TaskState, Triage, scheduler,
 };
 
 use crate::dispatch::{self, DispatchCtx};
@@ -26,7 +26,7 @@ projects
   project add <name> <path>       create a project (weight 3)
   project list                    list projects with weights
   project rename <project> <name> rename a project (tasks reference it by id)
-  project path <project> <path>   change a project's checkout path
+  project path <project> <path>   change a project's default repo's path
   project archive <project>       retire a project: hide it and all its tasks
                                   from the cockpit (queue, stats, running
                                   strip); tasks freeze in their states, and
@@ -44,10 +44,26 @@ projects
                                   picks a [viewers.NAME] entry)
   weight <project> <0-5>          set a project's weight (0 parks it)
 
+repos                             a project allocates attention; its repos
+                                  locate the checkouts its tasks run in
+  repo add <project> <name> <path>
+                                  add a checkout to a project
+  repo list [project]             list repos; * marks each project's default
+  repo path <project> <name> <path>
+                                  re-point a repo's checkout
+  repo default <project> <name>   make a repo the project's default — where
+                                  tasks that name no repo run
+  repo remove <project> <name>    remove a repo; refused for the last one, the
+                                  default while others remain, and one any
+                                  task still names
+
 tasks
   add <project> <title> [--body TEXT | --body-file PATH] [--priority 0-3]
       [--state proposed|parked|ready] [--agent NAME] [--blocked-by IDS]
-      [--blocks IDS] [--human]
+      [--blocks IDS] [--human] [--repo NAME]
+                                  --repo names which of the project's repos
+                                  the task runs in; omitted, it runs in the
+                                  project's default repo
                                   --blocked-by lists the tasks this one waits
                                   on; --blocks makes the listed tasks wait on
                                   this one
@@ -61,7 +77,7 @@ tasks
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
       [--body TEXT | --body-file PATH] [--blocked-by IDS] [--blocks IDS]
       [--pr URL | --no-pr] [--branch NAME | --no-branch] [--human | --no-human]
-      [--summary TEXT | --summary-file PATH]
+      [--summary TEXT | --summary-file PATH] [--repo NAME | --no-repo]
                                   --blocked-by replaces this task's own
                                   blocker list; --blocks adds this task as a
                                   blocker of each listed task
@@ -71,7 +87,10 @@ tasks
                                   prompt; --no-branch clears it. --summary
                                   sets or replaces a running/review task's
                                   completion summary (the PR body `pr` opens
-                                  from) without a reject/done round trip
+                                  from) without a reject/done round trip.
+                                  --repo re-points the task at another of its
+                                  project's repos; --no-repo returns it to the
+                                  project default
   show <task-id>                  full task: body, deps, events
   list [--state STATE] [--project P]
   inbox                           the next-action queue: questions, reviews,
@@ -82,10 +101,13 @@ tasks
                                   review, waiting, stalled, done; excludes
                                   parked projects
   explain <task-id>               score decomposition
-  import <project> [--repo owner/name]
+  import <project> [--repo NAME] [--gh-repo owner/name]
                                   import open GitHub issues as proposed
-                                  tasks via `gh issue list`; idempotent,
-                                  --repo overrides the checkout's own remote
+                                  tasks via `gh issue list`; idempotent.
+                                  --repo picks which of the project's repos to
+                                  import from (default: the default repo), and
+                                  imported tasks run in it; --gh-repo overrides
+                                  that checkout's own remote
 
 dispatch
   agent init                      write an optional voro.toml skeleton for
@@ -169,6 +191,10 @@ enum Verb {
     Project {
         #[command(subcommand)]
         cmd: ProjectCmd,
+    },
+    Repo {
+        #[command(subcommand)]
+        cmd: RepoCmd,
     },
     Weight {
         project: String,
@@ -266,6 +292,33 @@ enum ProjectCmd {
     Action { project: String, action: String },
 }
 
+/// The checkouts under a project (DESIGN.md §3/§5). A project always has at
+/// least one — `project add` makes it — so these verbs manage the rest.
+#[derive(Subcommand)]
+enum RepoCmd {
+    Add {
+        project: String,
+        name: String,
+        path: String,
+    },
+    List {
+        project: Option<String>,
+    },
+    Path {
+        project: String,
+        name: String,
+        path: String,
+    },
+    Default {
+        project: String,
+        name: String,
+    },
+    Remove {
+        project: String,
+        name: String,
+    },
+}
+
 #[derive(Subcommand)]
 enum AgentCmd {
     Init,
@@ -301,6 +354,8 @@ struct AddArgs {
     blocks: Option<String>,
     #[arg(long)]
     human: bool,
+    #[arg(long)]
+    repo: Option<String>,
 }
 
 #[derive(Args)]
@@ -355,6 +410,10 @@ struct SetArgs {
     summary: Option<String>,
     #[arg(long, conflicts_with = "summary")]
     summary_file: Option<String>,
+    #[arg(long)]
+    repo: Option<String>,
+    #[arg(long, conflicts_with = "repo")]
+    no_repo: bool,
 }
 
 #[derive(Args)]
@@ -388,8 +447,12 @@ struct DoneArgs {
 #[derive(Args)]
 struct ImportArgs {
     project: String,
+    /// Which of the project's repos to import from — a Voro repo name, the
+    /// same noun `add --repo` takes. The GitHub-side override is `--gh-repo`.
     #[arg(long)]
     repo: Option<String>,
+    #[arg(long)]
+    gh_repo: Option<String>,
 }
 
 #[derive(Args)]
@@ -433,6 +496,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         .map_err(|e| e.to_string().trim_end().to_string())?;
     match cli.verb {
         Verb::Project { cmd } => project_verb(store, cmd),
+        Verb::Repo { cmd } => repo_verb(store, cmd),
         Verb::Weight { project, weight } => weight_verb(store, &project, weight),
         Verb::Add(args) => add_verb(store, args),
         Verb::Propose(args) => propose_verb(store, args),
@@ -563,10 +627,22 @@ fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
                     other => format!("  [{other}]"),
                 };
                 let archived = if p.archived { "  [archived]" } else { "" };
+                // The path column stays the default repo's, so a single-repo
+                // project reads exactly as it did; extras are tagged.
+                let repos = store.repos(p.id).map_err(|e| e.to_string())?;
+                let path = repos
+                    .iter()
+                    .find(|r| r.is_default)
+                    .map(|r| r.path.as_str())
+                    .unwrap_or_default();
+                let extra = match repos.len() {
+                    0 | 1 => String::new(),
+                    n => format!("  [+{} repo(s)]", n - 1),
+                };
                 writeln!(
                     out,
-                    "{:3}  w{}  {}  {}{action}{archived}",
-                    p.id, p.weight, p.name, p.path
+                    "{:3}  w{}  {}  {}{extra}{action}{archived}",
+                    p.id, p.weight, p.name, path
                 )
                 .unwrap();
             }
@@ -584,10 +660,13 @@ fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
         }
         ProjectCmd::Path { project, path } => {
             let project = resolve_project(store, &project)?;
-            let p = store
-                .set_path(project.id, &path)
+            let repo = store
+                .set_default_repo_path(project.id, &path)
                 .map_err(|e| e.to_string())?;
-            Ok(format!("project {} path -> {}", p.id, p.path))
+            Ok(format!(
+                "project {} default repo '{}' path -> {}",
+                project.id, repo.name, repo.path
+            ))
         }
         ProjectCmd::Archive { project } => {
             let project = resolve_project(store, &project)?;
@@ -629,6 +708,89 @@ fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
             ))
         }
     }
+}
+
+/// The `repo` verbs (DESIGN.md §3/§5). Every refusal — last repo, default
+/// repo, referenced repo — comes from the store API, so the CLI only names
+/// which repo is meant and relays the store's answer.
+fn repo_verb(store: &mut Store, cmd: RepoCmd) -> Result<String, String> {
+    match cmd {
+        RepoCmd::Add {
+            project,
+            name,
+            path,
+        } => {
+            let project = resolve_project(store, &project)?;
+            let repo = store
+                .add_repo(project.id, &name, &path)
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "repo '{}' added to {} at {} — dispatch a task there with \
+                 `voro add {} <title> --repo {}`",
+                repo.name, project.name, repo.path, project.name, repo.name
+            ))
+        }
+        RepoCmd::List { project } => {
+            let projects = match project {
+                Some(key) => vec![resolve_project(store, &key)?],
+                None => store.projects().map_err(|e| e.to_string())?,
+            };
+            let mut out = String::new();
+            for project in projects {
+                for repo in store.repos(project.id).map_err(|e| e.to_string())? {
+                    let marker = if repo.is_default { "* " } else { "  " };
+                    writeln!(
+                        out,
+                        "{marker}{:14} {:14} {}",
+                        project.name, repo.name, repo.path
+                    )
+                    .unwrap();
+                }
+            }
+            if !out.is_empty() {
+                writeln!(out, "\n(* is each project's default repo)").unwrap();
+            }
+            Ok(out)
+        }
+        RepoCmd::Path {
+            project,
+            name,
+            path,
+        } => {
+            let project = resolve_project(store, &project)?;
+            let repo = resolve_repo(store, &project, &name)?;
+            let repo = store
+                .set_repo_path(repo.id, &path)
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "{} repo '{}' path -> {}",
+                project.name, repo.name, repo.path
+            ))
+        }
+        RepoCmd::Default { project, name } => {
+            let project = resolve_project(store, &project)?;
+            let repo = resolve_repo(store, &project, &name)?;
+            let repo = store.set_default_repo(repo.id).map_err(|e| e.to_string())?;
+            Ok(format!(
+                "{} default repo -> '{}' ({}) — tasks that name no repo now run there",
+                project.name, repo.name, repo.path
+            ))
+        }
+        RepoCmd::Remove { project, name } => {
+            let project = resolve_project(store, &project)?;
+            let repo = resolve_repo(store, &project, &name)?;
+            store.delete_repo(repo.id).map_err(|e| e.to_string())?;
+            Ok(format!("{} repo '{}' removed", project.name, repo.name))
+        }
+    }
+}
+
+/// Name one of a project's repos. An unknown name errors listing the project's
+/// repos, so a filing agent gets a correction rather than a wrong checkout.
+fn resolve_repo(store: &Store, project: &Project, name: &str) -> Result<Repo, String> {
+    store
+        .repo_by_name(project.id, name)
+        .map_err(|e| e.to_string())
 }
 
 /// Manage the `voro.toml` that dispatch resolves against — config that lives
@@ -717,6 +879,10 @@ fn weight_verb(store: &mut Store, project: &str, weight: i64) -> Result<String, 
 fn add_verb(store: &mut Store, args: AddArgs) -> Result<String, String> {
     let project = resolve_project(store, &args.project)?;
     let title = joined(&args.title, "title")?;
+    let repo = match &args.repo {
+        Some(name) => Some(resolve_repo(store, &project, name)?),
+        None => None,
+    };
     let state = match args.state.as_deref() {
         None => TaskState::Proposed,
         Some(raw) => {
@@ -733,6 +899,7 @@ fn add_verb(store: &mut Store, args: AddArgs) -> Result<String, String> {
     let task = store
         .create_task(NewTask {
             project_id: project.id,
+            repo_id: repo.as_ref().map(|r| r.id),
             title,
             body: text_or_file(args.body, args.body_file)?.unwrap_or_default(),
             priority: args.priority.unwrap_or(Priority::P2),
@@ -748,6 +915,9 @@ fn add_verb(store: &mut Store, args: AddArgs) -> Result<String, String> {
         None => task,
     };
     let mut out = format!("task {} '{}' created ({})", task.id, task.title, task.state);
+    if let Some(repo) = &repo {
+        out.push_str(&format!(" in repo '{}'", repo.name));
+    }
     if let Some(raw) = &args.blocks {
         out.push_str(&apply_blocks_flag(store, task.id, raw)?);
     }
@@ -772,6 +942,7 @@ fn propose_verb(store: &mut Store, args: ProposeArgs) -> Result<String, String> 
     let task = store
         .create_task(NewTask {
             project_id: project.id,
+            repo_id: None,
             title,
             body: text_or_file(args.body, args.body_file)?.unwrap_or_default(),
             priority: Priority::P2,
@@ -844,6 +1015,17 @@ fn set_verb(store: &mut Store, args: SetArgs) -> Result<String, String> {
         Some(text) => store.set_summary(id, &text).map_err(|e| e.to_string())?,
         None => task,
     };
+    let task = if args.no_repo {
+        store.set_task_repo(id, None).map_err(|e| e.to_string())?
+    } else if let Some(name) = &args.repo {
+        let project = store.project(task.project_id).map_err(|e| e.to_string())?;
+        let repo = resolve_repo(store, &project, name)?;
+        store
+            .set_task_repo(id, Some(repo.id))
+            .map_err(|e| e.to_string())?
+    } else {
+        task
+    };
     Ok(format!(
         "task {} updated ({}){blocks_echo}",
         task.id, task.state
@@ -861,7 +1043,8 @@ fn pr_verb(store: &mut Store, id: i64, yes: bool, ctx: &DispatchCtx) -> Result<S
         return crate::pr::open(store, id);
     }
     let project = store.project(task.project_id).map_err(|e| e.to_string())?;
-    if let ReviewMedium::Viewer(viewer) = crate::pr::resolve_medium(&project) {
+    let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
+    if let ReviewMedium::Viewer(viewer) = crate::pr::resolve_medium(&project, &repo.path) {
         return dispatch::open(store, ctx, id, viewer.as_deref());
     }
     // Assert PR-ready and learn the branch before prompting, so a task missing
@@ -982,6 +1165,12 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
     }
     if let Some(agent) = &task.agent {
         writeln!(out, "agent override: {agent}").unwrap();
+    }
+    // The checkout this task runs in, spelled out only when it is not the
+    // project default — a single-repo project reads exactly as it always did.
+    if task.repo_id.is_some() {
+        let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
+        writeln!(out, "repo: {} ({})", repo.name, repo.path).unwrap();
     }
     if let Some(q) = &task.question {
         writeln!(out, "question: {q}").unwrap();
@@ -1291,8 +1480,20 @@ fn viewer_verb(store: &mut Store, cmd: ViewerCmd, ctx: &DispatchCtx) -> Result<S
 /// `proposed` task, skipping ones already imported.
 fn import_verb(store: &mut Store, args: ImportArgs) -> Result<String, String> {
     let project = resolve_project(store, &args.project)?;
-    let json = import::fetch_issues(&project.path, args.repo.as_deref())?;
-    let summary = import::import_issues(store, &project, &json)?;
+    // Import runs against one checkout — the named repo, else the default —
+    // and the tasks it creates carry that repo, so they dispatch where their
+    // issues live (DESIGN.md §8).
+    let repo = match &args.repo {
+        Some(name) => resolve_repo(store, &project, name)?,
+        None => store.default_repo(project.id).map_err(|e| e.to_string())?,
+    };
+    let json = import::fetch_issues(&repo.path, args.gh_repo.as_deref())?;
+    let repo_id = if args.repo.is_some() {
+        Some(repo.id)
+    } else {
+        None
+    };
+    let summary = import::import_issues(store, &project, repo_id, &json)?;
     let mut out = String::new();
     for task in &summary.imported {
         writeln!(out, "{}", task_line(task, &project.name)).unwrap();
@@ -1334,8 +1535,9 @@ fn apply_action(store: &mut Store, id: i64, action: Action, yes: bool) -> Result
 /// `Ok`, so the transition it followed stands; `None` means nothing to clean
 /// (no branch, or no matching worktree).
 fn clean_up_worktree(store: &Store, task: &Task, yes: bool) -> Result<Option<String>, String> {
-    let project = store.project(task.project_id).map_err(|e| e.to_string())?;
-    let Some(plan) = crate::worktree::Cleanup::plan(task, &project.path)? else {
+    // The task's own checkout: its worktree lives in the repo it ran in.
+    let repo = store.repo_for_task(task).map_err(|e| e.to_string())?;
+    let Some(plan) = crate::worktree::Cleanup::plan(task, &repo.path)? else {
         return Ok(None);
     };
     if !yes && !confirm(&format!("{} — proceed?", plan.describe()))? {
@@ -1392,6 +1594,98 @@ mod tests {
         let out = ok(&mut s, &["project", "delete", "renamed"]);
         assert!(out.contains("deleted"), "{out}");
         assert!(!ok(&mut s, &["project", "list"]).contains("renamed"));
+    }
+
+    #[test]
+    fn repo_add_list_default_and_remove_through_the_cli() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "odm", "/tmp/odm"]);
+
+        // The project's own checkout is already a repo, named after it.
+        let out = ok(&mut s, &["repo", "list", "odm"]);
+        assert!(out.contains("* odm"), "{out}");
+        assert!(out.contains("/tmp/odm"), "{out}");
+
+        ok(&mut s, &["repo", "add", "odm", "oats", "/tmp/oats"]);
+        let out = ok(&mut s, &["repo", "list", "odm"]);
+        assert!(out.contains("/tmp/oats"), "{out}");
+        // `repo list` with no project spans every project.
+        assert!(ok(&mut s, &["repo", "list"]).contains("oats"));
+
+        ok(&mut s, &["repo", "path", "odm", "oats", "/tmp/oats2"]);
+        assert!(ok(&mut s, &["repo", "list", "odm"]).contains("/tmp/oats2"));
+
+        // Removing the default is refused until another is promoted.
+        let refusal = err(&mut s, &["repo", "remove", "odm", "odm"]);
+        assert!(refusal.contains("default repo"), "{refusal}");
+        let out = ok(&mut s, &["repo", "default", "odm", "oats"]);
+        assert!(out.contains("oats"), "{out}");
+        // The projects listing follows the new default and tags the extra.
+        let out = ok(&mut s, &["project", "list"]);
+        assert!(out.contains("/tmp/oats2"), "{out}");
+        assert!(out.contains("+1 repo"), "{out}");
+
+        ok(&mut s, &["repo", "remove", "odm", "odm"]);
+        let refusal = err(&mut s, &["repo", "remove", "odm", "oats"]);
+        assert!(refusal.contains("only repo"), "{refusal}");
+    }
+
+    #[test]
+    fn add_repo_names_the_task_checkout_and_a_bad_name_lists_the_valid_ones() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "odm", "/tmp/odm"]);
+        ok(&mut s, &["repo", "add", "odm", "oats", "/tmp/oats"]);
+
+        let out = ok(
+            &mut s,
+            &[
+                "add",
+                "odm",
+                "keyed results",
+                "--repo",
+                "oats",
+                "--state",
+                "ready",
+            ],
+        );
+        assert!(out.contains("in repo 'oats'"), "{out}");
+        // The message is not the point — the stored checkout is.
+        let task = s.task(1).unwrap();
+        assert_eq!(s.repo_for_task(&task).unwrap().path, "/tmp/oats");
+        assert!(ok(&mut s, &["show", "1"]).contains("repo: oats (/tmp/oats)"));
+
+        // A task filed without --repo stays on the project default.
+        ok(&mut s, &["add", "odm", "elsewhere", "--state", "ready"]);
+        let plain = s.task(2).unwrap();
+        assert_eq!(plain.repo_id, None);
+        assert_eq!(s.repo_for_task(&plain).unwrap().path, "/tmp/odm");
+        assert!(!ok(&mut s, &["show", "2"]).contains("repo:"));
+
+        // A filing agent that names a repo the project does not have gets a
+        // correction listing the real ones, not a wrong checkout.
+        let refusal = err(&mut s, &["add", "odm", "t", "--repo", "nope"]);
+        assert!(refusal.contains("nope"), "{refusal}");
+        assert!(refusal.contains("odm, oats"), "{refusal}");
+    }
+
+    #[test]
+    fn set_repo_repoints_a_task_and_no_repo_returns_it_to_the_default() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "odm", "/tmp/odm"]);
+        ok(&mut s, &["repo", "add", "odm", "oats", "/tmp/oats"]);
+        ok(&mut s, &["add", "odm", "t", "--state", "ready"]);
+
+        ok(&mut s, &["set", "1", "--repo", "oats"]);
+        let task = s.task(1).unwrap();
+        assert_eq!(s.repo_for_task(&task).unwrap().path, "/tmp/oats");
+
+        let refusal = err(&mut s, &["set", "1", "--repo", "nope"]);
+        assert!(refusal.contains("odm, oats"), "{refusal}");
+
+        ok(&mut s, &["set", "1", "--no-repo"]);
+        let task = s.task(1).unwrap();
+        assert_eq!(task.repo_id, None);
+        assert_eq!(s.repo_for_task(&task).unwrap().path, "/tmp/odm");
     }
 
     #[test]
@@ -2973,6 +3267,7 @@ mod tests {
         let task = store
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "Do the thing".into(),
                 body: "Detailed prompt.".into(),
                 priority: Priority::P1,

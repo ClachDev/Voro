@@ -195,13 +195,16 @@ pub struct PlanLaunch {
 /// deliverable is a `proposed` task the agent creates through `voro add`, so
 /// one that exits without creating anything has simply done nothing. There is
 /// deliberately no dispatch-style guard: planning only reads the checkout and
-/// writes nothing to it.
+/// writes nothing to it. A planning session runs in the project's *default*
+/// repo: it drafts a task rather than executing one, and the drafted task
+/// picks its own repo with `voro add --repo` (DESIGN.md §8).
 pub fn plan_session(
     store: &Store,
     ctx: &DispatchCtx,
     project_id: i64,
 ) -> Result<PlanLaunch, String> {
     let project = store.project(project_id).map_err(|e| e.to_string())?;
+    let repo = store.default_repo(project_id).map_err(|e| e.to_string())?;
     let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     let agent = config.resolve(None).map_err(|e| e.to_string())?;
     let Some(plan_cmd) = agent.plan.as_deref() else {
@@ -229,7 +232,7 @@ pub fn plan_session(
     .map_err(|e| format!("cannot write prompt {}: {e}", prompt_path.display()))?;
     Ok(PlanLaunch {
         command: plan_cmd.replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path)),
-        cwd: project.path,
+        cwd: repo.path,
     })
 }
 
@@ -311,7 +314,7 @@ pub fn dispatch(
 /// viewer medium of the per-project review action (§8). A dispatched agent works
 /// in a throwaway worktree on the task's branch, so the diff lives there, not in
 /// the primary checkout — the viewer is run in that worktree when the task has a
-/// live one, falling back to `project.path` when it has no branch or no worktree
+/// live one, falling back to the task's resolved repo when it has no branch or no worktree
 /// (§8). `viewer_override` names a `[viewers.<name>]` entry; `None` falls back to
 /// the project's review action or the config default. The viewer template gets
 /// `{path}` (the resolved dir), `{branch}` (the task's branch, empty when none),
@@ -332,6 +335,9 @@ pub fn open(
         ));
     }
     let project = store.project(task.project_id).map_err(|e| e.to_string())?;
+    // The task's own repo, not the project default: a task dispatched into a
+    // second repo has its branch and worktree there (DESIGN.md §8).
+    let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
 
     // The project's review action may pin a named viewer even when open was
     // invoked directly rather than through the resolved `pr` action.
@@ -349,12 +355,12 @@ pub fn open(
     // Run the viewer in the task's worktree when it has one — that is where the
     // dispatched agent's diff lives — otherwise the primary checkout.
     let viewer_dir = match task.branch.as_deref() {
-        Some(branch) => crate::worktree::worktree_on_branch(&project.path, branch)?
+        Some(branch) => crate::worktree::worktree_on_branch(&repo.path, branch)?
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| project.path.clone()),
-        None => project.path.clone(),
+            .unwrap_or_else(|| repo.path.clone()),
+        None => repo.path.clone(),
     };
-    let base = default_base_branch(&project.path);
+    let base = default_base_branch(&repo.path);
     let branch = task.branch.clone().unwrap_or_default();
     let command = viewer
         .replace(
@@ -456,12 +462,16 @@ fn spawn_session(
         ));
     }
 
+    // The checkout the session runs in: the task's own repo when it names one,
+    // else the project's default (DESIGN.md §8).
+    let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
+
     let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     let agent = config
         .resolve(agent_override.or(task.agent.as_deref()))
         .map_err(|e| e.to_string())?;
 
-    guard_git_repo(&project.path)?;
+    guard_git_repo(&repo.path)?;
 
     std::fs::create_dir_all(&ctx.runtime_dir)
         .map_err(|e| format!("cannot create {}: {e}", ctx.runtime_dir.display()))?;
@@ -504,7 +514,7 @@ fn spawn_session(
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&command)
-        .current_dir(&project.path)
+        .current_dir(&repo.path)
         .env("VORO_TASK_ID", task_id.to_string())
         .env("VORO_DB", &ctx.db_path)
         .stdin(Stdio::null())
@@ -551,7 +561,7 @@ fn spawn_session(
         Some(sessions_cmd) => {
             match capture_session_ref(
                 sessions_cmd,
-                &project.path,
+                &repo.path,
                 spawn_ms,
                 ctx.ref_capture_timeout,
                 &log_path,
@@ -590,14 +600,14 @@ fn spawn_session(
 /// the log. `None` once the timeout passes without either source producing one.
 fn capture_session_ref(
     sessions_cmd: &str,
-    project_path: &str,
+    repo_path: &str,
     spawn_ms: i64,
     timeout: Duration,
     log_path: &Path,
 ) -> Option<String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(session_ref) = query_new_session(sessions_cmd, project_path, spawn_ms) {
+        if let Some(session_ref) = query_new_session(sessions_cmd, repo_path, spawn_ms) {
             return Some(session_ref);
         }
         if let Some(session_ref) = log_backgrounded_ref(log_path) {
@@ -614,11 +624,11 @@ fn capture_session_ref(
 /// is this project and whose `startedAt` is at or after the spawn (with a
 /// little slack for the agent's own clock). `None` on any failure — capture
 /// is best-effort and the caller retries until its deadline.
-fn query_new_session(sessions_cmd: &str, project_path: &str, spawn_ms: i64) -> Option<String> {
+fn query_new_session(sessions_cmd: &str, repo_path: &str, spawn_ms: i64) -> Option<String> {
     let output = Command::new("sh")
         .arg("-c")
         .arg(sessions_cmd)
-        .current_dir(project_path)
+        .current_dir(repo_path)
         .stdin(Stdio::null())
         .output()
         .ok()?;
@@ -628,7 +638,7 @@ fn query_new_session(sessions_cmd: &str, project_path: &str, spawn_ms: i64) -> O
     let entries = parse_sessions_json(&String::from_utf8_lossy(&output.stdout)).ok()?;
     entries
         .into_iter()
-        .filter(|e| e.cwd.as_deref() == Some(project_path))
+        .filter(|e| e.cwd.as_deref() == Some(repo_path))
         .filter(|e| {
             e.started_at_ms
                 .is_some_and(|t| t >= spawn_ms - SPAWN_CLOCK_SLACK_MS)
@@ -704,10 +714,10 @@ fn guard_git_repo(path: &str) -> Result<(), String> {
 /// task branch against (DESIGN.md §8). Read from `refs/remotes/origin/HEAD`,
 /// whose `--short` form is `origin/<branch>`; the remote prefix is dropped. A
 /// checkout with no origin or no symbolic HEAD falls back to `main`.
-fn default_base_branch(project_path: &str) -> String {
+fn default_base_branch(repo_path: &str) -> String {
     let output = Command::new("git")
         .arg("-C")
-        .arg(project_path)
+        .arg(repo_path)
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .stdin(Stdio::null())
         .output();
@@ -781,6 +791,20 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    /// Poll a session log until the spawned agent has written something, so a
+    /// test can assert on what it printed without racing the detached child.
+    fn wait_for_log(path: &str) -> String {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && !text.trim().is_empty()
+            {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("{path} stayed empty");
+    }
+
     fn ready_task(store: &mut Store, project_path: &Path) -> i64 {
         let p = store
             .create_project("proj", project_path.to_str().unwrap())
@@ -788,6 +812,7 @@ mod tests {
         store
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "Do the thing".into(),
                 body: "Detailed prompt.".into(),
                 priority: Priority::P1,
@@ -1019,6 +1044,50 @@ mod tests {
         assert!(summary.contains("dispatched task"), "{summary}");
         assert_eq!(store.task(id).unwrap().state, TaskState::Running);
         assert_eq!(store.sessions_for(id).unwrap().len(), 1);
+    }
+
+    /// A task that names a second repo dispatches in *that* checkout — cwd,
+    /// git guard, and the worktree the agent will make (DESIGN.md §8).
+    #[test]
+    fn a_task_with_a_repo_dispatches_in_that_checkout() {
+        let (mut store, ctx, project) = fixture("pwd; : {prompt_file}");
+        let id = ready_task(&mut store, &project);
+        let second = project.parent().unwrap().join("second");
+        std::fs::create_dir_all(&second).unwrap();
+        git(&second, &["init", "-q"]);
+        let task = store.task(id).unwrap();
+        let repo = store
+            .add_repo(task.project_id, "second", second.to_str().unwrap())
+            .unwrap();
+        store.set_task_repo(id, Some(repo.id)).unwrap();
+
+        dispatch(&mut store, &ctx, id, None).unwrap();
+        let log = store.sessions_for(id).unwrap()[0].log_path.clone().unwrap();
+        // `pwd` writes the cwd the agent was spawned in.
+        let printed = wait_for_log(&log);
+        assert!(
+            printed.trim().ends_with("second"),
+            "expected the second repo as cwd, got {printed}"
+        );
+    }
+
+    /// The git guard runs against the task's repo, not the project default, so
+    /// a second checkout that is not a git repository is refused by name.
+    #[test]
+    fn a_non_git_second_repo_is_refused_naming_that_repo() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let id = ready_task(&mut store, &project);
+        let second = project.parent().unwrap().join("not-git");
+        std::fs::create_dir_all(&second).unwrap();
+        let task = store.task(id).unwrap();
+        let repo = store
+            .add_repo(task.project_id, "second", second.to_str().unwrap())
+            .unwrap();
+        store.set_task_repo(id, Some(repo.id)).unwrap();
+
+        let err = dispatch(&mut store, &ctx, id, None).unwrap_err();
+        assert!(err.contains(second.to_str().unwrap()), "{err}");
+        assert_eq!(store.task(id).unwrap().state, TaskState::Ready);
     }
 
     #[test]
@@ -1267,6 +1336,7 @@ mod tests {
         let no_wt = store
             .create_task(NewTask {
                 project_id,
+                repo_id: None,
                 title: "No worktree".into(),
                 body: String::new(),
                 priority: Priority::P1,
@@ -1557,6 +1627,7 @@ mod tests {
         let id = store
             .create_task(NewTask {
                 project_id: p.id,
+                repo_id: None,
                 title: "T".into(),
                 body: String::new(),
                 priority: Priority::P1,

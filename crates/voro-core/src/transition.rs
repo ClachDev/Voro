@@ -611,6 +611,7 @@ mod tests {
     fn create(s: &mut Store, project_id: i64, state: TaskState) -> i64 {
         s.create_task(NewTask {
             project_id,
+            repo_id: None,
             title: format!("task in {state}"),
             body: String::new(),
             priority: Priority::P1,
@@ -768,6 +769,7 @@ mod tests {
         fn create_human(s: &mut Store, project_id: i64, state: TaskState) -> i64 {
             s.create_task(NewTask {
                 project_id,
+                repo_id: None,
                 title: format!("human task in {state}"),
                 body: String::new(),
                 priority: Priority::P1,

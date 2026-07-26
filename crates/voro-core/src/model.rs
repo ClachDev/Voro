@@ -345,7 +345,6 @@ pub enum ReviewMedium {
 pub struct Project {
     pub id: i64,
     pub name: String,
-    pub path: String,
     pub weight: i64,
     /// How `pr` shows this project's review diffs (DESIGN.md §8/§11a).
     pub review_action: ReviewAction,
@@ -356,10 +355,28 @@ pub struct Project {
     pub archived: bool,
 }
 
+/// A checkout a project's work runs in (DESIGN.md §3): the execution target
+/// dispatch, `pr`/`open`, worktree cleanup, and `import` resolve against. A
+/// project owns at least one, exactly one of which is its default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repo {
+    pub id: i64,
+    pub project_id: i64,
+    /// Unique within the project; what `--repo` and the `repo` verbs name.
+    pub name: String,
+    pub path: String,
+    /// The repo a task with no `repo_id` resolves to. Exactly one per project.
+    pub is_default: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub id: i64,
     pub project_id: i64,
+    /// The repo this task's work runs in, or `None` for the project's default
+    /// (DESIGN.md §3/§8). Resolved through `Store::repo_for_task`; never read
+    /// raw by a consumer that wants a checkout.
+    pub repo_id: Option<i64>,
     pub title: String,
     pub body: String,
     pub priority: Priority,
@@ -540,6 +557,7 @@ mod tests {
         Task {
             id: 1,
             project_id: 1,
+            repo_id: None,
             title: "t".into(),
             body: String::new(),
             priority: Priority::P2,

@@ -442,6 +442,7 @@ mod tests {
         Task {
             id: 82,
             project_id: 1,
+            repo_id: None,
             title: "Extend pr to create the PR".into(),
             body: String::new(),
             priority: Priority::P1,
