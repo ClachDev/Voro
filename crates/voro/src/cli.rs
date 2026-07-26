@@ -60,7 +60,7 @@ repos                             a project allocates attention; its repos
 tasks
   add <project> <title> [--body TEXT | --body-file PATH] [--priority 0-3]
       [--state proposed|parked|ready] [--agent NAME] [--blocked-by IDS]
-      [--blocks IDS] [--human] [--repo NAME]
+      [--blocks IDS] [--human] [--deep] [--repo NAME]
                                   --repo names which of the project's repos
                                   the task runs in; omitted, it runs in the
                                   project's default repo
@@ -70,6 +70,9 @@ tasks
                                   --human marks a task no agent can execute:
                                   never dispatched, worked by hand, and its
                                   completion goes straight to done
+                                  --deep dispatches on the strongest model the
+                                  agent offers rather than its workhorse;
+                                  agents that name no models ignore it
   propose <project> <title> [--body TEXT | --body-file PATH] [--from TASK-ID]
                                   create a proposed task; --from links it
                                   discovered-from that task (dispatch renders
@@ -77,7 +80,8 @@ tasks
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
       [--body TEXT | --body-file PATH] [--blocked-by IDS] [--blocks IDS]
       [--pr URL | --no-pr] [--branch NAME | --no-branch] [--human | --no-human]
-      [--summary TEXT | --summary-file PATH] [--repo NAME | --no-repo]
+      [--deep | --no-deep] [--summary TEXT | --summary-file PATH]
+      [--repo NAME | --no-repo]
                                   --blocked-by replaces this task's own
                                   blocker list; --blocks adds this task as a
                                   blocker of each listed task
@@ -91,6 +95,8 @@ tasks
                                   --repo re-points the task at another of its
                                   project's repos; --no-repo returns it to the
                                   project default
+                                  --deep dispatches on the agent's strongest
+                                  model; --no-deep returns it to the workhorse
   show <task-id>                  full task: body, deps, events
   list [--state STATE] [--project P]
   inbox                           the next-action queue: questions, reviews,
@@ -355,6 +361,8 @@ struct AddArgs {
     #[arg(long)]
     human: bool,
     #[arg(long)]
+    deep: bool,
+    #[arg(long)]
     repo: Option<String>,
 }
 
@@ -406,6 +414,10 @@ struct SetArgs {
     human: bool,
     #[arg(long, conflicts_with = "human")]
     no_human: bool,
+    #[arg(long)]
+    deep: bool,
+    #[arg(long, conflicts_with = "deep")]
+    no_deep: bool,
     #[arg(long)]
     summary: Option<String>,
     #[arg(long, conflicts_with = "summary")]
@@ -831,9 +843,20 @@ fn agent_verb(cmd: AgentCmd, ctx: &DispatchCtx) -> Result<String, String> {
                 } else {
                     format!("  [{}]", verbs.join(" "))
                 };
+                // What `{model}` resolves to, so the template's placeholder is
+                // readable without opening the config; the fallbacks are
+                // spelled out rather than left implicit.
+                let models = match template.model() {
+                    None => String::new(),
+                    Some(model) => {
+                        let deep = template.model_deep().unwrap_or(model);
+                        let plan = template.model_plan().unwrap_or(model);
+                        format!("  <model {model} · deep {deep} · plan {plan}>")
+                    }
+                };
                 writeln!(
                     out,
-                    "{marker}{name}  {}{suffix}  ({})",
+                    "{marker}{name}  {}{suffix}{models}  ({})",
                     template.dispatch(),
                     provenance.label()
                 )
@@ -906,6 +929,7 @@ fn add_verb(store: &mut Store, args: AddArgs) -> Result<String, String> {
             state,
             agent: args.agent,
             human: args.human,
+            deep: args.deep,
         })
         .map_err(|e| e.to_string())?;
     let task = match &args.blocked_by {
@@ -949,6 +973,7 @@ fn propose_verb(store: &mut Store, args: ProposeArgs) -> Result<String, String> 
             state: TaskState::Proposed,
             agent: None,
             human: false,
+            deep: false,
         })
         .map_err(|e| e.to_string())?;
     let mut out = format!("task {} '{}' proposed", task.id, task.title);
@@ -974,12 +999,18 @@ fn set_verb(store: &mut Store, args: SetArgs) -> Result<String, String> {
         (_, true) => false,
         (false, false) => current.human,
     };
+    let deep = match (args.deep, args.no_deep) {
+        (true, _) => true,
+        (_, true) => false,
+        (false, false) => current.deep,
+    };
     let edit = TaskEdit {
         title: args.title.unwrap_or(current.title),
         body: text_or_file(args.body, args.body_file)?.unwrap_or(current.body),
         priority: args.priority.unwrap_or(current.priority),
         agent,
         human,
+        deep,
     };
     let task = store.update_task(id, edit).map_err(|e| e.to_string())?;
     let task = match &args.blocked_by {
@@ -1165,6 +1196,13 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
     }
     if let Some(agent) = &task.agent {
         writeln!(out, "agent override: {agent}").unwrap();
+    }
+    if task.deep {
+        writeln!(
+            out,
+            "deep: dispatches on the agent's strongest model, not its workhorse"
+        )
+        .unwrap();
     }
     // The checkout this task runs in, spelled out only when it is not the
     // project default — a single-repo project reads exactly as it always did.
@@ -2385,6 +2423,49 @@ mod tests {
         assert!(e.contains("agent override"), "{e}");
     }
 
+    // --- the deep flag (task #241) ---
+
+    #[test]
+    fn add_and_set_carry_the_deep_flag_and_show_displays_it() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+
+        ok(&mut s, &["add", "demo", "Hard one", "--deep"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("deep:"));
+
+        ok(&mut s, &["set", "1", "--no-deep"]);
+        assert!(!ok(&mut s, &["show", "1"]).contains("deep:"));
+        ok(&mut s, &["set", "1", "--deep"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("strongest model"));
+
+        // an unrelated edit leaves the flag alone
+        ok(&mut s, &["set", "1", "--priority", "0"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("deep:"));
+
+        let e = err(&mut s, &["set", "1", "--deep", "--no-deep"]);
+        assert!(e.contains("cannot be used with"), "{e}");
+    }
+
+    #[test]
+    fn deep_is_refused_on_a_human_task_both_ways() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+
+        let e = err(&mut s, &["add", "demo", "By hand", "--human", "--deep"]);
+        assert!(e.contains("deep"), "{e}");
+
+        ok(&mut s, &["add", "demo", "By hand", "--human"]);
+        let e = err(&mut s, &["set", "1", "--deep"]);
+        assert!(e.contains("deep"), "{e}");
+
+        // ...and the flag blocks the human flag symmetrically
+        ok(&mut s, &["add", "demo", "Agent work", "--deep"]);
+        let e = err(&mut s, &["set", "2", "--human"]);
+        assert!(e.contains("deep"), "{e}");
+        ok(&mut s, &["set", "2", "--human", "--no-deep"]);
+        assert!(ok(&mut s, &["show", "2"]).contains("human-only"));
+    }
+
     #[test]
     fn add_refuses_human_with_an_agent_override() {
         let mut s = store();
@@ -3274,6 +3355,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         crate::dispatch::dispatch(store, ctx, task.id, None).unwrap();

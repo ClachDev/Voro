@@ -188,6 +188,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         s.apply(t.id, Action::Start).unwrap();

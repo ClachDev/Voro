@@ -35,11 +35,12 @@ voro explain <id>       # score decomposition (weight × priority + age bonus)
 
 ```
 voro add <project> <title> --body-file plan.md [--priority 0-3]
-         [--blocked-by 3,7] [--blocks 9] [--repo NAME]
+         [--blocked-by 3,7] [--blocks 9] [--repo NAME] [--deep]
 voro set <id> [--title T] [--priority N] [--body-file F]
               [--blocked-by IDS] [--blocks IDS]
               [--branch NAME]        # intended git branch dispatch injects
               [--repo NAME | --no-repo]   # which checkout the task runs in
+              [--deep | --no-deep]   # dispatch on the agent's strongest model
 voro project add <name> <path>
 voro weight <project> <0-5>          # 0 parks/hides the project
 ```
@@ -55,6 +56,12 @@ always want: proposed tasks wait for human triage and never enter the queues
 untriaged. Write the body as a **dispatchable prompt** — self-contained
 enough that an agent could execute the task from the body alone (name files,
 state the acceptance criteria).
+
+`--deep` marks work that warrants the strongest model the dispatching agent
+offers rather than its workhorse. It changes only which model runs the task,
+never its place in the queue — that is priority's job — and an agent whose
+config names no models ignores it. It is refused on a `--human` task, which is
+never dispatched at all.
 
 ## Projects and repos
 

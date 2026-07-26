@@ -22,6 +22,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0010_add_waiting_state.sql"),
     include_str!("../migrations/0011_add_archived.sql"),
     include_str!("../migrations/0012_repos.sql"),
+    include_str!("../migrations/0013_add_deep.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -43,6 +44,7 @@ pub struct NewTask {
     pub state: TaskState,
     pub agent: Option<String>,
     pub human: bool,
+    pub deep: bool,
 }
 
 /// Content edits. State is deliberately absent — use `Store::apply`.
@@ -53,6 +55,7 @@ pub struct TaskEdit {
     pub priority: Priority,
     pub agent: Option<String>,
     pub human: bool,
+    pub deep: bool,
 }
 
 impl Store {
@@ -469,6 +472,13 @@ impl Store {
                     .into(),
             ));
         }
+        if new.human && new.deep {
+            return Err(Error::Invalid(
+                "a human-only task cannot be deep — deep only selects a dispatch model, \
+                 and no agent can execute the task"
+                    .into(),
+            ));
+        }
         // An archived project accepts no new work through any door — `add`,
         // `propose`, and import all create through here (DESIGN.md §5).
         let project = self.project(new.project_id)?;
@@ -489,8 +499,8 @@ impl Store {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO tasks (project_id, repo_id, title, body, priority, state, agent, human,
-                                state_since, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'), datetime('now'))",
+                                deep, state_since, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now'))",
             params![
                 new.project_id,
                 new.repo_id,
@@ -499,7 +509,8 @@ impl Store {
                 new.priority,
                 new.state,
                 new.agent,
-                new.human
+                new.human,
+                new.deep
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -527,6 +538,14 @@ impl Store {
                 id,
                 reason: "an agent override is meaningless on a task no agent can execute — \
                          clear one or the other"
+                    .into(),
+            });
+        }
+        if edit.human && edit.deep {
+            return Err(Error::HumanTask {
+                id,
+                reason: "the deep flag is meaningless on a task no agent can execute — it \
+                         only selects a dispatch model; clear one or the other"
                     .into(),
             });
         }
@@ -560,14 +579,16 @@ impl Store {
             }
         }
         self.conn.execute(
-            "UPDATE tasks SET title = ?1, body = ?2, priority = ?3, agent = ?4, human = ?5
-             WHERE id = ?6",
+            "UPDATE tasks SET title = ?1, body = ?2, priority = ?3, agent = ?4, human = ?5,
+                              deep = ?6
+             WHERE id = ?7",
             params![
                 edit.title,
                 edit.body,
                 edit.priority,
                 edit.agent,
                 edit.human,
+                edit.deep,
                 id
             ],
         )?;
@@ -586,6 +607,35 @@ impl Store {
             return Err(Error::TaskNotFound(id));
         }
         log_event(&self.conn, id, "priority", Some(&priority.to_string()))?;
+        self.task(id)
+    }
+
+    /// Flag a task as warranting the agent's strongest model, or clear the flag
+    /// (DESIGN.md §8). Like [`set_priority`] this touches one field and logs the
+    /// change, so the TUI's toggle needs no full edit; task state is untouched.
+    /// Refused on a human task, which is never dispatched and so has no model.
+    ///
+    /// [`set_priority`]: Store::set_priority
+    pub fn set_deep(&mut self, id: i64, deep: bool) -> Result<Task> {
+        let task = self.task(id)?;
+        if deep && task.human {
+            return Err(Error::HumanTask {
+                id,
+                reason: "the deep flag only selects a dispatch model, and no agent can \
+                         execute the task"
+                    .into(),
+            });
+        }
+        self.conn.execute(
+            "UPDATE tasks SET deep = ?1 WHERE id = ?2",
+            params![deep, id],
+        )?;
+        log_event(
+            &self.conn,
+            id,
+            "deep",
+            Some(if deep { "set" } else { "cleared" }),
+        )?;
         self.task(id)
     }
 
@@ -908,7 +958,7 @@ impl Store {
 
 pub(crate) const TASK_COLUMNS: &str = "id, project_id, title, body, priority, state, agent, \
                                        question, pr_url, branch, state_since, created_at, \
-                                       closed_at, human, repo_id";
+                                       closed_at, human, repo_id, deep";
 
 pub(crate) fn get_task(conn: &Connection, id: i64) -> Result<Option<Task>> {
     Ok(conn
@@ -937,6 +987,7 @@ pub(crate) fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         closed_at: row.get(12)?,
         human: row.get(13)?,
         repo_id: row.get(14)?,
+        deep: row.get(15)?,
     })
 }
 
@@ -1070,6 +1121,7 @@ mod tests {
             state: TaskState::Ready,
             agent: None,
             human: false,
+            deep: false,
         }
     }
 
@@ -1087,6 +1139,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
 
@@ -1155,6 +1208,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         assert!(s.task(t.id).unwrap().pr_url.is_none());
@@ -1192,6 +1246,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
 
@@ -1225,6 +1280,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         assert!(s.task(t.id).unwrap().branch.is_none());
@@ -1269,6 +1325,7 @@ mod tests {
             state: TaskState::Ready,
             agent: agent.map(str::to_string),
             human,
+            deep: false,
         }
     }
 
@@ -1279,6 +1336,7 @@ mod tests {
             priority: task.priority,
             agent: agent.map(str::to_string),
             human,
+            deep: false,
         }
     }
 
@@ -1379,6 +1437,77 @@ mod tests {
         );
     }
 
+    // --- the deep flag (task #241) ---
+
+    fn deep_new(project_id: i64, human: bool, deep: bool) -> NewTask {
+        NewTask {
+            deep,
+            ..new_with(project_id, None, human)
+        }
+    }
+
+    #[test]
+    fn set_deep_toggles_the_flag_and_logs_it() {
+        let (mut s, p) = human_fixture();
+        let t = s.create_task(deep_new(p, false, false)).unwrap();
+        assert!(!t.deep);
+
+        assert!(s.set_deep(t.id, true).unwrap().deep);
+        assert!(!s.set_deep(t.id, false).unwrap().deep);
+
+        let kinds: Vec<String> = s
+            .events_for(t.id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, vec!["created", "deep", "deep"]);
+        assert!(matches!(
+            s.set_deep(999, true),
+            Err(Error::TaskNotFound(999))
+        ));
+    }
+
+    /// Deep only selects a dispatch model, so it is refused on a task no agent
+    /// can execute — through every door that can set it.
+    #[test]
+    fn a_human_task_cannot_be_deep() {
+        let (mut s, p) = human_fixture();
+
+        let err = s.create_task(deep_new(p, true, true)).unwrap_err();
+        assert!(err.to_string().contains("deep"), "{err}");
+        assert!(s.tasks().unwrap().is_empty());
+
+        let human = s.create_task(deep_new(p, true, false)).unwrap();
+        let err = s.set_deep(human.id, true).unwrap_err();
+        assert!(matches!(err, Error::HumanTask { id, .. } if id == human.id));
+        assert!(!s.task(human.id).unwrap().deep);
+
+        let edit = TaskEdit {
+            deep: true,
+            ..edit_of(&human, None, true)
+        };
+        let err = s.update_task(human.id, edit).unwrap_err();
+        assert!(matches!(err, Error::HumanTask { id, .. } if id == human.id));
+
+        // clearing the flag on a human task is always allowed
+        assert!(!s.set_deep(human.id, false).unwrap().deep);
+    }
+
+    /// A database from before migration 0013 must open with every existing
+    /// task on the workhorse (`deep = 0`), and the CHECK must reject junk.
+    #[test]
+    fn deep_defaults_off_and_is_constrained() {
+        let (mut s, p) = human_fixture();
+        let t = s.create_task(deep_new(p, false, false)).unwrap();
+        assert!(!t.deep);
+        assert!(
+            s.conn
+                .execute("UPDATE tasks SET deep = 2 WHERE id = ?1", [t.id])
+                .is_err()
+        );
+    }
+
     /// A database from before migration 0007 must open with every existing
     /// task dispatchable (`human = 0`), and the CHECK must reject junk.
     #[test]
@@ -1422,6 +1551,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
 
@@ -1467,6 +1597,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         s.apply(t.id, Action::Start).unwrap();
@@ -1494,6 +1625,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         let err = s.set_summary(t.id, "too early").unwrap_err();
@@ -1705,6 +1837,7 @@ mod tests {
                 state,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap()
             .id
@@ -1812,6 +1945,7 @@ mod tests {
                     state,
                     agent: None,
                     human: false,
+                    deep: false,
                 })
                 .unwrap_err();
             assert!(
@@ -1832,6 +1966,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .is_ok()
         );
@@ -2208,6 +2343,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         s.apply(task.id, Action::Start).unwrap();
@@ -2240,6 +2376,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         assert_eq!(s.latest_summary(t.id).unwrap(), None);
@@ -2280,6 +2417,7 @@ mod tests {
                     state: TaskState::Ready,
                     agent: None,
                     human: false,
+                    deep: false,
                 })
                 .unwrap();
             s.apply(t.id, Action::Start).unwrap();
@@ -2328,6 +2466,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         s.set_branch(t.id, Some("feat/x")).unwrap();
@@ -2598,6 +2737,7 @@ mod tests {
             state: TaskState::Ready,
             agent: None,
             human: false,
+            deep: false,
         };
 
         // review keeps its session open, yet must not appear in the strip
@@ -2694,6 +2834,7 @@ mod tests {
             state: TaskState::Ready,
             agent: None,
             human: false,
+            deep: false,
         };
         let blocker = s.create_task(new("blocker")).unwrap();
         s.apply(blocker.id, Action::Start).unwrap();

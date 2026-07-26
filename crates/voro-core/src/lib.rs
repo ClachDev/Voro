@@ -47,6 +47,7 @@ mod tests {
             state,
             agent: None,
             human: false,
+            deep: false,
         }
     }
 

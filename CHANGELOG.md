@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remove`, pick one per task with `voro add --repo NAME` and `voro set --repo
   NAME`, and import from one with `voro import --repo NAME`. A project allocates
   attention; its repos locate checkouts.
+- The **deep** flag: mark a task with `voro add --deep`, `voro set <id> --deep`,
+  or `!` in the TUI and it dispatches on the strongest model its agent offers
+  rather than the workhorse. Agent templates gained a `{model}` placeholder and
+  a per-agent `model`/`model_deep`/`model_plan` map to fill it; an agent naming
+  no models, such as the built-in `codex`, ignores the flag entirely.
 
 ### Changed
 
