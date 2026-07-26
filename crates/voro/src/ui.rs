@@ -1299,7 +1299,6 @@ mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            session_task_id: None,
         };
         let mut app = App::new(store, ctx).unwrap();
         app.on_key(KeyEvent::from(KeyCode::Char('4')));

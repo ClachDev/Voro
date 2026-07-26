@@ -1455,7 +1455,6 @@ mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            session_task_id: None,
         };
         let mut s = store();
         let call = |s: &mut Store, args: &[&str]| {
