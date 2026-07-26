@@ -217,7 +217,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 lines.extend(score_lines(&b));
             }
             lines.push(Line::default());
-            lines.extend(t.body.lines().map(|l| Line::from(l.to_string())));
+            lines.extend(crate::markdown::body_lines(&t.body));
             if app.show_history {
                 lines.push(Line::default());
                 lines.extend(history_lines(&app.task_events(*task_id)));
@@ -791,7 +791,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         lines.extend(score_lines(&b));
     }
     lines.push(Line::default());
-    lines.extend(task.body.lines().map(|l| Line::from(l.to_string())));
+    lines.extend(crate::markdown::body_lines(&task.body));
     if app.show_history {
         lines.push(Line::default());
         lines.extend(history_lines(&app.task_events(task.id)));
@@ -1299,7 +1299,6 @@ mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            session_task_id: None,
         };
         let mut app = App::new(store, ctx).unwrap();
         app.on_key(KeyEvent::from(KeyCode::Char('4')));

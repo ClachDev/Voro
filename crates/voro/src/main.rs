@@ -3,6 +3,7 @@ mod cli;
 mod dispatch;
 mod editor;
 mod import;
+mod markdown;
 mod pr;
 mod reconcile;
 mod ui;
