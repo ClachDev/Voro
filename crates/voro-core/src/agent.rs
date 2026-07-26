@@ -33,6 +33,13 @@ pub const TASK_ID_PLACEHOLDER: &str = "{task_id}";
 /// Codex session id, a tmux session name).
 pub const SESSION_PLACEHOLDER: &str = "{session}";
 
+/// The model substitution in a verb template, resolved from the agent's own
+/// `model`/`model_deep`/`model_plan` keys (DESIGN.md §8). Voro is model-blind:
+/// the values are opaque strings it pastes into the command and never
+/// interprets. Optional — an agent with no `{model}` anywhere takes no model
+/// direction at all, and a deep task dispatches with it unchanged.
+pub const MODEL_PLACEHOLDER: &str = "{model}";
+
 /// The substitution in a viewer command template (DESIGN.md §11a): the checkout
 /// path of the task's project — or the task's worktree, when it has a branch
 /// checked out in one (DESIGN.md §8). Optional — a viewer that acts on the
@@ -56,19 +63,25 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// plans interactively in the foreground; `codex` covers the headless-resume
 /// shape. Must parse and pass [`validate_agent`].
 ///
-/// The claude verbs carry per-purpose `--model` defaults: `dispatch` a
-/// workhorse implementation model, `plan` a stronger reasoning model. They
-/// pass the `claude` model *aliases* (`opus`, `fable`), not pinned model ids,
-/// so they resolve to the current model of that class and do not churn with
+/// The claude verbs take their model from `{model}` rather than a baked-in
+/// flag, so the model varies per purpose and per task: `model` is the workhorse
+/// a normal dispatch runs, `model_deep` the stronger one a `deep` task earns,
+/// and `model_plan` the one interactive planning reasons with (DESIGN.md §8).
+/// They name `claude` model *aliases* (`opus`, `fable`), not pinned model ids,
+/// so each resolves to the current model of that class and does not churn with
 /// each release; an operator wanting other models overrides the agent
-/// wholesale in `voro.toml`.
+/// wholesale in `voro.toml`. `codex` carries no `{model}`, which is the
+/// no-model-direction case: a deep task dispatches with it unchanged.
 const BUILTIN_AGENTS: &str = "\
 [agents.claude]
-dispatch = \"claude --bg --name \\\"voro-{task_id}\\\" --permission-mode auto --model opus \\\"$(cat {prompt_file})\\\"\"
-sessions = \"claude agents --json\"
-attach   = \"claude attach {session}\"
-resume   = \"claude --resume {session}\"
-plan     = \"claude --permission-mode auto --model fable \\\"$(cat {prompt_file})\\\"\"
+dispatch   = \"claude --bg --name \\\"voro-{task_id}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
+sessions   = \"claude agents --json\"
+attach     = \"claude attach {session}\"
+resume     = \"claude --resume {session}\"
+plan       = \"claude --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
+model      = \"opus\"
+model_deep = \"fable\"
+model_plan = \"fable\"
 
 [agents.codex]
 dispatch = \"codex exec \\\"$(cat {prompt_file})\\\"\"
@@ -112,6 +125,12 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #       attach    open a running session interactively    ({session})
 #       resume    reopen a finished session interactively  ({session})
 #       plan      run an interactive foreground planning session ({prompt_file})
+#     `dispatch` and `plan` may also carry `{model}`, filled from this agent's
+#     own model keys: `model` normally, `model_deep` for a task flagged deep
+#     (`voro set <id> --deep`), and `model_plan` when planning — the last two
+#     falling back to `model`. The values are opaque names Voro pastes in and
+#     never interprets, so an agent with no `{model}` takes no model direction
+#     and a deep task dispatches with it unchanged.
 #     See docs/agent-integration.md for the full contract.
 #   * override a built-in — a table named `claude` or `codex` REPLACES that
 #     built-in entirely (not per-verb), so copy every verb you still want. The
@@ -184,6 +203,15 @@ pub struct AgentTemplate {
     /// run by the TUI's planning flow (DESIGN.md §8) — no `{session}`, since a
     /// planning session belongs to no task or session row.
     plan: Option<String>,
+    /// The agent-opaque model name substituted into [`MODEL_PLACEHOLDER`]: the
+    /// workhorse this agent runs work with, and the fallback for the two keys
+    /// below. Required once any template carries the placeholder.
+    model: Option<String>,
+    /// The stronger model a `deep` task dispatches with (DESIGN.md §8),
+    /// falling back to `model`.
+    model_deep: Option<String>,
+    /// The model the `plan` verb reasons with, falling back to `model`.
+    model_plan: Option<String>,
 }
 
 impl AgentTemplate {
@@ -210,6 +238,29 @@ impl AgentTemplate {
 
     pub fn plan(&self) -> Option<&str> {
         self.plan.as_deref()
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    pub fn model_deep(&self) -> Option<&str> {
+        self.model_deep.as_deref()
+    }
+
+    pub fn model_plan(&self) -> Option<&str> {
+        self.model_plan.as_deref()
+    }
+}
+
+/// Substitute [`MODEL_PLACEHOLDER`] in a verb template. `model` is the name
+/// that verb resolved to, or `None` for an agent that declares none — in which
+/// case the template carries no placeholder either (`validate_agent` enforces
+/// that pairing), so this is a no-op.
+fn render_model(template: &str, model: Option<&str>) -> String {
+    match model {
+        Some(model) => template.replace(MODEL_PLACEHOLDER, model),
+        None => template.to_string(),
     }
 }
 
@@ -312,6 +363,37 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
             "agent '{name}' plan is missing the {PROMPT_FILE_PLACEHOLDER} placeholder"
         )));
     }
+    // `{model}` is resolved only where a command launches work, so it is
+    // meaningful on `dispatch` and `plan` and nowhere else; anywhere else it
+    // would reach the shell unsubstituted.
+    for (verb, template) in [
+        ("sessions", &agent.sessions),
+        ("attach", &agent.attach),
+        ("resume", &agent.resume),
+    ] {
+        if let Some(template) = template
+            && template.contains(MODEL_PLACEHOLDER)
+        {
+            return Err(invalid(format!(
+                "agent '{name}' {verb} carries {MODEL_PLACEHOLDER}, which is resolved only on \
+                 dispatch and plan — a session verb reuses the model its session started with"
+            )));
+        }
+    }
+    // The model keys are inert without the placeholder (a wholesale override
+    // that drops `{model}` keeps loading), but the placeholder without them
+    // has nothing to resolve to.
+    if agent.model.is_none()
+        && [dispatch.as_str(), agent.plan.as_deref().unwrap_or_default()]
+            .iter()
+            .any(|t| t.contains(MODEL_PLACEHOLDER))
+    {
+        return Err(invalid(format!(
+            "agent '{name}' uses {MODEL_PLACEHOLDER} but sets no model — add model = \
+             \"<model name>\" to its [agents.{name}] table (optionally model_deep for deep \
+             tasks and model_plan for planning), or drop the placeholder"
+        )));
+    }
     Ok(())
 }
 
@@ -328,6 +410,11 @@ fn binary_on_path(name: &str) -> bool {
 /// The agent a task will be dispatched with: the task's own override if it
 /// has one, otherwise the config's global default, with every verb template
 /// resolved.
+///
+/// The `dispatch` and `plan` fields still hold `{model}` unresolved, because
+/// which model they name depends on the task: reach them through
+/// [`dispatch_command`](Self::dispatch_command) and
+/// [`plan_command`](Self::plan_command).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAgent {
     pub name: String,
@@ -336,6 +423,35 @@ pub struct ResolvedAgent {
     pub attach: Option<String>,
     pub resume: Option<String>,
     pub plan: Option<String>,
+    pub model: Option<String>,
+    pub model_deep: Option<String>,
+    pub model_plan: Option<String>,
+}
+
+impl ResolvedAgent {
+    /// The dispatch command with `{model}` resolved for a task of this depth
+    /// (DESIGN.md §8): `model_deep` for a deep task, falling back to `model`
+    /// when the agent names no deeper one, and `model` otherwise. An agent
+    /// whose template carries no placeholder renders the same string either
+    /// way — the graceful degradation of the `deep` flag.
+    pub fn dispatch_command(&self, deep: bool) -> String {
+        let model = if deep {
+            self.model_deep.as_deref().or(self.model.as_deref())
+        } else {
+            self.model.as_deref()
+        };
+        render_model(&self.dispatch, model)
+    }
+
+    /// The plan command with `{model}` resolved — `model_plan`, falling back to
+    /// `model` — when the agent defines the verb. Planning has no depth: it is
+    /// interactive reasoning either way.
+    pub fn plan_command(&self) -> Option<String> {
+        let model = self.model_plan.as_deref().or(self.model.as_deref());
+        self.plan
+            .as_deref()
+            .map(|template| render_model(template, model))
+    }
 }
 
 /// The effective agent config: the built-in agents with any `voro.toml`
@@ -495,6 +611,9 @@ impl AgentsConfig {
             attach: agent.attach.clone(),
             resume: agent.resume.clone(),
             plan: agent.plan.clone(),
+            model: agent.model.clone(),
+            model_deep: agent.model_deep.clone(),
+            model_plan: agent.model_plan.clone(),
         })
     }
 
@@ -1287,18 +1406,126 @@ mod tests {
         assert!(agents["codex"].resume().is_some());
     }
 
+    // --- the model map and {model} (task #241) ---
+
     #[test]
-    fn builtin_claude_carries_per_purpose_model_defaults() {
-        let claude = &builtin_agents()["claude"];
-        // dispatch runs a workhorse implementation model, plan a stronger one;
-        // both via `claude` model aliases, so neither churns with a release.
+    fn builtin_claude_renders_a_model_per_purpose_and_depth() {
+        let config = AgentsConfig::builtin_only(Path::new("/tmp/voro.toml"));
+        let claude = config.resolve(Some("claude")).unwrap();
+        // A workhorse for ordinary implementation, the stronger model for a
+        // deep task and for interactive planning; all `claude` model aliases,
+        // so none churns with a release.
         assert!(
-            claude.dispatch().contains("--model opus"),
+            claude.dispatch_command(false).contains("--model opus"),
             "{}",
-            claude.dispatch()
+            claude.dispatch_command(false)
         );
-        let plan = claude.plan().unwrap();
-        assert!(plan.contains("--model fable"), "{plan}");
+        assert!(
+            claude.dispatch_command(true).contains("--model fable"),
+            "{}",
+            claude.dispatch_command(true)
+        );
+        assert!(
+            claude.plan_command().unwrap().contains("--model fable"),
+            "{:?}",
+            claude.plan_command()
+        );
+        for rendered in [
+            claude.dispatch_command(false),
+            claude.dispatch_command(true),
+            claude.plan_command().unwrap(),
+        ] {
+            assert!(
+                !rendered.contains(MODEL_PLACEHOLDER),
+                "placeholder left unresolved: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_without_the_placeholder_ignores_depth_entirely() {
+        let config = AgentsConfig::builtin_only(Path::new("/tmp/voro.toml"));
+        let codex = config.resolve(Some("codex")).unwrap();
+        assert_eq!(codex.dispatch_command(true), codex.dispatch_command(false));
+        assert_eq!(codex.dispatch_command(true), codex.dispatch);
+        assert_eq!(codex.plan_command(), None);
+    }
+
+    #[test]
+    fn model_deep_and_model_plan_fall_back_to_model() {
+        let text = r#"
+            [agents.a]
+            dispatch = "run --model {model} {prompt_file}"
+            plan     = "run -i --model {model} {prompt_file}"
+            model    = "workhorse"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        let a = config.resolve(Some("a")).unwrap();
+        assert_eq!(
+            a.dispatch_command(false),
+            "run --model workhorse {prompt_file}"
+        );
+        assert_eq!(
+            a.dispatch_command(true),
+            "run --model workhorse {prompt_file}"
+        );
+        assert_eq!(
+            a.plan_command().unwrap(),
+            "run -i --model workhorse {prompt_file}"
+        );
+    }
+
+    #[test]
+    fn the_placeholder_without_a_model_key_is_a_config_error() {
+        let text = r#"
+            [agents.a]
+            dispatch = "run --model {model} {prompt_file}"
+        "#;
+        let message = AgentsConfig::parse(text, Path::new("/tmp/voro.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("{model}"), "{message}");
+        assert!(message.contains("model = "), "{message}");
+        assert!(message.contains("'a'"), "{message}");
+
+        // ...and the same when only `plan` carries it.
+        let text = r#"
+            [agents.a]
+            dispatch = "run {prompt_file}"
+            plan     = "run -i --model {model} {prompt_file}"
+        "#;
+        assert!(AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).is_err());
+    }
+
+    /// Wholesale overrides written before the model map existed carry no
+    /// `{model}`; the keys are inert there rather than newly required.
+    #[test]
+    fn model_keys_without_the_placeholder_are_inert_not_an_error() {
+        let text = r#"
+            [agents.claude]
+            dispatch   = "claude -p {prompt_file}"
+            model      = "opus"
+            model_deep = "fable"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        let claude = config.resolve(Some("claude")).unwrap();
+        assert_eq!(claude.dispatch_command(true), "claude -p {prompt_file}");
+        assert_eq!(claude.dispatch_command(false), "claude -p {prompt_file}");
+    }
+
+    #[test]
+    fn a_session_verb_carrying_the_placeholder_is_rejected() {
+        let text = r#"
+            [agents.a]
+            dispatch = "run {prompt_file}"
+            attach   = "reopen --model {model} {session}"
+            model    = "workhorse"
+        "#;
+        let message = AgentsConfig::parse(text, Path::new("/tmp/voro.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("attach"), "{message}");
+        assert!(message.contains("{model}"), "{message}");
     }
 
     #[test]

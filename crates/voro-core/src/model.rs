@@ -399,6 +399,13 @@ pub struct Task {
     /// completion goes `running → done` directly. Default `false` means
     /// dispatchable.
     pub human: bool,
+    /// Marks work that warrants the strongest model its agent offers rather
+    /// than the workhorse (DESIGN.md §8). Read only at dispatch, where it
+    /// picks which model fills the agent's `{model}` placeholder; an agent
+    /// whose templates carry none ignores it. Orthogonal to priority, which
+    /// orders the queue, and to the agent override, which picks which agent
+    /// runs. Default `false` means the workhorse.
+    pub deep: bool,
 }
 
 /// The verb a task's queue row asks of the human (DESIGN.md §3), derived from
@@ -570,6 +577,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             closed_at: None,
             human,
+            deep: false,
         }
     }
 

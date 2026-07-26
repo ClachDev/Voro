@@ -73,11 +73,14 @@ agent init` writes the same built-ins into a fresh `voro.toml`, commented out.
 
 ```toml
 [agents.claude]
-dispatch = "claude --bg --name \"voro-{task_id}\" --permission-mode auto --model opus \"$(cat {prompt_file})\""
-sessions = "claude agents --json"
-attach   = "claude attach {session}"
-resume   = "claude --resume {session}"
-plan     = "claude --permission-mode auto --model fable \"$(cat {prompt_file})\""
+dispatch   = "claude --bg --name \"voro-{task_id}\" --permission-mode auto --model {model} \"$(cat {prompt_file})\""
+sessions   = "claude agents --json"
+attach     = "claude attach {session}"
+resume     = "claude --resume {session}"
+plan       = "claude --permission-mode auto --model {model} \"$(cat {prompt_file})\""
+model      = "opus"
+model_deep = "fable"
+model_plan = "fable"
 
 [agents.codex]
 dispatch = "codex exec \"$(cat {prompt_file})\""
@@ -101,14 +104,31 @@ resume   = "codex resume {session}"
   background itself. It carries no `{session}` — a planning session belongs to
   no task and records no session row.
 
-The two claude verbs pick different models for their different jobs:
-`dispatch` runs `--model opus`, a workhorse for implementation, and `plan` runs
-`--model fable`, a stronger reasoning model for interactive planning. These are
-`claude` model *aliases*, not pinned model ids, so each resolves to the current
-model of its class and does not churn as models are released. Want other models?
-Override the agent wholesale in `voro.toml` — copy the block above and change
-the `--model` flags (a user `[agents.claude]` table replaces the built-in
-entirely, so keep every verb you still want).
+The **model map** is the last three keys, and it is what `{model}` resolves to.
+`dispatch` and `plan` may each carry the placeholder; Voro fills it from this
+agent's own keys and never interprets the values, which are opaque names passed
+straight through to the command:
+
+- `model` on an ordinary dispatch — a workhorse for implementation.
+- `model_deep` on a dispatch of a task flagged **deep** (`voro add --deep`,
+  `voro set <id> --deep`, or `!` in the TUI) — the strongest model, for work
+  that warrants it. Falls back to `model` when an agent names only one.
+- `model_plan` on `plan`, whatever the queue holds — a planning session belongs
+  to no task, so there is no depth to read. Falls back to `model` too.
+
+The values above are `claude` model *aliases*, not pinned model ids, so each
+resolves to the current model of its class and does not churn as models are
+released. Want other models? Override the agent wholesale in `voro.toml` — copy
+the block above and change the three keys (a user `[agents.claude]` table
+replaces the built-in entirely, so keep every verb you still want).
+
+The placeholder is meaningful only on `dispatch` and `plan`, the two verbs that
+launch work; on a session verb it is refused at config load, since a session
+already runs on whatever model started it. An agent that carries `{model}` but
+names no `model` is likewise a config error. The reverse is fine and inert: an
+agent whose templates carry no `{model}` — `codex` above — simply takes no model
+direction, and a deep task dispatches with it exactly as any other task does,
+which is how the flag degrades gracefully across agents.
 
 The dispatch template runs Claude in `auto` mode: it auto-approves the actions it
 judges safe — edits, a build, a commit — and pauses on genuinely risky ones, so
@@ -160,9 +180,9 @@ model intact: a dispatched agent still cannot push. The task never leaves
 
 Every verb degrades gracefully when absent: no `attach`/`resume` disables the
 jump-in key for that agent, no `sessions` keeps pid-liveness reconciliation, no
-`plan` turns the TUI's planning key into a status line saying what to configure.
-An agent defining only `dispatch`/`cmd` behaves exactly as before the verbs
-existed.
+`plan` turns the TUI's planning key into a status line saying what to configure,
+and no `{model}` anywhere makes the deep flag a no-op for that agent. An agent
+defining only `dispatch`/`cmd` behaves exactly as before the verbs existed.
 
 ### tmux as a universal fallback
 

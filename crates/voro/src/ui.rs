@@ -207,6 +207,9 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             if t.human {
                 lines.push(human_line());
             }
+            if t.deep {
+                lines.push(deep_line());
+            }
             if let Some(session) = app.last_sessions.get(task_id) {
                 lines.extend(session_lines(session, t.state));
             }
@@ -229,7 +232,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 .wrap(Wrap { trim: false })
                 .scroll((*scroll, 0))
                 .block(Block::default().borders(Borders::ALL).title(format!(
-                    "#{task_id} — ⏎ state · 0-3 priority · x score · h history · j/k scroll · esc close"
+                    "#{task_id} — ⏎ state · 0-3 priority · ! deep · x score · h history · j/k scroll · esc close"
                 )));
             frame.render_widget(para, area);
         }
@@ -542,6 +545,29 @@ fn human_line() -> Line<'static> {
     ))
 }
 
+/// The deep flag (task #241) as a one-column row marker sitting beside the
+/// priority cell: `!` when the task dispatches on the agent's strongest model,
+/// a blank of the same width otherwise, so the columns after it stay aligned
+/// whether or not any row in the list is deep.
+fn deep_marker(deep: bool) -> Span<'static> {
+    if deep {
+        Span::styled(
+            "!",
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw(" ")
+    }
+}
+
+/// The same flag spelled out for a detail view, beside the human line.
+fn deep_line() -> Line<'static> {
+    Line::from(Span::styled(
+        "deep — dispatches on the agent's strongest model",
+        Style::new().fg(Color::Magenta),
+    ))
+}
+
 /// A tracked GitHub PR (DESIGN.md §11c) rendered for the detail pane, with the
 /// jump-to-PR key spelled out so the reviewer knows how to reach it.
 fn pr_span(url: &str) -> Span<'static> {
@@ -663,15 +689,15 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
                     score,
                     Span::styled(
                         format!(
-                            "{} {:10} {} {}: {}",
+                            "{} {:10} {}",
                             task_ref(c.task.id),
                             c.task.next_action().map_or("", |a| a.as_str()),
                             c.task.priority,
-                            c.project_name,
-                            c.task.title
                         ),
                         style,
                     ),
+                    deep_marker(c.task.deep),
+                    Span::styled(format!(" {}: {}", c.project_name, c.task.title), style),
                 ];
                 if c.task.human {
                     spans.push(human_span());
@@ -794,6 +820,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     if task.human {
         lines.push(human_line());
     }
+    if task.deep {
+        lines.push(deep_line());
+    }
     if let Some(session) = app.last_sessions.get(&task.id) {
         lines.extend(session_lines(session, task.state));
     }
@@ -906,18 +935,22 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
             } else {
                 Style::new()
             };
-            let mut spans = vec![Span::styled(
-                format!(
-                    "{} {:11} {} w{} {:14} {}",
-                    task_ref(r.task.id),
-                    r.task.state,
-                    r.task.priority,
-                    r.weight,
-                    r.project,
-                    r.task.title
+            let mut spans = vec![
+                Span::styled(
+                    format!(
+                        "{} {:11} {}",
+                        task_ref(r.task.id),
+                        r.task.state,
+                        r.task.priority,
+                    ),
+                    style,
                 ),
-                style,
-            )];
+                deep_marker(r.task.deep),
+                Span::styled(
+                    format!(" w{} {:14} {}", r.weight, r.project, r.task.title),
+                    style,
+                ),
+            ];
             if r.task.human {
                 spans.push(human_span());
             }
@@ -1091,11 +1124,20 @@ fn draw_config(frame: &mut Frame, app: &App) {
         } else {
             format!("  [{}]", a.verbs.join(" "))
         };
+        // What `{model}` resolves to, so the placeholder in the command line
+        // below reads without opening voro.toml.
+        let models = match &a.models {
+            None => String::new(),
+            Some((model, deep, plan)) => {
+                format!("  <model {model} · deep {deep} · plan {plan}>")
+            }
+        };
         agent_lines.push(Line::from(vec![
             Span::raw(marker),
             Span::styled(format!("{:<10}", a.name), Style::new().bold()),
             Span::styled(format!(" {:<14}", a.provenance), Style::new().dim()),
             Span::raw(verbs),
+            Span::styled(models, Style::new().dim()),
         ]));
         // The dispatch command on a dim continuation line (clipped to the pane),
         // so the row shows what each agent actually runs.
@@ -1219,6 +1261,7 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             }
             pairs.push(("s", "state"));
             if app.selected_task_id().is_some() {
+                pairs.push(("!", "deep"));
                 pairs.push(("x", "score"));
                 pairs.push(("h", "history"));
             }
@@ -1245,6 +1288,7 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 pairs.push(("w", "wait"));
             }
             pairs.push(("s", "state"));
+            pairs.push(("!", "deep"));
             pairs.push(("n", "new"));
             pairs.push(("N", "plan"));
             pairs.push(("e", "edit"));
@@ -1361,6 +1405,7 @@ mod tests {
                 state,
                 agent: None,
                 human: false,
+                deep: false,
                 question: None,
                 pr_url: None,
                 branch: None,
@@ -1439,6 +1484,7 @@ mod tests {
             state: TaskState::Ready,
             agent: None,
             human: false,
+            deep: false,
         };
         let open = store.create_task(new("open blocker")).unwrap();
         let closed = store.create_task(new("closed blocker")).unwrap();
@@ -1494,6 +1540,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: true,
+                deep: false,
             })
             .unwrap();
 
@@ -1536,6 +1583,75 @@ mod tests {
         assert!(!marker.style.add_modifier.contains(Modifier::BOLD));
     }
 
+    /// End-to-end: a deep task carries the `!` marker beside the priority cell
+    /// on its queue and browser rows and the spelled-out line in the cockpit
+    /// detail pane; a task on the workhorse carries neither (task #241).
+    #[test]
+    fn deep_flag_renders_in_queue_browser_and_detail() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let new = |title: &str, deep: bool| NewTask {
+            project_id: p.id,
+            repo_id: None,
+            title: title.into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state: TaskState::Ready,
+            agent: None,
+            human: false,
+            deep,
+        };
+        store.create_task(new("the hard one", true)).unwrap();
+        store.create_task(new("the ordinary one", false)).unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        let render = |app: &App, terminal: &mut Terminal<TestBackend>| -> String {
+            terminal.draw(|f| draw(f, app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        let cockpit = render(&app, &mut terminal);
+        assert!(
+            cockpit.contains("P2! voro: the hard one"),
+            "queue row should mark the deep task: {cockpit}"
+        );
+        assert!(
+            cockpit.contains("P2  voro: the ordinary one"),
+            "a workhorse row keeps the column blank: {cockpit}"
+        );
+        assert!(
+            cockpit.contains("deep — dispatches on the agent's strongest model"),
+            "detail pane should spell the flag out: {cockpit}"
+        );
+
+        app.toggle_screen();
+        let browser = render(&app, &mut terminal);
+        assert!(
+            browser.contains("P2! w3"),
+            "browser row should mark the deep task: {browser}"
+        );
+        assert!(
+            browser.contains("P2  w3"),
+            "a workhorse row keeps the column blank: {browser}"
+        );
+    }
+
     /// End-to-end: the projects screen renders one row per project showing its
     /// weight, name, path, and the count of its non-terminal tasks.
     #[test]
@@ -1558,6 +1674,7 @@ mod tests {
             state,
             agent: None,
             human: false,
+            deep: false,
         };
         store.create_task(new("open", TaskState::Ready)).unwrap();
         let closed = store.create_task(new("closed", TaskState::Ready)).unwrap();
@@ -1623,6 +1740,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
 
@@ -1715,6 +1833,7 @@ mod tests {
             state: TaskState::Ready,
             agent: None,
             human: false,
+            deep: false,
         };
         let closed = store
             .create_task(new("closed blocker", Priority::P2))
@@ -1805,6 +1924,7 @@ mod tests {
             state,
             agent: None,
             human,
+            deep: false,
         };
 
         let triage = store
@@ -1904,6 +2024,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
 
@@ -1982,6 +2103,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
 
@@ -2042,6 +2164,7 @@ mod tests {
                     state: TaskState::Ready,
                     agent: None,
                     human: false,
+                    deep: false,
                 })
                 .unwrap();
             let (_, session) = store
@@ -2087,6 +2210,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         let clean = App::new(store, ctx()).unwrap();
@@ -2120,6 +2244,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         store
@@ -2171,6 +2296,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         store
@@ -2243,6 +2369,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         let selected = App::new(store, ctx()).unwrap();
@@ -2311,6 +2438,7 @@ mod tests {
             state,
             agent: None,
             human: false,
+            deep: false,
         };
         store.create_task(new("idea", TaskState::Proposed)).unwrap();
         store.create_task(new("go", TaskState::Ready)).unwrap();

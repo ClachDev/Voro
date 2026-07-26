@@ -297,6 +297,7 @@ mod tests {
             state: TaskState::Ready,
             agent: None,
             human: false,
+            deep: false,
             question: None,
             pr_url: None,
             branch: None,

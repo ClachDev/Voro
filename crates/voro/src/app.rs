@@ -45,6 +45,9 @@ pub struct ConfigAgentRow {
     pub is_default: bool,
     pub verbs: Vec<&'static str>,
     pub missing_verbs: Vec<&'static str>,
+    /// What `{model}` resolves to for this agent as `(ordinary, deep, plan)`,
+    /// with the fallbacks already applied; `None` when it names no model.
+    pub models: Option<(String, String, String)>,
 }
 
 /// A named viewer row on the Config screen — the editable half of the page.
@@ -516,6 +519,13 @@ impl App {
                     is_default: Some(name) == default_agent.as_deref(),
                     verbs,
                     missing_verbs: config.override_missing_verbs(name),
+                    models: template.model().map(|model| {
+                        (
+                            model.to_string(),
+                            template.model_deep().unwrap_or(model).to_string(),
+                            template.model_plan().unwrap_or(model).to_string(),
+                        )
+                    }),
                 }
             })
             .collect();
@@ -879,12 +889,39 @@ impl App {
                     self.open_agent_picker(task_id, agent);
                 }
             }
+            KeyCode::Char('!') => {
+                if let Some(id) = self.selected_task_id() {
+                    self.toggle_deep(id);
+                }
+            }
             KeyCode::Char('o') => self.open_selected_in_viewer(),
             KeyCode::Char('g') => self.open_selected_pr(),
             KeyCode::Char('a') => self.jump_into_session(),
             KeyCode::Char('l') => self.view_session_log(),
             KeyCode::Char('w') => self.hand_off_selected(),
             _ => {}
+        }
+    }
+
+    /// Toggle the selected task's deep flag (DESIGN.md §8): `!` moves it
+    /// between the agent's workhorse model and its strongest one. Routes
+    /// through `voro-core` so the change is logged, and reports the store's
+    /// refusal — of a human task — on the status line.
+    fn toggle_deep(&mut self, task_id: i64) {
+        let Ok(task) = self.store.task(task_id) else {
+            return;
+        };
+        let to = !task.deep;
+        let result = self
+            .store
+            .set_deep(task_id, to)
+            .and_then(|_| self.refresh());
+        if self.report(result).is_some() {
+            self.status = Some(if to {
+                format!("task {task_id} is deep — dispatches on the agent's strongest model")
+            } else {
+                format!("task {task_id} is no longer deep — dispatches on the workhorse")
+            });
         }
     }
 
@@ -2004,6 +2041,7 @@ impl App {
                     self.set_priority(task_id, priority);
                 }
             }
+            KeyCode::Char('!') => self.toggle_deep(task_id),
             // The popup only opens on the selected task, so the selection-based
             // helper pages the right log.
             KeyCode::Char('l') => self.view_session_log(),
@@ -2045,6 +2083,7 @@ impl App {
             state: form.state.unwrap_or(TaskState::Proposed),
             agent: form.agent,
             human: form.human,
+            deep: false,
         })?;
         if !form.blocked_by.is_empty() {
             self.store.set_blocks_deps(task.id, &form.blocked_by)?;
@@ -2057,6 +2096,9 @@ impl App {
         task_id: i64,
         form: crate::editor::TaskForm,
     ) -> voro_core::Result<()> {
+        // The form edits content; `deep` is not among its fields, so it is
+        // carried through untouched — `!` is the key that changes it.
+        let deep = self.store.task(task_id)?.deep;
         self.store.update_task(
             task_id,
             voro_core::TaskEdit {
@@ -2065,6 +2107,7 @@ impl App {
                 priority: form.priority,
                 agent: form.agent,
                 human: form.human,
+                deep,
             },
         )?;
         self.store.set_blocks_deps(task_id, &form.blocked_by)?;
@@ -2108,6 +2151,7 @@ mod tests {
                     state: created,
                     agent: None,
                     human: false,
+                    deep: false,
                 })
                 .unwrap();
             match state {
@@ -2268,6 +2312,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
@@ -2452,6 +2497,63 @@ mod tests {
         key(&mut app, KeyCode::Char('1'));
         assert_eq!(app.screen, Screen::Cockpit);
         assert!(app.show_score && app.show_history);
+    }
+
+    /// `!` is the same toggle wherever a task is selected (task #241): the
+    /// cockpit queue, the tasks list, and the detail popup that opens over it.
+    #[test]
+    fn deep_key_toggles_the_flag_on_every_screen() {
+        let mut app = app_with(&[TaskState::Ready]);
+        let id = app.queue[0].task.id;
+
+        key(&mut app, KeyCode::Char('!'));
+        assert!(app.store.task(id).unwrap().deep);
+        assert!(app.status.as_ref().unwrap().contains("strongest model"));
+        key(&mut app, KeyCode::Char('!'));
+        assert!(!app.store.task(id).unwrap().deep);
+
+        app.toggle_screen();
+        assert_eq!(app.screen, Screen::Tasks);
+        key(&mut app, KeyCode::Char('!'));
+        assert!(app.store.task(id).unwrap().deep);
+
+        // ...and inside the detail popup, without closing it
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Detail { .. }));
+        key(&mut app, KeyCode::Char('!'));
+        assert!(!app.store.task(id).unwrap().deep);
+        assert!(matches!(app.mode, Mode::Detail { .. }));
+    }
+
+    /// A human task is never dispatched, so it has no model to deepen; the
+    /// store's refusal reaches the status line rather than the flag.
+    #[test]
+    fn deep_key_on_a_human_task_reports_and_changes_nothing() {
+        let mut app = app_with(&[TaskState::Ready]);
+        let id = app.queue[0].task.id;
+        let task = app.store.task(id).unwrap();
+        app.store
+            .update_task(
+                id,
+                voro_core::TaskEdit {
+                    title: task.title,
+                    body: task.body,
+                    priority: task.priority,
+                    agent: None,
+                    human: true,
+                    deep: false,
+                },
+            )
+            .unwrap();
+        app.refresh().unwrap();
+
+        key(&mut app, KeyCode::Char('!'));
+        assert!(!app.store.task(id).unwrap().deep);
+        assert!(
+            app.status.as_ref().is_some_and(|s| s.contains("deep")),
+            "{:?}",
+            app.status
+        );
     }
 
     #[test]
@@ -2844,6 +2946,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
 
@@ -2916,6 +3019,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
 
@@ -2985,6 +3089,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
 
@@ -3034,6 +3139,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
@@ -3105,6 +3211,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
@@ -3191,6 +3298,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         store
@@ -3243,6 +3351,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         let (_, session) = store
@@ -3287,6 +3396,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap();
         store.apply(task.id, Action::Start).unwrap();

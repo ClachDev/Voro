@@ -207,7 +207,7 @@ pub fn plan_session(
     let repo = store.default_repo(project_id).map_err(|e| e.to_string())?;
     let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     let agent = config.resolve(None).map_err(|e| e.to_string())?;
-    let Some(plan_cmd) = agent.plan.as_deref() else {
+    let Some(plan_cmd) = agent.plan_command() else {
         return Err(format!(
             "agent '{}' defines no plan template in {} — add plan = \"<interactive command> \
              {{prompt_file}}\" to its [agents.{}] table to plan tasks with it",
@@ -503,8 +503,11 @@ fn spawn_session(
         .try_clone()
         .map_err(|e| format!("cannot open log {}: {e}", log_path.display()))?;
 
+    // `dispatch_command` resolves `{model}` from the task's depth: the deeper
+    // model for a deep task, the workhorse otherwise, and nothing at all for an
+    // agent whose template names no model (DESIGN.md §8).
     let command = agent
-        .dispatch
+        .dispatch_command(task.deep)
         .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path))
         .replace(TASK_ID_PLACEHOLDER, &task_id.to_string());
     let spawn_ms = SystemTime::now()
@@ -819,6 +822,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap()
             .id
@@ -1343,6 +1347,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: None,
                 human: false,
+                deep: false,
             })
             .unwrap()
             .id;
@@ -1611,6 +1616,100 @@ mod tests {
         assert!(err.contains(ctx.agents_path.to_str().unwrap()), "{err}");
     }
 
+    // --- the deep flag (task #241) ---
+
+    /// The stub command writes the model it was rendered with to a per-task
+    /// marker file, so a successful run proves which model reached the spawned
+    /// command line.
+    fn model_marker(
+        store: &mut Store,
+        ctx: &DispatchCtx,
+        project: &Path,
+        project_id: i64,
+        deep: bool,
+    ) -> String {
+        let id = store
+            .create_task(NewTask {
+                project_id,
+                repo_id: None,
+                title: "T".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep,
+            })
+            .unwrap()
+            .id;
+        dispatch(store, ctx, id, None).unwrap();
+        let marker = project.join(format!("model-{id}.txt"));
+        for _ in 0..50 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::read_to_string(&marker).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn a_deep_task_dispatches_with_the_deeper_model() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file} && echo {model} > model-{task_id}.txt\"\n\
+             model = \"workhorse\"\nmodel_deep = \"strongest\"\n",
+        );
+        let p = store
+            .create_project("proj", project.to_str().unwrap())
+            .unwrap()
+            .id;
+        assert_eq!(
+            model_marker(&mut store, &ctx, &project, p, false),
+            "workhorse"
+        );
+        assert_eq!(
+            model_marker(&mut store, &ctx, &project, p, true),
+            "strongest"
+        );
+    }
+
+    /// An agent whose templates carry no `{model}` — the built-in `codex`
+    /// shape — takes no model direction, so a deep task dispatches with the
+    /// same command as any other.
+    #[test]
+    fn an_agent_without_the_placeholder_dispatches_a_deep_task_identically() {
+        let (mut store, ctx, project) =
+            fixture("cat {prompt_file} && echo none > model-{task_id}.txt");
+        let p = store
+            .create_project("proj", project.to_str().unwrap())
+            .unwrap()
+            .id;
+        assert_eq!(model_marker(&mut store, &ctx, &project, p, false), "none");
+        assert_eq!(model_marker(&mut store, &ctx, &project, p, true), "none");
+    }
+
+    /// Planning takes `model_plan` whatever the queue holds — a planning
+    /// session belongs to no task, so there is no depth to read.
+    #[test]
+    fn plan_renders_its_own_model() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file}\"\n\
+             plan = \"stub -i --model {model} {prompt_file}\"\n\
+             model = \"workhorse\"\nmodel_deep = \"strongest\"\nmodel_plan = \"thinker\"\n",
+        );
+        let p = store
+            .create_project("proj", project.to_str().unwrap())
+            .unwrap();
+        let launch = plan_session(&store, &ctx, p.id).unwrap();
+        assert!(
+            launch.command.contains("--model thinker"),
+            "{}",
+            launch.command
+        );
+    }
+
     #[test]
     fn task_override_selects_the_agent() {
         let (mut store, ctx, project) = fixture("cat {prompt_file}");
@@ -1634,6 +1733,7 @@ mod tests {
                 state: TaskState::Ready,
                 agent: Some("special".into()),
                 human: false,
+                deep: false,
             })
             .unwrap()
             .id;

@@ -618,6 +618,7 @@ mod tests {
             state,
             agent: None,
             human: false,
+            deep: false,
         })
         .unwrap()
         .id
@@ -776,6 +777,7 @@ mod tests {
                 state,
                 agent: None,
                 human: true,
+                deep: false,
             })
             .unwrap()
             .id

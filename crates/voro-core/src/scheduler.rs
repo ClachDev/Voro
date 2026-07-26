@@ -120,7 +120,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.project_id, t.title, t.body, t.priority, t.state, t.agent,
                     t.question, t.pr_url, t.branch, t.state_since, t.created_at, t.closed_at,
-                    t.human, t.repo_id, p.name, p.weight,
+                    t.human, t.repo_id, t.deep, p.name, p.weight,
                     julianday('now') - julianday(t.state_since)
              FROM tasks t JOIN projects p ON p.id = t.project_id
              WHERE p.weight > 0 AND p.archived = 0
@@ -128,9 +128,9 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |row| {
             let task = task_from_row(row)?;
-            let project_name: String = row.get(15)?;
-            let weight: i64 = row.get(16)?;
-            let age_days: f64 = row.get(17)?;
+            let project_name: String = row.get(16)?;
+            let weight: i64 = row.get(17)?;
+            let age_days: f64 = row.get(18)?;
             let score = score(weight, task.priority, task.state, age_days);
             Ok(Candidate {
                 task,
@@ -290,6 +290,7 @@ mod tests {
             state: TaskState::Ready,
             agent: None,
             human: false,
+            deep: false,
         })
         .unwrap()
         .id
@@ -326,6 +327,7 @@ mod tests {
             state: TaskState::Proposed,
             agent: None,
             human: false,
+            deep: false,
         })
         .unwrap()
         .id
@@ -572,6 +574,7 @@ mod tests {
             state: TaskState::Proposed,
             agent: None,
             human: false,
+            deep: false,
         })
         .unwrap();
         let visible = add_task(&mut s, active, "visible", Priority::P3);
@@ -642,6 +645,7 @@ mod tests {
             state: TaskState::Proposed,
             agent: None,
             human: false,
+            deep: false,
         })
         .unwrap();
         let question = add_task(&mut s, active, "blocked on me", Priority::P2);
@@ -663,6 +667,7 @@ mod tests {
             state: TaskState::Proposed,
             agent: None,
             human: false,
+            deep: false,
         })
         .unwrap();
 
