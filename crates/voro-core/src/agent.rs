@@ -523,6 +523,22 @@ impl AgentsConfig {
         self.viewers.keys().cloned().collect()
     }
 
+    /// A named viewer's command, without the default-resolution [`viewer_cmd`]
+    /// applies — for the Config screen, which lists each viewer beside its own
+    /// template.
+    ///
+    /// [`viewer_cmd`]: Self::viewer_cmd
+    pub fn named_viewer_cmd(&self, name: &str) -> Option<&str> {
+        self.viewers.get(name).map(|v| v.cmd.as_str())
+    }
+
+    /// The anonymous `[viewer]` table's command, if the file defines one — the
+    /// legacy default the Config screen surfaces read-only, since it carries no
+    /// name to edit or delete by.
+    pub fn anonymous_viewer_cmd(&self) -> Option<&str> {
+        self.viewer.as_ref().map(|v| v.cmd.as_str())
+    }
+
     /// The name of the viewer used when nothing picks one by name, for
     /// `viewer list` to flag: the user's `default_viewer` when set (honoured
     /// even if it names a missing viewer), else the sole `[viewers.*]` entry.

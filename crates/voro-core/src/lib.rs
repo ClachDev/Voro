@@ -4,6 +4,7 @@
 //! `docs/DESIGN.md`.
 
 mod agent;
+pub mod config_edit;
 mod error;
 mod import;
 mod model;
