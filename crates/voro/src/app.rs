@@ -264,13 +264,17 @@ pub struct App {
     /// open session's agent and log — and what gates the `l` log key. Loaded per
     /// refresh like the dependency maps, so the render path never queries the store.
     pub last_sessions: std::collections::HashMap<i64, voro_core::Session>,
-    /// The stale-branch probe for the *currently selected* task (DESIGN.md §8):
-    /// its id and whether its tracked PR reports a merge conflict. Filled by one
-    /// on-demand `gh` call the moment the selection lands on a review task with
-    /// a PR, and held until the selection moves — never a per-row sweep, so the
-    /// queue stays unannotated and the network is touched at most once per
-    /// selection. Re-selecting the row picks up a fresh verdict.
+    /// The stale-branch probe's verdict for the *currently selected* task
+    /// (DESIGN.md §8): its id and whether its tracked PR reports a merge
+    /// conflict. Filled when a background probe returns — one `gh` call, started
+    /// once the selection has rested on a review task with a PR — and cleared
+    /// the moment the selection moves, so re-selecting the row probes afresh.
+    /// Never a per-row sweep: the queue stays unannotated and the network is
+    /// touched at most once per settled selection. `None` while a probe is in
+    /// flight, which renders as no marker — a missing signal is never a conflict.
     pub conflict_selected: Option<(i64, bool)>,
+    /// The background thread and debounce clock behind `conflict_selected`.
+    probe: crate::probe::ConflictProbe,
 
     pub cockpit_rows: Vec<CockpitRow>,
     pub cockpit_sel: usize,
@@ -351,6 +355,7 @@ impl App {
             dependents: std::collections::HashMap::new(),
             last_sessions: std::collections::HashMap::new(),
             conflict_selected: None,
+            probe: crate::probe::ConflictProbe::default(),
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
             tasks_sel: 0,
@@ -546,28 +551,54 @@ impl App {
         }
     }
 
-    /// Probe the selected task's PR mergeability if it is a review task with a
-    /// tracked PR the current selection has not been probed for (DESIGN.md §8).
-    /// One `gh` call, on demand, cached against the selected id — so the detail
-    /// pane can render `[branch conflicts]` without the render path, the
-    /// queue, or a refresh ever touching the network. Called from the event
-    /// loop each tick; a no-op unless the selection landed somewhere new, which
-    /// is what makes re-selecting a row re-probe for a fresh verdict.
-    pub fn probe_selected_conflict(&mut self) {
-        let Some(id) = self.selected_task_id() else {
-            self.conflict_selected = None;
-            return;
-        };
-        if self.conflict_selected.is_some_and(|(cid, _)| cid == id) {
-            return;
-        }
-        let is_review_pr = self
-            .all
+    /// The selected task's tracked PR URL, when it is a `review` task carrying
+    /// one — the only selection there is anything to probe for (DESIGN.md §8).
+    /// Read from the refreshed rows rather than the store, so the tick costs no
+    /// query.
+    fn review_pr_url(&self, id: i64) -> Option<String> {
+        self.all
             .iter()
             .find(|r| r.task.id == id)
-            .is_some_and(|r| r.task.state == TaskState::Review && r.task.pr_url.is_some());
-        let conflicts = is_review_pr && crate::pr::conflict_status(&self.store, id).conflicts();
-        self.conflict_selected = Some((id, conflicts));
+            .filter(|r| r.task.state == TaskState::Review)
+            .and_then(|r| r.task.pr_url.clone())
+    }
+
+    /// Advance the stale-branch probe one tick (DESIGN.md §8): collect a
+    /// finished verdict and start a new probe when one is due. Both halves are
+    /// non-blocking — the `gh` call itself runs on a background thread — so the
+    /// event loop never stalls on the network, and the probe only starts once
+    /// the selection has rested (`probe::SETTLE`), so scrolling through a queue
+    /// of review tasks spawns nothing for the rows passed over. A verdict that
+    /// arrives after the selection has moved on is discarded rather than shown
+    /// against the wrong task.
+    pub fn poll_conflict_probe(&mut self) {
+        let selected = self.selected_task_id();
+        // The verdict belongs to the row it was taken for; moving off it means
+        // there is nothing to show, and coming back re-probes for a fresh one.
+        if self
+            .conflict_selected
+            .is_some_and(|(id, _)| Some(id) != selected)
+        {
+            self.conflict_selected = None;
+        }
+        if let Some((id, verdict)) = self.probe.take_result()
+            && Some(id) == selected
+        {
+            self.conflict_selected = Some((id, verdict.conflicts()));
+        }
+
+        let target = selected.and_then(|id| self.review_pr_url(id).map(|url| (id, url)));
+        let inputs = crate::probe::ProbeInputs {
+            target: target.as_ref().map(|(id, _)| *id),
+            cached: self.conflict_selected.map(|(id, _)| id),
+            in_flight: self.probe.in_flight(),
+            rested: self.probe.settle(selected, std::time::Instant::now()),
+        };
+        if let Some((id, url)) = target
+            && crate::probe::probe_due(inputs)
+        {
+            self.probe.start(id, url);
+        }
     }
 
     pub fn move_selection(&mut self, delta: i64) {
@@ -3482,5 +3513,71 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         let launch = app.pending_plan.take().expect("a planning session queued");
         assert_eq!(launch.cwd, "/tmp/demo");
+    }
+
+    /// A review task with a tracked PR, selected in the cockpit — the only
+    /// selection the stale-branch probe has anything to say about.
+    fn app_with_review_pr() -> App {
+        let mut app = app_with(&[TaskState::Review]);
+        let id = app.selected_task_id().expect("the review task is selected");
+        app.store
+            .set_pr(id, Some("https://github.com/o/r/pull/1"))
+            .unwrap();
+        app.refresh().unwrap();
+        app
+    }
+
+    /// Landing on a review task starts no probe on the tick it arrives
+    /// (DESIGN.md §8): the selection has not rested yet, so scrolling past the
+    /// row costs neither a `gh` call nor a thread.
+    #[test]
+    fn a_fresh_selection_starts_no_probe() {
+        let mut app = app_with_review_pr();
+        app.poll_conflict_probe();
+        assert_eq!(app.probe.in_flight(), None);
+        assert_eq!(app.conflict_selected, None);
+    }
+
+    /// A verdict landing while its task is still selected fills the marker.
+    #[test]
+    fn a_conflicting_verdict_marks_the_selected_task() {
+        let mut app = app_with_review_pr();
+        let id = app.selected_task_id().unwrap();
+        app.probe
+            .inject_result(id, voro_core::Mergeability::Conflicting);
+        app.poll_conflict_probe();
+        assert_eq!(app.conflict_selected, Some((id, true)));
+
+        // A clean verdict is held too, so the row is not probed again.
+        app.conflict_selected = None;
+        app.probe
+            .inject_result(id, voro_core::Mergeability::Mergeable);
+        app.poll_conflict_probe();
+        assert_eq!(app.conflict_selected, Some((id, false)));
+    }
+
+    /// A verdict that arrives after the selection has moved on is discarded,
+    /// never shown against whatever is selected now.
+    #[test]
+    fn a_verdict_for_an_unselected_task_is_discarded() {
+        let mut app = app_with_review_pr();
+        let id = app.selected_task_id().unwrap();
+        app.probe
+            .inject_result(id + 1, voro_core::Mergeability::Conflicting);
+        app.poll_conflict_probe();
+        assert_eq!(app.conflict_selected, None);
+        assert_eq!(app.probe.in_flight(), None);
+    }
+
+    /// Moving off the row drops its verdict, so nothing stale is rendered and
+    /// re-selecting it probes afresh.
+    #[test]
+    fn moving_the_selection_drops_the_verdict() {
+        let mut app = app_with(&[TaskState::Review, TaskState::Ready]);
+        let id = app.selected_task_id().unwrap();
+        app.conflict_selected = Some((id, true));
+        app.move_selection(1);
+        app.poll_conflict_probe();
+        assert_eq!(app.conflict_selected, None);
     }
 }

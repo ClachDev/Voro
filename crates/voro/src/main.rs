@@ -5,6 +5,7 @@ mod editor;
 mod import;
 mod markdown;
 mod pr;
+mod probe;
 mod reconcile;
 mod ui;
 mod worktree;
@@ -58,10 +59,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut terminal = ratatui::init();
     let result = loop {
-        // Probe the selected review task's PR mergeability before drawing — a
-        // no-op unless the selection moved, so the one `gh` call fires on demand
-        // (DESIGN.md §8) rather than per frame or per row.
-        app.probe_selected_conflict();
         if let Err(e) = terminal.draw(|frame| ui::draw(frame, &app)) {
             break Err(e.into());
         }
@@ -77,6 +74,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = app.poll_external() {
             break Err(e.into());
         }
+        // Advance the selected review task's PR mergeability probe (DESIGN.md
+        // §8): collect a verdict a background thread has finished, and start a
+        // probe once the selection has rested. Both halves are non-blocking, so
+        // the `gh` call never stalls the loop and scrolling spawns nothing.
+        app.poll_conflict_probe();
         if let Some(request) = app.pending_editor.take() {
             // $EDITOR owns the terminal for the duration; tear the TUI down
             // around it rather than fighting over raw mode.
