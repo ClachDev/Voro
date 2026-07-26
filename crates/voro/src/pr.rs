@@ -87,13 +87,10 @@ pub fn create(store: &mut Store, task_id: i64) -> Result<String, String> {
 
 /// Ask GitHub whether a review task's tracked PR still merges cleanly with its
 /// base (DESIGN.md §8) — a purely informational signal that the branch has gone
-/// stale. One `gh pr view <url> --json mergeable` call for the one task, run
-/// on demand from `voro show` and the TUI detail pane, never per rendered row.
-/// The URL carries the host, so an enterprise instance is reached without
-/// `--hostname`. A task with no tracked PR, an unparseable URL, or any `gh`
-/// failure (missing, unauthenticated, network) degrades to
-/// [`Mergeability::Unknown`]: no signal, so the marker shows only on a definite
-/// `CONFLICTING`. The verdict itself is decided by `voro_core::parse_mergeable`.
+/// stale. One `gh pr view <url> --json mergeable` call for the one task, run on
+/// demand from `voro show`, where blocking is fine. A task with no tracked PR
+/// degrades to [`Mergeability::Unknown`], as does every failure in
+/// [`conflict_status_url`].
 pub fn conflict_status(store: &Store, task_id: i64) -> Mergeability {
     let Ok(task) = store.task(task_id) else {
         return Mergeability::Unknown;
@@ -101,6 +98,17 @@ pub fn conflict_status(store: &Store, task_id: i64) -> Mergeability {
     let Some(url) = task.pr_url.as_deref() else {
         return Mergeability::Unknown;
     };
+    conflict_status_url(url)
+}
+
+/// The blocking `gh` call behind [`conflict_status`], taking the PR URL alone so
+/// the TUI can run it on a background thread with no store handle in reach
+/// (`crate::probe`). The URL carries the host, so an enterprise instance is
+/// reached without `--hostname`. An unparseable URL or any `gh` failure
+/// (missing, unauthenticated, network) degrades to [`Mergeability::Unknown`]: no
+/// signal, so the marker shows only on a definite `CONFLICTING`. The verdict
+/// itself is decided by `voro_core::parse_mergeable`.
+pub fn conflict_status_url(url: &str) -> Mergeability {
     let Ok(pr) = PrRef::parse(url) else {
         return Mergeability::Unknown;
     };
