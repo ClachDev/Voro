@@ -21,8 +21,8 @@ pub use agent::{
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};
 pub use model::{
-    Dep, DepKind, DepRef, Event, NextAction, Priority, Project, Repo, ReviewAction, ReviewMedium,
-    RunningRow, Session, SessionOutcome, Task, TaskState,
+    Dep, DepKind, DepRef, Doc, Event, NextAction, Priority, Project, Repo, ReviewAction,
+    ReviewMedium, RunningRow, Session, SessionOutcome, Task, TaskState, location_is_url,
 };
 pub use pr::{Mergeability, PrPlan, PrRef, format_review_feedback, parse_mergeable, plan_pr};
 pub use scheduler::{Candidate, ScoreBreakdown, StateCounts};

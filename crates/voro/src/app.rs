@@ -262,6 +262,14 @@ pub struct App {
     /// Loaded whole per refresh so the render path never queries the store.
     pub deps: std::collections::HashMap<i64, Vec<DepRef>>,
     pub dependents: std::collections::HashMap<i64, Vec<DepRef>>,
+    /// The plan documents each task derives from (DESIGN.md §3), keyed by task
+    /// id and loaded whole per refresh like the dependency maps. Read-only in
+    /// the TUI: registering and linking documents is a CLI affair.
+    pub docs: std::collections::HashMap<i64, Vec<voro_core::Doc>>,
+    /// Where each document resolves to, keyed by doc id — a relative location
+    /// joined onto its checkout. Resolved once per refresh beside `docs`, so
+    /// the render path can show the real location without querying the store.
+    pub doc_locations: std::collections::HashMap<i64, String>,
     /// Each task's newest session (tasks #73/#110), keyed by task id: what the
     /// detail views render — a stalled task's post-mortem (DESIGN.md §8), an
     /// open session's agent and log — and what gates the `l` log key. Loaded per
@@ -356,6 +364,8 @@ impl App {
             incomplete_report: std::collections::HashSet::new(),
             deps: std::collections::HashMap::new(),
             dependents: std::collections::HashMap::new(),
+            docs: std::collections::HashMap::new(),
+            doc_locations: std::collections::HashMap::new(),
             last_sessions: std::collections::HashMap::new(),
             conflict_selected: None,
             probe: crate::probe::ConflictProbe::default(),
@@ -422,6 +432,13 @@ impl App {
 
         self.deps = self.store.deps_by_task()?;
         self.dependents = self.store.dependents_by_task()?;
+        self.docs = self.store.docs_by_task()?;
+        self.doc_locations = self
+            .store
+            .all_docs()?
+            .iter()
+            .filter_map(|doc| Some((doc.id, self.store.resolve_doc(doc).ok()?)))
+            .collect();
 
         let mut all: Vec<TaskRow> = self
             .store
@@ -3689,5 +3706,38 @@ mod tests {
         app.move_selection(1);
         app.poll_conflict_probe();
         assert_eq!(app.conflict_selected, None);
+    }
+
+    #[test]
+    fn a_refresh_loads_every_task_s_documents_and_where_they_resolve_to() {
+        // The render path never queries the store, so both the links and the
+        // resolved locations the detail panes show are loaded per refresh.
+        let mut app = app_with(&[TaskState::Ready]);
+        let task_id = app.all[0].task.id;
+        let project_id = app.projects[0].id;
+        let doc = app
+            .store
+            .create_doc(project_id, None, "docs/plan.md", Some("The Plan"))
+            .unwrap();
+        let url = app
+            .store
+            .create_doc(project_id, None, "https://example.com/rfc", None)
+            .unwrap();
+        app.store.set_task_docs(task_id, &[doc.id, url.id]).unwrap();
+        app.refresh().unwrap();
+
+        let linked = &app.docs[&task_id];
+        assert_eq!(linked.len(), 2);
+        assert_eq!(linked[0].label(), "The Plan");
+        // A relative location is joined onto the project's checkout; a URL is
+        // already where it is.
+        assert_eq!(app.doc_locations[&doc.id], "/tmp/demo/docs/plan.md");
+        assert_eq!(app.doc_locations[&url.id], "https://example.com/rfc");
+
+        // Unlinking is reflected on the next refresh, and a task citing no
+        // document has no entry at all rather than an empty one.
+        app.store.set_task_docs(task_id, &[]).unwrap();
+        app.refresh().unwrap();
+        assert!(!app.docs.contains_key(&task_id));
     }
 }

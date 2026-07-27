@@ -34,6 +34,9 @@ pub enum Error {
     #[error("repo {0} not found")]
     RepoIdNotFound(i64),
 
+    #[error("document {0} not found — `voro doc list` shows the registered ones")]
+    DocNotFound(i64),
+
     #[error(
         "repo '{name}' is the only repo in project '{project}' — a project always has a \
          checkout, so add another repo before removing this one"
