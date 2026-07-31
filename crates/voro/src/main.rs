@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // a planning session is interactive in the same way; the refresh
             // on return is what makes the task it proposed appear in the queue.
             ratatui::restore();
-            foreground_session(&mut app, "plan", &launch.command, &launch.cwd);
+            foreground_session(&mut app, launch.label, &launch.command, &launch.cwd);
             terminal = ratatui::init();
         }
         if app.should_quit {

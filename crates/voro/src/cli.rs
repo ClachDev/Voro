@@ -146,7 +146,15 @@ dispatch
                                   the configured viewer, like `open`
 
 transitions
-  triage <task-id> <parked|ready|reject>
+  triage <task-id> <parked|ready|reject|refine>
+                                  the three verdicts move the proposal; refine
+                                  is not a verdict — it dispatches an agent to
+                                  rewrite the body against --note TEXT (or
+                                  --note-file PATH), leaving the task proposed
+                                  and marked ↻ refined for a re-triage of the
+                                  improved version. The note-less interactive
+                                  variant is a conversation with the agent, so
+                                  it lives in the TUI's triage menu
   start <task-id>                 ready → running
   ask <task-id> --question TEXT   running → needs-input
   resume <task-id>                needs-input → running, once you have answered
@@ -246,10 +254,7 @@ enum Verb {
     Reject(RejectArgs),
     Done(DoneArgs),
     Import(ImportArgs),
-    Triage {
-        task_id: i64,
-        target: TriageTarget,
-    },
+    Triage(TriageArgs),
     Start {
         task_id: i64,
     },
@@ -476,19 +481,39 @@ struct AskArgs {
     question: Option<String>,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Args)]
+struct TriageArgs {
+    task_id: i64,
+    target: TriageTarget,
+    /// The one-line brief a `refine` hands its agent: what is wrong with the
+    /// body as it stands. Required for `refine` — the interactive variant,
+    /// which needs no note, is TUI-only (DESIGN.md §6).
+    #[arg(long)]
+    note: Option<String>,
+    #[arg(long, conflicts_with = "note")]
+    note_file: Option<String>,
+}
+
+/// The triage outcomes. Three are verdicts that transition the task; `refine`
+/// is not — it dispatches an agent to rewrite the body and leaves the task
+/// `proposed` for a re-triage of the improved version (DESIGN.md §6).
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum TriageTarget {
     Parked,
     Ready,
     Reject,
+    Refine,
 }
 
-impl From<TriageTarget> for Triage {
-    fn from(target: TriageTarget) -> Triage {
+impl TryFrom<TriageTarget> for Triage {
+    type Error = ();
+
+    fn try_from(target: TriageTarget) -> Result<Triage, ()> {
         match target {
-            TriageTarget::Parked => Triage::Parked,
-            TriageTarget::Ready => Triage::Ready,
-            TriageTarget::Reject => Triage::Reject,
+            TriageTarget::Parked => Ok(Triage::Parked),
+            TriageTarget::Ready => Ok(Triage::Ready),
+            TriageTarget::Reject => Ok(Triage::Reject),
+            TriageTarget::Refine => Err(()),
         }
     }
 }
@@ -529,9 +554,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Reject(args) => reject_verb(store, args),
         Verb::Done(args) => done_verb(store, args),
         Verb::Import(args) => import_verb(store, args),
-        Verb::Triage { task_id, target } => {
-            apply_action(store, task_id, Action::Triage(target.into()), false)
-        }
+        Verb::Triage(args) => triage_verb(store, args, ctx),
         Verb::Start { task_id } => apply_action(store, task_id, Action::Start, false),
         Verb::Ask(args) => ask_verb(store, args),
         Verb::Resume { task_id } => apply_action(store, task_id, Action::Resume, false),
@@ -1232,6 +1255,15 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
         )
         .unwrap();
     }
+    // The refine marker (DESIGN.md §6): a proposal whose body an agent has
+    // reworked, so the operator triages the improved version knowing it moved.
+    if store.refined_flag(id).map_err(|e| e.to_string())? {
+        let note = store
+            .latest_refine_note(id)
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        writeln!(out, "refined: {note}").unwrap();
+    }
     // The stale-branch marker (DESIGN.md §8): one on-demand `gh` probe of the
     // tracked PR's mergeability, only for a review task that has one. Purely
     // informational — a CONFLICTING verdict flags that the branch needs
@@ -1301,7 +1333,14 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
         } else {
             incomplete.to_string()
         };
-        writeln!(out, "{}{}", task_line(&task, name), suffix).unwrap();
+        writeln!(
+            out,
+            "{}{}{}",
+            task_line(&task, name),
+            refined_suffix(store, task.id),
+            suffix
+        )
+        .unwrap();
     }
     Ok(out)
 }
@@ -1337,6 +1376,7 @@ fn inbox_verb(store: &mut Store) -> Result<String, String> {
         if let Some(q) = &c.task.question {
             write!(out, "  — {q}").unwrap();
         }
+        write!(out, "{}", refined_suffix(store, c.task.id)).unwrap();
         write!(out, "{}", incomplete_report_suffix(store, c.task.id)).unwrap();
         writeln!(out).unwrap();
     }
@@ -1394,6 +1434,18 @@ fn next_verb(store: &mut Store) -> Result<String, String> {
 fn incomplete_report_suffix(store: &Store, task_id: i64) -> &'static str {
     if store.incomplete_report_flag(task_id).unwrap_or(false) {
         "  [incomplete report]"
+    } else {
+        ""
+    }
+}
+
+/// `  ↻ refined` when a proposal's body has been through a refine (DESIGN.md
+/// §6), else empty — so the triage queue shows which rows are an improved
+/// version awaiting a fresh verdict. Cleared by triage, since the flag is gated
+/// on `proposed`.
+fn refined_suffix(store: &Store, task_id: i64) -> &'static str {
+    if store.refined_flag(task_id).unwrap_or(false) {
+        "  ↻ refined"
     } else {
         ""
     }
@@ -1552,6 +1604,36 @@ fn ask_verb(store: &mut Store, args: AskArgs) -> Result<String, String> {
         None => joined(&args.text, "question (--question TEXT)")?,
     };
     apply_action(store, args.task_id, Action::Ask(question), false)
+}
+
+/// Triage a proposal (DESIGN.md §6). Three of the four outcomes are verdicts
+/// that transition the task; `refine` is the fourth — it dispatches an agent to
+/// rewrite the body against the operator's note and leaves the task `proposed`,
+/// so the improved version comes back round for a real verdict. A note is
+/// required here: the note-less interactive variant is an agent conversation,
+/// which is TUI-only for the same reason planning sessions are (§8) — the CLI is
+/// how an LLM drives Voro.
+fn triage_verb(store: &mut Store, args: TriageArgs, ctx: &DispatchCtx) -> Result<String, String> {
+    let note = text_or_file(args.note, args.note_file)?;
+    match Triage::try_from(args.target) {
+        Ok(verdict) => {
+            if note.is_some() {
+                return Err("--note applies to `triage <id> refine` only".into());
+            }
+            apply_action(store, args.task_id, Action::Triage(verdict), false)
+        }
+        Err(()) => {
+            let Some(note) = note else {
+                return Err(format!(
+                    "refine needs a note saying what to fix: `voro triage {} refine --note \
+                     \"...\"`. The note-less interactive variant is a conversation with the \
+                     agent, so it lives in the TUI's triage menu",
+                    args.task_id
+                ));
+            };
+            dispatch::refine(store, ctx, args.task_id, &note)
+        }
+    }
 }
 
 /// Apply a plain state-machine action. `accept`/`abandon` are the terminal
@@ -1969,6 +2051,86 @@ mod tests {
         assert!(ok(&mut s, &["inbox"]).contains("P2 demo: An idea"));
         ok(&mut s, &["triage", "1", "ready"]);
         assert!(ok(&mut s, &["next"]).contains("An idea"));
+    }
+
+    /// The fourth triage outcome (DESIGN.md §6). The dispatch half needs a real
+    /// agent, so it is covered in `dispatch.rs`; what belongs here is the verb's
+    /// own contract — a note is required, it is refine's alone, and the three
+    /// verdicts are untouched.
+    #[test]
+    fn triage_refine_requires_a_note_and_leaves_the_verdicts_alone() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "An idea"]);
+
+        let e = err(&mut s, &["triage", "1", "refine"]);
+        assert!(e.contains("--note"), "{e}");
+        assert!(e.contains("TUI"), "{e}");
+        assert_eq!(s.task(1).unwrap().state, TaskState::Proposed);
+
+        // A note on a verdict is a misuse, not a silently ignored flag.
+        let e = err(&mut s, &["triage", "1", "ready", "--note", "hmm"]);
+        assert!(e.contains("refine"), "{e}");
+        assert_eq!(s.task(1).unwrap().state, TaskState::Proposed);
+
+        // refine is parsed as a target: reaching the dispatch is what fails
+        // here, since the test context names no config or checkout.
+        let e = err(&mut s, &["triage", "1", "refine", "--note", "thin body"]);
+        assert!(!e.contains("invalid value"), "{e}");
+        assert_eq!(s.task(1).unwrap().state, TaskState::Proposed);
+        assert!(!s.refined_flag(1).unwrap());
+
+        ok(&mut s, &["triage", "1", "parked"]);
+        assert_eq!(s.task(1).unwrap().state, TaskState::Parked);
+    }
+
+    /// The `↻ refined` marker (DESIGN.md §6) rides the event, so it shows on
+    /// every proposal view until triage takes the task out of `proposed`.
+    #[test]
+    fn a_refined_proposal_is_marked_until_it_is_triaged() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "An idea"]);
+        assert!(!ok(&mut s, &["inbox"]).contains("refined"));
+
+        s.record_refine(1, "name the files it touches").unwrap();
+        assert!(ok(&mut s, &["inbox"]).contains("↻ refined"));
+        assert!(ok(&mut s, &["list"]).contains("↻ refined"));
+
+        // `show` names the note both as a header line and in the event log.
+        let out = ok(&mut s, &["show", "1"]);
+        assert!(out.contains("refined: name the files it touches"), "{out}");
+        assert!(
+            out.lines()
+                .any(|l| l.contains("refined") && l.contains("name the files it touches")),
+            "{out}"
+        );
+
+        ok(&mut s, &["triage", "1", "ready"]);
+        assert!(!ok(&mut s, &["inbox"]).contains("refined"));
+        assert!(!ok(&mut s, &["list"]).contains("↻ refined"));
+    }
+
+    /// The agent's half of a refine: it applies the rewritten body through the
+    /// ordinary `set --body-file`, which leaves the task `proposed` for a
+    /// re-triage of the improved version.
+    #[test]
+    fn a_refine_agent_applies_the_body_through_set_without_moving_the_task() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "An idea", "--body", "thin"]);
+        s.record_refine(1, "make it dispatchable").unwrap();
+
+        let path = std::env::temp_dir().join(format!("voro-refine-{}.md", std::process::id()));
+        std::fs::write(&path, "# Rewritten\n\nNames real files and criteria.\n").unwrap();
+        ok(&mut s, &["set", "1", "--body-file", path.to_str().unwrap()]);
+        std::fs::remove_file(&path).unwrap();
+
+        let task = s.task(1).unwrap();
+        assert!(task.body.contains("Names real files"), "{}", task.body);
+        assert_eq!(task.state, TaskState::Proposed);
+        assert_eq!(task.priority, Priority::P2);
+        assert!(s.refined_flag(1).unwrap());
     }
 
     /// The inbox renders each row's next-action verb in place of the state,

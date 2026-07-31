@@ -128,6 +128,68 @@ Never modify Voro's database with raw SQL, which would bypass the state
 machine and event log.
 ";
 
+/// The note-driven refine (DESIGN.md §6): a headless agent rewrites a proposed
+/// task's body to honour the operator's one-line note, and applies it through
+/// `voro set --body-file` — the same "the CLI is the agent's interface" shape as
+/// dispatch and planning. `{seed}` carries the task as it stands plus the
+/// context of the task it was discovered from; `{note}` is the operator's brief.
+const REFINE_PROMPT_TEMPLATE: &str = "\
+<!-- Voro refine: the deliverable is a rewritten task body -->
+You are an agent launched by Voro to rewrite the body of proposed task {task_id}
+so that it reads as a dispatchable prompt: the agent that picks the task up later
+gets no other context, so name the relevant files, spell out the decisions
+already made, and give concrete acceptance criteria. The checkout you are running
+in is there to read, so the body can name real files and code. Do not modify the
+project's files, and do not do the task itself — writing its brief is the job.
+
+The operator's note is what they want fixed. It is the brief; honour it:
+
+    {note}
+
+{seed}
+When the rewrite is ready, write it to a file outside the checkout and apply it
+with exactly this command:
+
+    voro set {task_id}{db} --body-file <path>
+
+That is the only change you may make. The task stays `proposed` so the operator
+re-triages the improved version, so do not change its state, priority, or
+dependencies — no `voro triage`, no `--priority`, no `--blocked-by`, no `voro
+add` or `voro propose` — and never modify Voro's database with raw SQL, which
+would bypass the state machine and event log. Rewrite the body and stop.
+";
+
+/// The interactive refine (DESIGN.md §6): the planning harness pointed at a task
+/// that already exists. Same conversation as [`PLANNING_PROMPT_TEMPLATE`], but
+/// seeded with the current body and ending in `set --body-file` rather than
+/// `add`, so it edits in place and creates nothing.
+const REFINE_PLAN_PROMPT_TEMPLATE: &str = "\
+<!-- Voro refine session: the deliverable is a rewritten task body -->
+You are an agent launched by Voro to help the operator rework the body of
+proposed task {task_id}. This is an interactive conversation: ask the operator
+what is wrong with the task as it stands, and interview them until it is well
+defined — scope, approach where it is settled, and what done looks like. Do not
+modify the project's files; the checkout is there to read, so the task can name
+real files and code. Do not do the task itself — writing its brief is the job.
+
+{seed}
+Write the body as a self-contained dispatchable prompt: the agent that picks it
+up later gets no other context, so name the relevant files, spell out the
+decisions already made, and give concrete acceptance criteria.
+
+When the operator confirms the rewrite, write the body to a file outside the
+checkout and apply it with:
+
+    voro set {task_id}{db} --body-file <path>
+
+That is the only change to make. The task stays `proposed` so the operator
+re-triages the improved version, so do not change its state, priority, or
+dependencies, and do not create a new task — this edits the one that exists. If
+the operator decides against changing anything, end the session without applying
+a body — that is a no-op, not a failure. Never modify Voro's database with raw
+SQL, which would bypass the state machine and event log.
+";
+
 /// How often the session-ref capture re-polls the agent's `sessions` command
 /// while waiting for the freshly-launched session to appear in the listing.
 const REF_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -137,15 +199,22 @@ const REF_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// beat behind the timestamp taken here just before the spawn.
 const SPAWN_CLOCK_SLACK_MS: i64 = 2000;
 
+/// The ` --db <path>` flag every rendered verb carries when the database in play
+/// is not the default one the CLI resolves to unaided — empty otherwise, since
+/// that is what the verbs already do (DESIGN.md §8).
+fn db_flag(db_path: &Path) -> String {
+    if db_path == Store::default_db_path() {
+        String::new()
+    } else {
+        format!(" --db {}", shell_quote(db_path))
+    }
+}
+
 /// Fill [`RETURN_PATH_PREAMBLE_TEMPLATE`] for a concrete dispatch: the literal
 /// task id in every verb, plus a `--db <path>` flag only when the dispatching
 /// database is not the default one the verbs resolve to on their own.
 fn render_preamble(task_id: i64, db_path: &Path, branch: Option<&str>) -> String {
-    let db_flag = if db_path == Store::default_db_path() {
-        String::new()
-    } else {
-        format!(" --db {}", shell_quote(db_path))
-    };
+    let db_flag = db_flag(db_path);
     let register = BRANCH_REGISTER_SENTENCE.replace("{name}", branch.unwrap_or("<name>"));
     let branch_block = match branch {
         Some(name) => ASSIGNED_BRANCH_TEMPLATE
@@ -167,15 +236,62 @@ fn render_preamble(task_id: i64, db_path: &Path, branch: Option<&str>) -> String
 /// [`render_preamble`] does, a `--db` flag only when the database is not the
 /// default one the verb resolves to unaided.
 fn render_planning_prompt(project: &str, db_path: &Path) -> String {
-    let db_flag = if db_path == Store::default_db_path() {
-        String::new()
-    } else {
-        format!(" --db {}", shell_quote(db_path))
-    };
     PLANNING_PROMPT_TEMPLATE
         .replace("{project_arg}", &shell_quote(Path::new(project)))
         .replace("{project}", project)
-        .replace("{db}", &db_flag)
+        .replace("{db}", &db_flag(db_path))
+}
+
+/// The seed context both refine flavours open with: the task as it stands, and
+/// the body and completion summary of the task it was discovered from. The
+/// parent's context is usually exactly what a sloppy proposal is missing
+/// (DESIGN.md §6), so it is pulled in rather than left for the agent to hunt.
+fn refine_seed(store: &Store, task: &voro_core::Task) -> Result<String, String> {
+    let mut seed = format!(
+        "## The task as it stands\n\nTitle: {}\n\nBody:\n\n{}\n\n",
+        task.title,
+        if task.body.trim().is_empty() {
+            "(empty)"
+        } else {
+            task.body.trim_end()
+        }
+    );
+    if let Some(parent) = store.discovered_from(task.id).map_err(|e| e.to_string())? {
+        seed.push_str(&format!(
+            "## Discovered from task {} — {}\n\nThat task's body:\n\n{}\n\n",
+            parent.id,
+            parent.title,
+            if parent.body.trim().is_empty() {
+                "(empty)"
+            } else {
+                parent.body.trim_end()
+            }
+        ));
+        if let Some(summary) = store.latest_summary(parent.id).map_err(|e| e.to_string())? {
+            seed.push_str(&format!(
+                "That task's completion summary:\n\n{}\n\n",
+                summary.trim_end()
+            ));
+        }
+    }
+    Ok(seed)
+}
+
+/// Fill a refine template for a concrete task: the literal task id in the `set`
+/// command, the same conditional `--db` flag the other prompts render, the seed
+/// context, and — for the note-driven flavour — the operator's note.
+fn render_refine_prompt(
+    template: &str,
+    task_id: i64,
+    db_path: &Path,
+    seed: &str,
+    note: &str,
+) -> String {
+    template
+        .replace("{seed}", seed)
+        .replace("{note}", note.trim())
+        .replace("{task_id}", &task_id.to_string())
+        .replace("{db}", &db_flag(db_path))
 }
 
 /// The assembled launch of a planning session: the agent's `plan` template
@@ -186,25 +302,38 @@ fn render_planning_prompt(project: &str, db_path: &Path) -> String {
 pub struct PlanLaunch {
     pub command: String,
     pub cwd: String,
+    /// Which flow this is — `plan` or `refine` — for the launch log's
+    /// breadcrumbs, since both run through the same foreground round-trip.
+    pub label: &'static str,
 }
 
-/// Assemble an interactive planning session for a project (DESIGN.md §8):
-/// resolve the default agent, require its `plan` verb, write the planning
-/// prompt outside the checkout, and substitute it into the template. No
-/// session row is recorded and no task state changes — the session's
-/// deliverable is a `proposed` task the agent creates through `voro add`, so
-/// one that exits without creating anything has simply done nothing. There is
-/// deliberately no dispatch-style guard: planning only reads the checkout and
-/// writes nothing to it. A planning session runs in the project's *default*
-/// repo: it drafts a task rather than executing one, and the drafted task
-/// picks its own repo with `voro add --repo` (DESIGN.md §8).
+/// What an interactive agent session is pointed at (DESIGN.md §8/§6): the front
+/// of a task's life, or a proposed task that already exists. Both run the same
+/// `plan` verb in the foreground and both end in a CLI verb the agent calls —
+/// `add` for a new task, `set --body-file` for a refine.
+#[derive(Debug, Clone, Copy)]
+pub enum PlanTarget {
+    Create { project_id: i64 },
+    Refine { task_id: i64 },
+}
+
+/// Assemble an interactive planning session (DESIGN.md §8): resolve the default
+/// agent, require its `plan` verb, write the prompt outside the checkout, and
+/// substitute it into the template. No session row is recorded and no task state
+/// changes — the session's deliverable is a `proposed` task the agent creates
+/// through `voro add`, or (for [`PlanTarget::Refine`]) a rewritten body it
+/// applies through `voro set --body-file` — so one that exits without doing
+/// either has simply done nothing. There is deliberately no dispatch-style
+/// guard: planning only reads the checkout and writes nothing to it. A `Create`
+/// session runs in the project's *default* repo, since it drafts a task rather
+/// than executing one and the drafted task picks its own repo with `voro add
+/// --repo`; a `Refine` runs in the task's resolved repo, which is where the code
+/// its body must name actually lives.
 pub fn plan_session(
     store: &Store,
     ctx: &DispatchCtx,
-    project_id: i64,
+    target: PlanTarget,
 ) -> Result<PlanLaunch, String> {
-    let project = store.project(project_id).map_err(|e| e.to_string())?;
-    let repo = store.default_repo(project_id).map_err(|e| e.to_string())?;
     let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     let agent = config.resolve(None).map_err(|e| e.to_string())?;
     let Some(plan_cmd) = agent.plan_command() else {
@@ -216,24 +345,194 @@ pub fn plan_session(
             agent.name
         ));
     };
+    let (label, name, cwd, prompt) = match target {
+        PlanTarget::Create { project_id } => {
+            let project = store.project(project_id).map_err(|e| e.to_string())?;
+            let repo = store.default_repo(project_id).map_err(|e| e.to_string())?;
+            (
+                "plan",
+                format!("plan-{project_id}"),
+                repo.path,
+                render_planning_prompt(&project.name, &ctx.db_path),
+            )
+        }
+        PlanTarget::Refine { task_id } => {
+            let task = guard_refinable(store, task_id)?;
+            let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
+            let seed = refine_seed(store, &task)?;
+            (
+                "refine",
+                format!("refine-{task_id}"),
+                repo.path,
+                render_refine_prompt(
+                    REFINE_PLAN_PROMPT_TEMPLATE,
+                    task_id,
+                    &ctx.db_path,
+                    &seed,
+                    "",
+                ),
+            )
+        }
+    };
+    let prompt_path = write_prompt(ctx, &name, &prompt)?;
+    Ok(PlanLaunch {
+        command: plan_cmd.replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path)),
+        cwd,
+        label,
+    })
+}
+
+/// The precondition both refine flavours share: refine is an event on a
+/// `proposed` task, not a state (DESIGN.md §6), so anything else is refused
+/// before a prompt is written or a process spawned.
+fn guard_refinable(store: &Store, task_id: i64) -> Result<voro_core::Task, String> {
+    let task = store.task(task_id).map_err(|e| e.to_string())?;
+    if task.state != TaskState::Proposed {
+        return Err(format!(
+            "only a proposed task can be refined; task {task_id} is {}",
+            task.state
+        ));
+    }
+    Ok(task)
+}
+
+/// Write a prompt file outside every checkout, named for the flow that wrote it
+/// and stamped so successive runs never clobber each other.
+fn write_prompt(ctx: &DispatchCtx, name: &str, prompt: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&ctx.runtime_dir)
         .map_err(|e| format!("cannot create {}: {e}", ctx.runtime_dir.display()))?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let prompt_path = ctx
-        .runtime_dir
-        .join(format!("plan-{project_id}-{stamp}.prompt.md"));
-    std::fs::write(
-        &prompt_path,
-        render_planning_prompt(&project.name, &ctx.db_path),
-    )
-    .map_err(|e| format!("cannot write prompt {}: {e}", prompt_path.display()))?;
-    Ok(PlanLaunch {
-        command: plan_cmd.replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path)),
-        cwd: repo.path,
-    })
+    let path = ctx.runtime_dir.join(format!("{name}-{stamp}.prompt.md"));
+    std::fs::write(&path, prompt)
+        .map_err(|e| format!("cannot write prompt {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// A terse human intent handed to a headless agent to expand into a formal
+/// artefact, which the agent applies through a CLI verb (DESIGN.md §6). Refine
+/// is the first instance — a one-line note becomes a dispatchable task body —
+/// and the shape is deliberately general, because expanding review-reject
+/// feedback the same way is the next one. Unlike a dispatch this opens no
+/// session row and moves no task state: what comes back is whatever the verb the
+/// agent calls does, so nothing here has to observe the process.
+struct Expansion {
+    /// Names the prompt and log files and the launch-log line, e.g. `refine-314`.
+    label: String,
+    /// The agent's headless command template, still carrying `{prompt_file}`.
+    command: String,
+    prompt: String,
+    cwd: String,
+}
+
+/// Spawn an [`Expansion`] detached, with its output captured to a log beside the
+/// session logs, and return a summary line naming that log. The child is reaped
+/// in a thread — nothing waits on it, and a zombie would otherwise linger for
+/// the life of a long-running TUI (DESIGN.md §8).
+fn spawn_expansion(ctx: &DispatchCtx, exp: Expansion) -> Result<String, String> {
+    let prompt_path = write_prompt(ctx, &exp.label, &exp.prompt)?;
+    let stamp = prompt_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.trim_end_matches(".prompt").to_string())
+        .unwrap_or_else(|| exp.label.clone());
+    let log_path = ctx.runtime_dir.join(format!("{stamp}.log"));
+    let log = File::create(&log_path)
+        .map_err(|e| format!("cannot create log {}: {e}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| format!("cannot open log {}: {e}", log_path.display()))?;
+
+    let command = exp
+        .command
+        .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path));
+    let launch_log = ctx.launch_log_path();
+    append_launch_log(
+        &launch_log,
+        &format!("{}: {command} (cwd {})", exp.label, exp.cwd),
+    );
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .current_dir(&exp.cwd)
+        .env("VORO_DB", &ctx.db_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("cannot spawn agent in {}: {e}", exp.cwd))?;
+    let pid = i64::from(child.id());
+
+    let reap_label = exp.label.clone();
+    std::thread::spawn(move || {
+        let line = match child.wait() {
+            Ok(status) => format!("{reap_label}: exited with {status}"),
+            Err(e) => format!("{reap_label}: could not be waited on: {e}"),
+        };
+        append_launch_log(&launch_log, &line);
+    });
+
+    Ok(format!(
+        "{} launched (pid {pid}) — log {}",
+        exp.label,
+        log_path.display()
+    ))
+}
+
+/// Note-driven refine (DESIGN.md §6): hand a proposed task's body, the
+/// operator's note, and the context of the task it was discovered from to a
+/// headless agent, which rewrites the body and applies it with `voro set
+/// --body-file`. The task stays `proposed` throughout — the only store write
+/// here is the `refined` event that marks the row for re-triage. The *default*
+/// agent runs it whatever override the task carries, since a task's agent
+/// override picks who executes the task, not who writes its brief; the task's
+/// `deep` flag still applies, because a task worth the strongest model is worth
+/// a brief written with it. A human task refines like any other: no agent can
+/// *execute* it, but its brief is still text an agent can write.
+pub fn refine(
+    store: &mut Store,
+    ctx: &DispatchCtx,
+    task_id: i64,
+    note: &str,
+) -> Result<String, String> {
+    if note.trim().is_empty() {
+        return Err("a refine note is required".into());
+    }
+    let task = guard_refinable(store, task_id)?;
+    let project = store.project(task.project_id).map_err(|e| e.to_string())?;
+    if project.archived {
+        return Err(format!(
+            "project '{}' is archived — `voro project unarchive {}` first",
+            project.name, project.name
+        ));
+    }
+    let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
+    let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
+    let agent = config.resolve(None).map_err(|e| e.to_string())?;
+    let seed = refine_seed(store, &task)?;
+    let prompt = render_refine_prompt(REFINE_PROMPT_TEMPLATE, task_id, &ctx.db_path, &seed, note);
+
+    let summary = spawn_expansion(
+        ctx,
+        Expansion {
+            label: format!("refine-{task_id}"),
+            command: agent.dispatch_command(task.deep),
+            prompt,
+            cwd: repo.path,
+        },
+    )?;
+    // Recorded after the spawn, so a refine that never launched leaves no
+    // marker; the agent rewriting the body is what the marker is about.
+    store
+        .record_refine(task_id, note)
+        .map_err(|e| format!("{summary}, but recording the refine event failed: {e}"))?;
+    Ok(format!(
+        "task {task_id} sent for refinement by '{}' — {summary}",
+        agent.name
+    ))
 }
 
 /// Where dispatch finds its inputs and puts its artefacts. Built from the
@@ -1549,6 +1848,177 @@ mod tests {
         assert!(err.contains("zed"), "{err}");
     }
 
+    // --- refine (task #314) ---
+
+    /// A proposal in the fixture project, optionally discovered from a parent
+    /// task whose body and completion summary are the context a refine seeds
+    /// its agent with.
+    fn proposal(store: &mut Store, project_path: &Path, with_parent: bool) -> i64 {
+        let p = store
+            .create_project("proj", project_path.to_str().unwrap())
+            .unwrap();
+        let new = |title: &str, body: &str, state| NewTask {
+            project_id: p.id,
+            repo_id: None,
+            title: title.into(),
+            body: body.into(),
+            priority: Priority::P2,
+            state,
+            agent: None,
+            human: false,
+            deep: false,
+        };
+        let id = store
+            .create_task(new(
+                "Sloppy proposal",
+                "make it better",
+                TaskState::Proposed,
+            ))
+            .unwrap()
+            .id;
+        if with_parent {
+            let parent = store
+                .create_task(new(
+                    "The parent task",
+                    "parent body about the scheduler",
+                    TaskState::Ready,
+                ))
+                .unwrap()
+                .id;
+            store.apply(parent, voro_core::Action::Start).unwrap();
+            store
+                .apply(
+                    parent,
+                    voro_core::Action::Complete(Some("what the parent actually did".into())),
+                )
+                .unwrap();
+            store
+                .add_dep(id, parent, voro_core::DepKind::DiscoveredFrom)
+                .unwrap();
+        }
+        id
+    }
+
+    #[test]
+    fn refine_spawns_the_agent_seeds_it_and_records_the_event() {
+        // The stub copies the prompt it was handed, so the file it writes is
+        // exactly what reached the agent.
+        let (mut store, ctx, project) = fixture("cat {prompt_file} > refine-prompt.txt");
+        let id = proposal(&mut store, &project, true);
+
+        let summary = refine(&mut store, &ctx, id, "  name the files it touches  ").unwrap();
+        assert!(summary.contains("stub"), "{summary}");
+        assert!(summary.contains(&format!("refine-{id}")), "{summary}");
+
+        let landed = project.join("refine-prompt.txt");
+        for _ in 0..100 {
+            if landed.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let prompt = std::fs::read_to_string(&landed).unwrap();
+        // the operator's note, the body as it stands, and the discovered-from
+        // context the sloppy proposal is missing
+        assert!(prompt.contains("name the files it touches"), "{prompt}");
+        assert!(prompt.contains("Sloppy proposal"), "{prompt}");
+        assert!(prompt.contains("make it better"), "{prompt}");
+        assert!(
+            prompt.contains("parent body about the scheduler"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("what the parent actually did"), "{prompt}");
+        // the one write it is told to make, with the id and database literal
+        assert!(
+            prompt.contains(&format!(
+                "voro set {id} --db {} --body-file",
+                shell_quote(&ctx.db_path)
+            )),
+            "{prompt}"
+        );
+        // and the writes it is told not to make
+        assert!(
+            prompt.contains("do not change its state, priority, or"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("no `voro triage`"), "{prompt}");
+
+        // Voro's own half changed nothing but the marker event.
+        let task = store.task(id).unwrap();
+        assert_eq!(task.state, TaskState::Proposed);
+        assert_eq!(task.body, "make it better");
+        assert!(store.refined_flag(id).unwrap());
+        assert_eq!(
+            store.latest_refine_note(id).unwrap().as_deref(),
+            Some("name the files it touches")
+        );
+        // no session row: a refine is not a dispatch (DESIGN.md §6)
+        assert!(store.sessions_for(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn refine_is_refused_off_proposed_and_without_a_note() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let id = proposal(&mut store, &project, false);
+
+        let err = refine(&mut store, &ctx, id, "  ").unwrap_err();
+        assert!(err.contains("note"), "{err}");
+
+        store
+            .apply(id, voro_core::Action::Triage(voro_core::Triage::Ready))
+            .unwrap();
+        let err = refine(&mut store, &ctx, id, "too late").unwrap_err();
+        assert!(err.contains("proposed"), "{err}");
+        // refused before anything spawned, so no prompt was even written
+        assert!(!ctx.runtime_dir.exists());
+        assert!(!store.refined_flag(id).unwrap());
+    }
+
+    #[test]
+    fn interactive_refine_seeds_the_plan_session_with_the_task() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file}\"\nplan = \"stub --interactive {prompt_file}\"\n",
+        );
+        let id = proposal(&mut store, &project, false);
+
+        let launch = plan_session(&store, &ctx, PlanTarget::Refine { task_id: id }).unwrap();
+        assert_eq!(launch.label, "refine");
+        assert_eq!(launch.cwd, project.to_str().unwrap());
+
+        let prompt_path = prompt_files(&ctx).pop().unwrap();
+        assert_eq!(
+            launch.command,
+            format!("stub --interactive {}", shell_quote(&prompt_path))
+        );
+        let prompt = std::fs::read_to_string(&prompt_path).unwrap();
+        // the existing body is seeded, and the session ends in `set`, not `add`
+        assert!(prompt.contains("make it better"), "{prompt}");
+        assert!(prompt.contains(&format!("voro set {id}")), "{prompt}");
+        assert!(!prompt.contains("voro add"), "{prompt}");
+        assert!(prompt.contains("interactive"), "{prompt}");
+
+        // assembling it is not a refine: no event, no state change, no session
+        assert_eq!(store.task(id).unwrap().state, TaskState::Proposed);
+        assert!(!store.refined_flag(id).unwrap());
+        assert!(store.sessions_for(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn interactive_refine_is_refused_off_proposed() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file}\"\nplan = \"stub --interactive {prompt_file}\"\n",
+        );
+        let id = proposal(&mut store, &project, false);
+        store
+            .apply(id, voro_core::Action::Triage(voro_core::Triage::Ready))
+            .unwrap();
+
+        let err = plan_session(&store, &ctx, PlanTarget::Refine { task_id: id }).unwrap_err();
+        assert!(err.contains("proposed"), "{err}");
+    }
+
     // --- planning sessions (task #112) ---
 
     #[test]
@@ -1563,7 +2033,7 @@ mod tests {
         // a dirty checkout is fine for planning
         std::fs::write(project.join("scratch.txt"), "uncommitted").unwrap();
 
-        let launch = plan_session(&store, &ctx, p.id).unwrap();
+        let launch = plan_session(&store, &ctx, PlanTarget::Create { project_id: p.id }).unwrap();
         assert_eq!(launch.cwd, project.to_str().unwrap());
 
         // the plan template ran through the same {prompt_file} substitution as
@@ -1609,7 +2079,7 @@ mod tests {
             .create_project("proj", project.to_str().unwrap())
             .unwrap();
 
-        let err = plan_session(&store, &ctx, p.id).unwrap_err();
+        let err = plan_session(&store, &ctx, PlanTarget::Create { project_id: p.id }).unwrap_err();
         assert!(err.contains("stub"), "{err}");
         assert!(err.contains("plan"), "{err}");
         assert!(err.contains("{prompt_file}"), "{err}");
@@ -1702,7 +2172,7 @@ mod tests {
         let p = store
             .create_project("proj", project.to_str().unwrap())
             .unwrap();
-        let launch = plan_session(&store, &ctx, p.id).unwrap();
+        let launch = plan_session(&store, &ctx, PlanTarget::Create { project_id: p.id }).unwrap();
         assert!(
             launch.command.contains("--model thinker"),
             "{}",

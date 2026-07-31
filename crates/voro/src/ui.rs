@@ -95,10 +95,19 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             actions,
             sel,
         } => {
-            let items: Vec<ListItem> = actions
+            let mut items: Vec<ListItem> = actions
                 .iter()
                 .map(|a| ListItem::new(crate::app::action_label(a)))
                 .collect();
+            // The fourth triage outcome (DESIGN.md §6) is not a verdict, so it
+            // sits below the list as the two keys that reach it rather than as
+            // a selectable row that would transition nothing.
+            if app.is_proposed(*task_id) {
+                items.push(ListItem::new(Line::from(Span::styled(
+                    "r refine with a note · R refine by talking",
+                    Style::new().dim(),
+                ))));
+            }
             let height = items.len() as u16 + 2;
             let area = popup_area(frame, 48, height.max(3));
             let mut state = ListState::default().with_selected(Some(*sel));
@@ -520,6 +529,14 @@ fn incomplete_report_span() -> Span<'static> {
     )
 }
 
+/// The refine marker (DESIGN.md §6): a proposal whose body an agent has
+/// reworked against the operator's note, so this row is an improved version
+/// awaiting a fresh verdict. A property of the row rather than an anomaly —
+/// cyan like the question text, not the warning yellow.
+fn refined_span() -> Span<'static> {
+    Span::styled("  ↻ refined", Style::new().fg(Color::Cyan))
+}
+
 /// The stale-branch marker (DESIGN.md §8): a review task whose tracked PR
 /// reports a merge conflict, probed on demand for the selected task. Purely
 /// informational — it flags that the branch needs resolving before it can
@@ -708,6 +725,9 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
                         Style::new().fg(Color::Cyan),
                     ));
                 }
+                if app.refined.contains(&c.task.id) {
+                    spans.push(refined_span());
+                }
                 if app.incomplete_report.contains(&c.task.id) {
                     // The verb column says "pr", but a PR cannot be opened
                     // from a half-finished report, so name the gap too.
@@ -786,6 +806,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             };
             lines.push(Line::from(Span::styled(text, Style::new().fg(Color::Cyan))));
         }
+    }
+    if app.refined.contains(&task.id) {
+        lines.push(Line::from(refined_span()));
     }
     if let Some(pr) = &task.pr_url {
         lines.push(Line::from(pr_span(pr)));
@@ -953,6 +976,9 @@ fn draw_tasks(frame: &mut Frame, app: &App) {
             ];
             if r.task.human {
                 spans.push(human_span());
+            }
+            if app.refined.contains(&r.task.id) {
+                spans.push(refined_span());
             }
             if app.incomplete_report.contains(&r.task.id) {
                 spans.push(incomplete_report_span());

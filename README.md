@@ -73,7 +73,12 @@ like one.
 Select it in the queue and press `enter` — the footer reads `⏎ triage` — to accept
 it into ready work. The queue always floats items that need you first (a
 question shows `⏎ answer`, a finished task shows `⏎ review`) above the
-highest-scoring ready tasks.
+highest-scoring ready tasks. When a proposal is worth keeping but badly written,
+the triage menu offers a fourth outcome instead of accepting it as it stands:
+`r` sends it to an agent to rewrite with a one-line note about what is wrong
+(`voro triage <id> refine --note "..."` on the CLI), and `R` opens an
+interactive session to talk the body into shape. Either way the task stays a
+proposal, marked `↻ refined`, so you triage the improved version next pass.
 
 **4. Dispatch it to an agent.** Select a ready task and press `d` to hand it to
 the default coding agent, or `D` to choose which agent. Voro launches a headless
