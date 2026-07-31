@@ -4,7 +4,7 @@
 //! the event log, and cascades readiness of dependant tasks — all in one
 //! transaction.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use rusqlite::{Connection, params};
 
@@ -243,7 +243,9 @@ impl Store {
 
     /// Replace the `blocks` dependencies of a task with the given set, then
     /// reconcile its readiness. This is the dep-editing entry point for
-    /// interfaces; `add_dep`/`remove_dep` reconcile too.
+    /// interfaces; `add_dep`/`remove_dep` reconcile too. A repeated id in
+    /// `depends_on` names the same single edge, so the set is deduplicated
+    /// rather than left to collide on insert.
     pub fn set_blocks_deps(&mut self, task_id: i64, depends_on: &[i64]) -> Result<Task> {
         let tx = self.conn.transaction()?;
         if get_task(&tx, task_id)?.is_none() {
@@ -253,13 +255,14 @@ impl Store {
             "DELETE FROM deps WHERE task_id = ?1 AND kind = 'blocks'",
             [task_id],
         )?;
-        for dep in depends_on {
+        let mut seen = HashSet::new();
+        for dep in depends_on.iter().filter(|dep| seen.insert(**dep)) {
             if get_task(&tx, *dep)?.is_none() {
                 return Err(Error::TaskNotFound(*dep));
             }
             reject_blocks_cycle(&tx, task_id, *dep)?;
             tx.execute(
-                "INSERT OR IGNORE INTO deps (task_id, depends_on, kind) VALUES (?1, ?2, 'blocks')",
+                "INSERT INTO deps (task_id, depends_on, kind) VALUES (?1, ?2, 'blocks')",
                 params![task_id, dep],
             )?;
         }
@@ -271,9 +274,11 @@ impl Store {
     /// The reverse authoring direction of
     /// [`set_blocks_deps`](Store::set_blocks_deps): make `blocker_id` a blocker
     /// of each task in `dependents`. Additive and idempotent (replacing the set
-    /// here would detach edges other tasks authored). Each dependent's readiness
-    /// is reconciled in the same write; the returned pairs carry its prior state
-    /// so callers can surface a demotion.
+    /// here would detach edges other tasks authored) — the conflict clause is
+    /// scoped to the identical edge, so an edge of another kind between the same
+    /// pair coexists with the blocker rather than swallowing it. Each dependent's
+    /// readiness is reconciled in the same write; the returned pairs carry its
+    /// prior state so callers can surface a demotion.
     pub fn block_tasks(
         &mut self,
         blocker_id: i64,
@@ -288,7 +293,8 @@ impl Store {
             let before = get_task(&tx, *dep)?.ok_or(Error::TaskNotFound(*dep))?.state;
             reject_blocks_cycle(&tx, *dep, blocker_id)?;
             tx.execute(
-                "INSERT OR IGNORE INTO deps (task_id, depends_on, kind) VALUES (?1, ?2, 'blocks')",
+                "INSERT INTO deps (task_id, depends_on, kind) VALUES (?1, ?2, 'blocks')
+                 ON CONFLICT (task_id, depends_on, kind) DO NOTHING",
                 params![dep, blocker_id],
             )?;
             reconcile_readiness(&tx, *dep)?;
@@ -1143,9 +1149,53 @@ mod tests {
         let other = create(&mut s, p, TaskState::Ready);
         let task = create(&mut s, p, TaskState::Ready);
         for kind in [DepKind::DiscoveredFrom, DepKind::Parent, DepKind::Related] {
-            s.add_dep(task, other, kind).unwrap_or_default();
+            s.add_dep(task, other, kind).unwrap();
         }
         assert_eq!(s.task(task).unwrap().state, TaskState::Ready);
+    }
+
+    /// A task proposed from another and then gated on it: the `discovered-from`
+    /// edge already occupying the pair must not swallow the blocker.
+    #[test]
+    fn set_blocks_deps_coexists_with_a_discovered_from_edge() {
+        let (mut s, p) = store_with_project();
+        let source = create(&mut s, p, TaskState::Ready);
+        let task = create(&mut s, p, TaskState::Ready);
+        s.add_dep(task, source, DepKind::DiscoveredFrom).unwrap();
+
+        let after = s.set_blocks_deps(task, &[source]).unwrap();
+        assert_eq!(after.state, TaskState::Parked);
+        let kinds: Vec<DepKind> = s.deps_of(task).unwrap().iter().map(|d| d.kind).collect();
+        assert_eq!(kinds, vec![DepKind::Blocks, DepKind::DiscoveredFrom]);
+    }
+
+    /// The same collision authored from the blocker's end.
+    #[test]
+    fn block_tasks_coexists_with_a_discovered_from_edge() {
+        let (mut s, p) = store_with_project();
+        let source = create(&mut s, p, TaskState::Ready);
+        let task = create(&mut s, p, TaskState::Ready);
+        s.add_dep(task, source, DepKind::DiscoveredFrom).unwrap();
+
+        let affected = s.block_tasks(source, &[task]).unwrap();
+        assert_eq!(affected[0].0.state, TaskState::Parked);
+        assert_eq!(affected[0].1, TaskState::Ready);
+        let kinds: Vec<DepKind> = s.deps_of(task).unwrap().iter().map(|d| d.kind).collect();
+        assert_eq!(kinds, vec![DepKind::Blocks, DepKind::DiscoveredFrom]);
+
+        // still idempotent on the identical edge
+        s.block_tasks(source, &[task]).unwrap();
+        assert_eq!(s.deps_of(task).unwrap().len(), 2);
+    }
+
+    /// A repeated id names one edge, not a collision.
+    #[test]
+    fn set_blocks_deps_tolerates_a_repeated_id() {
+        let (mut s, p) = store_with_project();
+        let blocker = create(&mut s, p, TaskState::Ready);
+        let task = create(&mut s, p, TaskState::Ready);
+        s.set_blocks_deps(task, &[blocker, blocker]).unwrap();
+        assert_eq!(s.deps_of(task).unwrap().len(), 1);
     }
 
     #[test]

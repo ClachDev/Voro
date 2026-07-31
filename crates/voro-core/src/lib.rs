@@ -119,7 +119,48 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].depends_on, a.id);
         assert_eq!(deps[0].kind, DepKind::Blocks);
-        s.remove_dep(b.id, a.id).unwrap();
+        s.remove_dep(b.id, a.id, DepKind::Blocks).unwrap();
         assert!(s.deps_of(b.id).unwrap().is_empty());
+    }
+
+    /// A pair carrying edges of two kinds keeps both, and removing one leaves
+    /// the other standing.
+    #[test]
+    fn dep_remove_is_scoped_to_one_kind() {
+        let mut s = store();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let a = s
+            .create_task(new_task(p.id, "a", TaskState::Ready))
+            .unwrap();
+        let b = s
+            .create_task(new_task(p.id, "b", TaskState::Parked))
+            .unwrap();
+        s.add_dep(b.id, a.id, DepKind::DiscoveredFrom).unwrap();
+        s.add_dep(b.id, a.id, DepKind::Blocks).unwrap();
+        assert_eq!(s.deps_of(b.id).unwrap().len(), 2);
+
+        s.remove_dep(b.id, a.id, DepKind::Blocks).unwrap();
+        let left = s.deps_of(b.id).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].kind, DepKind::DiscoveredFrom);
+
+        let err = s.remove_dep(b.id, a.id, DepKind::Blocks).unwrap_err();
+        assert!(err.to_string().contains("no blocks dependency"), "{err}");
+    }
+
+    /// The same edge twice is a write that changes nothing, and says so.
+    #[test]
+    fn dep_add_rejects_a_duplicate_edge() {
+        let mut s = store();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let a = s
+            .create_task(new_task(p.id, "a", TaskState::Ready))
+            .unwrap();
+        let b = s
+            .create_task(new_task(p.id, "b", TaskState::Parked))
+            .unwrap();
+        s.add_dep(b.id, a.id, DepKind::Blocks).unwrap();
+        let err = s.add_dep(b.id, a.id, DepKind::Blocks).unwrap_err();
+        assert!(err.to_string().contains("already has a blocks"), "{err}");
     }
 }
