@@ -213,6 +213,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             if let Some(session) = app.last_sessions.get(task_id) {
                 lines.extend(session_lines(session, t.state));
             }
+            lines.extend(doc_lines(app, *task_id));
             lines.extend(dep_lines(
                 app.deps.get(task_id).map_or(&[][..], |v| v),
                 app.dependents.get(task_id).map_or(&[][..], |v| v),
@@ -593,6 +594,30 @@ fn repo_span(name: &str, path: &str) -> Span<'static> {
     )
 }
 
+/// The plans a task derives from (DESIGN.md §3), one line each: the title when
+/// the document carries one, then where it resolves to — the same location
+/// dispatch names in the agent's prompt. A task citing no document renders
+/// nothing.
+fn doc_lines(app: &App, task_id: i64) -> Vec<Line<'static>> {
+    app.docs
+        .get(&task_id)
+        .map_or(&[][..], |v| v)
+        .iter()
+        .map(|doc| {
+            let location = app
+                .doc_locations
+                .get(&doc.id)
+                .cloned()
+                .unwrap_or_else(|| doc.location.clone());
+            let text = match &doc.title {
+                Some(title) => format!("doc: {title} — {location}"),
+                None => format!("doc: {location}"),
+            };
+            Line::from(Span::styled(text, Style::new().fg(Color::Magenta)))
+        })
+        .collect()
+}
+
 /// A review row's next action rendered as a browser suffix (DESIGN.md §3). The
 /// browser shows state in its own column, so only `review` — whose verb reads
 /// the tracked PR, not the state alone — earns the suffix.
@@ -826,6 +851,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(session) = app.last_sessions.get(&task.id) {
         lines.extend(session_lines(session, task.state));
     }
+    lines.extend(doc_lines(app, task.id));
     lines.extend(dep_lines(
         app.deps.get(&task.id).map_or(&[][..], |v| v),
         app.dependents.get(&task.id).map_or(&[][..], |v| v),

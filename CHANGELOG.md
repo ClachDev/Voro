@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Document links**: register the plan or design doc a body of work derives
+  from with `voro doc add <project> <path-or-url>`, and link it to the tasks it
+  spawned (`voro doc link/unlink`, or `--doc` on `voro add`/`voro set`). `voro
+  list --doc <doc>` answers "which tasks came from this plan?", `voro doc show`
+  rolls up every linked task's state, and dispatch names each linked document
+  at its resolved location in the agent's prompt, so the agent reads the plan
+  instead of rediscovering it from hints in the task body. A task in any project
+  may cite a document, since one plan routinely spawns work across several. An
+  absolute path inside one of the project's checkouts is stored relative to it,
+  so the link survives the checkout moving.
 - Multi-repo projects: a project now owns one or more **repos**, and a task may
   name which one it runs in. Manage them with `voro repo add/list/path/default/
   remove`, pick one per task with `voro add --repo NAME` and `voro set --repo
