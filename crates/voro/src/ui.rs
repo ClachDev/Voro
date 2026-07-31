@@ -379,12 +379,14 @@ fn draw_mode(frame: &mut Frame, app: &App) {
 fn score_lines(b: &ScoreBreakdown) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         format!(
-            "weight {} · {} (value {}) · {} (+{}) · base w×(p+s) {:.1} · age {:.1}d (+{:.2})",
+            "weight {} · {} (value {}) · {} (+{}) · blocks ×{} (+{}) · base w×(p+s+u) {:.1} · age {:.1}d (+{:.2})",
             b.weight,
             b.priority,
             b.priority_value,
             b.state,
             b.state_bonus,
+            b.open_dependents,
+            b.unblock_bonus,
             b.base,
             b.age_days,
             b.age_bonus
@@ -1761,7 +1763,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(
-            rendered.contains("base w×(p+s)"),
+            rendered.contains("base w×(p+s+u)"),
             "score decomposition should fold into the detail pane: {rendered}"
         );
         assert!(
@@ -2127,7 +2129,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(
-            rendered.contains("base w×(p+s)"),
+            rendered.contains("base w×(p+s+u)"),
             "score decomposition should fold into the Detail popup: {rendered}"
         );
         assert!(
