@@ -2637,6 +2637,21 @@ mod tests {
         assert!(ok(&mut s, &["show", "2"]).contains("#2 proposed"));
     }
 
+    /// The reported failure end to end: a task proposed from another and then
+    /// gated on it keeps both edges, and `show` renders each.
+    #[test]
+    fn blocked_by_survives_an_existing_discovered_from_edge() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Source", "--state", "ready"]);
+        propose(&mut s, &["propose", "demo", "Follow-up", "--from", "1"]).unwrap();
+
+        ok(&mut s, &["set", "2", "--blocked-by", "1"]);
+        let shown = ok(&mut s, &["show", "2"]);
+        assert!(shown.contains("dep: blocked by #1"), "{shown}");
+        assert!(shown.contains("dep: discovered-from 1"), "{shown}");
+    }
+
     #[test]
     fn run_propose_without_from_links_nothing() {
         // `run` consults no environment: a bare `propose` never picks up an

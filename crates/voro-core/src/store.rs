@@ -24,6 +24,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0012_repos.sql"),
     include_str!("../migrations/0013_add_deep.sql"),
     include_str!("../migrations/0014_docs.sql"),
+    include_str!("../migrations/0015_dep_kind_in_key.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -991,10 +992,16 @@ impl Store {
         if kind == DepKind::Blocks {
             crate::transition::reject_blocks_cycle(&tx, task_id, depends_on)?;
         }
-        tx.execute(
-            "INSERT INTO deps (task_id, depends_on, kind) VALUES (?1, ?2, ?3)",
+        let inserted = tx.execute(
+            "INSERT INTO deps (task_id, depends_on, kind) VALUES (?1, ?2, ?3)
+             ON CONFLICT (task_id, depends_on, kind) DO NOTHING",
             params![task_id, depends_on, kind],
         )?;
+        if inserted == 0 {
+            return Err(Error::Invalid(format!(
+                "#{task_id} already has a {kind} dependency on #{depends_on}"
+            )));
+        }
         if kind == DepKind::Blocks {
             crate::transition::reconcile_readiness(&tx, task_id)?;
         }
@@ -1002,13 +1009,23 @@ impl Store {
         Ok(())
     }
 
-    pub fn remove_dep(&mut self, task_id: i64, depends_on: i64) -> Result<()> {
+    /// Drop one edge. The kind is part of the identity of an edge — a pair may
+    /// carry several — so removing a blocker must not take the
+    /// `discovered-from` edge beside it with it.
+    pub fn remove_dep(&mut self, task_id: i64, depends_on: i64, kind: DepKind) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM deps WHERE task_id = ?1 AND depends_on = ?2",
-            params![task_id, depends_on],
+        let removed = tx.execute(
+            "DELETE FROM deps WHERE task_id = ?1 AND depends_on = ?2 AND kind = ?3",
+            params![task_id, depends_on, kind],
         )?;
-        crate::transition::reconcile_readiness(&tx, task_id)?;
+        if removed == 0 {
+            return Err(Error::Invalid(format!(
+                "#{task_id} has no {kind} dependency on #{depends_on}"
+            )));
+        }
+        if kind == DepKind::Blocks {
+            crate::transition::reconcile_readiness(&tx, task_id)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1021,7 +1038,7 @@ impl Store {
         self.dep_refs(
             "SELECT d.task_id, t.id, t.title, t.state, d.kind
              FROM deps d JOIN tasks t ON t.id = d.depends_on
-             ORDER BY d.task_id, t.id",
+             ORDER BY d.task_id, t.id, d.kind",
         )
     }
 
@@ -1031,7 +1048,7 @@ impl Store {
         self.dep_refs(
             "SELECT d.depends_on, t.id, t.title, t.state, d.kind
              FROM deps d JOIN tasks t ON t.id = d.task_id
-             ORDER BY d.depends_on, t.id",
+             ORDER BY d.depends_on, t.id, d.kind",
         )
     }
 
@@ -1057,7 +1074,8 @@ impl Store {
 
     pub fn deps_of(&self, task_id: i64) -> Result<Vec<Dep>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_id, depends_on, kind FROM deps WHERE task_id = ?1 ORDER BY depends_on",
+            "SELECT task_id, depends_on, kind FROM deps WHERE task_id = ?1
+             ORDER BY depends_on, kind",
         )?;
         let rows = stmt.query_map([task_id], |row| {
             Ok(Dep {
@@ -2423,6 +2441,47 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    /// A database from before migration 0015 must open with every dependency
+    /// edge intact, and accept a second edge of another kind between a pair the
+    /// old primary key allowed only one edge for.
+    #[test]
+    fn migration_0015_widens_the_dep_key_without_losing_edges() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..14] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 14).unwrap();
+        conn.execute("INSERT INTO projects (name) VALUES ('voro')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO repos (project_id, name, path, is_default)
+             VALUES (1, 'voro', '/tmp/voro', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (project_id, title, state, state_since, created_at)
+             VALUES (1, 'source', 'ready', datetime('now'), datetime('now')),
+                    (1, 'spawned', 'ready', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO deps (task_id, depends_on, kind) VALUES (2, 1, 'discovered-from')",
+            [],
+        )
+        .unwrap();
+
+        let mut store = Store::from_connection(conn).unwrap();
+        let carried = store.deps_of(2).unwrap();
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].kind, DepKind::DiscoveredFrom);
+
+        store.set_blocks_deps(2, &[1]).unwrap();
+        let kinds: Vec<DepKind> = store.deps_of(2).unwrap().iter().map(|d| d.kind).collect();
+        assert_eq!(kinds, vec![DepKind::Blocks, DepKind::DiscoveredFrom]);
     }
 
     /// A database created at schema version 1 (state still named 'backlog')
