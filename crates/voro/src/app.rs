@@ -80,11 +80,14 @@ pub struct TaskRow {
     pub blockers: Vec<DepRef>,
 }
 
-/// What a text prompt is collecting, and the transition it feeds.
+/// What a text prompt is collecting, and the transition it feeds — or, for
+/// `RefineNote`, the agent launch it feeds instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     Ask,
     RejectWork,
+    /// The one-line brief a note-driven refine hands its agent (DESIGN.md §6).
+    RefineNote,
 }
 
 impl PromptKind {
@@ -92,13 +95,18 @@ impl PromptKind {
         match self {
             PromptKind::Ask => "Question",
             PromptKind::RejectWork => "Rejection feedback",
+            PromptKind::RefineNote => "Refine note — what needs fixing",
         }
     }
 
-    fn action(self, text: String) -> Action {
+    /// The transition this prompt feeds, where it feeds one. A refine note
+    /// feeds no transition: the task stays `proposed` and an agent rewrites
+    /// its body (DESIGN.md §6).
+    fn action(self, text: String) -> Option<Action> {
         match self {
-            PromptKind::Ask => Action::Ask(text),
-            PromptKind::RejectWork => Action::RejectWork(text),
+            PromptKind::Ask => Some(Action::Ask(text)),
+            PromptKind::RejectWork => Some(Action::RejectWork(text)),
+            PromptKind::RefineNote => None,
         }
     }
 }
@@ -270,6 +278,11 @@ pub struct App {
     /// the half-finished done report a dispatched session left behind, which a
     /// PR cannot be opened from. Re-derived per refresh, never stored.
     pub incomplete_report: std::collections::HashSet<i64>,
+    /// Proposals whose body an agent has reworked (DESIGN.md §6): what renders
+    /// the `↻ refined` marker, so the operator triages the improved version
+    /// knowing it moved. Re-derived per refresh and cleared by triage itself,
+    /// since the flag is gated on `proposed`.
+    pub refined: std::collections::HashSet<i64>,
     /// Every dependency edge, both directions, keyed by task id — what the
     /// detail views render as `blocked by #N` / `blocks #N` (task #103).
     /// Loaded whole per refresh so the render path never queries the store.
@@ -380,6 +393,7 @@ impl App {
             counts: StateCounts::default(),
             all: Vec::new(),
             incomplete_report: std::collections::HashSet::new(),
+            refined: std::collections::HashSet::new(),
             deps: std::collections::HashMap::new(),
             dependents: std::collections::HashMap::new(),
             docs: std::collections::HashMap::new(),
@@ -493,6 +507,16 @@ impl App {
             .filter_map(|r| {
                 self.store
                     .incomplete_report_flag(r.task.id)
+                    .ok()?
+                    .then_some(r.task.id)
+            })
+            .collect();
+        self.refined = all
+            .iter()
+            .filter(|r| r.task.state == TaskState::Proposed)
+            .filter_map(|r| {
+                self.store
+                    .refined_flag(r.task.id)
                     .ok()?
                     .then_some(r.task.id)
             })
@@ -1179,11 +1203,53 @@ impl App {
                 self.pending_editor = Some(EditorRequest::Create { project_id });
             }
             CreateFlow::Plan => {
-                match crate::dispatch::plan_session(&self.store, &self.dispatch_ctx, project_id) {
+                match crate::dispatch::plan_session(
+                    &self.store,
+                    &self.dispatch_ctx,
+                    crate::dispatch::PlanTarget::Create { project_id },
+                ) {
                     Ok(launch) => self.pending_plan = Some(launch),
                     Err(e) => self.status = Some(e),
                 }
             }
+        }
+    }
+
+    /// Whether a task is still awaiting triage — what gates the triage menu's
+    /// refine keys.
+    pub fn is_proposed(&self, task_id: i64) -> bool {
+        self.all
+            .iter()
+            .any(|r| r.task.id == task_id && r.task.state == TaskState::Proposed)
+    }
+
+    /// Note-driven refine (DESIGN.md §6): hand the body, the note, and the
+    /// discovered-from context to a headless agent that rewrites the body in
+    /// place. No transition — the task stays `proposed` and comes back round
+    /// for a verdict on the improved version.
+    fn refine_with_note(&mut self, task_id: i64, note: &str) {
+        match crate::dispatch::refine(&mut self.store, &self.dispatch_ctx, task_id, note) {
+            Ok(summary) => {
+                self.status = Some(summary);
+                let result = self.refresh();
+                self.report(result);
+            }
+            Err(e) => self.status = Some(e),
+        }
+    }
+
+    /// Interactive refine (DESIGN.md §6): the planning harness pointed at a
+    /// task that already exists, so the operator talks the body into shape and
+    /// the agent applies it with `set --body-file`. Same foreground round-trip
+    /// as `N`, and the same "no-op with an explanation" failure style.
+    fn refine_interactively(&mut self, task_id: i64) {
+        match crate::dispatch::plan_session(
+            &self.store,
+            &self.dispatch_ctx,
+            crate::dispatch::PlanTarget::Refine { task_id },
+        ) {
+            Ok(launch) => self.pending_plan = Some(launch),
+            Err(e) => self.status = Some(e),
         }
     }
 
@@ -2096,6 +2162,22 @@ impl App {
                 sel = (sel + 1).min(actions.len().saturating_sub(1));
             }
             KeyCode::Char('k') | KeyCode::Up => sel = sel.saturating_sub(1),
+            // The fourth triage outcome (DESIGN.md §6), on the two keys the
+            // menu advertises for a proposal: `r` collects a one-line note for
+            // a headless rewrite, `R` opens the interactive conversation. Both
+            // leave the task `proposed`, so neither is a menu verdict.
+            KeyCode::Char('r') | KeyCode::Char('R') if self.is_proposed(task_id) => {
+                if key.code == KeyCode::Char('r') {
+                    self.mode = Mode::Prompt {
+                        task_id,
+                        kind: PromptKind::RefineNote,
+                        buffer: String::new(),
+                    };
+                } else {
+                    self.refine_interactively(task_id);
+                }
+                return;
+            }
             KeyCode::Enter => {
                 let action = actions[sel].clone();
                 let kind = match action {
@@ -2129,7 +2211,10 @@ impl App {
         match key.code {
             KeyCode::Esc => return,
             KeyCode::Enter => {
-                self.apply_and_refresh(task_id, kind.action(buffer));
+                match kind.action(buffer.clone()) {
+                    Some(action) => self.apply_and_refresh(task_id, action),
+                    None => self.refine_with_note(task_id, &buffer),
+                }
                 return;
             }
             KeyCode::Backspace => {
@@ -2549,6 +2634,78 @@ mod tests {
         // the triaged task re-enters the queue as startable work
         assert_eq!(app.queue.rows.len(), 1);
         assert_eq!(app.enter_hint(), Some("⏎ act"));
+    }
+
+    /// The two keystrokes a proposal's triage menu now takes: Enter folds the
+    /// project's digest open, Enter on the proposal beneath it opens the menu.
+    fn open_triage_menu(app: &mut App) -> i64 {
+        key(app, KeyCode::Enter);
+        app.move_selection(1);
+        key(app, KeyCode::Enter);
+        match &app.mode {
+            Mode::Transition { task_id, .. } => *task_id,
+            _ => panic!("expected the triage menu"),
+        }
+    }
+
+    /// `r` in the triage menu collects the note the refine agent is briefed
+    /// with (DESIGN.md §6). The launch itself needs a configured agent, which
+    /// the dummy context has none of, so what is asserted here is the path: the
+    /// prompt opens, submitting it reaches the dispatch, and the task stays
+    /// `proposed` either way — refine is an event, not a verdict.
+    #[test]
+    fn refine_key_in_the_triage_menu_collects_a_note_and_moves_no_state() {
+        let mut app = app_with(&[TaskState::Proposed]);
+        let task_id = open_triage_menu(&mut app);
+
+        key(&mut app, KeyCode::Char('r'));
+        match &app.mode {
+            Mode::Prompt {
+                kind: PromptKind::RefineNote,
+                buffer,
+                ..
+            } => assert!(buffer.is_empty(), "buffer was {buffer:?}"),
+            _ => panic!("r on a proposal should open the refine-note prompt"),
+        }
+
+        for c in "thin".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.status.is_some(), "the launch outcome is reported");
+        assert_eq!(
+            app.store.task(task_id).unwrap().state,
+            TaskState::Proposed,
+            "refine never transitions the task"
+        );
+    }
+
+    /// `R` opens the interactive variant — the planning harness pointed at the
+    /// existing task. The dummy context configures no `plan` verb, so the
+    /// failure lands on the status line rather than transitioning anything.
+    #[test]
+    fn talk_key_in_the_triage_menu_reaches_the_plan_flow() {
+        let mut app = app_with(&[TaskState::Proposed]);
+        let task_id = open_triage_menu(&mut app);
+
+        key(&mut app, KeyCode::Char('R'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.pending_plan.is_some() || app.status.is_some());
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Proposed);
+    }
+
+    /// The refine keys belong to the triage menu alone: on any other state the
+    /// menu keeps its own bindings, so `r` is not swallowed.
+    #[test]
+    fn the_refine_keys_are_inert_outside_a_proposal() {
+        let mut app = app_with(&[TaskState::Ready]);
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('r'));
+        assert!(
+            matches!(app.mode, Mode::Transition { .. }),
+            "r should not open a refine prompt on a ready task"
+        );
     }
 
     #[test]

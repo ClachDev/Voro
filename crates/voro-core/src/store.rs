@@ -982,7 +982,82 @@ impl Store {
         self.task(id)
     }
 
+    /// Record that a `proposed` task's body has been sent for agent refinement
+    /// (DESIGN.md §6): a `refined` event carrying the operator's note, and
+    /// nothing else — refine is an event on a proposed task, not a state, so
+    /// this touches neither `tasks.state` nor priority nor deps. The event is
+    /// what marks the row `↻ refined` in the triage queue until the task is
+    /// triaged out of `proposed`.
+    pub fn record_refine(&mut self, id: i64, note: &str) -> Result<Task> {
+        if note.trim().is_empty() {
+            return Err(Error::Invalid("a refine note is required".into()));
+        }
+        let task = self.task(id)?;
+        if task.state != TaskState::Proposed {
+            return Err(Error::Invalid(format!(
+                "only a proposed task can be refined; task {} is {}",
+                id, task.state
+            )));
+        }
+        log_event(&self.conn, id, "refined", Some(note.trim()))?;
+        self.task(id)
+    }
+
+    /// Whether `task_id` is a `proposed` task whose body has been through a
+    /// refine (DESIGN.md §6) — what renders the `↻ refined` marker. Gated on
+    /// `proposed`, so triaging the task clears it; derived fresh, never stored.
+    pub fn refined_flag(&self, task_id: i64) -> Result<bool> {
+        let state: Option<TaskState> = self
+            .conn
+            .query_row("SELECT state FROM tasks WHERE id = ?1", [task_id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if state != Some(TaskState::Proposed) {
+            return Ok(false);
+        }
+        let refines: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE task_id = ?1 AND kind = 'refined'",
+            [task_id],
+            |r| r.get(0),
+        )?;
+        Ok(refines > 0)
+    }
+
+    /// The newest refine note recorded on a task, for the seed context a refine
+    /// agent is launched with and for the detail views.
+    pub fn latest_refine_note(&self, task_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT detail FROM events WHERE task_id = ?1 AND kind = 'refined'
+                 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     // --- deps ---
+
+    /// The task a proposal was discovered from (the `discovered-from` edge of
+    /// §5), if any — the context a sloppy proposal is usually missing, which is
+    /// what a refine session is seeded with. The newest edge wins if a task
+    /// somehow carries several.
+    pub fn discovered_from(&self, task_id: i64) -> Result<Option<Task>> {
+        let parent: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT depends_on FROM deps
+                 WHERE task_id = ?1 AND kind = 'discovered-from'
+                 ORDER BY depends_on DESC LIMIT 1",
+                [task_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        parent.map(|id| self.task(id)).transpose()
+    }
 
     pub fn add_dep(&mut self, task_id: i64, depends_on: i64, kind: DepKind) -> Result<()> {
         if kind != DepKind::Blocks && task_id == depends_on {
@@ -2870,6 +2945,110 @@ mod tests {
         // Accepting past review clears it — no PR is opened from `done`.
         s.apply(t.id, Action::Accept).unwrap();
         assert!(!s.incomplete_report_flag(t.id).unwrap(), "done");
+    }
+
+    /// A proposal, its priority and deps recorded so a refine can be shown to
+    /// leave both alone.
+    fn proposal(s: &mut Store, title: &str) -> Task {
+        let p = s.projects().unwrap().first().cloned().unwrap_or_else(|| {
+            s.create_project("voro", "/tmp/voro").unwrap();
+            s.projects().unwrap().remove(0)
+        });
+        s.create_task(NewTask {
+            project_id: p.id,
+            repo_id: None,
+            title: title.into(),
+            body: "thin body".into(),
+            priority: Priority::P2,
+            state: TaskState::Proposed,
+            agent: None,
+            human: false,
+            deep: false,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn record_refine_logs_the_note_and_changes_nothing_else() {
+        use crate::transition::Action;
+
+        let mut s = Store::open_in_memory().unwrap();
+        let blocker = proposal(&mut s, "blocker");
+        let t = proposal(&mut s, "refine me");
+        s.add_dep(t.id, blocker.id, DepKind::Blocks).unwrap();
+        let before = s.task(t.id).unwrap();
+
+        let after = s
+            .record_refine(t.id, "  name the files it touches  ")
+            .unwrap();
+
+        // An event on a proposed task, not a state (DESIGN.md §6): state,
+        // priority, deps, and the body itself are all untouched.
+        assert_eq!(after.state, TaskState::Proposed);
+        assert_eq!(after.priority, before.priority);
+        assert_eq!(after.body, before.body);
+        assert_eq!(s.deps_of(t.id).unwrap().len(), 1);
+        assert!(s.refined_flag(t.id).unwrap());
+        assert_eq!(
+            s.latest_refine_note(t.id).unwrap().as_deref(),
+            Some("name the files it touches")
+        );
+        let refines: Vec<_> = s
+            .events_for(t.id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "refined")
+            .collect();
+        assert_eq!(refines.len(), 1);
+
+        // A second pass supersedes the note the flag reads, keeping both events.
+        s.record_refine(t.id, "and the acceptance criteria")
+            .unwrap();
+        assert_eq!(
+            s.latest_refine_note(t.id).unwrap().as_deref(),
+            Some("and the acceptance criteria")
+        );
+
+        // Triage is what clears the marker — the flag is gated on `proposed`.
+        s.apply(t.id, Action::Triage(crate::transition::Triage::Parked))
+            .unwrap();
+        assert!(!s.refined_flag(t.id).unwrap());
+    }
+
+    #[test]
+    fn record_refine_is_refused_outside_proposed_and_without_a_note() {
+        use crate::transition::Action;
+
+        let mut s = Store::open_in_memory().unwrap();
+        let t = proposal(&mut s, "refine me");
+
+        let err = s.record_refine(t.id, "   ").unwrap_err().to_string();
+        assert!(err.contains("note"), "{err}");
+        assert!(!s.refined_flag(t.id).unwrap());
+
+        s.apply(t.id, Action::Triage(crate::transition::Triage::Ready))
+            .unwrap();
+        let err = s.record_refine(t.id, "too late").unwrap_err().to_string();
+        assert!(err.contains("proposed"), "{err}");
+    }
+
+    #[test]
+    fn discovered_from_resolves_the_parent_proposal() {
+        let mut s = Store::open_in_memory().unwrap();
+        let parent = proposal(&mut s, "parent");
+        let child = proposal(&mut s, "child");
+        assert!(s.discovered_from(child.id).unwrap().is_none());
+
+        s.add_dep(child.id, parent.id, DepKind::DiscoveredFrom)
+            .unwrap();
+        assert_eq!(
+            s.discovered_from(child.id).unwrap().map(|t| t.id),
+            Some(parent.id)
+        );
+        // A plain blocker is not a parent: only `discovered-from` carries the
+        // context a proposal was written against.
+        let blocker = proposal(&mut s, "blocker");
+        assert!(s.discovered_from(blocker.id).unwrap().is_none());
     }
 
     #[test]
