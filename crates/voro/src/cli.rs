@@ -9,8 +9,8 @@ use std::fmt::Write as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use voro_core::{
-    Action, AgentsConfig, DepKind, NewTask, PrRef, Priority, Project, Repo, ReviewAction,
-    ReviewMedium, Store, Task, TaskEdit, TaskState, Triage, scheduler,
+    Action, AgentsConfig, DepKind, Doc, NewTask, PrRef, Priority, Project, QueueRow, Repo,
+    ReviewAction, ReviewMedium, Store, Task, TaskEdit, TaskState, Triage, WipGate, scheduler,
 };
 
 use crate::dispatch::{self, DispatchCtx};
@@ -57,13 +57,35 @@ repos                             a project allocates attention; its repos
                                   default while others remain, and one any
                                   task still names
 
+documents                         the plan or design doc a body of work derives
+                                  from, linked to the tasks it spawned so the
+                                  derivation is queryable and reaches the agent
+  doc add <project> <path-or-url> [--title T] [--repo NAME]
+                                  register a document against a project; an
+                                  absolute path inside one of its checkouts is
+                                  stored relative to that checkout, so the link
+                                  survives the checkout moving. --repo picks
+                                  which checkout a relative path is read from
+  doc list [project]              list documents with how many tasks cite each
+  doc show <doc>                  a document and every task linked to it, with
+                                  states — the progress view for one plan
+  doc link <doc> <task-ids>       link tasks to a document; a task in any
+                                  project may cite it, since one plan routinely
+                                  spawns work across several
+  doc unlink <doc> <task-ids>     drop those links
+  doc remove <doc>                unregister a document, unlinking its tasks
+                                  <doc> is a document id or its exact location
+
 tasks
   add <project> <title> [--body TEXT | --body-file PATH] [--priority 0-3]
       [--state proposed|parked|ready] [--agent NAME] [--blocked-by IDS]
-      [--blocks IDS] [--human] [--deep] [--repo NAME]
+      [--blocks IDS] [--human] [--deep] [--repo NAME] [--doc DOCS]
                                   --repo names which of the project's repos
                                   the task runs in; omitted, it runs in the
                                   project's default repo
+                                  --doc links the task to registered documents
+                                  (ids or locations, comma-separated), which
+                                  dispatch then names in the agent's prompt
                                   --blocked-by lists the tasks this one waits
                                   on; --blocks makes the listed tasks wait on
                                   this one
@@ -81,7 +103,7 @@ tasks
       [--body TEXT | --body-file PATH] [--blocked-by IDS] [--blocks IDS]
       [--pr URL | --no-pr] [--branch NAME | --no-branch] [--human | --no-human]
       [--deep | --no-deep] [--summary TEXT | --summary-file PATH]
-      [--repo NAME | --no-repo]
+      [--repo NAME | --no-repo] [--doc DOCS | --no-doc]
                                   --blocked-by replaces this task's own
                                   blocker list; --blocks adds this task as a
                                   blocker of each listed task
@@ -97,16 +119,26 @@ tasks
                                   project default
                                   --deep dispatches on the agent's strongest
                                   model; --no-deep returns it to the workhorse
-  show <task-id>                  full task: body, deps, events
-  list [--state STATE] [--project P]
+                                  --doc replaces the task's whole document list
+                                  (`voro doc link` adds one without listing the
+                                  rest); --no-doc clears it
+  show <task-id>                  full task: body, docs, deps, events
+  list [--state STATE] [--project P] [--doc DOC]
+                                  --doc answers 'which tasks derive from this
+                                  plan?'
   inbox                           the next-action queue: questions, reviews,
-                                  proposals, top ready tasks — by score
+                                  proposals, top ready tasks — ranked by score
+                                  divided by what each action costs your
+                                  attention. Proposals ride as one digest row
+                                  per project; dispatch rows give way to a
+                                  capacity line once max_running are in flight
   next                            the single highest-scoring ready task
   stats                           task counts by state — the triage backlog
                                   (§12) plus ready, running, needs-input,
                                   review, waiting, stalled, done; excludes
                                   parked projects
-  explain <task-id>               score decomposition
+  explain <task-id>               score decomposition, and the divisor the
+                                  inbox ranks it by
   import <project> [--repo NAME] [--gh-repo owner/name]
                                   import open GitHub issues as proposed
                                   tasks via `gh issue list`; idempotent.
@@ -209,6 +241,10 @@ enum Verb {
     Repo {
         #[command(subcommand)]
         cmd: RepoCmd,
+    },
+    Doc {
+        #[command(subcommand)]
+        cmd: DocCmd,
     },
     Weight {
         project: String,
@@ -330,6 +366,39 @@ enum RepoCmd {
     },
 }
 
+/// The plan and design documents a project's work derives from (DESIGN.md
+/// §3/§5). `<doc>` throughout is a document id or its exact stored location.
+#[derive(Subcommand)]
+enum DocCmd {
+    Add {
+        project: String,
+        location: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    List {
+        project: Option<String>,
+    },
+    Show {
+        doc: String,
+    },
+    Link {
+        doc: String,
+        #[arg(value_name = "TASK-IDS", required = true)]
+        task_ids: Vec<String>,
+    },
+    Unlink {
+        doc: String,
+        #[arg(value_name = "TASK-IDS", required = true)]
+        task_ids: Vec<String>,
+    },
+    Remove {
+        doc: String,
+    },
+}
+
 #[derive(Subcommand)]
 enum AgentCmd {
     Init,
@@ -369,6 +438,8 @@ struct AddArgs {
     deep: bool,
     #[arg(long)]
     repo: Option<String>,
+    #[arg(long)]
+    doc: Option<String>,
 }
 
 #[derive(Args)]
@@ -431,6 +502,10 @@ struct SetArgs {
     repo: Option<String>,
     #[arg(long, conflicts_with = "repo")]
     no_repo: bool,
+    #[arg(long)]
+    doc: Option<String>,
+    #[arg(long, conflicts_with = "doc")]
+    no_doc: bool,
 }
 
 #[derive(Args)]
@@ -439,6 +514,8 @@ struct ListArgs {
     state: Option<String>,
     #[arg(long)]
     project: Option<String>,
+    #[arg(long)]
+    doc: Option<String>,
 }
 
 #[derive(Args)]
@@ -534,16 +611,17 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
     match cli.verb {
         Verb::Project { cmd } => project_verb(store, cmd),
         Verb::Repo { cmd } => repo_verb(store, cmd),
+        Verb::Doc { cmd } => doc_verb(store, cmd),
         Verb::Weight { project, weight } => weight_verb(store, &project, weight),
         Verb::Add(args) => add_verb(store, args),
         Verb::Propose(args) => propose_verb(store, args),
         Verb::Set(args) => set_verb(store, args),
         Verb::Show { task_id } => show_verb(store, task_id),
         Verb::List(args) => list_verb(store, &args),
-        Verb::Inbox => inbox_verb(store),
+        Verb::Inbox => inbox_verb(store, ctx),
         Verb::Next => next_verb(store),
         Verb::Stats => stats_verb(store),
-        Verb::Explain { task_id } => explain_verb(store, task_id),
+        Verb::Explain { task_id } => explain_verb(store, task_id, ctx),
         Verb::Agent { cmd } => agent_verb(cmd, ctx),
         Verb::Dispatch { task_id, agent } => {
             dispatch::dispatch(store, ctx, task_id, agent.as_deref())
@@ -828,6 +906,200 @@ fn resolve_repo(store: &Store, project: &Project, name: &str) -> Result<Repo, St
         .map_err(|e| e.to_string())
 }
 
+/// The `doc` verbs (DESIGN.md §3/§5): register the plan a body of work derives
+/// from, and link it to the tasks it spawned. Every refusal — an unknown repo,
+/// a path outside the checkout it names, a duplicate registration — comes from
+/// the store API; this only resolves which project, repo, doc, and tasks are
+/// meant.
+fn doc_verb(store: &mut Store, cmd: DocCmd) -> Result<String, String> {
+    match cmd {
+        DocCmd::Add {
+            project,
+            location,
+            title,
+            repo,
+        } => {
+            let project = resolve_project(store, &project)?;
+            let repo = match &repo {
+                Some(name) => Some(resolve_repo(store, &project, name)?),
+                None => None,
+            };
+            let doc = store
+                .create_doc(
+                    project.id,
+                    repo.as_ref().map(|r| r.id),
+                    &location,
+                    title.as_deref(),
+                )
+                .map_err(|e| e.to_string())?;
+            let mut out = format!(
+                "doc {} '{}' registered against {}",
+                doc.id,
+                doc.label(),
+                project.name
+            );
+            // The stored location is often not the one typed — an absolute path
+            // inside a checkout is relativised — so echo what will be resolved.
+            if doc.location != location.trim() {
+                write!(out, " as {}", doc.location).unwrap();
+            }
+            write!(
+                out,
+                "\nlink tasks to it with `voro doc link {} <task-ids>`",
+                doc.id
+            )
+            .unwrap();
+            Ok(out)
+        }
+        DocCmd::List { project } => {
+            let projects = match project {
+                Some(key) => vec![resolve_project(store, &key)?],
+                None => store.projects().map_err(|e| e.to_string())?,
+            };
+            let mut out = String::new();
+            for project in projects {
+                for doc in store.docs(project.id).map_err(|e| e.to_string())? {
+                    let linked = store
+                        .tasks_for_doc(doc.id)
+                        .map_err(|e| e.to_string())?
+                        .len();
+                    let title = match &doc.title {
+                        Some(title) => format!("  {title}"),
+                        None => String::new(),
+                    };
+                    writeln!(
+                        out,
+                        "{:3}  {:14} {}{title}  [{linked} task(s)]",
+                        doc.id, project.name, doc.location
+                    )
+                    .unwrap();
+                }
+            }
+            Ok(out)
+        }
+        DocCmd::Show { doc } => doc_show(store, &doc),
+        DocCmd::Link { doc, task_ids } => {
+            let doc = resolve_doc(store, &doc)?;
+            let mut out = String::new();
+            for id in parse_ids("doc link", &task_ids.join(","))? {
+                let linked = store.link_doc(id, doc.id).map_err(|e| e.to_string())?;
+                let verb = if linked { "linked" } else { "already linked" };
+                writeln!(out, "#{id} {verb} to doc {} '{}'", doc.id, doc.label()).unwrap();
+            }
+            Ok(out)
+        }
+        DocCmd::Unlink { doc, task_ids } => {
+            let doc = resolve_doc(store, &doc)?;
+            let mut out = String::new();
+            for id in parse_ids("doc unlink", &task_ids.join(","))? {
+                let unlinked = store.unlink_doc(id, doc.id).map_err(|e| e.to_string())?;
+                let verb = if unlinked {
+                    "unlinked from"
+                } else {
+                    "not linked to"
+                };
+                writeln!(out, "#{id} {verb} doc {} '{}'", doc.id, doc.label()).unwrap();
+            }
+            Ok(out)
+        }
+        DocCmd::Remove { doc } => {
+            let doc = resolve_doc(store, &doc)?;
+            let freed = store.delete_doc(doc.id).map_err(|e| e.to_string())?;
+            let mut out = format!("doc {} '{}' removed", doc.id, doc.label());
+            if !freed.is_empty() {
+                write!(out, " — unlinked from {} task(s)", freed.len()).unwrap();
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// `doc show <doc>`: the document, where it resolves to, and the rollup of
+/// every task that cites it with its state — the per-plan progress view.
+fn doc_show(store: &mut Store, key: &str) -> Result<String, String> {
+    let doc = resolve_doc(store, key)?;
+    let project = store.project(doc.project_id).map_err(|e| e.to_string())?;
+    let mut out = format!("doc {}  {}\n", doc.id, doc.label());
+    writeln!(out, "project: {}", project.name).unwrap();
+    writeln!(out, "location: {}", doc.location).unwrap();
+    let resolved = store.resolve_doc(&doc).map_err(|e| e.to_string())?;
+    if resolved != doc.location {
+        writeln!(out, "resolves to: {resolved}").unwrap();
+    }
+    writeln!(out, "registered {}", doc.created_at).unwrap();
+
+    let tasks = store.tasks_for_doc(doc.id).map_err(|e| e.to_string())?;
+    let projects = store.projects().map_err(|e| e.to_string())?;
+    if tasks.is_empty() {
+        writeln!(
+            out,
+            "\nno tasks linked yet — `voro doc link {} <task-ids>`",
+            doc.id
+        )
+        .unwrap();
+        return Ok(out);
+    }
+    writeln!(out, "\ntasks ({}):", tasks.len()).unwrap();
+    for task in &tasks {
+        let name = projects
+            .iter()
+            .find(|p| p.id == task.project_id)
+            .map(|p| p.name.as_str())
+            .unwrap_or("?");
+        writeln!(out, "  {}", task_line(task, name)).unwrap();
+    }
+    // The rollup the plan is actually read for: how far its work has got.
+    let mut counts: Vec<(TaskState, usize)> = Vec::new();
+    for task in &tasks {
+        match counts.iter_mut().find(|(s, _)| *s == task.state) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((task.state, 1)),
+        }
+    }
+    counts.sort_by_key(|(s, _)| s.as_str());
+    let rollup: Vec<String> = counts
+        .into_iter()
+        .map(|(state, n)| format!("{n} {state}"))
+        .collect();
+    writeln!(out, "\n{}", rollup.join(" · ")).unwrap();
+    Ok(out)
+}
+
+/// Name a registered document by id or by its exact stored location. A location
+/// shared by two projects' registrations is an ambiguity the operator resolves
+/// by id rather than one this picks a winner for.
+fn resolve_doc(store: &Store, key: &str) -> Result<Doc, String> {
+    if let Ok(id) = key.parse::<i64>() {
+        return store.doc(id).map_err(|e| e.to_string());
+    }
+    let matches = store.docs_at(key).map_err(|e| e.to_string())?;
+    match matches.len() {
+        1 => Ok(matches.into_iter().next().expect("one match")),
+        0 => Err(format!(
+            "no document at '{key}' — register one with `voro doc add <project> {key}`, or name \
+             an id from `voro doc list`"
+        )),
+        _ => Err(format!(
+            "'{key}' is registered by more than one project — name it by id ({})",
+            matches
+                .iter()
+                .map(|d| d.id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Resolve a `--doc` flag's comma- or space-separated list of ids and
+/// locations into concrete documents, in the order given.
+fn resolve_docs(store: &Store, raw: &str) -> Result<Vec<Doc>, String> {
+    raw.split([',', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|key| resolve_doc(store, key))
+        .collect()
+}
+
 /// Manage the `voro.toml` that dispatch resolves against — config that lives
 /// outside the database (DESIGN.md §8), so this verb takes no `store`.
 fn agent_verb(cmd: AgentCmd, ctx: &DispatchCtx) -> Result<String, String> {
@@ -965,6 +1237,13 @@ fn add_verb(store: &mut Store, args: AddArgs) -> Result<String, String> {
     if let Some(repo) = &repo {
         out.push_str(&format!(" in repo '{}'", repo.name));
     }
+    if let Some(raw) = &args.doc {
+        let docs = resolve_docs(store, raw)?;
+        for doc in &docs {
+            store.link_doc(task.id, doc.id).map_err(|e| e.to_string())?;
+        }
+        write!(out, "\n{}", doc_link_echo(&docs)).unwrap();
+    }
     if let Some(raw) = &args.blocks {
         out.push_str(&apply_blocks_flag(store, task.id, raw)?);
     }
@@ -1080,10 +1359,32 @@ fn set_verb(store: &mut Store, args: SetArgs) -> Result<String, String> {
     } else {
         task
     };
+    // `--doc` replaces the whole list, as `--blocked-by` does, so the flag can
+    // drop a link as well as add one; `voro doc link` is the additive spelling.
+    let docs_echo = if args.no_doc {
+        store.set_task_docs(id, &[]).map_err(|e| e.to_string())?;
+        "\nno documents linked".to_string()
+    } else if let Some(raw) = &args.doc {
+        let ids: Vec<i64> = resolve_docs(store, raw)?.iter().map(|d| d.id).collect();
+        let docs = store.set_task_docs(id, &ids).map_err(|e| e.to_string())?;
+        format!("\n{}", doc_link_echo(&docs))
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "task {} updated ({}){blocks_echo}",
+        "task {} updated ({}){blocks_echo}{docs_echo}",
         task.id, task.state
     ))
+}
+
+/// How a mutated document list reads back — the ids and labels now linked, so
+/// the operator sees the resolution a bare id or a path matched.
+fn doc_link_echo(docs: &[Doc]) -> String {
+    let listed: Vec<String> = docs
+        .iter()
+        .map(|d| format!("{} '{}'", d.id, d.label()))
+        .collect();
+    format!("docs: {}", listed.join(", "))
 }
 
 /// `pr <task-id> [--yes]` (DESIGN.md §8/§11c): the per-project "show me this
@@ -1279,6 +1580,15 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
         )
         .unwrap();
     }
+    // The plans this task implements (DESIGN.md §3), resolved to where they
+    // actually are — the same absolute location dispatch hands the agent.
+    for doc in store.docs_for_task(id).map_err(|e| e.to_string())? {
+        let resolved = store.resolve_doc(&doc).map_err(|e| e.to_string())?;
+        match &doc.title {
+            Some(title) => writeln!(out, "doc: {title} — {resolved}").unwrap(),
+            None => writeln!(out, "doc: {resolved}").unwrap(),
+        }
+    }
     let deps = store.deps_of(id).map_err(|e| e.to_string())?;
     for dep in &deps {
         // `deps(task_id, depends_on, 'blocks')` means this task is blocked
@@ -1314,11 +1624,29 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
         Some(key) => Some(resolve_project(store, key)?.id),
         None => None,
     };
+    // "Which tasks derive from this plan?" — the query the doc link exists for.
+    let doc_filter: Option<Vec<i64>> = match &args.doc {
+        Some(key) => {
+            let doc = resolve_doc(store, key)?;
+            Some(
+                store
+                    .tasks_for_doc(doc.id)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|t| t.id)
+                    .collect(),
+            )
+        }
+        None => None,
+    };
     let projects = store.projects().map_err(|e| e.to_string())?;
     let mut out = String::new();
     for task in store.tasks().map_err(|e| e.to_string())? {
         if state_filter.is_some_and(|s| task.state != s)
             || project_filter.is_some_and(|p| task.project_id != p)
+            || doc_filter
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&task.id))
         {
             continue;
         }
@@ -1356,34 +1684,89 @@ fn review_next_suffix(task: &Task) -> String {
         .map_or_else(String::new, |verb| format!("  next: {verb}"))
 }
 
-fn inbox_verb(store: &mut Store) -> Result<String, String> {
+fn inbox_verb(store: &mut Store, ctx: &DispatchCtx) -> Result<String, String> {
+    let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     let candidates = store.candidates().map_err(|e| e.to_string())?;
+    let gate = WipGate {
+        running: store.state_counts().map_err(|e| e.to_string())?.running,
+        max_running: config.max_running(),
+    };
+    let queue = scheduler::queue(&candidates, &config.costs(), gate);
     let mut out = String::new();
-    for c in scheduler::queue(&candidates) {
-        // The queue row carries the verb instead of the state: every inbox row
-        // is a next action (DESIGN.md §3), like the TUI queue.
-        write!(
+    // The capacity line stands in for the dispatch rows the gate suppressed,
+    // so an inbox with no startable work still says why (DESIGN.md §7).
+    if let Some(gate) = queue.at_capacity {
+        writeln!(
             out,
-            "{:5.1}  #{} {:10} {} {}: {}",
-            c.score.total,
-            c.task.id,
-            c.task.next_action().map_or("", |a| a.as_str()),
-            c.task.priority,
-            c.project_name,
-            c.task.title
+            "⏸ dispatch at capacity ({}/{} running)",
+            gate.running, gate.max_running
         )
         .unwrap();
-        if let Some(q) = &c.task.question {
-            write!(out, "  — {q}").unwrap();
+    }
+    for row in &queue.rows {
+        match row {
+            QueueRow::Digest(digest) => {
+                // Informational on the CLI: `voro list --state proposed` is
+                // where the constituents are triaged one by one.
+                // The digest hides its constituents' own markers, so the count
+                // of reworked bodies rides the summary row (DESIGN.md §6).
+                let refined = digest
+                    .tasks
+                    .iter()
+                    .filter(|row| store.refined_flag(row.candidate.task.id).unwrap_or(false))
+                    .count();
+                writeln!(
+                    out,
+                    "{:5.1}  ▲ {} awaiting triage ({}){}",
+                    digest.effective,
+                    plural(digest.tasks.len(), "proposal"),
+                    digest.project_name,
+                    if refined > 0 {
+                        format!("  ↻ {refined} refined")
+                    } else {
+                        String::new()
+                    }
+                )
+                .unwrap();
+            }
+            QueueRow::Action(row) => {
+                let c = &row.candidate;
+                // The queue row carries the verb instead of the state: every
+                // inbox row is a next action (DESIGN.md §3), like the TUI queue.
+                // The score is the effective one the row is ranked by; `explain`
+                // is where the division back to the raw score is shown.
+                write!(
+                    out,
+                    "{:5.1}  #{} {:10} {} {}: {}",
+                    row.effective,
+                    c.task.id,
+                    row.action.as_str(),
+                    c.task.priority,
+                    c.project_name,
+                    c.task.title
+                )
+                .unwrap();
+                if let Some(q) = &c.task.question {
+                    write!(out, "  — {q}").unwrap();
+                }
+                write!(out, "{}", refined_suffix(store, c.task.id)).unwrap();
+                write!(out, "{}", incomplete_report_suffix(store, c.task.id)).unwrap();
+                writeln!(out).unwrap();
+            }
         }
-        write!(out, "{}", refined_suffix(store, c.task.id)).unwrap();
-        write!(out, "{}", incomplete_report_suffix(store, c.task.id)).unwrap();
-        writeln!(out).unwrap();
     }
     if out.is_empty() {
         out = "nothing needs you\n".to_string();
     }
     Ok(out)
+}
+
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("{n} {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }
 
 /// Task counts by state (DESIGN.md §12) as a scriptable readout, excluding
@@ -1451,7 +1834,8 @@ fn refined_suffix(store: &Store, task_id: i64) -> &'static str {
     }
 }
 
-fn explain_verb(store: &mut Store, id: i64) -> Result<String, String> {
+fn explain_verb(store: &mut Store, id: i64, ctx: &DispatchCtx) -> Result<String, String> {
+    let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     let task = store.task(id).map_err(|e| e.to_string())?;
     let b = store.explain(id).map_err(|e| e.to_string())?;
     let mut out = String::new();
@@ -1471,7 +1855,14 @@ fn explain_verb(store: &mut Store, id: i64) -> Result<String, String> {
         b.state_bonus
     )
     .unwrap();
-    writeln!(out, "base w×(p+s)    {:>6.1}", b.base).unwrap();
+    writeln!(
+        out,
+        "blocks          {:>6}  (bonus +{}, 1/dependent, cap 2)",
+        format!("×{}", b.open_dependents),
+        b.unblock_bonus
+    )
+    .unwrap();
+    writeln!(out, "base w×(p+s+u)  {:>6.1}", b.base).unwrap();
     writeln!(out, "age             {:>6.1} days", b.age_days).unwrap();
     writeln!(
         out,
@@ -1480,6 +1871,18 @@ fn explain_verb(store: &mut Store, id: i64) -> Result<String, String> {
     )
     .unwrap();
     writeln!(out, "total           {:>6.2}", b.total).unwrap();
+    // What the inbox actually ranks by: the total priced by what the row asks
+    // of the operator (DESIGN.md §7).
+    if let Some(e) = scheduler::effective_score(&task, b.total, &config.costs()) {
+        writeln!(
+            out,
+            "action          {:>6}  (cost ÷{})",
+            e.action.as_str(),
+            e.cost
+        )
+        .unwrap();
+        writeln!(out, "effective       {:>6.2}  (inbox rank)", e.effective).unwrap();
+    }
     if !matches!(
         task.state,
         TaskState::Ready | TaskState::NeedsInput | TaskState::Review | TaskState::Stalled
@@ -1685,7 +2088,7 @@ mod tests {
     }
 
     fn ctx() -> DispatchCtx {
-        DispatchCtx::from_db_path(std::path::Path::new("/nonexistent/voro.db"))
+        DispatchCtx::without_config(std::path::Path::new("/nonexistent/voro.db"))
     }
 
     fn ok(store: &mut Store, args: &[&str]) -> String {
@@ -2048,8 +2451,14 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "An idea"]);
-        assert!(ok(&mut s, &["inbox"]).contains("P2 demo: An idea"));
+        // Proposals ride the inbox as one digest row per project (DESIGN.md §7).
+        assert!(
+            ok(&mut s, &["inbox"]).contains("1 proposal awaiting triage (demo)"),
+            "{}",
+            ok(&mut s, &["inbox"])
+        );
         ok(&mut s, &["triage", "1", "ready"]);
+        assert!(ok(&mut s, &["inbox"]).contains("P2 demo: An idea"));
         assert!(ok(&mut s, &["next"]).contains("An idea"));
     }
 
@@ -2094,7 +2503,9 @@ mod tests {
         assert!(!ok(&mut s, &["inbox"]).contains("refined"));
 
         s.record_refine(1, "name the files it touches").unwrap();
-        assert!(ok(&mut s, &["inbox"]).contains("↻ refined"));
+        // The inbox collapses proposals into their project's digest row, so
+        // the marker rides that row as a count; `list` carries it per task.
+        assert!(ok(&mut s, &["inbox"]).contains("↻ 1 refined"));
         assert!(ok(&mut s, &["list"]).contains("↻ refined"));
 
         // `show` names the note both as a header line and in the event log.
@@ -2150,10 +2561,131 @@ mod tests {
         ok(&mut s, &["ask", "4", "--question", "Schema A or B?"]);
 
         let out = ok(&mut s, &["inbox"]);
-        assert!(out.contains("#1 triage"), "{out}");
+        // The proposal is inside the digest rather than carrying a row itself.
+        assert!(out.contains("▲ 1 proposal awaiting triage (demo)"), "{out}");
+        assert!(!out.contains("#1 triage"), "{out}");
         assert!(out.contains("#2 dispatch"), "{out}");
         assert!(out.contains("#3 do"), "{out}");
         assert!(out.contains("#4 answer"), "{out}");
+    }
+
+    /// The inbox ranks by attention price, not raw score (DESIGN.md §7): a
+    /// question outranks a review worth more on paper, and the digest sits
+    /// where its best proposal would.
+    #[test]
+    fn inbox_ranks_a_question_above_a_higher_scoring_review() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["weight", "demo", "3"]);
+        // P0 review: 3×(8+2) = 30 raw, ÷1.4 = 21.4
+        ok(
+            &mut s,
+            &[
+                "add",
+                "demo",
+                "Big diff",
+                "--priority",
+                "0",
+                "--state",
+                "ready",
+            ],
+        );
+        ok(&mut s, &["start", "1"]);
+        ok(
+            &mut s,
+            &["done", "1", "--summary", "did it", "--branch", "b"],
+        );
+        // P2 question: 3×(2+4) = 18 raw, ÷0.8 = 22.5
+        ok(&mut s, &["add", "demo", "Blocked", "--state", "ready"]);
+        ok(&mut s, &["start", "2"]);
+        ok(&mut s, &["ask", "2", "--question", "A or B?"]);
+
+        let out = ok(&mut s, &["inbox"]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("#2 answer"), "{out}");
+        assert!(
+            lines[1].contains("#1 review PR") || lines[1].contains("#1 pr"),
+            "{out}"
+        );
+    }
+
+    /// The `[costs]` table re-prices the same queue (DESIGN.md §7).
+    #[test]
+    fn costs_overrides_in_voro_toml_change_the_inbox_order() {
+        let mut s = store();
+        let ctx = ctx_with_toml("[costs]\nreview = 0.5\n");
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["weight", "demo", "3"]);
+        ok(
+            &mut s,
+            &[
+                "add",
+                "demo",
+                "Big diff",
+                "--priority",
+                "0",
+                "--state",
+                "ready",
+            ],
+        );
+        ok(&mut s, &["start", "1"]);
+        ok(
+            &mut s,
+            &["done", "1", "--summary", "did it", "--branch", "b"],
+        );
+        ok(&mut s, &["add", "demo", "Blocked", "--state", "ready"]);
+        ok(&mut s, &["start", "2"]);
+        ok(&mut s, &["ask", "2", "--question", "A or B?"]);
+
+        // Default costs put the question first; pricing review at 0.5 (30 ÷0.5
+        // = 60 against the question's 22.5) puts the diff back on top.
+        let out = run_with(&mut s, &["inbox"], &ctx).unwrap();
+        assert!(out.lines().next().unwrap().contains("#1 "), "{out}");
+    }
+
+    /// The dispatch WIP gate (DESIGN.md §7): at the cap the inbox offers no
+    /// more dispatches and says why.
+    #[test]
+    fn the_wip_gate_replaces_dispatch_rows_with_a_capacity_line() {
+        let mut s = store();
+        let ctx = ctx_with_toml("max_running = 1\n");
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "In flight", "--state", "ready"]);
+        ok(&mut s, &["add", "demo", "Startable", "--state", "ready"]);
+
+        // Nothing running yet: the startable row is offered.
+        let out = run_with(&mut s, &["inbox"], &ctx).unwrap();
+        assert!(out.contains("dispatch"), "{out}");
+        assert!(!out.contains("at capacity"), "{out}");
+
+        ok(&mut s, &["start", "1"]);
+        let out = run_with(&mut s, &["inbox"], &ctx).unwrap();
+        assert!(
+            out.contains("⏸ dispatch at capacity (1/1 running)"),
+            "{out}"
+        );
+        assert!(!out.contains("dispatch   "), "{out}");
+    }
+
+    /// `explain` shows the division the inbox ranked by (DESIGN.md §7).
+    #[test]
+    fn explain_shows_the_action_divisor_and_effective_score() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["weight", "demo", "3"]);
+        ok(&mut s, &["add", "demo", "Startable", "--state", "ready"]);
+
+        let out = ok(&mut s, &["explain", "1"]);
+        assert!(out.contains("total"), "{out}");
+        assert!(out.contains("dispatch"), "{out}");
+        assert!(out.contains("cost ÷1"), "{out}");
+        assert!(out.contains("effective"), "{out}");
+
+        // A parked task asks nothing of the operator, so there is no action to
+        // price and the effective line is absent.
+        ok(&mut s, &["park", "1"]);
+        let out = ok(&mut s, &["explain", "1"]);
+        assert!(!out.contains("effective"), "{out}");
     }
 
     /// A review row's verb reads the tracked PR: `pr` without one, `review PR`
@@ -2467,6 +2999,21 @@ mod tests {
         propose(&mut s, &["propose", "demo", "Follow-up", "--from", "1"]).unwrap();
         assert!(ok(&mut s, &["show", "2"]).contains("dep: discovered-from 1"));
         assert!(ok(&mut s, &["show", "2"]).contains("#2 proposed"));
+    }
+
+    /// The reported failure end to end: a task proposed from another and then
+    /// gated on it keeps both edges, and `show` renders each.
+    #[test]
+    fn blocked_by_survives_an_existing_discovered_from_edge() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Source", "--state", "ready"]);
+        propose(&mut s, &["propose", "demo", "Follow-up", "--from", "1"]).unwrap();
+
+        ok(&mut s, &["set", "2", "--blocked-by", "1"]);
+        let shown = ok(&mut s, &["show", "2"]);
+        assert!(shown.contains("dep: blocked by #1"), "{shown}");
+        assert!(shown.contains("dep: discovered-from 1"), "{shown}");
     }
 
     #[test]
@@ -3275,8 +3822,20 @@ mod tests {
             &["add", "demo", "T", "--priority", "0", "--state", "ready"],
         );
         let out = ok(&mut s, &["explain", "1"]);
-        assert!(out.contains("base w×(p+s)      16.0"), "{out}");
+        assert!(out.contains("base w×(p+s+u)    16.0"), "{out}");
         assert!(out.contains("state            ready  (bonus +0)"), "{out}");
+        assert!(out.contains("blocks              ×0  (bonus +0"), "{out}");
+
+        // a task another one waits on shows the dependent count and its bonus
+        ok(
+            &mut s,
+            &[
+                "add", "demo", "blocker", "--state", "ready", "--blocks", "1",
+            ],
+        );
+        let out = ok(&mut s, &["explain", "2"]);
+        assert!(out.contains("blocks              ×1  (bonus +1"), "{out}");
+        assert!(out.contains("base w×(p+s+u)     6.0"), "{out}");
     }
 
     #[test]
@@ -3567,5 +4126,192 @@ mod tests {
         assert_eq!(out, "task 1 -> running");
         assert_eq!(store.task(1).unwrap().state, TaskState::Running);
         assert!(store.sessions_for(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_doc_links_tasks_across_projects_and_list_answers_which_derive_from_it() {
+        // The acceptance case (task #267): register a plan, link tasks in
+        // three projects to it, and ask which tasks came from that plan.
+        let mut s = store();
+        ok(&mut s, &["project", "add", "augere", "/tmp/augere"]);
+        ok(&mut s, &["project", "add", "clachdev", "/tmp/clachdev"]);
+        ok(&mut s, &["project", "add", "mote", "/tmp/mote"]);
+
+        let out = ok(
+            &mut s,
+            &[
+                "doc",
+                "add",
+                "augere",
+                "/tmp/augere/docs/strategy.md",
+                "--title",
+                "Strategy 2026",
+            ],
+        );
+        // An absolute path inside the checkout is stored relative to it, and
+        // the echo says so rather than leaving the operator guessing.
+        assert!(out.contains("Strategy 2026"), "{out}");
+        assert!(out.contains("as docs/strategy.md"), "{out}");
+
+        ok(&mut s, &["add", "augere", "fleet plan"]);
+        ok(&mut s, &["add", "clachdev", "blog post"]);
+        ok(&mut s, &["add", "mote", "milestone M0"]);
+        let out = ok(&mut s, &["doc", "link", "1", "1", "2", "3"]);
+        assert!(out.contains("#1 linked"), "{out}");
+        assert!(out.contains("#3 linked"), "{out}");
+        // Re-linking is heard as a no-op, not an error.
+        assert!(ok(&mut s, &["doc", "link", "1", "1"]).contains("already linked"));
+
+        let derived = ok(&mut s, &["list", "--doc", "1"]);
+        for title in ["fleet plan", "blog post", "milestone M0"] {
+            assert!(derived.contains(title), "{derived}");
+        }
+        // ...and a task from no plan is not swept in.
+        ok(&mut s, &["add", "mote", "unrelated"]);
+        assert!(!ok(&mut s, &["list", "--doc", "1"]).contains("unrelated"));
+
+        // A doc is nameable by its stored location as well as its id.
+        assert!(ok(&mut s, &["list", "--doc", "docs/strategy.md"]).contains("blog post"));
+    }
+
+    #[test]
+    fn doc_show_rolls_up_the_states_of_every_task_linked_to_a_plan() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "mote", "/tmp/mote"]);
+        ok(&mut s, &["doc", "add", "mote", "docs/design/fleet.md"]);
+        let empty = ok(&mut s, &["doc", "show", "1"]);
+        assert!(empty.contains("no tasks linked yet"), "{empty}");
+        assert!(
+            empty.contains("resolves to: /tmp/mote/docs/design/fleet.md"),
+            "{empty}"
+        );
+
+        ok(
+            &mut s,
+            &["add", "mote", "M0", "--state", "ready", "--doc", "1"],
+        );
+        ok(
+            &mut s,
+            &["add", "mote", "M1", "--state", "ready", "--doc", "1"],
+        );
+        ok(&mut s, &["add", "mote", "M2", "--doc", "1"]);
+        ok(&mut s, &["start", "1"]);
+
+        let out = ok(&mut s, &["doc", "show", "1"]);
+        assert!(out.contains("tasks (3)"), "{out}");
+        assert!(out.contains("1 proposed"), "{out}");
+        assert!(out.contains("1 ready"), "{out}");
+        assert!(out.contains("1 running"), "{out}");
+        assert!(
+            ok(&mut s, &["doc", "list"]).contains("[3 task(s)]"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn show_renders_a_task_s_documents_at_their_resolved_locations() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "voro", "/tmp/voro"]);
+        ok(
+            &mut s,
+            &["doc", "add", "voro", "docs/DESIGN.md", "--title", "Design"],
+        );
+        ok(&mut s, &["doc", "add", "voro", "https://example.com/rfc"]);
+        ok(&mut s, &["add", "voro", "implement docs"]);
+        ok(&mut s, &["doc", "link", "1", "1"]);
+
+        let out = ok(&mut s, &["show", "1"]);
+        assert!(
+            out.contains("doc: Design — /tmp/voro/docs/DESIGN.md"),
+            "{out}"
+        );
+        // An untitled URL reads as itself, and an unlinked doc is not shown.
+        assert!(!out.contains("example.com"), "{out}");
+
+        ok(&mut s, &["set", "1", "--doc", "1,2"]);
+        let out = ok(&mut s, &["show", "1"]);
+        assert!(out.contains("doc: https://example.com/rfc"), "{out}");
+    }
+
+    #[test]
+    fn set_doc_replaces_the_list_and_no_doc_clears_it() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "voro", "/tmp/voro"]);
+        ok(&mut s, &["doc", "add", "voro", "docs/a.md"]);
+        ok(&mut s, &["doc", "add", "voro", "docs/b.md"]);
+        ok(&mut s, &["add", "voro", "t", "--doc", "1"]);
+
+        // Replace, matching --blocked-by, so the flag can drop a link too.
+        let out = ok(&mut s, &["set", "1", "--doc", "2"]);
+        assert!(out.contains("docs: 2 'docs/b.md'"), "{out}");
+        // The link is gone, though the append-only event trail still records
+        // that it was made and dropped.
+        let shown = ok(&mut s, &["show", "1"]);
+        assert!(!shown.contains("doc: /tmp/voro/docs/a.md"), "{shown}");
+        assert!(shown.contains("doc: /tmp/voro/docs/b.md"), "{shown}");
+        assert!(shown.contains("doc-unlinked"), "{shown}");
+
+        let out = ok(&mut s, &["set", "1", "--no-doc"]);
+        assert!(out.contains("no documents linked"), "{out}");
+        assert!(!ok(&mut s, &["show", "1"]).contains("doc:"));
+
+        // `doc unlink` is the subtractive spelling that names no other doc.
+        ok(&mut s, &["set", "1", "--doc", "1,2"]);
+        assert!(ok(&mut s, &["doc", "unlink", "1", "1"]).contains("unlinked from"));
+        assert!(ok(&mut s, &["doc", "unlink", "1", "1"]).contains("not linked to"));
+        assert!(ok(&mut s, &["show", "1"]).contains("docs/b.md"));
+    }
+
+    #[test]
+    fn doc_remove_unlinks_its_tasks_and_an_unknown_doc_says_what_to_do() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "voro", "/tmp/voro"]);
+        ok(&mut s, &["doc", "add", "voro", "docs/a.md"]);
+        ok(&mut s, &["add", "voro", "t", "--doc", "1"]);
+
+        let out = ok(&mut s, &["doc", "remove", "1"]);
+        assert!(out.contains("unlinked from 1 task(s)"), "{out}");
+        assert!(!ok(&mut s, &["show", "1"]).contains("doc:"));
+        assert!(ok(&mut s, &["doc", "list"]).is_empty());
+
+        let refusal = err(&mut s, &["doc", "show", "docs/gone.md"]);
+        assert!(
+            refusal.contains("no document at 'docs/gone.md'"),
+            "{refusal}"
+        );
+        assert!(err(&mut s, &["doc", "show", "9"]).contains("not found"));
+    }
+
+    #[test]
+    fn a_location_two_projects_register_is_resolved_by_id_not_guessed_at() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "one", "/tmp/one"]);
+        ok(&mut s, &["project", "add", "two", "/tmp/two"]);
+        ok(&mut s, &["doc", "add", "one", "docs/plan.md"]);
+        ok(&mut s, &["doc", "add", "two", "docs/plan.md"]);
+        ok(&mut s, &["add", "one", "t"]);
+
+        let refusal = err(&mut s, &["set", "1", "--doc", "docs/plan.md"]);
+        assert!(refusal.contains("more than one project"), "{refusal}");
+        assert!(refusal.contains("1, 2"), "{refusal}");
+        ok(&mut s, &["set", "1", "--doc", "2"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("/tmp/two/docs/plan.md"));
+    }
+
+    #[test]
+    fn doc_add_reads_a_relative_path_from_the_repo_it_names() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "odm", "/tmp/odm"]);
+        ok(&mut s, &["repo", "add", "odm", "oats", "/tmp/oats"]);
+        ok(
+            &mut s,
+            &["doc", "add", "odm", "docs/plan.md", "--repo", "oats"],
+        );
+        ok(&mut s, &["add", "odm", "t", "--doc", "1"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("/tmp/oats/docs/plan.md"));
+
+        // A repo of another project cannot be the reader.
+        ok(&mut s, &["project", "add", "voro", "/tmp/voro"]);
+        assert!(err(&mut s, &["doc", "add", "voro", "x.md", "--repo", "oats"]).contains("no repo"));
     }
 }
