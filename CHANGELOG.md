@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `voro set <id> --unlink <kind>:<other-id>` drops a single dependency edge —
+  `related:7`, `discovered-from:4`, `blocks:9` — named as `voro show` lists it.
+  A pair of tasks carrying two edges keeps the one not named, so an edge
+  authored by mistake no longer has to be removed with raw SQL; dropping a
+  blocker reconciles readiness as any other blocker edit does.
 - **Document links**: register the plan or design doc a body of work derives
   from with `voro doc add <project> <path-or-url>`, and link it to the tasks it
   spawned (`voro doc link/unlink`, or `--doc` on `voro add`/`voro set`). `voro
