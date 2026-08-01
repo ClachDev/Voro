@@ -101,12 +101,18 @@ tasks
                                   the flag with the running task's id)
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
       [--body TEXT | --body-file PATH] [--blocked-by IDS] [--blocks IDS]
-      [--pr URL | --no-pr] [--branch NAME | --no-branch] [--human | --no-human]
-      [--deep | --no-deep] [--summary TEXT | --summary-file PATH]
+      [--unlink KIND:ID] [--pr URL | --no-pr] [--branch NAME | --no-branch]
+      [--human | --no-human] [--deep | --no-deep]
+      [--summary TEXT | --summary-file PATH]
       [--repo NAME | --no-repo] [--doc DOCS | --no-doc]
                                   --blocked-by replaces this task's own
                                   blocker list; --blocks adds this task as a
                                   blocker of each listed task
+                                  --unlink drops one dependency edge of this
+                                  task, named as `show` lists it —
+                                  blocks:9, discovered-from:4, parent:2,
+                                  related:7 — leaving any other edge to the
+                                  same task standing; repeat it for several
                                   --pr tracks a GitHub PR (URL or owner/repo#N)
                                   for review; --no-pr clears it. --branch sets
                                   the git branch dispatch injects into the
@@ -478,6 +484,8 @@ struct SetArgs {
     blocked_by: Option<String>,
     #[arg(long)]
     blocks: Option<String>,
+    #[arg(long, value_name = "KIND:ID")]
+    unlink: Vec<String>,
     #[arg(long)]
     pr: Option<String>,
     #[arg(long, conflicts_with = "pr")]
@@ -690,6 +698,48 @@ fn apply_blocks_flag(store: &mut Store, blocker_id: i64, raw: &str) -> Result<St
         write!(out, "\ntask {} blocks #{}", blocker_id, dep.id).unwrap();
         if before == TaskState::Ready && dep.state == TaskState::Parked {
             write!(out, " — #{} demoted to parked", dep.id).unwrap();
+        }
+    }
+    Ok(out)
+}
+
+/// One `--unlink KIND:ID` argument: the kind and the task at the far end of
+/// the edge, in the direction `show` prints — the edge belongs to the task
+/// being edited.
+fn parse_edge(raw: &str) -> Result<(DepKind, i64), String> {
+    let (kind, id) = raw
+        .rsplit_once(':')
+        .ok_or_else(|| format!("unlink must be KIND:ID, got '{raw}'"))?;
+    let kind = DepKind::parse(kind.trim()).map_err(|e| e.to_string())?;
+    let id = id
+        .trim()
+        .parse()
+        .map_err(|_| format!("unlink must be KIND:ID, got '{raw}'"))?;
+    Ok((kind, id))
+}
+
+/// Apply `--unlink KIND:ID`: drop exactly the named edges of `task_id`, and
+/// echo each the way `show` reads it, so a `blocks` edge is never reported
+/// backwards. Removing a blocker reconciles readiness in the store, and the
+/// promotion it can produce is echoed for the same reason `--blocks` echoes
+/// its demotion — the graph edit's effect on the queue is the point of it.
+fn apply_unlink_flag(store: &mut Store, task_id: i64, specs: &[String]) -> Result<String, String> {
+    let mut out = String::new();
+    for spec in specs {
+        let (kind, other) = parse_edge(spec)?;
+        let before = store.task(task_id).map_err(|e| e.to_string())?.state;
+        store
+            .remove_dep(task_id, other, kind)
+            .map_err(|e| e.to_string())?;
+        match kind {
+            DepKind::Blocks => {
+                write!(out, "\ntask {task_id} no longer blocked by #{other}").unwrap()
+            }
+            _ => write!(out, "\ntask {task_id} no longer {kind} #{other}").unwrap(),
+        }
+        let after = store.task(task_id).map_err(|e| e.to_string())?.state;
+        if before == TaskState::Parked && after == TaskState::Ready {
+            write!(out, " — #{task_id} promoted to ready").unwrap();
         }
     }
     Ok(out)
@@ -1325,6 +1375,14 @@ fn set_verb(store: &mut Store, args: SetArgs) -> Result<String, String> {
         Some(raw) => apply_blocks_flag(store, id, raw)?,
         None => String::new(),
     };
+    // Unlinking a blocker can promote this task, so read it back rather than
+    // echoing the state it held before the edge went.
+    let (task, unlink_echo) = if args.unlink.is_empty() {
+        (task, String::new())
+    } else {
+        let echo = apply_unlink_flag(store, id, &args.unlink)?;
+        (store.task(id).map_err(|e| e.to_string())?, echo)
+    };
     let task = if args.no_pr {
         store.set_pr(id, None).map_err(|e| e.to_string())?
     } else if let Some(raw) = &args.pr {
@@ -1372,7 +1430,7 @@ fn set_verb(store: &mut Store, args: SetArgs) -> Result<String, String> {
         String::new()
     };
     Ok(format!(
-        "task {} updated ({}){blocks_echo}{docs_echo}",
+        "task {} updated ({}){blocks_echo}{unlink_echo}{docs_echo}",
         task.id, task.state
     ))
 }
@@ -3017,6 +3075,134 @@ mod tests {
     }
 
     #[test]
+    fn unlink_drops_one_kind_of_a_pair_carrying_two() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Source", "--state", "ready"]);
+        propose(&mut s, &["propose", "demo", "Follow-up", "--from", "1"]).unwrap();
+        ok(&mut s, &["set", "2", "--blocked-by", "1"]);
+
+        let out = ok(&mut s, &["set", "2", "--unlink", "blocks:1"]);
+        assert!(out.contains("task 2 no longer blocked by #1"), "{out}");
+        let shown = ok(&mut s, &["show", "2"]);
+        assert!(!shown.contains("blocked by #1"), "{shown}");
+        assert!(shown.contains("dep: discovered-from 1"), "{shown}");
+
+        // and the other way round: the provenance edge goes, the blocker stays
+        ok(&mut s, &["set", "2", "--blocked-by", "1"]);
+        let out = ok(&mut s, &["set", "2", "--unlink", "discovered-from:1"]);
+        assert!(out.contains("task 2 no longer discovered-from #1"), "{out}");
+        let shown = ok(&mut s, &["show", "2"]);
+        assert!(shown.contains("dep: blocked by #1"), "{shown}");
+        assert!(!shown.contains("discovered-from"), "{shown}");
+    }
+
+    #[test]
+    fn unlink_reconciles_readiness_and_says_so() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(
+            &mut s,
+            &["add", "demo", "Closed blocker", "--state", "ready"],
+        );
+        ok(&mut s, &["add", "demo", "Open blocker", "--state", "ready"]);
+        let out = ok(
+            &mut s,
+            &[
+                "add",
+                "demo",
+                "Dependent",
+                "--state",
+                "ready",
+                "--blocked-by",
+                "1,2",
+            ],
+        );
+        assert!(out.contains("(parked)"), "{out}");
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["done", "1"]);
+        ok(&mut s, &["accept", "1"]);
+
+        // dropping the one open blocker leaves a closed one behind it, so the
+        // dependent is genuinely actionable and the store promotes it
+        let out = ok(&mut s, &["set", "3", "--unlink", "blocks:2"]);
+        assert!(out.contains("task 3 no longer blocked by #2"), "{out}");
+        assert!(out.contains("#3 promoted to ready"), "{out}");
+        assert!(out.contains("task 3 updated (ready)"), "{out}");
+        assert!(ok(&mut s, &["list", "--state", "ready"]).contains("Dependent"));
+    }
+
+    #[test]
+    fn unlinking_the_last_blocker_leaves_the_task_parked() {
+        // A parked task with no blockers at all is deliberately deferred
+        // (DESIGN.md §5), so emptying the blocker set — however it is spelled —
+        // never promotes; `unpark` is the manual escape.
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Blocker", "--state", "ready"]);
+        ok(
+            &mut s,
+            &[
+                "add",
+                "demo",
+                "Dependent",
+                "--state",
+                "ready",
+                "--blocked-by",
+                "1",
+            ],
+        );
+
+        let out = ok(&mut s, &["set", "2", "--unlink", "blocks:1"]);
+        assert!(out.contains("task 2 updated (parked)"), "{out}");
+        assert!(!out.contains("promoted"), "{out}");
+        assert!(s.deps_of(2).unwrap().is_empty());
+        assert!(ok(&mut s, &["unpark", "2"]).contains("ready"));
+    }
+
+    #[test]
+    fn unlink_refuses_an_edge_that_is_not_there() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Source", "--state", "ready"]);
+        propose(&mut s, &["propose", "demo", "Follow-up", "--from", "1"]).unwrap();
+
+        let e = err(&mut s, &["set", "2", "--unlink", "related:1"]);
+        assert!(e.contains("#2 has no related dependency on #1"), "{e}");
+        // the edge that *is* there survives the refusal
+        assert!(ok(&mut s, &["show", "2"]).contains("dep: discovered-from 1"));
+
+        let e = err(&mut s, &["set", "2", "--unlink", "sibling:1"]);
+        assert!(e.contains("unknown dep kind 'sibling'"), "{e}");
+        let e = err(&mut s, &["set", "2", "--unlink", "blocks"]);
+        assert!(e.contains("unlink must be KIND:ID"), "{e}");
+    }
+
+    #[test]
+    fn unlink_repeats_for_several_edges() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "Source", "--state", "ready"]);
+        propose(&mut s, &["propose", "demo", "Follow-up", "--from", "1"]).unwrap();
+        ok(&mut s, &["set", "2", "--blocked-by", "1"]);
+
+        let out = ok(
+            &mut s,
+            &[
+                "set",
+                "2",
+                "--unlink",
+                "blocks:1",
+                "--unlink",
+                "discovered-from:1",
+            ],
+        );
+        assert!(out.contains("no longer blocked by #1"), "{out}");
+        assert!(out.contains("no longer discovered-from #1"), "{out}");
+        assert!(s.deps_of(2).unwrap().is_empty());
+    }
+
+    #[test]
     fn run_propose_without_from_links_nothing() {
         // `run` consults no environment: a bare `propose` never picks up an
         // ambient VORO_TASK_ID, so the discovered-from link comes only from an
@@ -3364,6 +3550,7 @@ mod tests {
         assert!(out.contains("--blocked-by IDS"), "{out}");
         assert!(out.contains("--blocks IDS"), "{out}");
         assert!(out.contains("wait on"), "{out}");
+        assert!(out.contains("--unlink KIND:ID"), "{out}");
     }
 
     #[test]

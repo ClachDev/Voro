@@ -37,7 +37,7 @@ voro explain <id>       # score decomposition (weight × priority + age bonus)
 voro add <project> <title> --body-file plan.md [--priority 0-3]
          [--blocked-by 3,7] [--blocks 9] [--repo NAME] [--deep]
 voro set <id> [--title T] [--priority N] [--body-file F]
-              [--blocked-by IDS] [--blocks IDS]
+              [--blocked-by IDS] [--blocks IDS] [--unlink KIND:ID]
               [--branch NAME]        # intended git branch dispatch injects
               [--repo NAME | --no-repo]   # which checkout the task runs in
               [--deep | --no-deep]   # dispatch on the agent's strongest model
@@ -50,6 +50,12 @@ task wait on tasks 3 and 7; `--blocks 9` makes task 9 wait on this one (the
 discovered-prerequisite pattern). On `set`, `--blocked-by` *replaces* the
 task's own blocker list while `--blocks` is *additive*. Both directions echo
 their effect and are cycle-checked; `show` renders the edge as `blocked by #N`.
+
+`--unlink KIND:ID` drops a single edge of any kind — `blocks:9`,
+`discovered-from:4`, `parent:2`, `related:7` — naming it as `show` lists it
+under that task, and leaves any other edge to the same task standing. Repeat
+the flag for several. Naming an edge that is not there fails rather than
+reporting a success it did not perform.
 
 `add` defaults to state `proposed`, which is what an agent should almost
 always want: proposed tasks wait for human triage and never enter the queues
