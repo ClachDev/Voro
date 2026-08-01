@@ -19,15 +19,24 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::scheduler::{AttentionCosts, DEFAULT_MAX_RUNNING};
+use crate::template::{render, shell_quote};
 
 /// The prompt-file substitution in the `dispatch` template. The working
 /// directory is handled by the spawner, not the template.
 pub const PROMPT_FILE_PLACEHOLDER: &str = "{prompt_file}";
 
 /// The task-id substitution in the `dispatch` template, the numeric id of the
-/// task. Optional — a template that omits it dispatches unchanged — so agents
-/// with a session-naming flag can tie the session back to its task.
+/// task. Optional — a template that omits it dispatches unchanged — so a
+/// template can put the id somewhere other than the session name. Refused on
+/// `plan`, which serves targets that have no task id to bind.
 pub const TASK_ID_PLACEHOLDER: &str = "{task_id}";
+
+/// The session-name substitution in the `dispatch` and `plan` templates: the
+/// name Voro composes for the session a launch opens ([`Launch::session_name`]),
+/// so every backgrounded session is findable by a name Voro chose. Optional,
+/// and refused on the session verbs for the same reason [`MODEL_PLACEHOLDER`]
+/// is — they act on a session that already exists and has its name.
+pub const SESSION_NAME_PLACEHOLDER: &str = "{session_name}";
 
 /// The session-reference substitution in the `attach` and `resume` templates:
 /// the agent-opaque reference captured at dispatch (a Claude session UUID, a
@@ -64,6 +73,12 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// plans interactively in the foreground; `codex` covers the headless-resume
 /// shape. Must parse and pass [`validate_agent`].
 ///
+/// Both claude verbs name their session from `{session_name}` rather than
+/// spelling `voro-{task_id}` themselves, so every launch Voro makes — a
+/// dispatch, a refine, a planning session — carries a distinct Voro-composed
+/// name in `claude agents` and the `/resume` picker (DESIGN.md §8). `--name` is
+/// not a background-only flag, so the foreground `plan` verb takes it too.
+///
 /// The claude verbs take their model from `{model}` rather than a baked-in
 /// flag, so the model varies per purpose and per task: `model` is the workhorse
 /// a normal dispatch runs, `model_deep` the stronger one a `deep` task earns,
@@ -75,11 +90,11 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// no-model-direction case: a deep task dispatches with it unchanged.
 const BUILTIN_AGENTS: &str = "\
 [agents.claude]
-dispatch   = \"claude --bg --name \\\"voro-{task_id}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
+dispatch   = \"claude --bg --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
 sessions   = \"claude agents --json\"
 attach     = \"claude attach {session}\"
 resume     = \"claude --resume {session}\"
-plan       = \"claude --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
+plan       = \"claude --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
 model      = \"opus\"
 model_deep = \"fable\"
 model_plan = \"fable\"
@@ -119,13 +134,18 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #
 #   * add your own agent — a new [agents.<name>] table. Only `dispatch` is
 #     required (`cmd` is an alias): it starts a session on a task, with
-#     `{prompt_file}` replaced by the prompt file's path and the optional
-#     `{task_id}` by the task's numeric id. The optional session verbs unlock
-#     attachable dispatch, and each degrades gracefully when absent:
+#     `{prompt_file}` replaced by the prompt file's path, the optional
+#     `{session_name}` by the name Voro composes for the session (`voro-<id>`
+#     for a dispatch, `voro-<id>-refine` for a refine, `voro-plan-<project>`
+#     for planning), and the optional `{task_id}` by the task's numeric id.
+#     The optional session verbs unlock attachable dispatch, and each degrades
+#     gracefully when absent:
 #       sessions  list the agent's sessions as JSON (liveness + ref capture)
 #       attach    open a running session interactively    ({session})
 #       resume    reopen a finished session interactively  ({session})
 #       plan      run an interactive foreground planning session ({prompt_file})
+#     `plan` may carry `{session_name}` too, but not `{task_id}`: a planning
+#     session drafts a task rather than naming one.
 #     `dispatch` and `plan` may also carry `{model}`, filled from this agent's
 #     own model keys: `model` normally, `model_deep` for a task flagged deep
 #     (`voro set <id> --deep`), and `model_plan` when planning — the last two
@@ -201,8 +221,9 @@ fn starter_config() -> String {
 
 /// A named set of verb templates from `voro.toml`. `dispatch` (or its alias
 /// `cmd`) is required and always contains [`PROMPT_FILE_PLACEHOLDER`]; it may
-/// also carry the optional [`TASK_ID_PLACEHOLDER`]. The rest are optional, with
-/// their `{session}`/`{prompt_file}` placeholders validated at parse time.
+/// also carry the optional [`SESSION_NAME_PLACEHOLDER`] and
+/// [`TASK_ID_PLACEHOLDER`]. The rest are optional, with their
+/// `{session}`/`{prompt_file}` placeholders validated at parse time.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTemplate {
@@ -266,15 +287,97 @@ impl AgentTemplate {
     }
 }
 
-/// Substitute [`MODEL_PLACEHOLDER`] in a verb template. `model` is the name
-/// that verb resolved to, or `None` for an agent that declares none — in which
-/// case the template carries no placeholder either (`validate_agent` enforces
-/// that pairing), so this is a no-op.
-fn render_model(template: &str, model: Option<&str>) -> String {
-    match model {
-        Some(model) => template.replace(MODEL_PLACEHOLDER, model),
-        None => template.to_string(),
+/// What a launch *is* (DESIGN.md §8): the one place a backgrounded or
+/// foreground agent session's identity is composed. A launch names its session,
+/// its prompt and log files, and its line in the launch log from this single
+/// value, so a new flavour of launch cannot inherit one of those and forget
+/// another — which is exactly how a refine came to be named `voro-{task_id}`,
+/// literally, on every task at once.
+///
+/// The invariant it carries: every session Voro launches has a Voro-composed
+/// name, `voro-<id>` for a dispatch and `voro-<id>-<kind>` for anything else
+/// pointed at that task, so nothing Voro starts shows up anonymous or
+/// duplicately named in the agent's own session listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Launch {
+    /// A task dispatched to a headless session (DESIGN.md §8).
+    Dispatch { task_id: i64 },
+    /// A proposed task's body rewritten by an agent (DESIGN.md §6), at either
+    /// intensity — the headless note-driven one and the interactive one are the
+    /// same operation, and only one of them is ever backgrounded.
+    Refine { task_id: i64 },
+    /// An interactive planning session drafting a new task for a project.
+    Plan { project_id: i64 },
+}
+
+impl Launch {
+    /// The name the agent's session carries, filling [`SESSION_NAME_PLACEHOLDER`].
+    /// `voro-<id>` for a dispatch is the published contract
+    /// (docs/agent-integration.md) and what `attach` and the `/resume` picker
+    /// are read by, so anything else pointed at the same task suffixes a kind
+    /// rather than colliding with it.
+    pub fn session_name(&self) -> String {
+        match self {
+            Launch::Dispatch { task_id } => format!("voro-{task_id}"),
+            Launch::Refine { task_id } => format!("voro-{task_id}-refine"),
+            Launch::Plan { project_id } => format!("voro-plan-{project_id}"),
+        }
     }
+
+    /// The stem of this launch's prompt and log files, and the label its
+    /// launch-log lines carry.
+    pub fn slug(&self) -> String {
+        match self {
+            Launch::Dispatch { task_id } => format!("task-{task_id}"),
+            Launch::Refine { task_id } => format!("refine-{task_id}"),
+            Launch::Plan { project_id } => format!("plan-{project_id}"),
+        }
+    }
+
+    /// The task this launch is pointed at, if any — `None` for a planning
+    /// session, which drafts a task rather than naming one, and why
+    /// [`TASK_ID_PLACEHOLDER`] is refused on the `plan` verb.
+    pub fn task_id(&self) -> Option<i64> {
+        match self {
+            Launch::Dispatch { task_id } | Launch::Refine { task_id } => Some(*task_id),
+            Launch::Plan { .. } => None,
+        }
+    }
+}
+
+/// Everything a verb template needs bound to become a command line: which
+/// launch this is, the prompt file written for it, and whether the task earns
+/// the deeper model. Assembled by the caller that wrote the prompt, rendered by
+/// [`ResolvedAgent::launch_command`] or
+/// [`ResolvedAgent::plan_launch_command`](ResolvedAgent::plan_launch_command).
+#[derive(Debug, Clone, Copy)]
+pub struct LaunchSpec<'a> {
+    pub launch: Launch,
+    pub prompt_file: &'a Path,
+    /// Whether the task carries the `deep` flag; ignored by the plan template,
+    /// which has no depth to read.
+    pub deep: bool,
+}
+
+/// Bind every launch placeholder a verb template may carry, in one pass, so no
+/// value's own braces are re-scanned. `{task_id}` goes unbound for a launch that
+/// has none, which only a `plan` template could contain — and that is refused at
+/// config load.
+fn render_launch(template: &str, spec: &LaunchSpec, model: Option<&str>) -> String {
+    let prompt_file = shell_quote(spec.prompt_file);
+    let session_name = spec.launch.session_name();
+    let task_id = spec.launch.task_id().map(|id| id.to_string());
+    let mut bindings = vec![
+        (PROMPT_FILE_PLACEHOLDER, prompt_file.as_str()),
+        (SESSION_NAME_PLACEHOLDER, session_name.as_str()),
+    ];
+    if let Some(task_id) = &task_id {
+        bindings.push((TASK_ID_PLACEHOLDER, task_id.as_str()));
+    }
+    if let Some(model) = model {
+        bindings.push((MODEL_PLACEHOLDER, model));
+    }
+    render(template, &bindings)
 }
 
 /// A viewer command template from `voro.toml` (DESIGN.md §11a): a shell command
@@ -423,22 +526,44 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
             "agent '{name}' plan is missing the {PROMPT_FILE_PLACEHOLDER} placeholder"
         )));
     }
-    // `{model}` is resolved only where a command launches work, so it is
-    // meaningful on `dispatch` and `plan` and nowhere else; anywhere else it
-    // would reach the shell unsubstituted.
+    // `{model}`, `{session_name}` and `{task_id}` are all resolved only where a
+    // command launches work, so they are meaningful on `dispatch` and `plan`
+    // and nowhere else; on a session verb they would reach the shell as literal
+    // braces. No launch placeholder may survive to a command line: either a
+    // renderer binds it or it is refused here.
     for (verb, template) in [
         ("sessions", &agent.sessions),
         ("attach", &agent.attach),
         ("resume", &agent.resume),
     ] {
-        if let Some(template) = template
-            && template.contains(MODEL_PLACEHOLDER)
-        {
+        let Some(template) = template else { continue };
+        if template.contains(MODEL_PLACEHOLDER) {
             return Err(invalid(format!(
                 "agent '{name}' {verb} carries {MODEL_PLACEHOLDER}, which is resolved only on \
                  dispatch and plan — a session verb reuses the model its session started with"
             )));
         }
+        for placeholder in [SESSION_NAME_PLACEHOLDER, TASK_ID_PLACEHOLDER] {
+            if template.contains(placeholder) {
+                return Err(invalid(format!(
+                    "agent '{name}' {verb} carries {placeholder}, which is resolved only on \
+                     dispatch and plan — a session verb names its session with {SESSION_PLACEHOLDER}, \
+                     the reference Voro captured at launch"
+                )));
+            }
+        }
+    }
+    // `plan` serves a target that has no task: a planning session drafts a task
+    // rather than naming one, so `{task_id}` there has nothing to bind to. A
+    // template must render for every target its verb serves.
+    if let Some(template) = &agent.plan
+        && template.contains(TASK_ID_PLACEHOLDER)
+    {
+        return Err(invalid(format!(
+            "agent '{name}' plan carries {TASK_ID_PLACEHOLDER}, but a planning session drafts a \
+             task rather than naming one — use {SESSION_NAME_PLACEHOLDER}, which Voro composes \
+             for every launch"
+        )));
     }
     // The model keys are inert without the placeholder (a wholesale override
     // that drops `{model}` keeps loading), but the placeholder without them
@@ -471,10 +596,11 @@ fn binary_on_path(name: &str) -> bool {
 /// has one, otherwise the config's global default, with every verb template
 /// resolved.
 ///
-/// The `dispatch` and `plan` fields still hold `{model}` unresolved, because
-/// which model they name depends on the task: reach them through
-/// [`dispatch_command`](Self::dispatch_command) and
-/// [`plan_command`](Self::plan_command).
+/// The `dispatch` and `plan` fields still hold their placeholders unresolved,
+/// because what they bind to depends on the launch: reach them through
+/// [`launch_command`](Self::launch_command) and
+/// [`plan_launch_command`](Self::plan_launch_command), which return a command
+/// line with nothing left to substitute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAgent {
     pub name: String,
@@ -489,28 +615,31 @@ pub struct ResolvedAgent {
 }
 
 impl ResolvedAgent {
-    /// The dispatch command with `{model}` resolved for a task of this depth
-    /// (DESIGN.md §8): `model_deep` for a deep task, falling back to `model`
-    /// when the agent names no deeper one, and `model` otherwise. An agent
-    /// whose template carries no placeholder renders the same string either
-    /// way — the graceful degradation of the `deep` flag.
-    pub fn dispatch_command(&self, deep: bool) -> String {
-        let model = if deep {
+    /// The dispatch template rendered into a runnable command line: the prompt
+    /// file shell-quoted, the launch's session name and task id bound, and
+    /// `{model}` resolved for the task's depth (DESIGN.md §8) — `model_deep` for
+    /// a deep task, falling back to `model` when the agent names no deeper one,
+    /// and `model` otherwise. An agent whose template carries no placeholder
+    /// renders the same string either way, the graceful degradation of the
+    /// `deep` flag.
+    pub fn launch_command(&self, spec: &LaunchSpec) -> String {
+        let model = if spec.deep {
             self.model_deep.as_deref().or(self.model.as_deref())
         } else {
             self.model.as_deref()
         };
-        render_model(&self.dispatch, model)
+        render_launch(&self.dispatch, spec, model)
     }
 
-    /// The plan command with `{model}` resolved — `model_plan`, falling back to
-    /// `model` — when the agent defines the verb. Planning has no depth: it is
-    /// interactive reasoning either way.
-    pub fn plan_command(&self) -> Option<String> {
+    /// The plan template rendered the same way, when the agent defines the
+    /// verb, with `{model}` resolved to `model_plan` falling back to `model`.
+    /// Planning has no depth: it is interactive reasoning either way, so
+    /// `spec.deep` is not read.
+    pub fn plan_launch_command(&self, spec: &LaunchSpec) -> Option<String> {
         let model = self.model_plan.as_deref().or(self.model.as_deref());
         self.plan
             .as_deref()
-            .map(|template| render_model(template, model))
+            .map(|template| render_launch(template, spec, model))
     }
 }
 
@@ -1499,7 +1628,7 @@ mod tests {
         let claude = config.agent("claude").unwrap();
         assert!(claude.dispatch().contains("--bg"), "{}", claude.dispatch());
         assert!(
-            claude.dispatch().contains("voro-{task_id}"),
+            claude.dispatch().contains(SESSION_NAME_PLACEHOLDER),
             "{}",
             claude.dispatch()
         );
@@ -1571,7 +1700,80 @@ mod tests {
         assert!(agents["codex"].resume().is_some());
     }
 
-    // --- the model map and {model} (task #241) ---
+    // --- launch identity and rendered commands (task #326) ---
+
+    /// A dispatch of task 7 with a fixed prompt file, so a rendered command is
+    /// a stable string to assert on.
+    fn spec(deep: bool) -> LaunchSpec<'static> {
+        LaunchSpec {
+            launch: Launch::Dispatch { task_id: 7 },
+            prompt_file: Path::new("/tmp/p.md"),
+            deep,
+        }
+    }
+
+    #[test]
+    fn a_launch_names_its_session_and_its_files() {
+        let dispatch = Launch::Dispatch { task_id: 42 };
+        let refine = Launch::Refine { task_id: 42 };
+        let plan = Launch::Plan { project_id: 3 };
+        // The dispatch name is the published contract; anything else pointed at
+        // the same task suffixes a kind rather than colliding with it.
+        assert_eq!(dispatch.session_name(), "voro-42");
+        assert_eq!(refine.session_name(), "voro-42-refine");
+        assert_eq!(plan.session_name(), "voro-plan-3");
+        assert_ne!(dispatch.session_name(), refine.session_name());
+        // The file slugs are exactly what the three paths computed before the
+        // identity was factored out, so no prompt or log filename moved.
+        assert_eq!(dispatch.slug(), "task-42");
+        assert_eq!(refine.slug(), "refine-42");
+        assert_eq!(plan.slug(), "plan-3");
+        assert_eq!(dispatch.task_id(), Some(42));
+        assert_eq!(refine.task_id(), Some(42));
+        assert_eq!(plan.task_id(), None);
+    }
+
+    #[test]
+    fn builtin_claude_names_the_session_from_the_launch() {
+        let config = AgentsConfig::builtin_only(Path::new("/tmp/voro.toml"));
+        let claude = config.resolve(Some("claude")).unwrap();
+        let dispatch = claude.launch_command(&spec(false));
+        assert!(dispatch.contains("--name \"voro-7\""), "{dispatch}");
+
+        let refined = claude.launch_command(&LaunchSpec {
+            launch: Launch::Refine { task_id: 7 },
+            ..spec(false)
+        });
+        assert!(refined.contains("--name \"voro-7-refine\""), "{refined}");
+        assert_ne!(dispatch, refined);
+
+        // A planning session is named too, and `--name` is not a --bg-only
+        // flag, so the foreground plan verb carries it.
+        let planned = claude
+            .plan_launch_command(&LaunchSpec {
+                launch: Launch::Plan { project_id: 3 },
+                ..spec(false)
+            })
+            .unwrap();
+        assert!(planned.contains("--name \"voro-plan-3\""), "{planned}");
+        assert!(!planned.contains("--bg"), "{planned}");
+
+        // Nothing reaches the shell as literal braces on any of them.
+        for rendered in [dispatch, refined, planned] {
+            assert!(!rendered.contains('{'), "unsubstituted: {rendered}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_file_is_shell_quoted_into_the_command() {
+        let config = AgentsConfig::builtin_only(Path::new("/tmp/voro.toml"));
+        let claude = config.resolve(Some("claude")).unwrap();
+        let rendered = claude.launch_command(&LaunchSpec {
+            prompt_file: Path::new("/tmp/a dir/p.md"),
+            ..spec(false)
+        });
+        assert!(rendered.contains("cat '/tmp/a dir/p.md'"), "{rendered}");
+    }
 
     #[test]
     fn builtin_claude_renders_a_model_per_purpose_and_depth() {
@@ -1581,24 +1783,21 @@ mod tests {
         // deep task and for interactive planning; all `claude` model aliases,
         // so none churns with a release.
         assert!(
-            claude.dispatch_command(false).contains("--model opus"),
+            claude.launch_command(&spec(false)).contains("--model opus"),
             "{}",
-            claude.dispatch_command(false)
+            claude.launch_command(&spec(false))
         );
         assert!(
-            claude.dispatch_command(true).contains("--model fable"),
+            claude.launch_command(&spec(true)).contains("--model fable"),
             "{}",
-            claude.dispatch_command(true)
+            claude.launch_command(&spec(true))
         );
-        assert!(
-            claude.plan_command().unwrap().contains("--model fable"),
-            "{:?}",
-            claude.plan_command()
-        );
+        let planned = claude.plan_launch_command(&spec(false)).unwrap();
+        assert!(planned.contains("--model fable"), "{planned}");
         for rendered in [
-            claude.dispatch_command(false),
-            claude.dispatch_command(true),
-            claude.plan_command().unwrap(),
+            claude.launch_command(&spec(false)),
+            claude.launch_command(&spec(true)),
+            planned,
         ] {
             assert!(
                 !rendered.contains(MODEL_PLACEHOLDER),
@@ -1611,9 +1810,15 @@ mod tests {
     fn an_agent_without_the_placeholder_ignores_depth_entirely() {
         let config = AgentsConfig::builtin_only(Path::new("/tmp/voro.toml"));
         let codex = config.resolve(Some("codex")).unwrap();
-        assert_eq!(codex.dispatch_command(true), codex.dispatch_command(false));
-        assert_eq!(codex.dispatch_command(true), codex.dispatch);
-        assert_eq!(codex.plan_command(), None);
+        assert_eq!(
+            codex.launch_command(&spec(true)),
+            codex.launch_command(&spec(false))
+        );
+        assert_eq!(
+            codex.launch_command(&spec(true)),
+            "codex exec \"$(cat '/tmp/p.md')\""
+        );
+        assert_eq!(codex.plan_launch_command(&spec(false)), None);
     }
 
     #[test]
@@ -1627,16 +1832,16 @@ mod tests {
         let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
         let a = config.resolve(Some("a")).unwrap();
         assert_eq!(
-            a.dispatch_command(false),
-            "run --model workhorse {prompt_file}"
+            a.launch_command(&spec(false)),
+            "run --model workhorse '/tmp/p.md'"
         );
         assert_eq!(
-            a.dispatch_command(true),
-            "run --model workhorse {prompt_file}"
+            a.launch_command(&spec(true)),
+            "run --model workhorse '/tmp/p.md'"
         );
         assert_eq!(
-            a.plan_command().unwrap(),
-            "run -i --model workhorse {prompt_file}"
+            a.plan_launch_command(&spec(false)).unwrap(),
+            "run -i --model workhorse '/tmp/p.md'"
         );
     }
 
@@ -1674,8 +1879,8 @@ mod tests {
         "#;
         let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
         let claude = config.resolve(Some("claude")).unwrap();
-        assert_eq!(claude.dispatch_command(true), "claude -p {prompt_file}");
-        assert_eq!(claude.dispatch_command(false), "claude -p {prompt_file}");
+        assert_eq!(claude.launch_command(&spec(true)), "claude -p '/tmp/p.md'");
+        assert_eq!(claude.launch_command(&spec(false)), "claude -p '/tmp/p.md'");
     }
 
     #[test]
@@ -1691,6 +1896,63 @@ mod tests {
             .to_string();
         assert!(message.contains("attach"), "{message}");
         assert!(message.contains("{model}"), "{message}");
+    }
+
+    /// No launch placeholder may survive to a command line: one a renderer does
+    /// not bind on that verb is refused at load rather than reaching the shell
+    /// as literal braces (DESIGN.md §8).
+    #[test]
+    fn launch_placeholders_are_refused_on_the_verbs_that_cannot_bind_them() {
+        for (verb, template) in [
+            ("sessions", "list --name {session_name}"),
+            ("attach", "reopen --name {session_name} {session}"),
+            ("resume", "reopen {session} --for {task_id}"),
+        ] {
+            let text =
+                format!("[agents.a]\ndispatch = \"run {{prompt_file}}\"\n{verb} = '{template}'\n");
+            let message = AgentsConfig::parse(&text, Path::new("/tmp/voro.toml"))
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(verb), "{verb}: {message}");
+            assert!(message.contains("dispatch and plan"), "{verb}: {message}");
+        }
+
+        // `plan` serves a target that has no task, so `{task_id}` is refused
+        // there even though `dispatch` still honours it.
+        let text = r#"
+            [agents.a]
+            dispatch = "run {prompt_file}"
+            plan     = "run -i --name \"voro-{task_id}\" {prompt_file}"
+        "#;
+        let message = AgentsConfig::parse(text, Path::new("/tmp/voro.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("plan"), "{message}");
+        assert!(message.contains(TASK_ID_PLACEHOLDER), "{message}");
+        assert!(message.contains(SESSION_NAME_PLACEHOLDER), "{message}");
+    }
+
+    #[test]
+    fn the_session_name_placeholder_is_accepted_on_dispatch_and_plan() {
+        let text = r#"
+            [agents.a]
+            dispatch = "run --name {session_name} --for {task_id} {prompt_file}"
+            plan     = "run -i --name {session_name} {prompt_file}"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        let a = config.resolve(Some("a")).unwrap();
+        assert_eq!(
+            a.launch_command(&spec(false)),
+            "run --name voro-7 --for 7 '/tmp/p.md'"
+        );
+        assert_eq!(
+            a.plan_launch_command(&LaunchSpec {
+                launch: Launch::Plan { project_id: 2 },
+                ..spec(false)
+            })
+            .unwrap(),
+            "run -i --name voro-plan-2 '/tmp/p.md'"
+        );
     }
 
     #[test]

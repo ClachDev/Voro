@@ -73,11 +73,11 @@ agent init` writes the same built-ins into a fresh `voro.toml`, commented out.
 
 ```toml
 [agents.claude]
-dispatch   = "claude --bg --name \"voro-{task_id}\" --permission-mode auto --model {model} \"$(cat {prompt_file})\""
+dispatch   = "claude --bg --name \"{session_name}\" --permission-mode auto --model {model} \"$(cat {prompt_file})\""
 sessions   = "claude agents --json"
 attach     = "claude attach {session}"
 resume     = "claude --resume {session}"
-plan       = "claude --permission-mode auto --model {model} \"$(cat {prompt_file})\""
+plan       = "claude --name \"{session_name}\" --permission-mode auto --model {model} \"$(cat {prompt_file})\""
 model      = "opus"
 model_deep = "fable"
 model_plan = "fable"
@@ -87,11 +87,20 @@ dispatch = "codex exec \"$(cat {prompt_file})\""
 resume   = "codex resume {session}"
 ```
 
-- `dispatch` may also carry `{task_id}`, replaced with the task's numeric id.
-  It is optional — a template that omits it dispatches unchanged — and is used
-  above to name the session `voro-<id>` (via Claude's `--name` flag) so it is
-  identifiable in `claude agents` and the `/resume` picker. Agents with no
-  session-naming flag simply leave it out.
+- `dispatch` and `plan` may also carry `{session_name}`, replaced with the name
+  Voro composes for the session that launch opens. It is used above with
+  Claude's `--name` flag so every session Voro starts is identifiable in
+  `claude agents` and the `/resume` picker; agents with no session-naming flag
+  simply leave it out. The scheme is `voro-<id>` for a dispatch of task `<id>`,
+  `voro-<id>-refine` for a refine of it (DESIGN.md §6), and
+  `voro-plan-<project-id>` for a planning session. A dispatch's name is a
+  stable contract — anything else pointed at the same task suffixes a kind
+  rather than colliding with it.
+- `dispatch` may also carry `{task_id}`, replaced with the task's numeric id,
+  for a template that wants the id somewhere other than the session name. It is
+  optional — a template that omits it dispatches unchanged — and it is refused
+  on `plan`, which serves a target that has no task id to bind, and on the
+  session verbs, which name their session with `{session}`.
 - `sessions` prints the agent's sessions as a JSON array; Voro reads
   `sessionId` (or `id`), `cwd`, `startedAt` (ms epoch), and `state` (`"done"`
   once finished) from each object and ignores the rest.
@@ -102,7 +111,11 @@ resume   = "codex resume {session}"
   task creation (DESIGN.md §8): `{prompt_file}` holds the planning brief, and
   the command owns the terminal until the conversation ends, so it must not
   background itself. It carries no `{session}` — a planning session belongs to
-  no task and records no session row.
+  no task and records no session row — and no `{task_id}`, since it may be
+  drafting a task that does not exist yet. It may carry `{session_name}`, as
+  the built-in does: Claude's `--name` is not a background-only flag, so a
+  planning or interactive-refine session is findable in the `/resume` picker
+  afterwards.
 
 The **model map** is the last three keys, and it is what `{model}` resolves to.
 `dispatch` and `plan` may each carry the placeholder; Voro fills it from this
