@@ -124,14 +124,25 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 Some(last) => last.spans.push(Span::raw("▏")),
                 None => lines.push(Line::from("▏")),
             }
-            let height = (lines.len() as u16 + 2).clamp(3, 20);
-            let area = popup_area(frame, 72, height);
             let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(format!("{} — ⏎ to submit, esc to cancel", kind.title())),
             );
-            frame.render_widget(para, area);
+            // Typed text never contains a newline (⏎ submits), so the box has
+            // to be sized from the *wrapped* line count at the popup's inner
+            // width — counting `\n`s would leave a one-row box with the tail of
+            // a long note wrapped out of sight. `line_count` counts both, and
+            // includes the block's two border rows.
+            let width = 72.min(frame.area().width);
+            let rendered_rows = para.line_count(width.saturating_sub(2)) as u16;
+            let area = popup_area(frame, width, rendered_rows.clamp(3, 20));
+            // Past the clamp the box stops growing, so scroll to the end of the
+            // text: the cursor lives there, and the tail is what is being typed.
+            let overflow = rendered_rows
+                .saturating_sub(2)
+                .saturating_sub(area.height.saturating_sub(2));
+            frame.render_widget(para.scroll((overflow, 0)), area);
         }
         Mode::LinkPr { buffer, .. } => {
             let area = popup_area(frame, 72, 3);
@@ -2840,5 +2851,67 @@ mod tests {
             rendered.contains("open it in the browser"),
             "modal should name the browser jump: {rendered}"
         );
+    }
+
+    /// A prompt buffer wider than the popup wraps, and the box grows with the
+    /// wrapped text so the tail being typed — and the cursor — stay on screen.
+    #[test]
+    fn prompt_popup_grows_with_wrapped_text() {
+        let buffer = format!("HEADMARK {}TAILMARK", "padding ".repeat(12));
+        let rendered = render_prompt(&buffer);
+        assert!(
+            rendered.contains("HEADMARK"),
+            "the start of a wrapped note stays visible: {rendered}"
+        );
+        assert!(
+            rendered.contains("TAILMARK▏"),
+            "the tail and the cursor stay visible: {rendered}"
+        );
+    }
+
+    /// Past the height clamp the popup stops growing, so it scrolls to the end
+    /// of the text: the tail shows, the head scrolls away.
+    #[test]
+    fn prompt_popup_scrolls_to_the_tail_when_it_overflows() {
+        let buffer = format!("HEADMARK {}TAILMARK", "padding ".repeat(200));
+        let rendered = render_prompt(&buffer);
+        assert!(
+            rendered.contains("TAILMARK▏"),
+            "the tail and the cursor stay visible: {rendered}"
+        );
+        assert!(
+            !rendered.contains("HEADMARK"),
+            "the head scrolls out of the clamped box: {rendered}"
+        );
+    }
+
+    /// Draws a `Mode::Prompt` over an otherwise empty app and returns the
+    /// terminal's cells as one string.
+    fn render_prompt(buffer: &str) -> String {
+        use crate::app::{App, Mode, PromptKind};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::Store;
+
+        let store = Store::open_in_memory().unwrap();
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+        app.mode = Mode::Prompt {
+            task_id: 1,
+            kind: PromptKind::RefineNote,
+            buffer: buffer.to_string(),
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
     }
 }
