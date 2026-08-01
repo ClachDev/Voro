@@ -369,6 +369,51 @@ pub struct Repo {
     pub is_default: bool,
 }
 
+/// A plan or design document a project's work derives from (DESIGN.md §3), and
+/// the thing tasks link to so "which tasks came from this plan?" is a query
+/// rather than a grep over task bodies. Owned by one project — which is where a
+/// relative location resolves — but linkable from a task in any project, since
+/// one plan routinely spawns work across several.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Doc {
+    pub id: i64,
+    pub project_id: i64,
+    /// Which of the project's checkouts a relative `location` resolves against,
+    /// or `None` for the project's default — the same shape as `Task::repo_id`.
+    /// Always `None` for a URL or an absolute path, which resolve unaided.
+    pub repo_id: Option<i64>,
+    /// An operator-supplied label, or `None` to read as the location itself.
+    pub title: Option<String>,
+    /// A checkout-relative path (preferred, so it survives a checkout move), an
+    /// absolute path outside every checkout, or a URL.
+    pub location: String,
+    pub created_at: String,
+}
+
+impl Doc {
+    /// Whether the location addresses the network rather than a file. A URL is
+    /// handed to a reader verbatim; a path is resolved against a checkout.
+    pub fn is_url(&self) -> bool {
+        location_is_url(&self.location)
+    }
+
+    /// What a rendered row calls this doc: its title when it has one, else the
+    /// location, which is then the only name it has.
+    pub fn label(&self) -> &str {
+        match &self.title {
+            Some(title) => title,
+            None => &self.location,
+        }
+    }
+}
+
+/// Whether a doc location is a URL rather than a path. Deliberately a narrow
+/// scheme test, so a bare `docs/plan.md` never has to be escaped to read as a
+/// path.
+pub fn location_is_url(location: &str) -> bool {
+    location.starts_with("http://") || location.starts_with("https://")
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub id: i64,

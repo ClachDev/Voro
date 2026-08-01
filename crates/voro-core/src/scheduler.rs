@@ -15,7 +15,11 @@ pub struct ScoreBreakdown {
     pub state: TaskState,
     /// Static per-state nudge folded into the priority term (§7).
     pub state_bonus: f64,
-    /// weight × (priority_value + state_bonus)
+    /// Open tasks with a `blocks` dependency on this one (§7).
+    pub open_dependents: i64,
+    /// 1 × open_dependents, capped at 2
+    pub unblock_bonus: f64,
+    /// weight × (priority_value + state_bonus + unblock_bonus)
     pub base: f64,
     pub age_days: f64,
     /// 0.1 × age_days, capped at 2
@@ -35,10 +39,24 @@ pub fn state_bonus(state: TaskState) -> f64 {
     }
 }
 
-pub fn score(weight: i64, priority: Priority, state: TaskState, age_days: f64) -> ScoreBreakdown {
+/// A nudge for a task other open work is parked behind (§7): one point per
+/// direct open `blocks` dependent, capped at two so unblocking never
+/// masquerades as a priority level.
+pub fn unblock_bonus(open_dependents: i64) -> f64 {
+    (open_dependents.max(0) as f64).min(2.0)
+}
+
+pub fn score(
+    weight: i64,
+    priority: Priority,
+    state: TaskState,
+    age_days: f64,
+    open_dependents: i64,
+) -> ScoreBreakdown {
     let priority_value = priority.value();
     let state_bonus = state_bonus(state);
-    let base = weight as f64 * (priority_value + state_bonus);
+    let unblock_bonus = unblock_bonus(open_dependents);
+    let base = weight as f64 * (priority_value + state_bonus + unblock_bonus);
     let age_bonus = (0.1 * age_days).min(2.0);
     ScoreBreakdown {
         weight,
@@ -46,6 +64,8 @@ pub fn score(weight: i64, priority: Priority, state: TaskState, age_days: f64) -
         priority_value,
         state,
         state_bonus,
+        open_dependents,
+        unblock_bonus,
         base,
         age_days,
         age_bonus,
@@ -115,14 +135,20 @@ fn state_rank(state: TaskState) -> u8 {
 impl Store {
     /// Scheduler input: every task in a scored state, joined with its
     /// project, excluding weight-0 (parked) and archived projects entirely
-    /// (§5/§7).
+    /// (§5/§7). The open-dependent count arrives as one grouped join, not a
+    /// lookup per row.
     pub fn candidates(&self) -> Result<Vec<Candidate>> {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.project_id, t.title, t.body, t.priority, t.state, t.agent,
                     t.question, t.pr_url, t.branch, t.state_since, t.created_at, t.closed_at,
                     t.human, t.repo_id, t.deep, p.name, p.weight,
-                    julianday('now') - julianday(t.state_since)
+                    julianday('now') - julianday(t.state_since),
+                    COALESCE(b.open_dependents, 0)
              FROM tasks t JOIN projects p ON p.id = t.project_id
+             LEFT JOIN (SELECT d.depends_on AS blocker_id, COUNT(*) AS open_dependents
+                        FROM deps d JOIN tasks dt ON dt.id = d.task_id
+                        WHERE d.kind = 'blocks' AND dt.state NOT IN ('done','rejected')
+                        GROUP BY d.depends_on) b ON b.blocker_id = t.id
              WHERE p.weight > 0 AND p.archived = 0
                AND t.state IN ('ready','needs-input','review','stalled','proposed')",
         )?;
@@ -131,7 +157,8 @@ impl Store {
             let project_name: String = row.get(16)?;
             let weight: i64 = row.get(17)?;
             let age_days: f64 = row.get(18)?;
-            let score = score(weight, task.priority, task.state, age_days);
+            let open_dependents: i64 = row.get(19)?;
+            let score = score(weight, task.priority, task.state, age_days, open_dependents);
             Ok(Candidate {
                 task,
                 project_name,
@@ -144,16 +171,24 @@ impl Store {
     /// Score decomposition for any single task, whatever its state — the
     /// TUI popup today, `voro explain <task>` later.
     pub fn explain(&self, task_id: i64) -> Result<ScoreBreakdown> {
-        let (weight, priority, state, age_days): (i64, Priority, TaskState, f64) =
-            self.conn.query_row(
-                "SELECT p.weight, t.priority, t.state,
-                        julianday('now') - julianday(t.state_since)
+        let (weight, priority, state, age_days, open_dependents): (
+            i64,
+            Priority,
+            TaskState,
+            f64,
+            i64,
+        ) = self.conn.query_row(
+            "SELECT p.weight, t.priority, t.state,
+                    julianday('now') - julianday(t.state_since),
+                    (SELECT COUNT(*) FROM deps d JOIN tasks dt ON dt.id = d.task_id
+                     WHERE d.depends_on = t.id AND d.kind = 'blocks'
+                       AND dt.state NOT IN ('done','rejected'))
              FROM tasks t JOIN projects p ON p.id = t.project_id
              WHERE t.id = ?1",
-                [task_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )?;
-        Ok(score(weight, priority, state, age_days))
+            [task_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+        Ok(score(weight, priority, state, age_days, open_dependents))
     }
 
     /// Count of untriaged tasks. Parked (weight-0) and archived projects are
@@ -213,8 +248,8 @@ mod tests {
     #[test]
     fn worked_example_from_design_doc() {
         // P0 in a weight-2 project (16) beats P2 in a weight-5 project (10).
-        let p0_low_weight = score(2, Priority::P0, TaskState::Ready, 0.0);
-        let p2_high_weight = score(5, Priority::P2, TaskState::Ready, 0.0);
+        let p0_low_weight = score(2, Priority::P0, TaskState::Ready, 0.0, 0);
+        let p2_high_weight = score(5, Priority::P2, TaskState::Ready, 0.0, 0);
         assert_eq!(p0_low_weight.total, 16.0);
         assert_eq!(p2_high_weight.total, 10.0);
         assert!(p0_low_weight.total > p2_high_weight.total);
@@ -222,32 +257,79 @@ mod tests {
 
     #[test]
     fn priority_values_are_geometric() {
-        assert_eq!(score(1, Priority::P0, TaskState::Ready, 0.0).total, 8.0);
-        assert_eq!(score(1, Priority::P1, TaskState::Ready, 0.0).total, 4.0);
-        assert_eq!(score(1, Priority::P2, TaskState::Ready, 0.0).total, 2.0);
-        assert_eq!(score(1, Priority::P3, TaskState::Ready, 0.0).total, 1.0);
+        assert_eq!(score(1, Priority::P0, TaskState::Ready, 0.0, 0).total, 8.0);
+        assert_eq!(score(1, Priority::P1, TaskState::Ready, 0.0, 0).total, 4.0);
+        assert_eq!(score(1, Priority::P2, TaskState::Ready, 0.0, 0).total, 2.0);
+        assert_eq!(score(1, Priority::P3, TaskState::Ready, 0.0, 0).total, 1.0);
     }
 
     #[test]
     fn age_bonus_grows_then_caps_at_two() {
-        assert_eq!(score(3, Priority::P2, TaskState::Ready, 0.0).age_bonus, 0.0);
-        assert_eq!(score(3, Priority::P2, TaskState::Ready, 5.0).age_bonus, 0.5);
         assert_eq!(
-            score(3, Priority::P2, TaskState::Ready, 20.0).age_bonus,
+            score(3, Priority::P2, TaskState::Ready, 0.0, 0).age_bonus,
+            0.0
+        );
+        assert_eq!(
+            score(3, Priority::P2, TaskState::Ready, 5.0, 0).age_bonus,
+            0.5
+        );
+        assert_eq!(
+            score(3, Priority::P2, TaskState::Ready, 20.0, 0).age_bonus,
             2.0
         );
         assert_eq!(
-            score(3, Priority::P2, TaskState::Ready, 365.0).age_bonus,
+            score(3, Priority::P2, TaskState::Ready, 365.0, 0).age_bonus,
             2.0
         );
-        assert_eq!(score(3, Priority::P2, TaskState::Ready, 365.0).total, 8.0);
+        assert_eq!(
+            score(3, Priority::P2, TaskState::Ready, 365.0, 0).total,
+            8.0
+        );
     }
 
     #[test]
     fn decomposition_terms_sum_to_total() {
-        let s = score(4, Priority::P1, TaskState::Ready, 7.3);
+        let s = score(4, Priority::P1, TaskState::Ready, 7.3, 0);
         assert_eq!(s.base, 16.0);
         assert_eq!(s.total, s.base + s.age_bonus);
+    }
+
+    #[test]
+    fn unblock_bonus_counts_dependents_and_caps_at_two() {
+        assert_eq!(unblock_bonus(0), 0.0);
+        assert_eq!(unblock_bonus(1), 1.0);
+        assert_eq!(unblock_bonus(2), 2.0);
+        assert_eq!(unblock_bonus(9), 2.0);
+
+        // priced inside the weight multiply like the state bonus: a P2 in a
+        // weight-3 project is 3×2 = 6 blocking nothing, 3×(2+1) = 9 blocking
+        // one task, 3×(2+2) = 12 blocking three or more.
+        assert_eq!(score(3, Priority::P2, TaskState::Ready, 0.0, 0).base, 6.0);
+        assert_eq!(score(3, Priority::P2, TaskState::Ready, 0.0, 1).base, 9.0);
+        assert_eq!(score(3, Priority::P2, TaskState::Ready, 0.0, 3).base, 12.0);
+
+        // and it stays a decomposition term the total accounts for
+        let s = score(3, Priority::P2, TaskState::Ready, 10.0, 1);
+        assert_eq!(s.open_dependents, 1);
+        assert_eq!(s.unblock_bonus, 1.0);
+        assert_eq!(s.total, s.base + s.age_bonus);
+    }
+
+    #[test]
+    fn the_unblock_bonus_applies_to_every_scored_state() {
+        // like the age bonus: a dependency edge is an operator/graph fact, so
+        // even an untriaged proposal earns it (§7).
+        for state in [
+            TaskState::Ready,
+            TaskState::NeedsInput,
+            TaskState::Review,
+            TaskState::Stalled,
+            TaskState::Proposed,
+        ] {
+            let plain = score(2, Priority::P2, state, 0.0, 0);
+            let blocking = score(2, Priority::P2, state, 0.0, 1);
+            assert_eq!(blocking.base - plain.base, 2.0, "{state}");
+        }
     }
 
     #[test]
@@ -261,11 +343,11 @@ mod tests {
 
         // P2 in a weight-3 project: 3×(2+4) = 18 as a question, 3×2 = 6 ready.
         assert_eq!(
-            score(3, Priority::P2, TaskState::NeedsInput, 0.0).base,
+            score(3, Priority::P2, TaskState::NeedsInput, 0.0, 0).base,
             18.0
         );
-        assert_eq!(score(3, Priority::P2, TaskState::Review, 0.0).base, 12.0);
-        assert_eq!(score(3, Priority::P2, TaskState::Ready, 0.0).base, 6.0);
+        assert_eq!(score(3, Priority::P2, TaskState::Review, 0.0, 0).base, 12.0);
+        assert_eq!(score(3, Priority::P2, TaskState::Ready, 0.0, 0).base, 6.0);
     }
 
     // --- ordering over a real store ---
@@ -440,7 +522,10 @@ mod tests {
     fn a_stalled_task_scores_the_review_bonus_and_competes_in_the_queue() {
         // stalled earns +2, the same as review (§7).
         assert_eq!(state_bonus(TaskState::Stalled), 2.0);
-        assert_eq!(score(3, Priority::P2, TaskState::Stalled, 0.0).base, 12.0);
+        assert_eq!(
+            score(3, Priority::P2, TaskState::Stalled, 0.0, 0).base,
+            12.0
+        );
 
         // A stalled P2 (3×(2+2) = 12) ties a ready P1 (3×4 = 12) exactly; the
         // state precedence slots stalled after review, before ready.
@@ -704,6 +789,95 @@ mod tests {
         s.apply(blocker, crate::Action::Accept).unwrap();
         let candidates = s.candidates().unwrap();
         assert_eq!(focus(&candidates).unwrap().task.id, blocked);
+    }
+
+    #[test]
+    fn only_open_blocks_dependents_count_toward_the_unblock_bonus() {
+        let mut s = setup();
+        let p = add_project(&mut s, "p", 2);
+        let blocker = add_task(&mut s, p, "blocker", Priority::P2);
+
+        // nothing waits on it yet
+        let alone = s.explain(blocker).unwrap();
+        assert_eq!(alone.open_dependents, 0);
+        assert_eq!(alone.unblock_bonus, 0.0);
+
+        // an open task parked behind it counts
+        let blocked = add_task(&mut s, p, "blocked", Priority::P2);
+        s.add_dep(blocked, blocker, crate::DepKind::Blocks).unwrap();
+        assert_eq!(s.explain(blocker).unwrap().open_dependents, 1);
+
+        // a closed dependent does not, whether accepted or rejected
+        let finished = add_task(&mut s, p, "finished", Priority::P2);
+        s.apply(finished, crate::Action::Start).unwrap();
+        s.apply(finished, crate::Action::Complete(None)).unwrap();
+        s.apply(finished, crate::Action::Accept).unwrap();
+        s.add_dep(finished, blocker, crate::DepKind::Blocks)
+            .unwrap();
+        let idea = add_proposed(&mut s, p, "bad idea", Priority::P2);
+        s.apply(idea, crate::Action::Triage(crate::Triage::Reject))
+            .unwrap();
+        s.add_dep(idea, blocker, crate::DepKind::Blocks).unwrap();
+        assert_eq!(s.explain(blocker).unwrap().open_dependents, 1);
+
+        // nor does an edge of any other kind
+        for kind in [
+            crate::DepKind::DiscoveredFrom,
+            crate::DepKind::Parent,
+            crate::DepKind::Related,
+        ] {
+            let other = add_task(&mut s, p, "adjacent work", Priority::P2);
+            s.add_dep(other, blocker, kind).unwrap();
+        }
+        assert_eq!(s.explain(blocker).unwrap().open_dependents, 1);
+
+        // the queue's own query agrees with the single-task decomposition
+        let candidates = s.candidates().unwrap();
+        let scored = candidates.iter().find(|c| c.task.id == blocker).unwrap();
+        assert_eq!(scored.score.open_dependents, 1);
+        assert_eq!(scored.score.base, 6.0); // 2×(2+1)
+    }
+
+    #[test]
+    fn blocking_open_work_lifts_a_task_over_an_identical_one() {
+        let mut s = setup();
+        let p = add_project(&mut s, "p", 3);
+        let plain = add_task(&mut s, p, "plain", Priority::P2); // 3×2 = 6
+        let blocking = add_task(&mut s, p, "blocking", Priority::P2); // 3×(2+1) = 9
+        let blocked = add_task(&mut s, p, "blocked", Priority::P2);
+        s.add_dep(blocked, blocking, crate::DepKind::Blocks)
+            .unwrap();
+        // pin the ages equal so only the unblock bonus separates them
+        s.conn
+            .execute(
+                "UPDATE tasks SET state_since = '2020-01-01 00:00:00' WHERE id IN (?1, ?2)",
+                (plain, blocking),
+            )
+            .unwrap();
+
+        let candidates = s.candidates().unwrap();
+        // the blocked task is parked behind its blocker, so only the two
+        // otherwise-identical tasks compete — and the one holding work up wins
+        let ids: Vec<i64> = queue(&candidates).iter().map(|c| c.task.id).collect();
+        assert_eq!(ids, vec![blocking, plain]);
+        assert_eq!(focus(&candidates).unwrap().task.id, blocking);
+
+        // a second and third dependent grow the bonus to the cap, no further
+        for i in 0..2 {
+            let more = add_task(&mut s, p, &format!("also blocked {i}"), Priority::P2);
+            s.add_dep(more, blocking, crate::DepKind::Blocks).unwrap();
+        }
+        let candidates = s.candidates().unwrap();
+        let scored = candidates.iter().find(|c| c.task.id == blocking).unwrap();
+        assert_eq!(scored.score.open_dependents, 3);
+        assert_eq!(scored.score.unblock_bonus, 2.0);
+        assert_eq!(scored.score.base, 12.0); // 3×(2+2)
+
+        // and even at the cap it never fakes a priority level: a fresh P0
+        // blocking nothing (3×8 = 24) still walks away with it
+        let urgent = add_task(&mut s, p, "urgent", Priority::P0);
+        let candidates = s.candidates().unwrap();
+        assert_eq!(focus(&candidates).unwrap().task.id, urgent);
     }
 
     #[test]

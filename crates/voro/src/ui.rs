@@ -213,6 +213,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             if let Some(session) = app.last_sessions.get(task_id) {
                 lines.extend(session_lines(session, t.state));
             }
+            lines.extend(doc_lines(app, *task_id));
             lines.extend(dep_lines(
                 app.deps.get(task_id).map_or(&[][..], |v| v),
                 app.dependents.get(task_id).map_or(&[][..], |v| v),
@@ -379,12 +380,14 @@ fn draw_mode(frame: &mut Frame, app: &App) {
 fn score_lines(b: &ScoreBreakdown) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         format!(
-            "weight {} · {} (value {}) · {} (+{}) · base w×(p+s) {:.1} · age {:.1}d (+{:.2})",
+            "weight {} · {} (value {}) · {} (+{}) · blocks ×{} (+{}) · base w×(p+s+u) {:.1} · age {:.1}d (+{:.2})",
             b.weight,
             b.priority,
             b.priority_value,
             b.state,
             b.state_bonus,
+            b.open_dependents,
+            b.unblock_bonus,
             b.base,
             b.age_days,
             b.age_bonus
@@ -591,6 +594,30 @@ fn repo_span(name: &str, path: &str) -> Span<'static> {
         format!("repo: {name} ({path})"),
         Style::new().fg(Color::Green),
     )
+}
+
+/// The plans a task derives from (DESIGN.md §3), one line each: the title when
+/// the document carries one, then where it resolves to — the same location
+/// dispatch names in the agent's prompt. A task citing no document renders
+/// nothing.
+fn doc_lines(app: &App, task_id: i64) -> Vec<Line<'static>> {
+    app.docs
+        .get(&task_id)
+        .map_or(&[][..], |v| v)
+        .iter()
+        .map(|doc| {
+            let location = app
+                .doc_locations
+                .get(&doc.id)
+                .cloned()
+                .unwrap_or_else(|| doc.location.clone());
+            let text = match &doc.title {
+                Some(title) => format!("doc: {title} — {location}"),
+                None => format!("doc: {location}"),
+            };
+            Line::from(Span::styled(text, Style::new().fg(Color::Magenta)))
+        })
+        .collect()
 }
 
 /// A review row's next action rendered as a browser suffix (DESIGN.md §3). The
@@ -826,6 +853,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(session) = app.last_sessions.get(&task.id) {
         lines.extend(session_lines(session, task.state));
     }
+    lines.extend(doc_lines(app, task.id));
     lines.extend(dep_lines(
         app.deps.get(&task.id).map_or(&[][..], |v| v),
         app.dependents.get(&task.id).map_or(&[][..], |v| v),
@@ -1761,7 +1789,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(
-            rendered.contains("base w×(p+s)"),
+            rendered.contains("base w×(p+s+u)"),
             "score decomposition should fold into the detail pane: {rendered}"
         );
         assert!(
@@ -2127,7 +2155,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(
-            rendered.contains("base w×(p+s)"),
+            rendered.contains("base w×(p+s+u)"),
             "score decomposition should fold into the Detail popup: {rendered}"
         );
         assert!(
