@@ -306,6 +306,17 @@ impl DispatchCtx {
         }
     }
 
+    /// A context whose `voro.toml` is deliberately absent, so a test resolves
+    /// agents and prices the queue from the built-ins alone rather than from
+    /// whatever the developer happens to have configured.
+    #[cfg(test)]
+    pub fn without_config(db_path: &Path) -> DispatchCtx {
+        DispatchCtx {
+            agents_path: db_path.with_file_name("no-such-voro.toml"),
+            ..DispatchCtx::from_db_path(db_path)
+        }
+    }
+
     /// The rolling log for subprocess launches that are *not* dispatches —
     /// viewer opens and attach/resume round-trips, which have no per-session
     /// log. They share one append-only file so a failure the TUI would paint

@@ -5,7 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use voro_core::{
-    DepKind, DepRef, Event, ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
+    ActionRow, DepKind, DepRef, DigestRow, EffectiveScore, Event, QueueRow, ScoreBreakdown,
+    Session, SessionOutcome, StateCounts, TaskState,
 };
 
 use crate::app::{App, CockpitRow, Mode, ReviewActionOption, Screen, TaskRow};
@@ -221,7 +222,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             if app.show_score
                 && let Some(b) = app.score_breakdown(*task_id)
             {
-                lines.extend(score_lines(&b));
+                lines.extend(score_lines(&b, app.effective_score(t, b.total)));
             }
             lines.push(Line::default());
             lines.extend(crate::markdown::body_lines(&t.body));
@@ -377,7 +378,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
 /// view: one dim line breaking the total down, plus a "not scheduled" note
 /// where the task's state keeps it out of the queue. Shared by the cockpit pane
 /// and the tasks-screen Detail popup.
-fn score_lines(b: &ScoreBreakdown) -> Vec<Line<'static>> {
+fn score_lines(b: &ScoreBreakdown, effective: Option<EffectiveScore>) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         format!(
             "weight {} · {} (value {}) · {} (+{}) · blocks ×{} (+{}) · base w×(p+s+u) {:.1} · age {:.1}d (+{:.2})",
@@ -394,6 +395,20 @@ fn score_lines(b: &ScoreBreakdown) -> Vec<Line<'static>> {
         ),
         Style::new().dim(),
     ))];
+    // What the queue ranks by: the total priced by what the row asks of the
+    // operator (DESIGN.md §7).
+    if let Some(e) = effective {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{:.2} ÷ {} ({}) = {:.2} effective",
+                b.total,
+                e.cost,
+                e.action.as_str(),
+                e.effective
+            ),
+            Style::new().dim(),
+        )));
+    }
     if !matches!(
         b.state,
         TaskState::Ready
@@ -433,7 +448,12 @@ fn history_lines(events: &[Event]) -> Vec<Line<'static>> {
 }
 
 fn draw_cockpit(frame: &mut Frame, app: &App) {
-    let queue_height = (app.queue.len() as u16 + 2).clamp(3, 12);
+    let queue_rows = app
+        .cockpit_rows
+        .iter()
+        .filter(|row| !matches!(row, CockpitRow::Running(_)))
+        .count();
+    let queue_height = (queue_rows as u16 + 2).clamp(3, 12);
     // Collapsed to nothing when no session is live, so the queue and detail
     // pane keep the space in the common case (DESIGN.md §9).
     let running_height = if app.running.is_empty() {
@@ -694,55 +714,92 @@ fn session_lines(session: &Session, state: TaskState) -> Vec<Line<'static>> {
     lines
 }
 
+/// One task's queue row: the effective score it was ranked by, its verb, and
+/// the markers the row carries. Shared by the top-level rows and the proposals
+/// listed under an expanded digest, which differ only in indent and dimming.
+fn action_row_line(app: &App, row: &ActionRow, indent: &str) -> Line<'static> {
+    let c = &row.candidate;
+    let untriaged = c.task.state == TaskState::Proposed;
+    let style = if untriaged {
+        Style::new().dim()
+    } else {
+        Style::new()
+    };
+    let score = if untriaged {
+        Span::styled(format!("{:5.1} ", row.effective), style)
+    } else {
+        score_span(row.effective)
+    };
+    let mut spans = vec![
+        score,
+        Span::styled(
+            format!(
+                "{indent}{} {:10} {}",
+                task_ref(c.task.id),
+                row.action.as_str(),
+                c.task.priority,
+            ),
+            style,
+        ),
+        deep_marker(c.task.deep),
+        Span::styled(format!(" {}: {}", c.project_name, c.task.title), style),
+    ];
+    if c.task.human {
+        spans.push(human_span());
+    }
+    if let Some(q) = &c.task.question {
+        spans.push(Span::styled(
+            format!("  — {}", question_summary(q)),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
+    if app.incomplete_report.contains(&c.task.id) {
+        // The verb column says "pr", but a PR cannot be opened
+        // from a half-finished report, so name the gap too.
+        spans.push(incomplete_report_span());
+    }
+    Line::from(spans)
+}
+
+/// A project's collapsed proposals (DESIGN.md §7): one row scored as its best
+/// child, so a triage backlog stays felt without swamping the queue.
+fn digest_line(digest: &DigestRow) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{:5.1} ", digest.effective), Style::new().dim()),
+        Span::styled(
+            format!(
+                "▲ {} awaiting triage ({})",
+                pluralise(digest.tasks.len(), "proposal"),
+                digest.project_name
+            ),
+            Style::new().fg(Color::Yellow),
+        ),
+    ])
+}
+
+fn pluralise(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("{n} {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
 fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
     let mut items: Vec<ListItem> = Vec::new();
     let mut selected: Option<usize> = None;
     for (i, row) in app.cockpit_rows.iter().enumerate() {
         let item = match row {
-            CockpitRow::Queue(idx) => {
-                let c = &app.queue[*idx];
-                let untriaged = c.task.state == voro_core::TaskState::Proposed;
-                let style = if untriaged {
-                    Style::new().dim()
-                } else {
-                    Style::new()
-                };
-                let score = if untriaged {
-                    Span::styled(format!("{:5.1} ", c.score.total), style)
-                } else {
-                    score_span(c.score.total)
-                };
-                let mut spans = vec![
-                    score,
-                    Span::styled(
-                        format!(
-                            "{} {:10} {}",
-                            task_ref(c.task.id),
-                            c.task.next_action().map_or("", |a| a.as_str()),
-                            c.task.priority,
-                        ),
-                        style,
-                    ),
-                    deep_marker(c.task.deep),
-                    Span::styled(format!(" {}: {}", c.project_name, c.task.title), style),
-                ];
-                if c.task.human {
-                    spans.push(human_span());
-                }
-                if let Some(q) = &c.task.question {
-                    spans.push(Span::styled(
-                        format!("  — {}", question_summary(q)),
-                        Style::new().fg(Color::Cyan),
-                    ));
-                }
-                if app.incomplete_report.contains(&c.task.id) {
-                    // The verb column says "pr", but a PR cannot be opened
-                    // from a half-finished report, so name the gap too.
-                    spans.push(incomplete_report_span());
-                }
-                ListItem::new(Line::from(spans))
-            }
-            _ => continue,
+            CockpitRow::Queue(idx) => match app.queue.rows.get(*idx) {
+                Some(QueueRow::Action(row)) => ListItem::new(action_row_line(app, row, "")),
+                Some(QueueRow::Digest(digest)) => ListItem::new(digest_line(digest)),
+                None => continue,
+            },
+            CockpitRow::Proposal(i, j) => match app.digest_child(*i, *j) {
+                Some(row) => ListItem::new(action_row_line(app, row, "  ↳ ")),
+                None => continue,
+            },
+            CockpitRow::Running(_) => continue,
         };
         if i == app.cockpit_sel {
             selected = Some(items.len());
@@ -751,14 +808,59 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
     }
     let empty = items.is_empty();
     let mut state = ListState::default().with_selected(selected);
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Next"))
-        .highlight_style(SELECTED);
+    let mut block = Block::default().borders(Borders::ALL).title("Next");
+    // The gate suppressed every dispatch row, so the pane says why rather than
+    // reading as "nothing startable" (DESIGN.md §7).
+    if let Some(gate) = app.queue.at_capacity {
+        block = block.title_top(
+            Line::from(Span::styled(
+                format!(
+                    " ⏸ dispatch at capacity ({}/{} running) ",
+                    gate.running, gate.max_running
+                ),
+                Style::new().fg(Color::Yellow),
+            ))
+            .right_aligned(),
+        );
+    }
+    let list = List::new(items).block(block).highlight_style(SELECTED);
     frame.render_stateful_widget(list, area, &mut state);
     if empty {
         let inner = area.inner(ratatui::layout::Margin::new(1, 1));
         frame.render_widget(Paragraph::new("nothing to do — press n").dim(), inner);
     }
+}
+
+/// The detail pane's view of a digest row: the proposals it stands for, so the
+/// operator can read the backlog without folding it open first.
+fn digest_detail_lines(digest: &DigestRow) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "{} awaiting triage in {}",
+                pluralise(digest.tasks.len(), "proposal"),
+                digest.project_name
+            ),
+            Style::new().bold(),
+        )),
+        Line::from(Span::styled(
+            "⏎ folds the digest open, so each proposal can be triaged in place",
+            Style::new().dim(),
+        )),
+        Line::default(),
+    ];
+    lines.extend(digest.tasks.iter().map(|row| {
+        Line::from(vec![
+            Span::styled(format!("{:5.1} ", row.effective), Style::new().dim()),
+            Span::raw(format!(
+                "{} {} {}",
+                task_ref(row.candidate.task.id),
+                row.candidate.task.priority,
+                row.candidate.task.title
+            )),
+        ])
+    }));
+    lines
 }
 
 /// The body of whichever row is selected — the pane follows the selection
@@ -768,10 +870,36 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
 
     let selected = app.cockpit_rows.get(app.cockpit_sel);
     let (task, project, score) = match selected {
-        Some(CockpitRow::Queue(i)) => {
-            let c = &app.queue[*i];
-            (&c.task, c.project_name.as_str(), Some(c.score.total))
-        }
+        Some(CockpitRow::Queue(i)) => match app.queue.rows.get(*i) {
+            Some(QueueRow::Action(row)) => (
+                &row.candidate.task,
+                row.candidate.project_name.as_str(),
+                Some(row.effective),
+            ),
+            Some(QueueRow::Digest(digest)) => {
+                let para = Paragraph::new(digest_detail_lines(digest))
+                    .wrap(Wrap { trim: false })
+                    .block(block);
+                frame.render_widget(para, area);
+                app.detail_max_scroll.set(0);
+                return;
+            }
+            None => {
+                frame.render_widget(Paragraph::new("").block(block), area);
+                return;
+            }
+        },
+        Some(CockpitRow::Proposal(i, j)) => match app.digest_child(*i, *j) {
+            Some(row) => (
+                &row.candidate.task,
+                row.candidate.project_name.as_str(),
+                Some(row.effective),
+            ),
+            None => {
+                frame.render_widget(Paragraph::new("").block(block), area);
+                return;
+            }
+        },
         Some(CockpitRow::Running(i)) => {
             let r = &app.running[*i];
             match app.all.iter().find(|row| row.task.id == r.task_id) {
@@ -861,7 +989,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     if app.show_score
         && let Some(b) = app.score_breakdown(task.id)
     {
-        lines.extend(score_lines(&b));
+        lines.extend(score_lines(&b, app.effective_score(task, b.total)));
     }
     lines.push(Line::default());
     lines.extend(crate::markdown::body_lines(&task.body));
@@ -1524,7 +1652,7 @@ mod tests {
             .set_blocks_deps(waiting.id, &[open.id, closed.id])
             .unwrap();
 
-        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
         let mut app = App::new(store, ctx).unwrap();
@@ -1572,7 +1700,7 @@ mod tests {
             })
             .unwrap();
 
-        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
         let mut app = App::new(store, ctx).unwrap();
@@ -1637,7 +1765,7 @@ mod tests {
         store.create_task(new("the hard one", true)).unwrap();
         store.create_task(new("the ordinary one", false)).unwrap();
 
-        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
         let mut app = App::new(store, ctx).unwrap();
@@ -1712,7 +1840,7 @@ mod tests {
             .and_then(|_| store.apply(closed.id, voro_core::Action::Accept))
             .unwrap();
 
-        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
         let mut app = App::new(store, ctx).unwrap();
@@ -1772,7 +1900,7 @@ mod tests {
             })
             .unwrap();
 
-        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
         let mut app = App::new(store, ctx).unwrap();
@@ -1884,7 +2012,7 @@ mod tests {
             .add_dep(waiting.id, target.id, DepKind::Blocks)
             .unwrap();
 
-        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
         let mut app = App::new(store, ctx).unwrap();
@@ -1992,7 +2120,7 @@ mod tests {
             .create_task(new("startable", TaskState::Ready, false))
             .unwrap();
 
-        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
         let app = App::new(store, ctx).unwrap();
@@ -2006,8 +2134,14 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
 
+        // The proposal's verb rides its digest row rather than a row of its
+        // own (DESIGN.md §7); every other verb still renders in place.
+        assert!(
+            rendered.contains("▲ 1 proposal awaiting triage"),
+            "the digest should stand in for #{}: {rendered}",
+            triage.id
+        );
         for (task, verb) in [
-            (&triage, "triage"),
             (&answer, "answer"),
             (&pr, "pr"),
             (&review_pr, "review PR"),
@@ -2022,6 +2156,66 @@ mod tests {
                 task.id
             );
         }
+    }
+
+    /// End-to-end: with the fleet full the cockpit offers no dispatch rows and
+    /// says why in the pane's own header (DESIGN.md §7), while the rows that
+    /// cost only attention stay put.
+    #[test]
+    fn cockpit_shows_the_capacity_line_instead_of_dispatch_rows() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let new = |title: &str| NewTask {
+            project_id: p.id,
+            repo_id: None,
+            title: title.into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state: TaskState::Ready,
+            agent: None,
+            human: false,
+            deep: false,
+        };
+        // Fill the default cap of five, then leave one startable task and one
+        // question behind it.
+        for i in 0..5 {
+            let t = store.create_task(new(&format!("in flight {i}"))).unwrap();
+            store.apply(t.id, Action::Start).unwrap();
+        }
+        store.create_task(new("startable")).unwrap();
+        let asking = store.create_task(new("asking")).unwrap();
+        store.apply(asking.id, Action::Start).unwrap();
+        store
+            .apply(asking.id, Action::Ask("A or B?".into()))
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let app = App::new(store, ctx).unwrap();
+        assert_eq!(app.queue_task_ids(), vec![asking.id]);
+
+        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+
+        assert!(
+            rendered.contains("⏸ dispatch at capacity (5/5 running)"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("startable"), "{rendered}");
+        assert!(rendered.contains("asking"), "{rendered}");
     }
 
     /// End-to-end: a body taller than the focus card overflows, so the pane
@@ -2056,7 +2250,7 @@ mod tests {
             })
             .unwrap();
 
-        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
         let mut app = App::new(store, ctx).unwrap();
@@ -2135,7 +2329,7 @@ mod tests {
             })
             .unwrap();
 
-        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
         let mut app = App::new(store, ctx).unwrap();
@@ -2176,7 +2370,9 @@ mod tests {
         use voro_core::{NewTask, Store};
 
         let ctx = || {
-            crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new("/nonexistent/voro.db"))
+            crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                "/nonexistent/voro.db",
+            ))
         };
         let app_with_session = |capped: bool| {
             let mut store = Store::open_in_memory().unwrap();
@@ -2280,7 +2476,7 @@ mod tests {
             .unwrap();
         store.apply(task.id, Action::Ask("A or B?".into())).unwrap();
 
-        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
         let app = App::new(store, ctx).unwrap();
@@ -2337,7 +2533,7 @@ mod tests {
             )
             .unwrap();
 
-        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
         let app = App::new(store, ctx).unwrap();
@@ -2370,7 +2566,9 @@ mod tests {
         use voro_core::{NewTask, Store};
 
         let ctx = || {
-            crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new("/nonexistent/voro.db"))
+            crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                "/nonexistent/voro.db",
+            ))
         };
 
         let empty = App::new(Store::open_in_memory().unwrap(), ctx()).unwrap();
@@ -2471,7 +2669,7 @@ mod tests {
         store.create_task(new("idea", TaskState::Proposed)).unwrap();
         store.create_task(new("go", TaskState::Ready)).unwrap();
 
-        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
         let app = App::new(store, ctx).unwrap();

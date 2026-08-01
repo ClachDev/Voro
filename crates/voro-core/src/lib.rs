@@ -25,7 +25,10 @@ pub use model::{
     ReviewMedium, RunningRow, Session, SessionOutcome, Task, TaskState, location_is_url,
 };
 pub use pr::{Mergeability, PrPlan, PrRef, format_review_feedback, parse_mergeable, plan_pr};
-pub use scheduler::{Candidate, ScoreBreakdown, StateCounts};
+pub use scheduler::{
+    ActionRow, AttentionCosts, Candidate, DigestRow, EffectiveScore, Queue, QueueRow,
+    ScoreBreakdown, StateCounts, WipGate,
+};
 pub use store::{NewTask, Store, TaskEdit};
 pub use transition::{Action, Triage};
 

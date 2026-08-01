@@ -1,8 +1,8 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use voro_core::{
-    Action, AgentsConfig, Candidate, DepKind, DepRef, Event, PrRef, Priority, Project,
-    ReviewAction, ReviewMedium, RunningRow, ScoreBreakdown, StateCounts, Store, Task, TaskState,
-    Triage, scheduler,
+    Action, ActionRow, AgentsConfig, DepKind, DepRef, DigestRow, Event, PrRef, Priority, Project,
+    Queue, QueueRow, ReviewAction, ReviewMedium, RunningRow, ScoreBreakdown, StateCounts, Store,
+    Task, TaskState, Triage, WipGate, scheduler,
 };
 
 /// Lines `PgDn`/`PgUp` move the focus card in one press. A fixed step, since
@@ -61,7 +61,11 @@ pub struct ConfigViewerRow {
 /// One selectable row on the cockpit; indices point into the App caches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CockpitRow {
+    /// One row of the scheduler's queue, by index.
     Queue(usize),
+    /// A proposal inside an expanded digest row (DESIGN.md §7): the digest's
+    /// queue index, then the proposal's index within it.
+    Proposal(usize, usize),
     Running(usize),
 }
 
@@ -243,7 +247,16 @@ pub struct App {
     pub status: Option<String>,
 
     pub projects: Vec<Project>,
-    pub queue: Vec<Candidate>,
+    /// The next-action queue (DESIGN.md §7), ranked by attention price and
+    /// carrying the dispatch gate's state when it is suppressing rows.
+    pub queue: Queue,
+    /// The attention price band the queue was last ranked with (DESIGN.md §7),
+    /// so the score decomposition can show the same division the order used.
+    pub costs: voro_core::AttentionCosts,
+    /// Which projects' proposal digests are expanded, so their constituent
+    /// rows are selectable for triage. Keyed by project name and held across
+    /// refreshes, so triaging one proposal does not collapse the rest.
+    pub expanded_digests: std::collections::HashSet<String>,
     /// The cockpit's running strip (DESIGN.md §9): one row per `running` task
     /// with its open session if any, so a task started by hand is still visible.
     /// Filtered on task state, so `review`/`needs-input` tasks stay in the queue.
@@ -357,7 +370,12 @@ impl App {
             should_quit: false,
             status: None,
             projects: Vec::new(),
-            queue: Vec::new(),
+            queue: Queue {
+                rows: Vec::new(),
+                at_capacity: None,
+            },
+            costs: voro_core::AttentionCosts::default(),
+            expanded_digests: std::collections::HashSet::new(),
             running: Vec::new(),
             counts: StateCounts::default(),
             all: Vec::new(),
@@ -428,7 +446,6 @@ impl App {
 
         self.projects = self.store.projects()?;
         let candidates = self.store.candidates()?;
-        self.queue = scheduler::queue(&candidates).into_iter().cloned().collect();
 
         self.deps = self.store.deps_by_task()?;
         self.dependents = self.store.dependents_by_task()?;
@@ -485,11 +502,24 @@ impl App {
         self.running = self.store.running_rows()?;
         self.counts = self.store.state_counts()?;
 
-        self.cockpit_rows = (0..self.queue.len()).map(CockpitRow::Queue).collect();
-        self.cockpit_rows
-            .extend((0..self.running.len()).map(CockpitRow::Running));
+        // The queue is priced by what each row asks of the operator and gated
+        // on how much is already in flight (DESIGN.md §7). A `voro.toml` that
+        // will not parse falls back to the defaults here rather than emptying
+        // the cockpit — the Config screen is where the error is surfaced.
+        let config = AgentsConfig::load(&self.dispatch_ctx.agents_path);
+        let costs = config.as_ref().map(AgentsConfig::costs).unwrap_or_default();
+        let gate = WipGate {
+            running: self.counts.running,
+            max_running: config
+                .as_ref()
+                .map_or(scheduler::DEFAULT_MAX_RUNNING, |c| c.max_running()),
+        };
+        self.costs = costs;
+        self.queue = scheduler::queue(&candidates, &costs, gate);
 
-        self.load_config_view();
+        self.cockpit_rows = self.build_cockpit_rows();
+
+        self.load_config_view(config);
 
         self.cockpit_sel = self
             .cockpit_sel
@@ -502,11 +532,77 @@ impl App {
         Ok(())
     }
 
+    /// Flatten the queue into selectable rows: every queue row, with an
+    /// expanded digest's proposals listed beneath it, then the running strip.
+    fn build_cockpit_rows(&self) -> Vec<CockpitRow> {
+        let mut rows = Vec::new();
+        for (i, row) in self.queue.rows.iter().enumerate() {
+            rows.push(CockpitRow::Queue(i));
+            if let QueueRow::Digest(digest) = row
+                && self.expanded_digests.contains(&digest.project_name)
+            {
+                rows.extend((0..digest.tasks.len()).map(|j| CockpitRow::Proposal(i, j)));
+            }
+        }
+        rows.extend((0..self.running.len()).map(CockpitRow::Running));
+        rows
+    }
+
+    /// What a task's raw score becomes once priced by its next action
+    /// (DESIGN.md §7) — what the queue actually ranked it by.
+    pub fn effective_score(&self, task: &Task, total: f64) -> Option<voro_core::EffectiveScore> {
+        scheduler::effective_score(task, total, &self.costs)
+    }
+
+    /// The queue's task rows in order, by id — digests contribute nothing,
+    /// since they name a backlog rather than a task.
+    #[cfg(test)]
+    pub fn queue_task_ids(&self) -> Vec<i64> {
+        self.queue
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                QueueRow::Action(row) => Some(row.candidate.task.id),
+                QueueRow::Digest(_) => None,
+            })
+            .collect()
+    }
+
+    /// The digest a queue row holds, if it is one.
+    pub fn digest(&self, queue_index: usize) -> Option<&DigestRow> {
+        match self.queue.rows.get(queue_index)? {
+            QueueRow::Digest(digest) => Some(digest),
+            QueueRow::Action(_) => None,
+        }
+    }
+
+    /// One proposal inside a digest row.
+    pub fn digest_child(&self, queue_index: usize, child: usize) -> Option<&ActionRow> {
+        self.digest(queue_index)?.tasks.get(child)
+    }
+
+    /// Fold a digest row open or shut, so its proposals become selectable for
+    /// triage (DESIGN.md §7). Rebuilds the row list in place; the selection
+    /// stays on the digest, which is where the operator pressed Enter.
+    fn toggle_digest(&mut self, queue_index: usize) {
+        let Some(digest) = self.digest(queue_index) else {
+            return;
+        };
+        let project = digest.project_name.clone();
+        if !self.expanded_digests.remove(&project) {
+            self.expanded_digests.insert(project);
+        }
+        self.cockpit_rows = self.build_cockpit_rows();
+        self.cockpit_sel = self
+            .cockpit_sel
+            .min(self.cockpit_rows.len().saturating_sub(1));
+    }
+
     /// Reload the Config screen's `voro.toml` view (DESIGN.md §5). A parse
     /// failure is held in `config_error` and shown on the screen; the agent and
     /// dispatch paths load the file independently, so this only feeds rendering.
-    fn load_config_view(&mut self) {
-        let config = match AgentsConfig::load(&self.dispatch_ctx.agents_path) {
+    fn load_config_view(&mut self, config: voro_core::Result<AgentsConfig>) {
+        let config = match config {
             Ok(config) => config,
             Err(e) => {
                 self.config_agents.clear();
@@ -570,7 +666,12 @@ impl App {
     pub fn selected_task_id(&self) -> Option<i64> {
         match self.screen {
             Screen::Cockpit => match self.cockpit_rows.get(self.cockpit_sel)? {
-                CockpitRow::Queue(i) => Some(self.queue.get(*i)?.task.id),
+                // A digest names no single task; its children do.
+                CockpitRow::Queue(i) => match self.queue.rows.get(*i)? {
+                    QueueRow::Action(row) => Some(row.candidate.task.id),
+                    QueueRow::Digest(_) => None,
+                },
+                CockpitRow::Proposal(i, j) => Some(self.digest_child(*i, *j)?.candidate.task.id),
                 CockpitRow::Running(i) => Some(self.running.get(*i)?.task_id),
             },
             Screen::Tasks => Some(self.all.get(self.tasks_sel)?.task.id),
@@ -673,6 +774,12 @@ impl App {
             }
             return;
         }
+        if let Some(CockpitRow::Queue(i)) = self.cockpit_rows.get(self.cockpit_sel)
+            && self.digest(*i).is_some()
+        {
+            self.toggle_digest(*i);
+            return;
+        }
         if let Some(task) = self.selected_task() {
             if task.state == TaskState::NeedsInput {
                 let id = task.id;
@@ -698,12 +805,21 @@ impl App {
             Screen::Config => self.config_viewers.get(self.config_sel).map(|_| "⏎ edit"),
             Screen::Tasks => self.all.get(self.tasks_sel).map(|_| "⏎ view"),
             Screen::Cockpit => match self.cockpit_rows.get(self.cockpit_sel)? {
-                CockpitRow::Queue(i) => match self.queue.get(*i)?.task.state {
-                    TaskState::NeedsInput => Some("⏎ resume"),
-                    TaskState::Proposed => Some("⏎ triage"),
-                    TaskState::Review => Some("⏎ review"),
-                    _ => Some("⏎ act"),
+                CockpitRow::Queue(i) => match self.queue.rows.get(*i)? {
+                    QueueRow::Digest(digest) => {
+                        if self.expanded_digests.contains(&digest.project_name) {
+                            Some("⏎ collapse")
+                        } else {
+                            Some("⏎ expand")
+                        }
+                    }
+                    QueueRow::Action(row) => match row.candidate.task.state {
+                        TaskState::NeedsInput => Some("⏎ resume"),
+                        TaskState::Review => Some("⏎ review"),
+                        _ => Some("⏎ act"),
+                    },
                 },
+                CockpitRow::Proposal(..) => Some("⏎ triage"),
                 CockpitRow::Running(_) => Some("⏎ act"),
             },
         }
@@ -2144,7 +2260,7 @@ mod tests {
     /// A `DispatchCtx` that is never actually used to spawn anything in these
     /// tests — the transitions they drive (`resume`, reject) only move state.
     fn dummy_ctx() -> crate::dispatch::DispatchCtx {
-        crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new("/nonexistent/voro.db"))
+        crate::dispatch::DispatchCtx::without_config(std::path::Path::new("/nonexistent/voro.db"))
     }
 
     /// A store with one project and one task per requested state, reached
@@ -2211,7 +2327,7 @@ mod tests {
             CockpitRow::Queue(_)
         ));
         assert_eq!(app.enter_hint(), Some("⏎ resume"));
-        let task_id = app.queue[0].task.id;
+        let task_id = app.queue_task_ids()[0];
 
         key(&mut app, KeyCode::Enter);
         assert!(
@@ -2219,7 +2335,7 @@ mod tests {
             "resume applies directly, opening no prompt"
         );
         assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
-        assert!(app.queue.is_empty());
+        assert!(app.queue.rows.is_empty());
     }
 
     /// A scratch database, a freshly-`git init`ed clean project, and (unless
@@ -2397,15 +2513,26 @@ mod tests {
         assert_eq!(app.enter_hint(), None);
     }
 
+    /// Proposals ride the queue as one digest row per project (DESIGN.md §7),
+    /// so triage is two keystrokes: Enter folds the digest open, Enter on the
+    /// proposal beneath it opens the triage menu as before.
     #[test]
-    fn enter_on_proposed_row_opens_triage_menu() {
+    fn enter_expands_the_digest_then_opens_the_triage_menu() {
         let mut app = app_with(&[TaskState::Proposed]);
         assert!(matches!(
             app.cockpit_rows[app.cockpit_sel],
             CockpitRow::Queue(_)
         ));
-        assert_eq!(app.enter_hint(), Some("⏎ triage"));
+        // The digest names no task of its own — the row stands for the backlog.
+        assert_eq!(app.selected_task_id(), None);
+        assert_eq!(app.enter_hint(), Some("⏎ expand"));
 
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.enter_hint(), Some("⏎ collapse"));
+        assert!(matches!(app.cockpit_rows[1], CockpitRow::Proposal(0, 0)));
+
+        app.move_selection(1);
+        assert_eq!(app.enter_hint(), Some("⏎ triage"));
         key(&mut app, KeyCode::Enter);
         let task_id = match &app.mode {
             Mode::Transition {
@@ -2420,7 +2547,7 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Ready);
         // the triaged task re-enters the queue as startable work
-        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue.rows.len(), 1);
         assert_eq!(app.enter_hint(), Some("⏎ act"));
     }
 
@@ -2474,7 +2601,7 @@ mod tests {
     #[test]
     fn task_events_reads_history_oldest_first() {
         let app = app_with(&[TaskState::NeedsInput]);
-        let events = app.task_events(app.queue[0].task.id);
+        let events = app.task_events(app.queue_task_ids()[0]);
         // created, then start, then ask — oldest first
         assert_eq!(
             events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
@@ -2521,7 +2648,7 @@ mod tests {
     #[test]
     fn deep_key_toggles_the_flag_on_every_screen() {
         let mut app = app_with(&[TaskState::Ready]);
-        let id = app.queue[0].task.id;
+        let id = app.queue_task_ids()[0];
 
         key(&mut app, KeyCode::Char('!'));
         assert!(app.store.task(id).unwrap().deep);
@@ -2547,7 +2674,7 @@ mod tests {
     #[test]
     fn deep_key_on_a_human_task_reports_and_changes_nothing() {
         let mut app = app_with(&[TaskState::Ready]);
-        let id = app.queue[0].task.id;
+        let id = app.queue_task_ids()[0];
         let task = app.store.task(id).unwrap();
         app.store
             .update_task(
@@ -2896,13 +3023,13 @@ mod tests {
     fn projects_screen_archive_toggles_and_the_cockpit_empties() {
         let mut app = app_with(&[TaskState::Ready, TaskState::NeedsInput]);
         let project_id = app.projects[0].id;
-        assert_eq!(app.queue.len(), 2);
+        assert_eq!(app.queue.rows.len(), 2);
         key(&mut app, KeyCode::Char('3'));
 
         key(&mut app, KeyCode::Char('A'));
         assert!(app.store.project(project_id).unwrap().archived);
         assert!(app.projects[0].archived);
-        assert!(app.queue.is_empty());
+        assert!(app.queue.rows.is_empty());
         assert_eq!(app.counts.ready, 0);
         assert_eq!(app.counts.needs_input, 0);
         // the tasks froze rather than transitioned
@@ -2910,7 +3037,7 @@ mod tests {
 
         key(&mut app, KeyCode::Char('A'));
         assert!(!app.store.project(project_id).unwrap().archived);
-        assert_eq!(app.queue.len(), 2);
+        assert_eq!(app.queue.rows.len(), 2);
         assert_eq!(app.counts.needs_input, 1);
     }
 
@@ -3278,7 +3405,7 @@ mod tests {
     #[test]
     fn refresh_captures_a_stalled_tasks_last_session() {
         let app = app_with(&[TaskState::Stalled]);
-        let task_id = app.queue[0].task.id;
+        let task_id = app.queue_task_ids()[0];
         let session = app.last_sessions.get(&task_id).expect("a captured session");
         assert_eq!(session.outcome, Some(voro_core::SessionOutcome::Failed));
         assert!(session.ended_at.is_some());
