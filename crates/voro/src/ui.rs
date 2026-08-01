@@ -1439,9 +1439,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The contextual per-screen key line (ui-redesign §2): the actions that apply
 /// on the current screen and selection, as key/label pairs the caller renders
-/// key-bold, label-dim. It lists actions, not navigation (`j`/`k` and `r`
+/// key-bold, label-dim. It lists actions, not navigation (`j`/`k` and `ctrl-r`
 /// refresh are omitted); `q` and `tab` are always present. Selection-only
-/// actions drop out on the cockpit when nothing is selected.
+/// actions drop out on the cockpit when nothing is selected, and the refine
+/// keys appear only on a proposal, which is all they act on.
+/// Whether the selection is a proposal, which is the only thing refine acts on.
+fn selection_is_proposed(app: &App) -> bool {
+    app.selected_task_id().is_some_and(|id| app.is_proposed(id))
+}
+
 fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     // `enter_hint` yields "⏎ <verb>"; split the glyph from the verb so the
     // glyph renders as the bold key and the verb as the dim label.
@@ -1456,6 +1462,9 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             if app.selected_task_id().is_some() {
                 pairs.push(("d", "dispatch"));
                 pairs.push(("D", "agent"));
+            }
+            if selection_is_proposed(app) {
+                pairs.push(("r/R", "refine"));
             }
             pairs.push(("s", "state"));
             if app.selected_task_id().is_some() {
@@ -1484,6 +1493,9 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             }
             if app.selected_can_hand_off() {
                 pairs.push(("w", "wait"));
+            }
+            if selection_is_proposed(app) {
+                pairs.push(("r/R", "refine"));
             }
             pairs.push(("s", "state"));
             pairs.push(("!", "deep"));
