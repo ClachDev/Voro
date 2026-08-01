@@ -13,7 +13,11 @@ mod worktree;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::DefaultTerminal;
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
+};
+use ratatui::crossterm::execute;
 
 use app::{App, EditorRequest};
 use voro_core::Store;
@@ -57,14 +61,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(store, ctx)?;
 
-    let mut terminal = ratatui::init();
+    let mut terminal = init_terminal();
+    // The click targets of the frame on screen, rebuilt by every draw, since
+    // the key handlers deliberately run without geometry (DESIGN.md §9).
+    let mut hits = ui::HitMap::default();
     let result = loop {
-        if let Err(e) = terminal.draw(|frame| ui::draw(frame, &app)) {
+        if let Err(e) = terminal.draw(|frame| hits = ui::draw(frame, &app)) {
             break Err(e.into());
         }
         match event::poll(Duration::from_millis(500)) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => app.on_key(key),
+                Ok(Event::Mouse(m)) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
+                    app.on_mouse(m.column, m.row, &hits)
+                }
                 Ok(_) => {}
                 Err(e) => break Err(e.into()),
             },
@@ -82,30 +92,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(request) = app.pending_editor.take() {
             // $EDITOR owns the terminal for the duration; tear the TUI down
             // around it rather than fighting over raw mode.
-            ratatui::restore();
+            restore_terminal();
             editor_session(&mut app, request);
-            terminal = ratatui::init();
+            terminal = init_terminal();
         }
         if let Some(request) = app.pending_attach.take() {
             // attach/resume are full-screen interactive sessions that own the
             // terminal until the user detaches, same treatment as $EDITOR.
-            ratatui::restore();
+            restore_terminal();
             foreground_session(&mut app, "attach", &request.command, &request.cwd);
-            terminal = ratatui::init();
+            terminal = init_terminal();
         }
         if let Some(launch) = app.pending_plan.take() {
             // a planning session is interactive in the same way; the refresh
             // on return is what makes the task it proposed appear in the queue.
-            ratatui::restore();
+            restore_terminal();
             foreground_session(&mut app, launch.label, &launch.command, &launch.cwd);
-            terminal = ratatui::init();
+            terminal = init_terminal();
         }
         if app.should_quit {
             break Ok(());
         }
     };
-    ratatui::restore();
+    restore_terminal();
     result
+}
+
+/// Take the terminal for the TUI: ratatui's own setup plus mouse reporting,
+/// which is what turns a click into an event the loop can route (DESIGN.md §9).
+/// Every teardown must undo both, so this is paired with [`restore_terminal`] at
+/// each of the round-trips that hand the terminal to another program.
+fn init_terminal() -> DefaultTerminal {
+    let terminal = ratatui::init();
+    install_mouse_panic_hook();
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    terminal
+}
+
+/// Hand the terminal back, mouse reporting first. A terminal left reporting
+/// spews escape bytes on every mouse move, so this runs even where the caller
+/// only means to borrow the screen for an $EDITOR or attach round-trip.
+fn restore_terminal() {
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::restore();
+}
+
+/// Disable mouse reporting on the way out of a panic too. `ratatui::init`
+/// installs a hook that restores the screen but knows nothing of the capture
+/// this TUI adds, so wrap it once with one that does.
+fn install_mouse_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+            hook(info);
+        }));
+    });
 }
 
 /// Run an agent's attach/resume command — or a planning session (DESIGN.md §8)

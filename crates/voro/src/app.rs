@@ -1,4 +1,6 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::ui::Hit;
 use voro_core::{
     Action, ActionRow, AgentsConfig, DepKind, DepRef, DigestRow, Event, PrRef, Priority, Project,
     Queue, QueueRow, ReviewAction, ReviewMedium, RunningRow, ScoreBreakdown, StateCounts, Store,
@@ -208,6 +210,35 @@ pub enum Mode {
         current: Option<String>,
         sel: usize,
     },
+}
+
+impl Mode {
+    /// The cursor of a pick-from-list popup, where this mode is one. The
+    /// text-entry forms and the detail popup have none, which is what makes them
+    /// ignore the mouse (DESIGN.md §9).
+    fn picker_sel(&self) -> Option<usize> {
+        match self {
+            Mode::PickProject { sel, .. }
+            | Mode::Transition { sel, .. }
+            | Mode::AgentPicker { sel, .. }
+            | Mode::DocPicker { sel, .. }
+            | Mode::ReviewActionPicker { sel, .. }
+            | Mode::DefaultPicker { sel, .. } => Some(*sel),
+            _ => None,
+        }
+    }
+
+    fn picker_sel_mut(&mut self) -> Option<&mut usize> {
+        match self {
+            Mode::PickProject { sel, .. }
+            | Mode::Transition { sel, .. }
+            | Mode::AgentPicker { sel, .. }
+            | Mode::DocPicker { sel, .. }
+            | Mode::ReviewActionPicker { sel, .. }
+            | Mode::DefaultPicker { sel, .. } => Some(sel),
+            _ => None,
+        }
+    }
 }
 
 /// Which create flow the project picker feeds (DESIGN.md §8/§9): the manual
@@ -789,6 +820,23 @@ impl App {
         self.detail_scroll = 0;
     }
 
+    /// Put the selection on `index` of the current screen's list, the way a
+    /// click does. Out-of-range indices are ignored rather than clamped: a stale
+    /// hit-map naming a row the last refresh dropped should move nothing.
+    fn select_index(&mut self, index: usize) {
+        let (sel, len) = match self.screen {
+            Screen::Cockpit => (&mut self.cockpit_sel, self.cockpit_rows.len()),
+            Screen::Tasks => (&mut self.tasks_sel, self.all.len()),
+            Screen::Projects => (&mut self.projects_sel, self.projects.len()),
+            Screen::Config => (&mut self.config_sel, self.config_viewers.len()),
+        };
+        if index >= len {
+            return;
+        }
+        *sel = index;
+        self.detail_scroll = 0;
+    }
+
     /// Scroll the cockpit focus card, clamped to the overflow `draw_detail`
     /// last measured so `K` past the top or `J` past the bottom simply stops.
     fn scroll_detail(&mut self, delta: i64) {
@@ -959,6 +1007,41 @@ impl App {
                 current,
                 sel,
             } => self.key_default_picker(key, kind, names, current, sel),
+        }
+    }
+
+    /// Route a left click at `(col, row)` through the hit-map the last draw
+    /// built (DESIGN.md §9). A click is a selection move and nothing more — it
+    /// never fires the row's action — except inside a picker, where a click on
+    /// the option already under the cursor confirms it as ⏎ would. Clicks
+    /// anywhere the map does not cover do nothing.
+    pub fn on_mouse(&mut self, col: u16, row: u16, hits: &crate::ui::HitMap) {
+        self.status = None;
+        let Some(hit) = hits.at(col, row) else {
+            return;
+        };
+        match hit {
+            Hit::CockpitRow(i) if self.screen == Screen::Cockpit => self.select_index(i),
+            Hit::TaskRow(i) if self.screen == Screen::Tasks => self.select_index(i),
+            Hit::ProjectRow(i) if self.screen == Screen::Projects => self.select_index(i),
+            Hit::ViewerRow(i) if self.screen == Screen::Config => self.select_index(i),
+            Hit::PickerOption(i) => self.click_picker_option(i),
+            _ => {}
+        }
+    }
+
+    /// A click on a picker option: move the cursor there, or — if it is already
+    /// there — hand the picker the Enter its key handler answers, so clicking
+    /// confirms through exactly the path the keyboard takes.
+    fn click_picker_option(&mut self, index: usize) {
+        match self.mode.picker_sel() {
+            Some(sel) if sel == index => self.on_key(KeyEvent::from(KeyCode::Enter)),
+            Some(_) => {
+                if let Some(sel) = self.mode.picker_sel_mut() {
+                    *sel = index;
+                }
+            }
+            None => {}
         }
     }
 

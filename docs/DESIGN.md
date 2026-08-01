@@ -315,6 +315,8 @@ Beyond the cockpit, the TUI cycles (Tab, or `1`–`4`) through three further ful
 
 The first milestone deliberately restricts scope to three lists and a handful of keybindings — the risk of TUI-first is polishing panes before the workflow is validated, and the mitigation is scope, not sequence. Core interactions, roughly in order of implementation: create/edit a task in `$EDITOR` (title, body, priority, deps, agent override via frontmatter or a form) — or plan one interactively with an agent (§8's planning sessions, on the sibling key); edit project weights on a dedicated projects screen — one row per project, weight set by a single keystroke (*this must be fast — it happens every morning*); resume a queued question once it is answered in the agent's session; dispatch a ready task (default agent) and dispatch-via-picker; accept/reject a review item; triage `proposed` tasks from the queue; redispatch a stalled task; a score-decomposition view folded inline into any task's detail (toggled with `x`, not a popup).
 
+The mouse is a secondary input over the same keys: a left click on any list row or picker option moves the selection there, exactly as `j`/`k` would, and a second click on an option already under the cursor picks it, as ⏎ would — a click never fires a row's action, and mouse reporting stays on for the whole session, which trades away the terminal's own text selection (shift-drag still bypasses it).
+
 Every action ultimately gets a CLI equivalent so the whole tool is scriptable and agent-legible, but the human-facing CLI trails the TUI rather than preceding it.
 
 ## 10. Delivery plan
