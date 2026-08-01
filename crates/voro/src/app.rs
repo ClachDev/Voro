@@ -2220,22 +2220,6 @@ impl App {
                 sel = (sel + 1).min(actions.len().saturating_sub(1));
             }
             KeyCode::Char('k') | KeyCode::Up => sel = sel.saturating_sub(1),
-            // The fourth triage outcome (DESIGN.md §6), on the two keys the
-            // menu advertises for a proposal: `r` collects a one-line note for
-            // a headless rewrite, `R` opens the interactive conversation. Both
-            // leave the task `proposed`, so neither is a menu verdict.
-            KeyCode::Char('r') | KeyCode::Char('R') if self.is_proposed(task_id) => {
-                if key.code == KeyCode::Char('r') {
-                    self.mode = Mode::Prompt {
-                        task_id,
-                        kind: PromptKind::RefineNote,
-                        buffer: String::new(),
-                    };
-                } else {
-                    self.refine_interactively(task_id);
-                }
-                return;
-            }
             KeyCode::Enter => {
                 let action = actions[sel].clone();
                 let kind = match action {
@@ -2698,17 +2682,6 @@ mod tests {
         assert_eq!(app.enter_hint(), Some("⏎ act"));
     }
 
-    /// The two keystrokes a proposal's triage menu now takes: Enter folds the
-    /// project's digest open, Enter on the proposal beneath it opens the menu.
-    fn open_triage_menu(app: &mut App) -> i64 {
-        select_proposal(app);
-        key(app, KeyCode::Enter);
-        match &app.mode {
-            Mode::Transition { task_id, .. } => *task_id,
-            _ => panic!("expected the triage menu"),
-        }
-    }
-
     /// Select a queued proposal: the cockpit collapses them into a per-project
     /// digest (DESIGN.md §7), so Enter folds it open before a constituent row
     /// can be selected.
@@ -2719,68 +2692,8 @@ mod tests {
             .expect("a folded-open digest should select a proposal")
     }
 
-    /// `r` in the triage menu collects the note the refine agent is briefed
-    /// with (DESIGN.md §6). The launch itself needs a configured agent, which
-    /// the dummy context has none of, so what is asserted here is the path: the
-    /// prompt opens, submitting it reaches the dispatch, and the task stays
-    /// `proposed` either way — refine is an event, not a verdict.
-    #[test]
-    fn refine_key_in_the_triage_menu_collects_a_note_and_moves_no_state() {
-        let mut app = app_with(&[TaskState::Proposed]);
-        let task_id = open_triage_menu(&mut app);
-
-        key(&mut app, KeyCode::Char('r'));
-        match &app.mode {
-            Mode::Prompt {
-                kind: PromptKind::RefineNote,
-                buffer,
-                ..
-            } => assert!(buffer.is_empty(), "buffer was {buffer:?}"),
-            _ => panic!("r on a proposal should open the refine-note prompt"),
-        }
-
-        for c in "thin".chars() {
-            key(&mut app, KeyCode::Char(c));
-        }
-        key(&mut app, KeyCode::Enter);
-        assert!(matches!(app.mode, Mode::Normal));
-        assert!(app.status.is_some(), "the launch outcome is reported");
-        assert_eq!(
-            app.store.task(task_id).unwrap().state,
-            TaskState::Proposed,
-            "refine never transitions the task"
-        );
-    }
-
-    /// `R` opens the interactive variant — the planning harness pointed at the
-    /// existing task. The dummy context configures no `plan` verb, so the
-    /// failure lands on the status line rather than transitioning anything.
-    #[test]
-    fn talk_key_in_the_triage_menu_reaches_the_plan_flow() {
-        let mut app = app_with(&[TaskState::Proposed]);
-        let task_id = open_triage_menu(&mut app);
-
-        key(&mut app, KeyCode::Char('R'));
-        assert!(matches!(app.mode, Mode::Normal));
-        assert!(app.pending_plan.is_some() || app.status.is_some());
-        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Proposed);
-    }
-
-    /// Inside the triage menu the refine keys stay gated on a proposal, so on
-    /// any other state the menu keeps its own bindings and `r` is not swallowed.
-    #[test]
-    fn the_refine_keys_are_inert_outside_a_proposal() {
-        let mut app = app_with(&[TaskState::Ready]);
-        key(&mut app, KeyCode::Enter);
-        key(&mut app, KeyCode::Char('r'));
-        assert!(
-            matches!(app.mode, Mode::Transition { .. }),
-            "r should not open a refine prompt on a ready task"
-        );
-    }
-
-    /// Refine answers from the queue, not only from behind the triage menu
-    /// (DESIGN.md §6): `r` over a selected proposal collects the note directly.
+    /// Refine answers from the queue (DESIGN.md §6): `r` over a selected
+    /// proposal collects the note directly.
     #[test]
     fn refine_key_on_the_queue_collects_a_note_without_the_triage_menu() {
         let mut app = app_with(&[TaskState::Proposed]);
@@ -2791,10 +2704,24 @@ mod tests {
             Mode::Prompt {
                 task_id: id,
                 kind: PromptKind::RefineNote,
-                ..
-            } => assert_eq!(*id, task_id),
+                buffer,
+            } => {
+                assert_eq!(*id, task_id);
+                assert!(buffer.is_empty(), "buffer was {buffer:?}");
+            }
             _ => panic!("r on a queued proposal should open the refine-note prompt"),
         }
+
+        // The launch itself needs a configured agent, which the dummy context
+        // has none of, so what is asserted is the path: submitting the note
+        // reaches the dispatch and reports, and the task stays `proposed`
+        // either way — refine is an event, not a verdict.
+        for c in "thin".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.status.is_some(), "the launch outcome is reported");
         assert_eq!(
             app.store.task(task_id).unwrap().state,
             TaskState::Proposed,
