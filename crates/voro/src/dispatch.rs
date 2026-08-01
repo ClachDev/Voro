@@ -82,29 +82,42 @@ const BRANCH_REBASE_SENTENCE: &str = "If the branch conflicts with the project's
      inside the worktree and rebase or merge onto `origin/<base>`, resolving the \
      conflicts there — never modify the primary checkout, and never push.";
 
+/// Shared by both branch blocks so the isolation instruction cannot drift. An
+/// agent whose harness owns worktree creation must use that mechanism rather
+/// than `git worktree add`: Claude Code refuses file edits until its own
+/// `EnterWorktree` tool has run, and pointing that tool at an already-made
+/// worktree raises an approval prompt no headless session can answer. Since the
+/// harness names that branch itself, the sentence ends with the rename that puts
+/// the work on the branch Voro tracks. `{name}` is the assigned branch or the
+/// `<name>` the agent will choose.
+const BRANCH_ISOLATE_SENTENCE: &str = "Isolate your work in a worktree, through your harness's own mechanism for that \
+     where it has one — in Claude Code that is the `EnterWorktree` tool, which \
+     creates and enters a worktree under `.claude/worktrees/` unprompted, on a \
+     branch it names itself, so run `git switch -c {name}` inside the worktree \
+     before you commit. Lacking such a mechanism, make the throwaway worktree \
+     yourself: `git worktree add <path> -b {name}`.";
+
 /// The `{branch}` block for a task that carries an intended git branch (task
 /// #81): the agent is told the name, to do its work in a throwaway worktree on
-/// it (never the primary checkout), to register it early via
-/// [`BRANCH_REGISTER_SENTENCE`], to confirm it at completion, and to self-serve
-/// a rebase onto a moved base via [`BRANCH_REBASE_SENTENCE`].
+/// it rather than the primary checkout via [`BRANCH_ISOLATE_SENTENCE`], to
+/// register it early via [`BRANCH_REGISTER_SENTENCE`], to confirm it at
+/// completion, and to self-serve a rebase onto a moved base via
+/// [`BRANCH_REBASE_SENTENCE`].
 const ASSIGNED_BRANCH_TEMPLATE: &str = "\n\n\
 This task is assigned the git branch `{name}`. You are spawned in the project
-checkout — never modify it. Create a throwaway git worktree of the checkout on
-this branch (e.g. `git worktree add <path> -b {name}`) and do all your work
-inside that worktree — Voro runs no git, so the branch and its worktree are yours
-to make — and {register}. Confirm the branch your work landed on with
-`voro done {task_id}{db} --branch {name}`. {rebase}";
+checkout — never modify it. {isolate} Voro runs no git, so the branch and its
+worktree are yours to make; {register}. Confirm the branch your work landed on
+with `voro done {task_id}{db} --branch {name}`. {rebase}";
 
-/// The `{branch}` block when no branch is assigned: the agent picks its own name
-/// and must still register it early via [`BRANCH_REGISTER_SENTENCE`], so Voro
-/// learns the branch while the task runs rather than only at `done`, and
-/// self-serve a rebase onto a moved base via [`BRANCH_REBASE_SENTENCE`].
+/// The `{branch}` block when no branch is assigned: the agent picks its own
+/// name, isolates the same way via [`BRANCH_ISOLATE_SENTENCE`], and must still
+/// register the name early via [`BRANCH_REGISTER_SENTENCE`], so Voro learns the
+/// branch while the task runs rather than only at `done`, and self-serve a
+/// rebase onto a moved base via [`BRANCH_REBASE_SENTENCE`].
 const UNASSIGNED_BRANCH_TEMPLATE: &str = "\n\n\
 Pick a git branch for this work. You are spawned in the project checkout — never
-modify it. Create a throwaway git worktree of the checkout on that branch (e.g.
-`git worktree add <path> -b <branch>`) and do all your work inside that worktree
-— Voro runs no git, so the branch and its worktree are yours to make — and
-{register}; `<name>` is the name you choose. {rebase}";
+modify it. {isolate} Voro runs no git, so the branch and its worktree are yours
+to make; {register}; `<name>` is the name you choose. {rebase}";
 
 /// Rendered per planning session (DESIGN.md §8) and written as the whole
 /// prompt — unlike dispatch there is no task body to prepend it to, because
@@ -232,13 +245,17 @@ fn render_preamble(
     docs: &[(String, String)],
 ) -> String {
     let db_flag = db_flag(db_path);
-    let register = BRANCH_REGISTER_SENTENCE.replace("{name}", branch.unwrap_or("<name>"));
+    let name = branch.unwrap_or("<name>");
+    let register = BRANCH_REGISTER_SENTENCE.replace("{name}", name);
+    let isolate = BRANCH_ISOLATE_SENTENCE.replace("{name}", name);
     let branch_block = match branch {
         Some(name) => ASSIGNED_BRANCH_TEMPLATE
+            .replace("{isolate}", &isolate)
             .replace("{register}", &register)
             .replace("{rebase}", BRANCH_REBASE_SENTENCE)
             .replace("{name}", name),
         None => UNASSIGNED_BRANCH_TEMPLATE
+            .replace("{isolate}", &isolate)
             .replace("{register}", &register)
             .replace("{rebase}", BRANCH_REBASE_SENTENCE),
     };
@@ -1330,6 +1347,34 @@ mod tests {
             branched.contains("voro done 62 --branch feat/parser"),
             "{branched}"
         );
+    }
+
+    #[test]
+    fn preamble_puts_the_harness_worktree_tool_ahead_of_git_worktree_add() {
+        // A harness that owns worktree creation must be used on its own terms:
+        // Claude Code blocks edits until `EnterWorktree` has run, and aiming it
+        // at a hand-made worktree asks for an approval a headless session
+        // cannot give. `git worktree add` survives only as the fallback, and
+        // because the harness names the branch itself, both cases spell out the
+        // rename onto the branch Voro tracks.
+        for (branch, name) in [(None, "<name>"), (Some("feat/parser"), "feat/parser")] {
+            let rendered = render_preamble(62, &Store::default_db_path(), branch, &[]);
+            assert!(rendered.contains("`EnterWorktree` tool"), "{rendered}");
+            assert!(
+                rendered.contains(&format!("git switch -c {name}")),
+                "{rendered}"
+            );
+            let enter = rendered.find("EnterWorktree").unwrap();
+            let manual = rendered.find("git worktree add").unwrap();
+            assert!(
+                enter < manual,
+                "the harness mechanism must lead, the manual worktree follow: {rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("git worktree add <path> -b {name}")),
+                "{rendered}"
+            );
+        }
     }
 
     #[test]
