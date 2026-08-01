@@ -165,6 +165,18 @@ pub enum Mode {
         resolved: Option<String>,
         sel: usize,
     },
+    /// Toggling a task's document links (DESIGN.md §3/§8): every registered
+    /// document, the task's own project's first, with ⏎ linking or unlinking the
+    /// highlighted one in place. Which are linked is read from the App's own
+    /// per-refresh map rather than carried here, so a toggle's refresh is the
+    /// only thing the list needs to stay current. `back` is the detail popup's
+    /// scroll when the picker was opened from it, so closing returns there.
+    DocPicker {
+        task_id: i64,
+        docs: Vec<voro_core::Doc>,
+        sel: usize,
+        back: Option<u16>,
+    },
     /// Picking a project's review action on the projects screen (DESIGN.md
     /// §8/§11a): auto, pr, the default viewer, each named viewer from
     /// `voro.toml`, and a trailing "new viewer…" that opens the add-viewer form.
@@ -913,6 +925,12 @@ impl App {
                 resolved,
                 sel,
             } => self.key_agent_picker(key, task_id, agents, resolved, sel),
+            Mode::DocPicker {
+                task_id,
+                docs,
+                sel,
+                back,
+            } => self.key_doc_picker(key, task_id, docs, sel, back),
             Mode::ReviewActionPicker {
                 project_id,
                 options,
@@ -1049,6 +1067,11 @@ impl App {
             KeyCode::Char('!') => {
                 if let Some(id) = self.selected_task_id() {
                     self.toggle_deep(id);
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(id) = self.selected_task_id() {
+                    self.open_doc_picker(id, None);
                 }
             }
             KeyCode::Char('o') => self.open_selected_in_viewer(),
@@ -1633,6 +1656,97 @@ impl App {
             resolved,
             sel,
         };
+    }
+
+    /// Open the document picker on a task (DESIGN.md §8): every registered
+    /// document, since a task in any project may cite any plan (§3), with the
+    /// task's own project's listed first — the ones a triage is most likely to
+    /// reach for. Read fresh from the store rather than from the refresh cache,
+    /// which only holds documents something already links to. Returns whether it
+    /// opened, so a caller with a screen to restore knows to give way.
+    fn open_doc_picker(&mut self, task_id: i64, back: Option<u16>) -> bool {
+        let Ok(task) = self.store.task(task_id) else {
+            return false;
+        };
+        let mut docs = match self.store.all_docs() {
+            Ok(docs) => docs,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return false;
+            }
+        };
+        if docs.is_empty() {
+            self.status =
+                Some("no documents registered — add one with voro doc add <project> <path>".into());
+            return false;
+        }
+        docs.sort_by_key(|doc| (doc.project_id != task.project_id, doc.id));
+        self.mode = Mode::DocPicker {
+            task_id,
+            docs,
+            sel: 0,
+            back,
+        };
+        true
+    }
+
+    /// Drive the document picker: ⏎ links or unlinks the highlighted document
+    /// through the same `voro-core` calls `doc link`/`doc unlink` make, and the
+    /// picker stays open on the refreshed list so several can be toggled in one
+    /// visit. Esc returns to the detail popup it was opened from, if any.
+    fn key_doc_picker(
+        &mut self,
+        key: KeyEvent,
+        task_id: i64,
+        docs: Vec<voro_core::Doc>,
+        mut sel: usize,
+        back: Option<u16>,
+    ) {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(scroll) = back {
+                    self.mode = Mode::Detail { task_id, scroll };
+                }
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                sel = (sel + 1).min(docs.len().saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => sel = sel.saturating_sub(1),
+            KeyCode::Enter => self.toggle_doc_link(task_id, &docs[sel]),
+            _ => {}
+        }
+        self.mode = Mode::DocPicker {
+            task_id,
+            docs,
+            sel,
+            back,
+        };
+    }
+
+    /// Link or unlink one document, whichever the current state calls for, and
+    /// refresh so the detail panes behind the picker show the new list.
+    fn toggle_doc_link(&mut self, task_id: i64, doc: &voro_core::Doc) {
+        let linked = self.doc_linked(task_id, doc.id);
+        let result = if linked {
+            self.store.unlink_doc(task_id, doc.id)
+        } else {
+            self.store.link_doc(task_id, doc.id)
+        }
+        .and_then(|_| self.refresh());
+        if self.report(result).is_some() {
+            let verb = if linked { "unlinked" } else { "linked" };
+            self.status = Some(format!("{verb} {} on task {task_id}", doc.label()));
+        }
+    }
+
+    /// Whether a task cites a document, read from the per-refresh link map the
+    /// detail panes render — so the picker's marks and those lines can never
+    /// disagree.
+    pub fn doc_linked(&self, task_id: i64, doc_id: i64) -> bool {
+        self.docs
+            .get(&task_id)
+            .is_some_and(|docs| docs.iter().any(|d| d.id == doc_id))
     }
 
     /// The projects screen's local keys (DESIGN.md §9). `0`–`5` sets the
@@ -2278,6 +2392,13 @@ impl App {
                 }
             }
             KeyCode::Char('!') => self.toggle_deep(task_id),
+            // The picker takes over the screen, so hand it this popup's scroll
+            // to restore; when nothing opens it, fall through and stay put.
+            KeyCode::Char('c') => {
+                if self.open_doc_picker(task_id, Some(scroll)) {
+                    return;
+                }
+            }
             // The popup only opens on the selected task, so the selection-based
             // helper pages the right log.
             KeyCode::Char('l') => self.view_session_log(),
@@ -4094,5 +4215,171 @@ mod tests {
         app.store.set_task_docs(task_id, &[]).unwrap();
         app.refresh().unwrap();
         assert!(!app.docs.contains_key(&task_id));
+    }
+
+    /// `c` opens the picker over every registered document and ⏎ toggles the
+    /// highlighted one, so a link and its removal both happen without leaving
+    /// the TUI (DESIGN.md §8).
+    #[test]
+    fn doc_picker_toggles_the_selected_task_s_links_in_place() {
+        let mut app = app_with(&[TaskState::Ready]);
+        let task_id = app.all[0].task.id;
+        let project_id = app.projects[0].id;
+        let plan = app
+            .store
+            .create_doc(project_id, None, "docs/plan.md", Some("The Plan"))
+            .unwrap();
+        app.store
+            .create_doc(project_id, None, "docs/rfc.md", None)
+            .unwrap();
+        app.refresh().unwrap();
+
+        key(&mut app, KeyCode::Char('c'));
+        let docs = match &app.mode {
+            Mode::DocPicker {
+                task_id: id,
+                docs,
+                sel,
+                back,
+            } => {
+                assert_eq!(*id, task_id);
+                assert_eq!(*sel, 0);
+                assert_eq!(*back, None);
+                docs.clone()
+            }
+            _ => panic!("c should open the document picker"),
+        };
+        assert_eq!(docs.len(), 2);
+        assert!(!app.doc_linked(task_id, plan.id));
+
+        // ⏎ links the highlighted document and the picker stays open on it,
+        // now marked, so a second ⏎ takes the link away again.
+        key(&mut app, KeyCode::Enter);
+        assert!(app.doc_linked(task_id, plan.id));
+        assert!(matches!(app.mode, Mode::DocPicker { sel: 0, .. }));
+        assert_eq!(
+            app.store.docs_for_task(task_id).unwrap(),
+            vec![plan.clone()]
+        );
+
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.doc_linked(task_id, plan.id));
+        assert!(app.store.docs_for_task(task_id).unwrap().is_empty());
+
+        // Esc from a picker opened off the cockpit lands back on the cockpit.
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    /// The case the picker exists for: citing a plan while triaging a proposal.
+    /// Proposals ride the queue folded into a per-project digest (DESIGN.md §7)
+    /// which names no task of its own, so `c` reaches one only once the digest
+    /// is expanded and the cursor has moved onto the proposal beneath it — and
+    /// on the digest row itself the key correctly does nothing.
+    #[test]
+    fn doc_picker_reaches_a_proposal_under_an_expanded_digest() {
+        let mut app = app_with(&[TaskState::Proposed]);
+        let task_id = app.all[0].task.id;
+        let project_id = app.projects[0].id;
+        let plan = app
+            .store
+            .create_doc(project_id, None, "docs/plan.md", Some("The Plan"))
+            .unwrap();
+        app.refresh().unwrap();
+
+        assert_eq!(app.selected_task_id(), None, "the digest names no task");
+        key(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        key(&mut app, KeyCode::Enter);
+        app.move_selection(1);
+        assert_eq!(app.selected_task_id(), Some(task_id));
+
+        key(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.mode, Mode::DocPicker { .. }));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.doc_linked(task_id, plan.id));
+    }
+
+    /// A task may cite a plan owned by any project (DESIGN.md §3), so the
+    /// picker spans them all — with the task's own project's documents first,
+    /// where a triage most often reaches.
+    #[test]
+    fn doc_picker_lists_every_project_s_documents_own_first() {
+        let mut app = app_with(&[TaskState::Ready]);
+        let task_id = app.all[0].task.id;
+        let own = app.projects[0].id;
+        let other = app.store.create_project("other", "/tmp/other").unwrap().id;
+        // registered first, so id order alone would put it at the top
+        let strategy = app
+            .store
+            .create_doc(other, None, "docs/strategy.md", Some("Strategy"))
+            .unwrap();
+        let plan = app
+            .store
+            .create_doc(own, None, "docs/plan.md", Some("The Plan"))
+            .unwrap();
+        app.refresh().unwrap();
+
+        key(&mut app, KeyCode::Char('c'));
+        match &app.mode {
+            Mode::DocPicker { docs, .. } => {
+                assert_eq!(
+                    docs.iter().map(|d| d.id).collect::<Vec<_>>(),
+                    vec![plan.id, strategy.id]
+                );
+            }
+            _ => panic!("c should open the document picker"),
+        }
+
+        // and the out-of-project document links just like an own one
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.doc_linked(task_id, strategy.id));
+    }
+
+    /// With nothing registered there is nothing to pick, so the picker says so
+    /// on the status line — pointing at the CLI verb that registers one, which
+    /// the TUI deliberately does not — rather than opening empty.
+    #[test]
+    fn doc_picker_with_no_documents_reports_instead_of_opening() {
+        let mut app = app_with(&[TaskState::Ready]);
+        key(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("voro doc add"),
+            "{:?}",
+            app.status
+        );
+    }
+
+    /// Opened from the task browser's detail popup, the picker returns to it on
+    /// esc with its scroll intact — the reading position survives the detour.
+    #[test]
+    fn doc_picker_opened_from_the_detail_popup_returns_to_it() {
+        let mut app = app_with(&[TaskState::Proposed]);
+        let task_id = app.all[0].task.id;
+        let project_id = app.projects[0].id;
+        app.store
+            .create_doc(project_id, None, "docs/plan.md", None)
+            .unwrap();
+        app.refresh().unwrap();
+
+        key(&mut app, KeyCode::Char('2'));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('j'));
+        assert!(matches!(app.mode, Mode::Detail { scroll: 1, .. }));
+
+        key(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.mode, Mode::DocPicker { back: Some(1), .. }));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(
+            app.mode,
+            Mode::Detail {
+                task_id: id,
+                scroll: 1
+            } if id == task_id
+        ));
     }
 }
