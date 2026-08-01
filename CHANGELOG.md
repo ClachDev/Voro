@@ -44,6 +44,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Agent contract**: verb templates gain a `{session_name}` placeholder, and
+  the built-in `claude` agent now names its session with it instead of spelling
+  `voro-{task_id}` itself. Every session Voro launches carries a name it
+  composed — `voro-<id>` for a dispatch (unchanged), `voro-<id>-refine` for a
+  refine, `voro-plan-<project>` for a planning session — so a refine no longer
+  launches under the literal, shared name `voro-{task_id}` and can be found and
+  attached to in `claude agents`. `{session_name}` is honoured on `dispatch` and
+  `plan` and refused elsewhere, the same rule `{model}` follows; `{task_id}` is
+  now refused on `plan`, whose target may be a project with no task. No verb was
+  added: an agent defining only `dispatch` (or `cmd`) refines exactly as before.
+  A wholesale `[agents.claude]` override copied from an older `voro.toml` keeps
+  working, and keeps its old naming.
+- Prompts and command lines are filled by a single-pass renderer, so a task
+  body, branch name, document title or project name containing `{task_id}`,
+  `{db}`, `{note}`, `{seed}`, `{branch}` or `{docs}` now reaches the agent
+  verbatim instead of being rewritten before it is read.
 - `projects.path` is gone. Existing databases convert in place: every project's
   old path becomes its default repo, and existing tasks resolve to exactly the
   checkouts they had before. `voro project add` and `voro project path` keep
