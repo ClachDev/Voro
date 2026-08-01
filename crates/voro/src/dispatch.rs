@@ -49,11 +49,21 @@ task; drop it for a proposal that stands on its own. Finish
 with your work committed on a branch and a PR-ready `--summary` on `done` — what
 changed, why, and how you verified it — since `voro pr` opens the pull request
 straight from that summary. Never modify the database with raw SQL, which would
-bypass the state machine and event log.{branch}
+bypass the state machine and event log.{branch}{docs}
 
 ---
 
 ";
+
+/// The `{docs}` block for a task linked to plan or design documents (DESIGN.md
+/// §3/§8). Each is named at its resolved location — absolute for a path, since
+/// a linked doc may live in another project's checkout entirely — so the agent
+/// reads the plan rather than rediscovering it from hints in the body.
+const LINKED_DOCS_TEMPLATE: &str = "\n\n\
+This task derives from the document(s) below. Read them before the task body:
+they carry the plan this task implements, and the body assumes them.
+
+{list}";
 
 /// Shared by both branch blocks below so the early-registration instruction
 /// cannot drift (task #96). `{name}` is the assigned branch or the `<name>` the
@@ -139,8 +149,15 @@ const SPAWN_CLOCK_SLACK_MS: i64 = 2000;
 
 /// Fill [`RETURN_PATH_PREAMBLE_TEMPLATE`] for a concrete dispatch: the literal
 /// task id in every verb, plus a `--db <path>` flag only when the dispatching
-/// database is not the default one the verbs resolve to on their own.
-fn render_preamble(task_id: i64, db_path: &Path, branch: Option<&str>) -> String {
+/// database is not the default one the verbs resolve to on their own. `docs` is
+/// the task's linked documents as `(label, resolved location)` pairs, already
+/// resolved by the store so this renders paths rather than joining them.
+fn render_preamble(
+    task_id: i64,
+    db_path: &Path,
+    branch: Option<&str>,
+    docs: &[(String, String)],
+) -> String {
     let db_flag = if db_path == Store::default_db_path() {
         String::new()
     } else {
@@ -156,8 +173,27 @@ fn render_preamble(task_id: i64, db_path: &Path, branch: Option<&str>) -> String
             .replace("{register}", &register)
             .replace("{rebase}", BRANCH_REBASE_SENTENCE),
     };
+    // A task with no linked document renders no block at all, so an unlinked
+    // dispatch's prompt is byte-for-byte what it was before docs existed.
+    let docs_block = if docs.is_empty() {
+        String::new()
+    } else {
+        let list = docs
+            .iter()
+            .map(|(label, location)| {
+                if label == location {
+                    format!("    {location}")
+                } else {
+                    format!("    {location}  — {label}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        LINKED_DOCS_TEMPLATE.replace("{list}", &list)
+    };
     RETURN_PATH_PREAMBLE_TEMPLATE
         .replace("{branch}", &branch_block)
+        .replace("{docs}", &docs_block)
         .replace("{task_id}", &task_id.to_string())
         .replace("{db}", &db_flag)
 }
@@ -500,9 +536,22 @@ fn spawn_session(
     } else {
         format!("# {}\n\n{}\n", task.title, task.body.trim_end())
     };
+    // The plans this task derives from (DESIGN.md §3/§8), each resolved to
+    // where it actually is — a linked doc may live in another project's
+    // checkout, so the prompt names it absolutely rather than relative to the
+    // cwd the session runs in.
+    let docs = store
+        .docs_for_task(task_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|doc| {
+            let location = store.resolve_doc(&doc).map_err(|e| e.to_string())?;
+            Ok((doc.label().to_string(), location))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let prompt = format!(
         "{}{body}",
-        render_preamble(task_id, &ctx.db_path, task.branch.as_deref())
+        render_preamble(task_id, &ctx.db_path, task.branch.as_deref(), &docs)
     );
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("cannot write prompt {}: {e}", prompt_path.display()))?;
@@ -893,7 +942,7 @@ mod tests {
         assert!(prompt.contains("Detailed prompt."), "{prompt}");
         // the rendered preamble is dropped in ahead of the task body
         assert!(
-            prompt.starts_with(&render_preamble(id, &ctx.db_path, None)),
+            prompt.starts_with(&render_preamble(id, &ctx.db_path, None, &[])),
             "{prompt}"
         );
         assert!(
@@ -906,7 +955,7 @@ mod tests {
     fn preamble_renders_a_db_flag_only_for_a_non_default_database() {
         // a scratch (non-default) db renders --db on every verb, shell-quoted
         let db = PathBuf::from("/tmp/scratch/voro.db");
-        let rendered = render_preamble(62, &db, None);
+        let rendered = render_preamble(62, &db, None, &[]);
         assert!(
             rendered.contains("voro ask 62 --db '/tmp/scratch/voro.db'"),
             "{rendered}"
@@ -921,7 +970,7 @@ mod tests {
         );
 
         // the default db is what the verbs resolve to unaided, so no flag
-        let default = render_preamble(62, &Store::default_db_path(), None);
+        let default = render_preamble(62, &Store::default_db_path(), None, &[]);
         assert!(default.contains("voro ask 62 --question"), "{default}");
         assert!(!default.contains("--db"), "{default}");
     }
@@ -931,7 +980,7 @@ mod tests {
         // no assigned branch: the agent is told to register the name it picks,
         // but branch-assignment wording and a completion `voro done --branch`
         // are absent, since no name is known.
-        let plain = render_preamble(62, &Store::default_db_path(), None);
+        let plain = render_preamble(62, &Store::default_db_path(), None, &[]);
         assert!(!plain.contains("git branch `"), "{plain}");
         assert!(plain.contains("voro set 62 --branch <name>"), "{plain}");
         assert!(!plain.contains("voro done 62 --branch"), "{plain}");
@@ -947,7 +996,7 @@ mod tests {
 
         // with a branch: the agent is told to use it, register it, and confirm
         // it at completion.
-        let branched = render_preamble(62, &Store::default_db_path(), Some("feat/parser"));
+        let branched = render_preamble(62, &Store::default_db_path(), Some("feat/parser"), &[]);
         assert!(branched.contains("git branch `feat/parser`"), "{branched}");
         assert!(branched.contains("Voro runs no git"), "{branched}");
         // the assigned case carries the same stale-branch self-serve instruction.
@@ -968,6 +1017,45 @@ mod tests {
             branched.contains("voro done 62 --branch feat/parser"),
             "{branched}"
         );
+    }
+
+    #[test]
+    fn preamble_names_a_task_s_linked_documents_at_their_resolved_locations() {
+        // A task linked to a plan gets it handed over rather than having to
+        // rediscover it from hints in the body (DESIGN.md §3/§8). The location
+        // is absolute, since a linked doc may live in another checkout.
+        let db = Store::default_db_path();
+        let docs = [
+            (
+                "Strategy 2026".to_string(),
+                "/tmp/augere/docs/strategy.md".to_string(),
+            ),
+            (
+                "https://example.com/rfc".to_string(),
+                "https://example.com/rfc".to_string(),
+            ),
+        ];
+        let linked = render_preamble(62, &db, None, &docs);
+        assert!(
+            linked.contains("derives from the document(s) below"),
+            "{linked}"
+        );
+        assert!(
+            linked.contains("/tmp/augere/docs/strategy.md  — Strategy 2026"),
+            "{linked}"
+        );
+        // An untitled doc is named once, not doubled up with itself.
+        assert!(
+            linked.contains("\n    https://example.com/rfc\n"),
+            "{linked}"
+        );
+        // The block sits ahead of the body separator, so the plan is read first.
+        let docs_at = linked.find("derives from the document").unwrap();
+        assert!(docs_at < linked.rfind("---").unwrap(), "{linked}");
+
+        // A task citing no document renders exactly the prompt it always did.
+        let plain = render_preamble(62, &db, None, &[]);
+        assert!(!plain.contains("derives from the document"), "{plain}");
     }
 
     #[test]

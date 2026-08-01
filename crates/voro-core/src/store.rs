@@ -5,8 +5,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    Dep, DepKind, DepRef, Event, Priority, Project, Repo, ReviewAction, RunningRow, Session,
-    SessionOutcome, Task, TaskState,
+    Dep, DepKind, DepRef, Doc, Event, Priority, Project, Repo, ReviewAction, RunningRow, Session,
+    SessionOutcome, Task, TaskState, location_is_url,
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -23,6 +23,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0011_add_archived.sql"),
     include_str!("../migrations/0012_repos.sql"),
     include_str!("../migrations/0013_add_deep.sql"),
+    include_str!("../migrations/0014_docs.sql"),
+    include_str!("../migrations/0015_dep_kind_in_key.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -453,6 +455,293 @@ impl Store {
             .unwrap_or_default()
     }
 
+    // --- docs ---
+    //
+    // A document is a plan a project's work derives from (DESIGN.md §3/§5).
+    // It is *owned* by one project, which is where a relative location resolves
+    // and where `doc list` shows it, but the task edge is deliberately not
+    // constrained to that project: one strategy doc routinely spawns work
+    // across several, and refusing the cross-project link would defeat the
+    // "which tasks came from this plan?" query the table exists for.
+
+    /// Register a document against a project. `location` is a checkout-relative
+    /// path, an absolute path, or a URL; an absolute path that lies inside one
+    /// of the project's checkouts is stored relative to it (DESIGN.md §5), so
+    /// the link survives the checkout moving. `repo` names which checkout a
+    /// relative path resolves against, `None` meaning the project's default.
+    pub fn create_doc(
+        &mut self,
+        project_id: i64,
+        repo_id: Option<i64>,
+        location: &str,
+        title: Option<&str>,
+    ) -> Result<Doc> {
+        self.project(project_id)?;
+        let (location, repo_id) = self.normalise_location(project_id, repo_id, location)?;
+        if self
+            .docs(project_id)?
+            .iter()
+            .any(|d| d.location == location)
+        {
+            return Err(Error::Invalid(format!(
+                "this project already has a document at '{location}'"
+            )));
+        }
+        self.conn.execute(
+            "INSERT INTO docs (project_id, repo_id, title, location, created_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            params![project_id, repo_id, title, location],
+        )?;
+        let doc = self.doc(self.conn.last_insert_rowid())?;
+        log_global_event(&self.conn, "doc-added", Some(&doc.location))?;
+        Ok(doc)
+    }
+
+    /// Reduce an operator-supplied location to what is stored: a URL verbatim
+    /// (and never against a repo, since it resolves unaided), an absolute path
+    /// relativised against the checkout that contains it, and anything else
+    /// left as given. An explicit `repo_id` pins which checkout is meant, and
+    /// an absolute path outside it is refused rather than silently stored whole.
+    fn normalise_location(
+        &self,
+        project_id: i64,
+        repo_id: Option<i64>,
+        location: &str,
+    ) -> Result<(String, Option<i64>)> {
+        let location = location.trim();
+        if location.is_empty() {
+            return Err(Error::Invalid("a document path or URL is required".into()));
+        }
+        if let Some(id) = repo_id {
+            let repo = self.repo(id)?;
+            if repo.project_id != project_id {
+                return Err(Error::Invalid(format!(
+                    "repo '{}' belongs to another project",
+                    repo.name
+                )));
+            }
+        }
+        if location_is_url(location) {
+            if repo_id.is_some() {
+                return Err(Error::Invalid(
+                    "a URL resolves on its own — drop --repo, which only picks the checkout a \
+                     relative path is read from"
+                        .into(),
+                ));
+            }
+            return Ok((location.to_string(), None));
+        }
+        if !Path::new(location).is_absolute() {
+            return Ok((location.to_string(), repo_id));
+        }
+        // An absolute path: prefer the checkout that contains it, so the stored
+        // location survives that checkout moving. The longest matching path
+        // wins, for the case of a repo nested inside another.
+        let mut repos = match repo_id {
+            Some(id) => vec![self.repo(id)?],
+            None => self.repos(project_id)?,
+        };
+        repos.sort_by_key(|r| std::cmp::Reverse(r.path.len()));
+        for repo in &repos {
+            if let Ok(rel) = Path::new(location).strip_prefix(&repo.path) {
+                return Ok((rel.to_string_lossy().into_owned(), Some(repo.id)));
+            }
+        }
+        match repo_id {
+            // An explicit --repo said which checkout to read this path from, so
+            // a path outside it is a mistake worth hearing rather than storing.
+            Some(id) => Err(Error::Invalid(format!(
+                "'{location}' is not inside repo '{}' ({})",
+                self.repo(id)?.name,
+                self.repo(id)?.path
+            ))),
+            // Outside every checkout: a legitimate external document, kept
+            // absolute and resolving against no repo.
+            None => Ok((location.to_string(), None)),
+        }
+    }
+
+    pub fn doc(&self, id: i64) -> Result<Doc> {
+        self.conn
+            .query_row(
+                &format!("SELECT {DOC_COLUMNS} FROM docs WHERE id = ?1"),
+                [id],
+                doc_from_row,
+            )
+            .optional()?
+            .ok_or(Error::DocNotFound(id))
+    }
+
+    /// A project's documents, oldest first — registration order is the closest
+    /// thing a plan library has to a meaningful one.
+    pub fn docs(&self, project_id: i64) -> Result<Vec<Doc>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DOC_COLUMNS} FROM docs WHERE project_id = ?1 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([project_id], doc_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn all_docs(&self) -> Result<Vec<Doc>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {DOC_COLUMNS} FROM docs ORDER BY id"))?;
+        let rows = stmt.query_map([], doc_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every document with the given location, across projects — what a `--doc`
+    /// flag naming a path rather than an id matches. More than one match is
+    /// returned rather than resolved, so the caller can say which ids collided.
+    pub fn docs_at(&self, location: &str) -> Result<Vec<Doc>> {
+        let location = location.trim();
+        Ok(self
+            .all_docs()?
+            .into_iter()
+            .filter(|d| d.location == location)
+            .collect())
+    }
+
+    /// Where a document actually is: a URL or absolute path verbatim, and a
+    /// relative one joined onto its checkout. The single resolution point —
+    /// dispatch and every renderer come here rather than joining paths itself.
+    pub fn resolve_doc(&self, doc: &Doc) -> Result<String> {
+        if doc.is_url() || Path::new(&doc.location).is_absolute() {
+            return Ok(doc.location.clone());
+        }
+        let repo = match doc.repo_id {
+            Some(id) => self.repo(id)?,
+            None => self.default_repo(doc.project_id)?,
+        };
+        Ok(Path::new(&repo.path)
+            .join(&doc.location)
+            .to_string_lossy()
+            .into_owned())
+    }
+
+    /// Remove a document and every task link to it, in one transaction. Unlike
+    /// a repo, a doc is navigational — nothing resolves to nothing when it goes
+    /// — so this unlinks rather than refusing, and returns the tasks it freed
+    /// so the caller can say how far the removal reached.
+    pub fn delete_doc(&mut self, doc_id: i64) -> Result<Vec<i64>> {
+        let doc = self.doc(doc_id)?;
+        let linked = self.tasks_for_doc(doc_id)?;
+        let tx = self.conn.transaction()?;
+        for task in &linked {
+            log_event(&tx, task.id, "doc-unlinked", Some(doc.label()))?;
+        }
+        tx.execute("DELETE FROM task_docs WHERE doc_id = ?1", [doc_id])?;
+        tx.execute("DELETE FROM docs WHERE id = ?1", [doc_id])?;
+        log_global_event(&tx, "doc-removed", Some(&doc.location))?;
+        tx.commit()?;
+        Ok(linked.into_iter().map(|t| t.id).collect())
+    }
+
+    /// Link a task to a document. Returns whether the edge was new, so a
+    /// repeated link reads as a no-op rather than an error — and logs the link
+    /// on the task's own event trail only when something changed.
+    pub fn link_doc(&mut self, task_id: i64, doc_id: i64) -> Result<bool> {
+        self.task(task_id)?;
+        let doc = self.doc(doc_id)?;
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?1, ?2)",
+            params![task_id, doc_id],
+        )?;
+        if changed > 0 {
+            log_event(&self.conn, task_id, "doc-linked", Some(doc.label()))?;
+        }
+        Ok(changed > 0)
+    }
+
+    pub fn unlink_doc(&mut self, task_id: i64, doc_id: i64) -> Result<bool> {
+        self.task(task_id)?;
+        let doc = self.doc(doc_id)?;
+        let changed = self.conn.execute(
+            "DELETE FROM task_docs WHERE task_id = ?1 AND doc_id = ?2",
+            params![task_id, doc_id],
+        )?;
+        if changed > 0 {
+            log_event(&self.conn, task_id, "doc-unlinked", Some(doc.label()))?;
+        }
+        Ok(changed > 0)
+    }
+
+    /// Replace a task's whole document list — what `set --doc` writes, matching
+    /// `--blocked-by`'s replace semantics so the flag can remove a link as well
+    /// as add one. Each added and dropped edge is logged individually.
+    pub fn set_task_docs(&mut self, task_id: i64, doc_ids: &[i64]) -> Result<Vec<Doc>> {
+        self.task(task_id)?;
+        let wanted: Vec<Doc> = doc_ids
+            .iter()
+            .map(|id| self.doc(*id))
+            .collect::<Result<_>>()?;
+        let current = self.docs_for_task(task_id)?;
+        let tx = self.conn.transaction()?;
+        for doc in &current {
+            if !wanted.iter().any(|d| d.id == doc.id) {
+                tx.execute(
+                    "DELETE FROM task_docs WHERE task_id = ?1 AND doc_id = ?2",
+                    params![task_id, doc.id],
+                )?;
+                log_event(&tx, task_id, "doc-unlinked", Some(doc.label()))?;
+            }
+        }
+        for doc in &wanted {
+            if !current.iter().any(|d| d.id == doc.id) {
+                tx.execute(
+                    "INSERT INTO task_docs (task_id, doc_id) VALUES (?1, ?2)",
+                    params![task_id, doc.id],
+                )?;
+                log_event(&tx, task_id, "doc-linked", Some(doc.label()))?;
+            }
+        }
+        tx.commit()?;
+        self.docs_for_task(task_id)
+    }
+
+    /// The documents a task cites, in registration order.
+    pub fn docs_for_task(&self, task_id: i64) -> Result<Vec<Doc>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM docs d JOIN task_docs td ON td.doc_id = d.id
+             WHERE td.task_id = ?1 ORDER BY d.id",
+            prefixed(DOC_COLUMNS, "d")
+        ))?;
+        let rows = stmt.query_map([task_id], doc_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every document link keyed by task id, loaded whole — what the TUI reads
+    /// once per refresh so the render path never queries the store, the same
+    /// shape as the dependency maps.
+    pub fn docs_by_task(&self) -> Result<HashMap<i64, Vec<Doc>>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT td.task_id, {} FROM docs d JOIN task_docs td ON td.doc_id = d.id
+             ORDER BY td.task_id, d.id",
+            prefixed(DOC_COLUMNS, "d")
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, doc_from_row_at(row, 1)?))
+        })?;
+        let mut map: HashMap<i64, Vec<Doc>> = HashMap::new();
+        for row in rows {
+            let (task_id, doc) = row?;
+            map.entry(task_id).or_default().push(doc);
+        }
+        Ok(map)
+    }
+
+    /// The tasks derived from a document — the "which tasks came from this
+    /// plan?" query, in id order so a plan's rollout reads chronologically.
+    pub fn tasks_for_doc(&self, doc_id: i64) -> Result<Vec<Task>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM tasks t JOIN task_docs td ON td.task_id = t.id
+             WHERE td.doc_id = ?1 ORDER BY t.id",
+            prefixed(TASK_COLUMNS, "t")
+        ))?;
+        let rows = stmt.query_map([doc_id], task_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     // --- tasks ---
 
     pub fn create_task(&mut self, new: NewTask) -> Result<Task> {
@@ -703,10 +992,16 @@ impl Store {
         if kind == DepKind::Blocks {
             crate::transition::reject_blocks_cycle(&tx, task_id, depends_on)?;
         }
-        tx.execute(
-            "INSERT INTO deps (task_id, depends_on, kind) VALUES (?1, ?2, ?3)",
+        let inserted = tx.execute(
+            "INSERT INTO deps (task_id, depends_on, kind) VALUES (?1, ?2, ?3)
+             ON CONFLICT (task_id, depends_on, kind) DO NOTHING",
             params![task_id, depends_on, kind],
         )?;
+        if inserted == 0 {
+            return Err(Error::Invalid(format!(
+                "#{task_id} already has a {kind} dependency on #{depends_on}"
+            )));
+        }
         if kind == DepKind::Blocks {
             crate::transition::reconcile_readiness(&tx, task_id)?;
         }
@@ -714,13 +1009,23 @@ impl Store {
         Ok(())
     }
 
-    pub fn remove_dep(&mut self, task_id: i64, depends_on: i64) -> Result<()> {
+    /// Drop one edge. The kind is part of the identity of an edge — a pair may
+    /// carry several — so removing a blocker must not take the
+    /// `discovered-from` edge beside it with it.
+    pub fn remove_dep(&mut self, task_id: i64, depends_on: i64, kind: DepKind) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM deps WHERE task_id = ?1 AND depends_on = ?2",
-            params![task_id, depends_on],
+        let removed = tx.execute(
+            "DELETE FROM deps WHERE task_id = ?1 AND depends_on = ?2 AND kind = ?3",
+            params![task_id, depends_on, kind],
         )?;
-        crate::transition::reconcile_readiness(&tx, task_id)?;
+        if removed == 0 {
+            return Err(Error::Invalid(format!(
+                "#{task_id} has no {kind} dependency on #{depends_on}"
+            )));
+        }
+        if kind == DepKind::Blocks {
+            crate::transition::reconcile_readiness(&tx, task_id)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -733,7 +1038,7 @@ impl Store {
         self.dep_refs(
             "SELECT d.task_id, t.id, t.title, t.state, d.kind
              FROM deps d JOIN tasks t ON t.id = d.depends_on
-             ORDER BY d.task_id, t.id",
+             ORDER BY d.task_id, t.id, d.kind",
         )
     }
 
@@ -743,7 +1048,7 @@ impl Store {
         self.dep_refs(
             "SELECT d.depends_on, t.id, t.title, t.state, d.kind
              FROM deps d JOIN tasks t ON t.id = d.task_id
-             ORDER BY d.depends_on, t.id",
+             ORDER BY d.depends_on, t.id, d.kind",
         )
     }
 
@@ -769,7 +1074,8 @@ impl Store {
 
     pub fn deps_of(&self, task_id: i64) -> Result<Vec<Dep>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_id, depends_on, kind FROM deps WHERE task_id = ?1 ORDER BY depends_on",
+            "SELECT task_id, depends_on, kind FROM deps WHERE task_id = ?1
+             ORDER BY depends_on, kind",
         )?;
         let rows = stmt.query_map([task_id], |row| {
             Ok(Dep {
@@ -1030,6 +1336,35 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     })
 }
 
+pub(crate) const DOC_COLUMNS: &str = "id, project_id, repo_id, title, location, created_at";
+
+fn doc_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Doc> {
+    doc_from_row_at(row, 0)
+}
+
+/// The same projection read from a wider row — a join that carries the task id
+/// alongside the doc columns.
+fn doc_from_row_at(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Doc> {
+    Ok(Doc {
+        id: row.get(at)?,
+        project_id: row.get(at + 1)?,
+        repo_id: row.get(at + 2)?,
+        title: row.get(at + 3)?,
+        location: row.get(at + 4)?,
+        created_at: row.get(at + 5)?,
+    })
+}
+
+/// Qualify a column list with a table alias, so a joined query can reuse the
+/// same projection constant its unjoined sibling does.
+fn prefixed(columns: &str, alias: &str) -> String {
+    columns
+        .split(", ")
+        .map(|c| format!("{alias}.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub(crate) const REPO_COLUMNS: &str = "id, project_id, name, path, is_default";
 
 fn repo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Repo> {
@@ -1102,6 +1437,18 @@ pub(crate) fn log_event(
     conn.execute(
         "INSERT INTO events (task_id, at, kind, detail) VALUES (?1, datetime('now'), ?2, ?3)",
         params![task_id, kind, detail],
+    )?;
+    Ok(())
+}
+
+/// An audit row for a mutation that belongs to no single task — registering or
+/// removing a document. The `events.task_id` column is nullable exactly for
+/// this, and the append-only log stays the record of every mutation.
+pub(crate) fn log_global_event(conn: &Connection, kind: &str, detail: Option<&str>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO events (task_id, at, kind, detail)
+         VALUES (NULL, datetime('now'), ?1, ?2)",
+        params![kind, detail],
     )?;
     Ok(())
 }
@@ -2096,6 +2443,47 @@ mod tests {
         );
     }
 
+    /// A database from before migration 0015 must open with every dependency
+    /// edge intact, and accept a second edge of another kind between a pair the
+    /// old primary key allowed only one edge for.
+    #[test]
+    fn migration_0015_widens_the_dep_key_without_losing_edges() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..14] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 14).unwrap();
+        conn.execute("INSERT INTO projects (name) VALUES ('voro')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO repos (project_id, name, path, is_default)
+             VALUES (1, 'voro', '/tmp/voro', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (project_id, title, state, state_since, created_at)
+             VALUES (1, 'source', 'ready', datetime('now'), datetime('now')),
+                    (1, 'spawned', 'ready', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO deps (task_id, depends_on, kind) VALUES (2, 1, 'discovered-from')",
+            [],
+        )
+        .unwrap();
+
+        let mut store = Store::from_connection(conn).unwrap();
+        let carried = store.deps_of(2).unwrap();
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].kind, DepKind::DiscoveredFrom);
+
+        store.set_blocks_deps(2, &[1]).unwrap();
+        let kinds: Vec<DepKind> = store.deps_of(2).unwrap().iter().map(|d| d.kind).collect();
+        assert_eq!(kinds, vec![DepKind::Blocks, DepKind::DiscoveredFrom]);
+    }
+
     /// A database created at schema version 1 (state still named 'backlog')
     /// must convert on open: rows renamed, deps/events surviving the table
     /// rebuild, version stamped.
@@ -2883,5 +3271,268 @@ mod tests {
         assert_eq!(dependents[&source.id].len(), 1);
         assert_eq!(dependents[&source.id][0].kind, DepKind::DiscoveredFrom);
         assert!(!dependents.contains_key(&task.id));
+    }
+
+    // --- docs (DESIGN.md §3/§5) ---
+
+    #[test]
+    fn a_doc_links_tasks_across_projects_and_answers_both_directions() {
+        // The case the table exists for: one plan doc spawning work in several
+        // projects, so the link cannot be constrained to the doc's own project.
+        let mut s = Store::open_in_memory().unwrap();
+        let plan = s.create_project("augere", "/tmp/augere").unwrap();
+        let other = s.create_project("mote", "/tmp/mote").unwrap();
+        let doc = s
+            .create_doc(plan.id, None, "docs/strategy.md", Some("Strategy"))
+            .unwrap();
+
+        let a = s.create_task(new_ready(plan.id)).unwrap();
+        let b = s.create_task(new_ready(other.id)).unwrap();
+        let c = s.create_task(new_ready(other.id)).unwrap();
+        for task in [&a, &b, &c] {
+            assert!(s.link_doc(task.id, doc.id).unwrap());
+        }
+        // A repeated link is a no-op rather than an error.
+        assert!(!s.link_doc(a.id, doc.id).unwrap());
+
+        let derived: Vec<i64> = s
+            .tasks_for_doc(doc.id)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(derived, vec![a.id, b.id, c.id]);
+        assert_eq!(s.docs_for_task(b.id).unwrap(), vec![doc.clone()]);
+        assert_eq!(s.docs_by_task().unwrap()[&c.id], vec![doc.clone()]);
+
+        assert!(s.unlink_doc(b.id, doc.id).unwrap());
+        assert!(!s.unlink_doc(b.id, doc.id).unwrap());
+        assert_eq!(s.tasks_for_doc(doc.id).unwrap().len(), 2);
+        assert!(s.docs_for_task(b.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_doc_link_and_unlink_lands_on_the_task_event_trail() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let doc = s.create_doc(p.id, None, "docs/DESIGN.md", None).unwrap();
+        let t = s.create_task(new_ready(p.id)).unwrap();
+
+        s.link_doc(t.id, doc.id).unwrap();
+        s.unlink_doc(t.id, doc.id).unwrap();
+        // A no-op link writes nothing, so the trail records changes only.
+        s.unlink_doc(t.id, doc.id).unwrap();
+
+        let kinds: Vec<String> = s
+            .events_for(t.id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, vec!["created", "doc-linked", "doc-unlinked"]);
+    }
+
+    #[test]
+    fn set_task_docs_replaces_the_whole_list_and_logs_both_directions() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let one = s.create_doc(p.id, None, "docs/a.md", None).unwrap();
+        let two = s.create_doc(p.id, None, "docs/b.md", None).unwrap();
+        let t = s.create_task(new_ready(p.id)).unwrap();
+
+        s.set_task_docs(t.id, &[one.id]).unwrap();
+        // Replace, not append: `a` goes as `b` arrives.
+        let now = s.set_task_docs(t.id, &[two.id]).unwrap();
+        assert_eq!(now, vec![two.clone()]);
+
+        let events: Vec<(String, Option<String>)> = s
+            .events_for(t.id)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.kind, e.detail))
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                ("created".into(), Some("ready".into())),
+                ("doc-linked".into(), Some("docs/a.md".into())),
+                ("doc-unlinked".into(), Some("docs/a.md".into())),
+                ("doc-linked".into(), Some("docs/b.md".into())),
+            ]
+        );
+
+        // Clearing the list is the empty replacement.
+        assert!(s.set_task_docs(t.id, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_absolute_path_inside_a_checkout_is_stored_relative_to_it() {
+        // Storing it relative is what makes the link survive the checkout
+        // moving, which is why an operator may paste an absolute path.
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("augere", "/tmp/augere").unwrap();
+        let doc = s
+            .create_doc(p.id, None, "/tmp/augere/docs/strategy.md", None)
+            .unwrap();
+        assert_eq!(doc.location, "docs/strategy.md");
+        assert_eq!(s.resolve_doc(&doc).unwrap(), "/tmp/augere/docs/strategy.md");
+
+        // ...and it follows the checkout when that moves.
+        s.set_default_repo_path(p.id, "/srv/augere").unwrap();
+        assert_eq!(
+            s.resolve_doc(&s.doc(doc.id).unwrap()).unwrap(),
+            "/srv/augere/docs/strategy.md"
+        );
+    }
+
+    #[test]
+    fn a_relative_doc_resolves_against_the_repo_it_names() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("odm", "/tmp/odm").unwrap();
+        let oats = s.add_repo(p.id, "oats", "/tmp/oats").unwrap();
+
+        let default = s.create_doc(p.id, None, "docs/plan.md", None).unwrap();
+        assert_eq!(s.resolve_doc(&default).unwrap(), "/tmp/odm/docs/plan.md");
+
+        let named = s
+            .create_doc(p.id, Some(oats.id), "notes/plan.md", None)
+            .unwrap();
+        assert_eq!(s.resolve_doc(&named).unwrap(), "/tmp/oats/notes/plan.md");
+
+        // The longest containing checkout wins for an absolute path, so a repo
+        // nested inside another is not swallowed by its parent.
+        let nested = s.add_repo(p.id, "inner", "/tmp/odm/vendor").unwrap();
+        let doc = s
+            .create_doc(p.id, None, "/tmp/odm/vendor/docs/x.md", None)
+            .unwrap();
+        assert_eq!(doc.repo_id, Some(nested.id));
+        assert_eq!(doc.location, "docs/x.md");
+    }
+
+    #[test]
+    fn a_url_resolves_verbatim_and_takes_no_repo() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let repo = s.default_repo(p.id).unwrap();
+
+        let doc = s
+            .create_doc(p.id, None, "https://example.com/plan", Some("Plan"))
+            .unwrap();
+        assert!(doc.is_url());
+        assert!(doc.repo_id.is_none());
+        assert_eq!(s.resolve_doc(&doc).unwrap(), "https://example.com/plan");
+        assert_eq!(doc.label(), "Plan");
+
+        // A URL resolves on its own, so pairing it with a checkout is refused
+        // rather than silently ignored.
+        assert!(
+            s.create_doc(p.id, Some(repo.id), "https://example.com/other", None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_doc_outside_every_checkout_stays_absolute() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let doc = s
+            .create_doc(p.id, None, "/etc/notes/plan.md", None)
+            .unwrap();
+        assert_eq!(doc.location, "/etc/notes/plan.md");
+        assert!(doc.repo_id.is_none());
+        assert_eq!(s.resolve_doc(&doc).unwrap(), "/etc/notes/plan.md");
+        // With --repo given, though, a path outside it is a mistake, not an
+        // external document.
+        let repo = s.default_repo(p.id).unwrap();
+        assert!(
+            s.create_doc(p.id, Some(repo.id), "/etc/notes/other.md", None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_doc_is_registered_once_per_project_and_labels_itself() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let other = s.create_project("mote", "/tmp/mote").unwrap();
+        let doc = s.create_doc(p.id, None, "docs/plan.md", None).unwrap();
+        // With no title, the location is the only name it has.
+        assert_eq!(doc.label(), "docs/plan.md");
+        assert!(s.create_doc(p.id, None, "docs/plan.md", None).is_err());
+        // The same relative location under another project is a different doc,
+        // since it resolves against that project's checkout.
+        let twin = s.create_doc(other.id, None, "docs/plan.md", None).unwrap();
+        assert_eq!(s.docs_at("docs/plan.md").unwrap().len(), 2);
+        assert_ne!(doc.id, twin.id);
+        assert_eq!(s.docs(p.id).unwrap(), vec![doc]);
+        assert!(s.create_doc(p.id, None, "   ", None).is_err());
+    }
+
+    #[test]
+    fn removing_a_doc_unlinks_its_tasks_rather_than_refusing() {
+        // Unlike a repo, a doc is navigational — nothing resolves to nothing
+        // when it goes — so removal frees its links instead of being refused.
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let doc = s.create_doc(p.id, None, "docs/plan.md", None).unwrap();
+        let a = s.create_task(new_ready(p.id)).unwrap();
+        let b = s.create_task(new_ready(p.id)).unwrap();
+        s.link_doc(a.id, doc.id).unwrap();
+        s.link_doc(b.id, doc.id).unwrap();
+
+        let freed = s.delete_doc(doc.id).unwrap();
+        assert_eq!(freed, vec![a.id, b.id]);
+        assert!(s.doc(doc.id).is_err());
+        assert!(s.docs_for_task(a.id).unwrap().is_empty());
+        assert!(s.docs_by_task().unwrap().is_empty());
+        assert_eq!(
+            s.events_for(a.id).unwrap().last().unwrap().kind,
+            "doc-unlinked"
+        );
+    }
+
+    #[test]
+    fn linking_names_a_task_and_a_doc_that_exist() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let doc = s.create_doc(p.id, None, "docs/plan.md", None).unwrap();
+        let t = s.create_task(new_ready(p.id)).unwrap();
+        assert!(s.link_doc(999, doc.id).is_err());
+        assert!(s.link_doc(t.id, 999).is_err());
+        assert!(s.set_task_docs(t.id, &[999]).is_err());
+        // A refused replacement leaves the list as it was.
+        assert!(s.docs_for_task(t.id).unwrap().is_empty());
+    }
+
+    /// A database from before migration 0014 must open with every existing
+    /// task intact and no documents registered — docs are purely additive.
+    #[test]
+    fn migration_0014_leaves_existing_tasks_untouched() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..13] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 13).unwrap();
+        conn.execute("INSERT INTO projects (name) VALUES ('legacy')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO repos (project_id, name, path, is_default)
+             VALUES (1, 'legacy', '/tmp/legacy', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (project_id, title, state, state_since, created_at)
+             VALUES (1, 'old work', 'ready', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let store = Store::from_connection(conn).unwrap();
+        let task = store.task(1).unwrap();
+        assert_eq!(task.title, "old work");
+        assert_eq!(task.state, TaskState::Ready);
+        assert!(store.all_docs().unwrap().is_empty());
+        assert!(store.docs_for_task(1).unwrap().is_empty());
     }
 }
