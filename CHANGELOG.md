@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   may cite a document, since one plan routinely spawns work across several. An
   absolute path inside one of the project's checkouts is stored relative to it,
   so the link survives the checkout moving.
+- Document links from the TUI: `c` on a selected task — on the cockpit, in the
+  task browser, and inside the browser's detail popup — opens a picker over
+  every registered document with the task's existing links ticked, and ⏎ links
+  or unlinks the highlighted one without leaving the TUI. Registering and
+  removing documents remains `voro doc add`/`remove`.
 - Multi-repo projects: a project now owns one or more **repos**, and a task may
   name which one it runs in. Manage them with `voro repo add/list/path/default/
   remove`, pick one per task with `voro add --repo NAME` and `voro set --repo

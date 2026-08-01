@@ -244,7 +244,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                 .wrap(Wrap { trim: false })
                 .scroll((*scroll, 0))
                 .block(Block::default().borders(Borders::ALL).title(format!(
-                    "#{task_id} — ⏎ state · 0-3 priority · ! deep · x score · h history · j/k scroll · esc close"
+                    "#{task_id} — ⏎ state · 0-3 priority · ! deep · c docs · x score · h history · j/k scroll · esc close"
                 )));
             frame.render_widget(para, area);
         }
@@ -270,6 +270,27 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             let list = List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(format!(
                     "Dispatch #{task_id} — pick agent, ⏎ dispatch, esc cancel"
+                )))
+                .highlight_style(SELECTED);
+            frame.render_stateful_widget(list, area, &mut state);
+        }
+        Mode::DocPicker {
+            task_id, docs, sel, ..
+        } => {
+            let items: Vec<ListItem> = docs
+                .iter()
+                .map(|doc| ListItem::new(doc_picker_row(app, *task_id, doc)))
+                .collect();
+            let height = items.len() as u16 + 2;
+            // Resolved locations are absolute paths, so this picker takes what
+            // the terminal will give rather than the fixed width the short-row
+            // pickers use.
+            let width = frame.area().width.saturating_sub(4).max(44);
+            let area = popup_area(frame, width, height.max(3));
+            let mut state = ListState::default().with_selected(Some(*sel));
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(format!(
+                    "Documents for #{task_id} — ⏎ link/unlink, esc close"
                 )))
                 .highlight_style(SELECTED);
             frame.render_stateful_widget(list, area, &mut state);
@@ -656,6 +677,38 @@ fn doc_lines(app: &App, task_id: i64) -> Vec<Line<'static>> {
             Line::from(Span::styled(text, Style::new().fg(Color::Magenta)))
         })
         .collect()
+}
+
+/// One row of the document picker (DESIGN.md §8): a tick for the documents the
+/// task already cites, then the same title-and-location pair the detail panes
+/// show, so a link made here reads back identically. A document owned by
+/// another project carries that project's name, since the list spans them all
+/// and two plans can share a filename.
+fn doc_picker_row(app: &App, task_id: i64, doc: &voro_core::Doc) -> Line<'static> {
+    let linked = app.doc_linked(task_id, doc.id);
+    let owner = app
+        .all
+        .iter()
+        .find(|row| row.task.id == task_id)
+        .filter(|row| row.task.project_id != doc.project_id)
+        .and_then(|_| app.projects.iter().find(|p| p.id == doc.project_id))
+        .map(|p| format!("[{}] ", p.name))
+        .unwrap_or_default();
+    let location = app
+        .doc_locations
+        .get(&doc.id)
+        .cloned()
+        .unwrap_or_else(|| doc.location.clone());
+    let text = match &doc.title {
+        Some(title) => format!("{owner}{title} — {location}"),
+        None => format!("{owner}{location}"),
+    };
+    let (mark, style) = if linked {
+        ("✓ ", Style::new().fg(Color::Magenta))
+    } else {
+        ("  ", Style::new().dim())
+    };
+    Line::from(vec![Span::styled(mark, style), Span::styled(text, style)])
 }
 
 /// A review row's next action rendered as a browser suffix (DESIGN.md §3). The
@@ -1460,6 +1513,7 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             pairs.push(("s", "state"));
             if app.selected_task_id().is_some() {
                 pairs.push(("!", "deep"));
+                pairs.push(("c", "docs"));
                 pairs.push(("x", "score"));
                 pairs.push(("h", "history"));
             }
@@ -1487,6 +1541,7 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             }
             pairs.push(("s", "state"));
             pairs.push(("!", "deep"));
+            pairs.push(("c", "docs"));
             pairs.push(("n", "new"));
             pairs.push(("N", "plan"));
             pairs.push(("e", "edit"));
