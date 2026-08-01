@@ -462,7 +462,7 @@ fn history_lines(events: &[Event]) -> Vec<Line<'static>> {
             Line::from(vec![
                 Span::styled(format!("{:<19} ", e.at), Style::new().dim()),
                 Span::styled(format!("{:<10} ", e.kind), Style::new().bold()),
-                Span::raw(e.detail.clone().unwrap_or_default()),
+                Span::raw(crate::cli::event_detail(e)),
             ])
         }));
     }
@@ -2399,6 +2399,45 @@ mod tests {
         }
         app.on_key(KeyEvent::from(KeyCode::Char('j')));
         assert_eq!(app.detail_scroll, 0, "a new selection starts at the top");
+    }
+
+    /// A `body` event's detail is a whole replaced brief (DESIGN.md §8), so the
+    /// history folds it to a marker naming the event that holds it rather than
+    /// spilling a superseded body across the pane. Every other kind reads as-is.
+    #[test]
+    fn history_folds_a_replaced_body_to_a_recovery_marker() {
+        let events = vec![
+            Event {
+                id: 4,
+                task_id: Some(62),
+                at: "2026-08-01 10:00:00".into(),
+                kind: "priority".into(),
+                detail: Some("P1".into()),
+            },
+            Event {
+                id: 5,
+                task_id: Some(62),
+                at: "2026-08-01 10:01:00".into(),
+                kind: "body".into(),
+                detail: Some("the brief\nline two\nline three".into()),
+            },
+        ];
+        let rendered: Vec<String> = history_lines(&events)
+            .iter()
+            .map(ratatui::text::Line::to_string)
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|l| l.contains("priority") && l.contains("P1"))
+        );
+        let body = rendered
+            .iter()
+            .find(|l| l.contains("body"))
+            .expect("the body event renders");
+        assert!(body.contains("replaced body kept (3 lines)"), "{body}");
+        assert!(body.contains("voro show 62 --event 5"), "{body}");
+        assert!(!body.contains("line two"), "{body}");
     }
 
     /// End-to-end: on the tasks screen the same sections fold into the Detail

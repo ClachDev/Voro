@@ -28,6 +28,7 @@ voro inbox              # the next-action queue: questions, reviews, proposals, 
 voro next               # the single top ready task, with its full body
 voro list [--state ready] [--project NAME]
 voro show <id>          # body, deps, event history
+voro show <id> --event <event-id>   # one event's detail alone, undecorated
 voro explain <id>       # score decomposition (weight × priority + age bonus)
 ```
 
@@ -37,6 +38,7 @@ voro explain <id>       # score decomposition (weight × priority + age bonus)
 voro add <project> <title> --body-file plan.md [--priority 0-3]
          [--blocked-by 3,7] [--blocks 9] [--repo NAME] [--deep]
 voro set <id> [--title T] [--priority N] [--body-file F]
+              [--append-body-file F] # add to the body instead of replacing it
               [--blocked-by IDS] [--blocks IDS] [--unlink KIND:ID]
               [--branch NAME]        # intended git branch dispatch injects
               [--repo NAME | --no-repo]   # which checkout the task runs in
@@ -56,6 +58,13 @@ their effect and are cycle-checked; `show` renders the edge as `blocked by #N`.
 under that task, and leaves any other edge to the same task standing. Repeat
 the flag for several. Naming an edge that is not there fails rather than
 reporting a success it did not perform.
+
+`--body-file` on `set` replaces the **whole** body, so reach for
+`--append-body-file` when you mean to add a finding to a task rather than
+rewrite its brief. A replacement that would leave the body empty is refused
+unless you pass `--allow-empty`, and the text any replacement discards is kept
+on the event log — `show` marks the `body` event with the command that prints
+it back (`voro show <id> --event <event-id> > body.md`).
 
 `add` defaults to state `proposed`, which is what an agent should almost
 always want: proposed tasks wait for human triage and never enter the queues
