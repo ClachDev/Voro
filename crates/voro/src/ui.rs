@@ -96,19 +96,10 @@ fn draw_mode(frame: &mut Frame, app: &App) {
             actions,
             sel,
         } => {
-            let mut items: Vec<ListItem> = actions
+            let items: Vec<ListItem> = actions
                 .iter()
                 .map(|a| ListItem::new(crate::app::action_label(a)))
                 .collect();
-            // The fourth triage outcome (DESIGN.md §6) is not a verdict, so it
-            // sits below the list as the two keys that reach it rather than as
-            // a selectable row that would transition nothing.
-            if app.is_proposed(*task_id) {
-                items.push(ListItem::new(Line::from(Span::styled(
-                    "r refine with a note · R refine by talking",
-                    Style::new().dim(),
-                ))));
-            }
             let height = items.len() as u16 + 2;
             let area = popup_area(frame, 48, height.max(3));
             let mut state = ListState::default().with_selected(Some(*sel));
