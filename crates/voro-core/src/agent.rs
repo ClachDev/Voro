@@ -18,6 +18,7 @@ use std::sync::LazyLock;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+use crate::scheduler::{AttentionCosts, DEFAULT_MAX_RUNNING};
 
 /// The prompt-file substitution in the `dispatch` template. The working
 /// directory is handled by the spawner, not the template.
@@ -146,6 +147,11 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #     does not pick a viewer itself (`voro project action <p> viewer:<name>`); a
 #     single anonymous [viewer] table is the older, still-valid spelling of
 #     the default.
+#   * price the queue — `max_running` caps how many dispatches ride at once
+#     (default 5; at the cap the queue offers no more), and a [costs] table
+#     divides each row's score by what its action asks of you, so a cheap
+#     decision outranks an expensive review of the same raw worth. Keep the
+#     band narrow (DESIGN.md §7) — it is a nudge, not a re-ranking.
 "#;
 
 /// The full skeleton `voro agent init` writes: the header, the built-ins
@@ -181,7 +187,14 @@ fn starter_config() -> String {
          # [viewers.zed]\n\
          # cmd = \"zed {path}\"\n#\n\
          # [viewers.difftool]\n\
-         # cmd = \"git -C {path} difftool -d {base}...{branch}\"\n",
+         # cmd = \"git -C {path} difftool -d {base}...{branch}\"\n#\n\
+         # max_running = 5\n#\n\
+         # [costs]\n\
+         # answer = 0.8\n\
+         # triage = 0.8\n\
+         # dispatch = 1.0\n\
+         # review = 1.4\n\
+         # do = 1.8\n",
     );
     out
 }
@@ -316,6 +329,53 @@ struct RawConfig {
     viewers: BTreeMap<String, ViewerTemplate>,
     #[serde(default)]
     default_viewer: Option<String>,
+    #[serde(default)]
+    max_running: Option<i64>,
+    #[serde(default)]
+    costs: Option<RawCosts>,
+}
+
+/// The `[costs]` table (DESIGN.md §7): per-action overrides of the attention
+/// price band. Every key is optional and falls back to the built-in default,
+/// so a table naming one action leaves the rest alone.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCosts {
+    answer: Option<f64>,
+    triage: Option<f64>,
+    dispatch: Option<f64>,
+    review: Option<f64>,
+    /// Spelled `do` in the file, after the verb a human task's row asks for.
+    #[serde(rename = "do")]
+    human_do: Option<f64>,
+}
+
+impl RawCosts {
+    /// Layer the file's overrides onto the defaults, rejecting a divisor that
+    /// would invert or blow up the ranking.
+    fn resolve(self, path: &Path) -> Result<AttentionCosts> {
+        let defaults = AttentionCosts::default();
+        let checked = |name: &str, value: Option<f64>, default: f64| -> Result<f64> {
+            match value {
+                None => Ok(default),
+                Some(value) if value.is_finite() && value > 0.0 => Ok(value),
+                Some(value) => Err(Error::AgentConfigInvalid {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "cost '{name}' is {value} — every [costs] divisor must be a positive \
+                         number (the defaults sit between 0.8 and 1.8)"
+                    ),
+                }),
+            }
+        };
+        Ok(AttentionCosts {
+            answer: checked("answer", self.answer, defaults.answer)?,
+            triage: checked("triage", self.triage, defaults.triage)?,
+            dispatch: checked("dispatch", self.dispatch, defaults.dispatch)?,
+            review: checked("review", self.review, defaults.review)?,
+            human_do: checked("do", self.human_do, defaults.human_do)?,
+        })
+    }
 }
 
 /// Validate one agent's verb templates, shared by the built-ins and the user
@@ -471,6 +531,11 @@ pub struct AgentsConfig {
     viewers: BTreeMap<String, ViewerTemplate>,
     /// The user-set `default_viewer`, naming a `[viewers.*]` entry.
     default_viewer: Option<String>,
+    /// The attention price band the queue ranks by (DESIGN.md §7), defaults
+    /// with any `[costs]` overrides layered on.
+    costs: AttentionCosts,
+    /// How many dispatches ride at once before the queue stops offering more.
+    max_running: i64,
     path: PathBuf,
 }
 
@@ -525,6 +590,8 @@ impl AgentsConfig {
             viewer: None,
             viewers: BTreeMap::new(),
             default_viewer: None,
+            costs: AttentionCosts::default(),
+            max_running: DEFAULT_MAX_RUNNING,
             path: path.to_path_buf(),
         }
     }
@@ -555,6 +622,23 @@ impl AgentsConfig {
             provenance.insert(name.clone(), prov);
             agents.insert(name, agent);
         }
+        let max_running = match raw.max_running {
+            None => DEFAULT_MAX_RUNNING,
+            Some(n) if n >= 0 => n,
+            Some(n) => {
+                return Err(Error::AgentConfigInvalid {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "max_running is {n} — it counts dispatches in flight, so it cannot be \
+                         negative (0 stops the queue offering dispatches at all)"
+                    ),
+                });
+            }
+        };
+        let costs = match raw.costs {
+            Some(costs) => costs.resolve(path)?,
+            None => AttentionCosts::default(),
+        };
         Ok(AgentsConfig {
             default: raw.default_agent,
             agents,
@@ -562,8 +646,21 @@ impl AgentsConfig {
             viewer: raw.viewer,
             viewers: raw.viewers,
             default_viewer: raw.default_viewer,
+            costs,
+            max_running,
             path: path.to_path_buf(),
         })
+    }
+
+    /// The attention price band the queue ranks by (DESIGN.md §7).
+    pub fn costs(&self) -> AttentionCosts {
+        self.costs
+    }
+
+    /// The dispatch WIP cap (DESIGN.md §7): how many tasks may be running
+    /// before the queue stops offering dispatches.
+    pub fn max_running(&self) -> i64 {
+        self.max_running
     }
 
     /// Every agent name defined in the config, for the TUI's dispatch picker
@@ -865,6 +962,74 @@ mod tests {
 
     fn config() -> AgentsConfig {
         AgentsConfig::parse(CONFIG, Path::new("/tmp/voro.toml")).unwrap()
+    }
+
+    fn parse(text: &str) -> Result<AgentsConfig> {
+        AgentsConfig::parse(text, Path::new("/tmp/voro.toml"))
+    }
+
+    #[test]
+    fn absent_costs_and_max_running_take_the_defaults() {
+        // A file that says nothing about pricing prices the queue exactly as
+        // the built-ins do (DESIGN.md §7) — as does a missing file.
+        for config in [
+            config(),
+            AgentsConfig::builtin_only(Path::new("/tmp/voro.toml")),
+        ] {
+            assert_eq!(config.costs(), AttentionCosts::default());
+            assert_eq!(config.max_running(), DEFAULT_MAX_RUNNING);
+        }
+    }
+
+    #[test]
+    fn costs_table_overrides_only_the_actions_it_names() {
+        let config = parse(
+            r#"
+            max_running = 3
+
+            [costs]
+            review = 2.5
+            do = 4.0
+            "#,
+        )
+        .unwrap();
+        let costs = config.costs();
+        assert_eq!(costs.review, 2.5);
+        assert_eq!(costs.human_do, 4.0);
+        // untouched keys keep the defaults
+        assert_eq!(costs.answer, AttentionCosts::default().answer);
+        assert_eq!(costs.triage, AttentionCosts::default().triage);
+        assert_eq!(costs.dispatch, AttentionCosts::default().dispatch);
+        assert_eq!(config.max_running(), 3);
+    }
+
+    #[test]
+    fn a_non_positive_cost_is_refused() {
+        // A zero or negative divisor would blow up or invert the ranking, so
+        // it is caught at load rather than producing a nonsense queue.
+        for text in [
+            "[costs]\nreview = 0",
+            "[costs]\nanswer = -1.0",
+            "[costs]\ntriage = nan",
+        ] {
+            let e = parse(text).unwrap_err().to_string();
+            assert!(e.contains("must be a positive number"), "{text}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_negative_max_running_is_refused() {
+        let e = parse("max_running = -1").unwrap_err().to_string();
+        assert!(e.contains("cannot be negative"), "{e}");
+        // zero is legal — it is how the operator stops the queue offering
+        // dispatches at all.
+        assert_eq!(parse("max_running = 0").unwrap().max_running(), 0);
+    }
+
+    #[test]
+    fn an_unknown_cost_key_is_refused_rather_than_ignored() {
+        let e = parse("[costs]\nredispatch = 1.0").unwrap_err().to_string();
+        assert!(e.contains("redispatch"), "{e}");
     }
 
     #[test]

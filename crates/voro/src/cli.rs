@@ -9,8 +9,8 @@ use std::fmt::Write as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use voro_core::{
-    Action, AgentsConfig, DepKind, NewTask, PrRef, Priority, Project, Repo, ReviewAction,
-    ReviewMedium, Store, Task, TaskEdit, TaskState, Triage, scheduler,
+    Action, AgentsConfig, DepKind, NewTask, PrRef, Priority, Project, QueueRow, Repo, ReviewAction,
+    ReviewMedium, Store, Task, TaskEdit, TaskState, Triage, WipGate, scheduler,
 };
 
 use crate::dispatch::{self, DispatchCtx};
@@ -100,13 +100,18 @@ tasks
   show <task-id>                  full task: body, deps, events
   list [--state STATE] [--project P]
   inbox                           the next-action queue: questions, reviews,
-                                  proposals, top ready tasks — by score
+                                  proposals, top ready tasks — ranked by score
+                                  divided by what each action costs your
+                                  attention. Proposals ride as one digest row
+                                  per project; dispatch rows give way to a
+                                  capacity line once max_running are in flight
   next                            the single highest-scoring ready task
   stats                           task counts by state — the triage backlog
                                   (§12) plus ready, running, needs-input,
                                   review, waiting, stalled, done; excludes
                                   parked projects
-  explain <task-id>               score decomposition
+  explain <task-id>               score decomposition, and the divisor the
+                                  inbox ranks it by
   import <project> [--repo NAME] [--gh-repo owner/name]
                                   import open GitHub issues as proposed
                                   tasks via `gh issue list`; idempotent.
@@ -515,10 +520,10 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Set(args) => set_verb(store, args),
         Verb::Show { task_id } => show_verb(store, task_id),
         Verb::List(args) => list_verb(store, &args),
-        Verb::Inbox => inbox_verb(store),
+        Verb::Inbox => inbox_verb(store, ctx),
         Verb::Next => next_verb(store),
         Verb::Stats => stats_verb(store),
-        Verb::Explain { task_id } => explain_verb(store, task_id),
+        Verb::Explain { task_id } => explain_verb(store, task_id, ctx),
         Verb::Agent { cmd } => agent_verb(cmd, ctx),
         Verb::Dispatch { task_id, agent } => {
             dispatch::dispatch(store, ctx, task_id, agent.as_deref())
@@ -1317,33 +1322,76 @@ fn review_next_suffix(task: &Task) -> String {
         .map_or_else(String::new, |verb| format!("  next: {verb}"))
 }
 
-fn inbox_verb(store: &mut Store) -> Result<String, String> {
+fn inbox_verb(store: &mut Store, ctx: &DispatchCtx) -> Result<String, String> {
+    let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     let candidates = store.candidates().map_err(|e| e.to_string())?;
+    let gate = WipGate {
+        running: store.state_counts().map_err(|e| e.to_string())?.running,
+        max_running: config.max_running(),
+    };
+    let queue = scheduler::queue(&candidates, &config.costs(), gate);
     let mut out = String::new();
-    for c in scheduler::queue(&candidates) {
-        // The queue row carries the verb instead of the state: every inbox row
-        // is a next action (DESIGN.md §3), like the TUI queue.
-        write!(
+    // The capacity line stands in for the dispatch rows the gate suppressed,
+    // so an inbox with no startable work still says why (DESIGN.md §7).
+    if let Some(gate) = queue.at_capacity {
+        writeln!(
             out,
-            "{:5.1}  #{} {:10} {} {}: {}",
-            c.score.total,
-            c.task.id,
-            c.task.next_action().map_or("", |a| a.as_str()),
-            c.task.priority,
-            c.project_name,
-            c.task.title
+            "⏸ dispatch at capacity ({}/{} running)",
+            gate.running, gate.max_running
         )
         .unwrap();
-        if let Some(q) = &c.task.question {
-            write!(out, "  — {q}").unwrap();
+    }
+    for row in &queue.rows {
+        match row {
+            QueueRow::Digest(digest) => {
+                // Informational on the CLI: `voro list --state proposed` is
+                // where the constituents are triaged one by one.
+                writeln!(
+                    out,
+                    "{:5.1}  ▲ {} awaiting triage ({})",
+                    digest.effective,
+                    plural(digest.tasks.len(), "proposal"),
+                    digest.project_name
+                )
+                .unwrap();
+            }
+            QueueRow::Action(row) => {
+                let c = &row.candidate;
+                // The queue row carries the verb instead of the state: every
+                // inbox row is a next action (DESIGN.md §3), like the TUI queue.
+                // The score is the effective one the row is ranked by; `explain`
+                // is where the division back to the raw score is shown.
+                write!(
+                    out,
+                    "{:5.1}  #{} {:10} {} {}: {}",
+                    row.effective,
+                    c.task.id,
+                    row.action.as_str(),
+                    c.task.priority,
+                    c.project_name,
+                    c.task.title
+                )
+                .unwrap();
+                if let Some(q) = &c.task.question {
+                    write!(out, "  — {q}").unwrap();
+                }
+                write!(out, "{}", incomplete_report_suffix(store, c.task.id)).unwrap();
+                writeln!(out).unwrap();
+            }
         }
-        write!(out, "{}", incomplete_report_suffix(store, c.task.id)).unwrap();
-        writeln!(out).unwrap();
     }
     if out.is_empty() {
         out = "nothing needs you\n".to_string();
     }
     Ok(out)
+}
+
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("{n} {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }
 
 /// Task counts by state (DESIGN.md §12) as a scriptable readout, excluding
@@ -1399,7 +1447,8 @@ fn incomplete_report_suffix(store: &Store, task_id: i64) -> &'static str {
     }
 }
 
-fn explain_verb(store: &mut Store, id: i64) -> Result<String, String> {
+fn explain_verb(store: &mut Store, id: i64, ctx: &DispatchCtx) -> Result<String, String> {
+    let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     let task = store.task(id).map_err(|e| e.to_string())?;
     let b = store.explain(id).map_err(|e| e.to_string())?;
     let mut out = String::new();
@@ -1428,6 +1477,18 @@ fn explain_verb(store: &mut Store, id: i64) -> Result<String, String> {
     )
     .unwrap();
     writeln!(out, "total           {:>6.2}", b.total).unwrap();
+    // What the inbox actually ranks by: the total priced by what the row asks
+    // of the operator (DESIGN.md §7).
+    if let Some(e) = scheduler::effective_score(&task, b.total, &config.costs()) {
+        writeln!(
+            out,
+            "action          {:>6}  (cost ÷{})",
+            e.action.as_str(),
+            e.cost
+        )
+        .unwrap();
+        writeln!(out, "effective       {:>6.2}  (inbox rank)", e.effective).unwrap();
+    }
     if !matches!(
         task.state,
         TaskState::Ready | TaskState::NeedsInput | TaskState::Review | TaskState::Stalled
@@ -1603,7 +1664,7 @@ mod tests {
     }
 
     fn ctx() -> DispatchCtx {
-        DispatchCtx::from_db_path(std::path::Path::new("/nonexistent/voro.db"))
+        DispatchCtx::without_config(std::path::Path::new("/nonexistent/voro.db"))
     }
 
     fn ok(store: &mut Store, args: &[&str]) -> String {
@@ -1966,8 +2027,14 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "An idea"]);
-        assert!(ok(&mut s, &["inbox"]).contains("P2 demo: An idea"));
+        // Proposals ride the inbox as one digest row per project (DESIGN.md §7).
+        assert!(
+            ok(&mut s, &["inbox"]).contains("1 proposal awaiting triage (demo)"),
+            "{}",
+            ok(&mut s, &["inbox"])
+        );
         ok(&mut s, &["triage", "1", "ready"]);
+        assert!(ok(&mut s, &["inbox"]).contains("P2 demo: An idea"));
         assert!(ok(&mut s, &["next"]).contains("An idea"));
     }
 
@@ -1988,10 +2055,131 @@ mod tests {
         ok(&mut s, &["ask", "4", "--question", "Schema A or B?"]);
 
         let out = ok(&mut s, &["inbox"]);
-        assert!(out.contains("#1 triage"), "{out}");
+        // The proposal is inside the digest rather than carrying a row itself.
+        assert!(out.contains("▲ 1 proposal awaiting triage (demo)"), "{out}");
+        assert!(!out.contains("#1 triage"), "{out}");
         assert!(out.contains("#2 dispatch"), "{out}");
         assert!(out.contains("#3 do"), "{out}");
         assert!(out.contains("#4 answer"), "{out}");
+    }
+
+    /// The inbox ranks by attention price, not raw score (DESIGN.md §7): a
+    /// question outranks a review worth more on paper, and the digest sits
+    /// where its best proposal would.
+    #[test]
+    fn inbox_ranks_a_question_above_a_higher_scoring_review() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["weight", "demo", "3"]);
+        // P0 review: 3×(8+2) = 30 raw, ÷1.4 = 21.4
+        ok(
+            &mut s,
+            &[
+                "add",
+                "demo",
+                "Big diff",
+                "--priority",
+                "0",
+                "--state",
+                "ready",
+            ],
+        );
+        ok(&mut s, &["start", "1"]);
+        ok(
+            &mut s,
+            &["done", "1", "--summary", "did it", "--branch", "b"],
+        );
+        // P2 question: 3×(2+4) = 18 raw, ÷0.8 = 22.5
+        ok(&mut s, &["add", "demo", "Blocked", "--state", "ready"]);
+        ok(&mut s, &["start", "2"]);
+        ok(&mut s, &["ask", "2", "--question", "A or B?"]);
+
+        let out = ok(&mut s, &["inbox"]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("#2 answer"), "{out}");
+        assert!(
+            lines[1].contains("#1 review PR") || lines[1].contains("#1 pr"),
+            "{out}"
+        );
+    }
+
+    /// The `[costs]` table re-prices the same queue (DESIGN.md §7).
+    #[test]
+    fn costs_overrides_in_voro_toml_change_the_inbox_order() {
+        let mut s = store();
+        let ctx = ctx_with_toml("[costs]\nreview = 0.5\n");
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["weight", "demo", "3"]);
+        ok(
+            &mut s,
+            &[
+                "add",
+                "demo",
+                "Big diff",
+                "--priority",
+                "0",
+                "--state",
+                "ready",
+            ],
+        );
+        ok(&mut s, &["start", "1"]);
+        ok(
+            &mut s,
+            &["done", "1", "--summary", "did it", "--branch", "b"],
+        );
+        ok(&mut s, &["add", "demo", "Blocked", "--state", "ready"]);
+        ok(&mut s, &["start", "2"]);
+        ok(&mut s, &["ask", "2", "--question", "A or B?"]);
+
+        // Default costs put the question first; pricing review at 0.5 (30 ÷0.5
+        // = 60 against the question's 22.5) puts the diff back on top.
+        let out = run_with(&mut s, &["inbox"], &ctx).unwrap();
+        assert!(out.lines().next().unwrap().contains("#1 "), "{out}");
+    }
+
+    /// The dispatch WIP gate (DESIGN.md §7): at the cap the inbox offers no
+    /// more dispatches and says why.
+    #[test]
+    fn the_wip_gate_replaces_dispatch_rows_with_a_capacity_line() {
+        let mut s = store();
+        let ctx = ctx_with_toml("max_running = 1\n");
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "In flight", "--state", "ready"]);
+        ok(&mut s, &["add", "demo", "Startable", "--state", "ready"]);
+
+        // Nothing running yet: the startable row is offered.
+        let out = run_with(&mut s, &["inbox"], &ctx).unwrap();
+        assert!(out.contains("dispatch"), "{out}");
+        assert!(!out.contains("at capacity"), "{out}");
+
+        ok(&mut s, &["start", "1"]);
+        let out = run_with(&mut s, &["inbox"], &ctx).unwrap();
+        assert!(
+            out.contains("⏸ dispatch at capacity (1/1 running)"),
+            "{out}"
+        );
+        assert!(!out.contains("dispatch   "), "{out}");
+    }
+
+    /// `explain` shows the division the inbox ranked by (DESIGN.md §7).
+    #[test]
+    fn explain_shows_the_action_divisor_and_effective_score() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["weight", "demo", "3"]);
+        ok(&mut s, &["add", "demo", "Startable", "--state", "ready"]);
+
+        let out = ok(&mut s, &["explain", "1"]);
+        assert!(out.contains("total"), "{out}");
+        assert!(out.contains("dispatch"), "{out}");
+        assert!(out.contains("cost ÷1"), "{out}");
+        assert!(out.contains("effective"), "{out}");
+
+        // A parked task asks nothing of the operator, so there is no action to
+        // price and the effective line is absent.
+        ok(&mut s, &["park", "1"]);
+        let out = ok(&mut s, &["explain", "1"]);
+        assert!(!out.contains("effective"), "{out}");
     }
 
     /// A review row's verb reads the tracked PR: `pr` without one, `review PR`
