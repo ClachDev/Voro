@@ -1460,15 +1460,13 @@ impl App {
     }
 
     /// Drive the create-PR confirmation modal (DESIGN.md §8). Enter (or `y`)
-    /// runs the same `crate::pr::create` the CLI's `pr` calls, then refreshes;
-    /// esc (or `n`) cancels without touching anything.
+    /// runs the same `crate::pr::create` the CLI's `pr` calls and shows the new
+    /// PR, then refreshes; esc (or `n`) cancels without touching anything.
     fn key_confirm_pr(&mut self, key: KeyEvent, task_id: i64, branch: String, title: String) {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                match crate::pr::create(&mut self.store, task_id) {
-                    Ok(summary) => self.status = Some(summary),
-                    Err(e) => self.status = Some(e),
-                }
+                let created = crate::pr::create(&mut self.store, task_id);
+                self.report_created_pr(task_id, created, crate::pr::open_url);
                 let result = self.refresh();
                 self.report(result);
             }
@@ -1483,6 +1481,26 @@ impl App {
                 };
             }
         }
+    }
+
+    /// Report a create-PR attempt, chaining a success straight into the browser
+    /// (DESIGN.md §8): creating a PR is all but always followed by looking at
+    /// it, so `g` does both. The create is the durable half — its URL is already
+    /// recorded on the task — so a browser that will not launch is reported
+    /// beside the URL rather than as a failed create.
+    fn report_created_pr(
+        &mut self,
+        task_id: i64,
+        created: Result<String, String>,
+        open: impl FnOnce(&str) -> Result<String, String>,
+    ) {
+        self.status = Some(match created {
+            Ok(url) => match open(&url) {
+                Ok(_) => format!("opened {url} for task {task_id} — showing it in the browser"),
+                Err(e) => format!("PR created ({url}); could not open browser: {e}"),
+            },
+            Err(e) => e,
+        });
     }
 
     /// Drive the link-a-PR prompt (DESIGN.md §11c). Enter validates and stores
@@ -3798,6 +3816,59 @@ mod tests {
         }
         assert!(app.status.is_some());
         assert!(app.store.task(task_id).unwrap().pr_url.is_none());
+    }
+
+    /// Confirming the create-PR modal shows the new PR without a second `g`:
+    /// the browser is launched with the URL `create` just recorded (DESIGN.md
+    /// §8). The launch is passed in so the chain is exercised without `gh`.
+    #[test]
+    fn a_created_pr_is_opened_in_the_browser() {
+        let mut app = app_with(&[TaskState::Review]);
+        let task_id = app.selected_task_id().unwrap();
+        let url = "https://github.com/acme/widget/pull/7";
+        let mut opened = None;
+        app.report_created_pr(task_id, Ok(url.to_string()), |u| {
+            opened = Some(u.to_string());
+            Ok(format!("opening {u} in the browser"))
+        });
+        assert_eq!(opened.as_deref(), Some(url));
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(
+            status.contains(url) && status.contains("browser"),
+            "{status}"
+        );
+    }
+
+    /// A browser that will not launch does not turn a created PR into a
+    /// failure: the URL is recorded, so it is reported with the open error
+    /// alongside it (DESIGN.md §8).
+    #[test]
+    fn a_browser_failure_after_a_create_still_reports_the_pr() {
+        let mut app = app_with(&[TaskState::Review]);
+        let task_id = app.selected_task_id().unwrap();
+        let url = "https://github.com/acme/widget/pull/7";
+        app.report_created_pr(task_id, Ok(url.to_string()), |_| {
+            Err("cannot run `gh` to open the PR: not found".to_string())
+        });
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(
+            status.contains("PR created") && status.contains(url) && status.contains("not found"),
+            "{status}"
+        );
+    }
+
+    /// A failed create is reported as-is and never reaches the browser.
+    #[test]
+    fn a_failed_create_does_not_open_a_browser() {
+        let mut app = app_with(&[TaskState::Review]);
+        let task_id = app.selected_task_id().unwrap();
+        let mut opened = false;
+        app.report_created_pr(task_id, Err("`gh pr create` failed".to_string()), |_| {
+            opened = true;
+            Ok(String::new())
+        });
+        assert!(!opened, "the browser was launched for a failed create");
+        assert_eq!(app.status.as_deref(), Some("`gh pr create` failed"));
     }
 
     /// Rejecting a review task with no tracked PR opens the ordinary feedback

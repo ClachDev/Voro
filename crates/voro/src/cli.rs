@@ -1408,7 +1408,7 @@ fn pr_verb(store: &mut Store, id: i64, yes: bool, ctx: &DispatchCtx) -> Result<S
     if !yes && !confirm(&format!("push `{}` and open a PR for #{id}?", plan.branch))? {
         return Ok(format!("cancelled — no PR opened for #{id}"));
     }
-    crate::pr::create(store, id)
+    crate::pr::create(store, id).map(|url| format!("opened {url} for task {id}"))
 }
 
 /// Ask a yes/no question on the terminal, defaulting to no (DESIGN.md §8). A

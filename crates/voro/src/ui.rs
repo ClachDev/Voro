@@ -166,6 +166,7 @@ fn draw_mode(frame: &mut Frame, app: &App) {
                     Span::raw("create a ready PR titled "),
                     Span::styled(format!("“{title}”"), Style::new().fg(Color::Blue)),
                 ]),
+                Line::from(Span::raw("and open it in the browser")),
                 Line::default(),
                 Line::from(Span::styled(
                     "⏎/y confirm · esc/n cancel",
@@ -2729,6 +2730,57 @@ mod tests {
         assert!(
             header.contains("ready 1"),
             "header missing ready count: {header}"
+        );
+    }
+
+    /// The create-PR modal spells out every consequence of confirming, the
+    /// browser jump included (DESIGN.md §8), so the key's second half is not a
+    /// surprise.
+    #[test]
+    fn confirm_pr_modal_announces_the_browser_jump() {
+        use crate::app::{App, Mode};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "ship it".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+        app.mode = Mode::ConfirmPr {
+            task_id: task.id,
+            branch: "feat/ship".into(),
+            title: "ship it".into(),
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("open it in the browser"),
+            "modal should name the browser jump: {rendered}"
         );
     }
 }

@@ -22,12 +22,19 @@ fn tracked_pr(store: &Store, task_id: i64) -> Result<PrRef, String> {
 }
 
 /// Open a task's tracked PR in a browser via `gh pr view --web` (DESIGN.md
-/// §11c). Spawned detached and reaped like the viewer in `dispatch::open`, so
-/// nothing lingers as a zombie.
+/// §11c).
 pub fn open(store: &Store, task_id: i64) -> Result<String, String> {
     let pr = tracked_pr(store, task_id)?;
+    open_url(&pr.url)
+}
+
+/// Open a PR URL in a browser, taking the URL rather than a task so a
+/// just-created PR can be shown without re-reading the store (DESIGN.md §8).
+/// Spawned detached and reaped like the viewer in `dispatch::open`, so nothing
+/// lingers as a zombie.
+pub fn open_url(url: &str) -> Result<String, String> {
     let mut child = Command::new("gh")
-        .args(["pr", "view", "--web", &pr.url])
+        .args(["pr", "view", "--web", url])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -36,7 +43,7 @@ pub fn open(store: &Store, task_id: i64) -> Result<String, String> {
     std::thread::spawn(move || {
         let _ = child.wait();
     });
-    Ok(format!("opening {} in the browser", pr.url))
+    Ok(format!("opening {url} in the browser"))
 }
 
 /// Pull a task's tracked PR's review comments into a reject-with-feedback body
@@ -69,7 +76,8 @@ pub fn plan(store: &Store, task_id: i64) -> Result<PrPlan, String> {
 /// state change — the task stays in `review` until a human accepts. The
 /// operator has already been gated by the caller; `pr` is operator-invoked, so
 /// the dispatched agent still cannot publish. Only called when no PR is
-/// tracked; a tracked one jumps to [`open`] instead.
+/// tracked; a tracked one jumps to [`open`] instead. Returns the canonical URL
+/// so a caller can chain into [`open_url`] without re-reading the task.
 pub fn create(store: &mut Store, task_id: i64) -> Result<String, String> {
     let plan = plan(store, task_id)?;
     let task = store.task(task_id).map_err(|e| e.to_string())?;
@@ -84,7 +92,7 @@ pub fn create(store: &mut Store, task_id: i64) -> Result<String, String> {
     store
         .set_pr(task_id, Some(&pr.url))
         .map_err(|e| e.to_string())?;
-    Ok(format!("opened {} for task {task_id}", pr.url))
+    Ok(pr.url)
 }
 
 /// Ask GitHub whether a review task's tracked PR still merges cleanly with its
