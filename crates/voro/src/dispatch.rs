@@ -1963,6 +1963,23 @@ mod tests {
 
     // --- refine (task #314) ---
 
+    /// Read a prompt the stub agent copied out with `cat {prompt_file} > file`,
+    /// waiting for the copy to *complete* rather than merely to start: the shell
+    /// creates the redirect target before `cat` runs, so polling for existence
+    /// races the write and can read an empty file on a loaded runner. The
+    /// template's closing sentence is the marker that the whole prompt landed.
+    fn read_captured_prompt(path: &Path) -> String {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && text.contains("Rewrite the body and stop.")
+            {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for {} to be written", path.display())
+    }
+
     /// A proposal in the fixture project, optionally discovered from a parent
     /// task whose body and completion summary are the context a refine seeds
     /// its agent with.
@@ -2023,14 +2040,7 @@ mod tests {
         assert!(summary.contains("stub"), "{summary}");
         assert!(summary.contains(&format!("refine-{id}")), "{summary}");
 
-        let landed = project.join("refine-prompt.txt");
-        for _ in 0..100 {
-            if landed.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let prompt = std::fs::read_to_string(&landed).unwrap();
+        let prompt = read_captured_prompt(&project.join("refine-prompt.txt"));
         // the operator's note, the body as it stands, and the discovered-from
         // context the sloppy proposal is missing
         assert!(prompt.contains("name the files it touches"), "{prompt}");
@@ -2084,14 +2094,7 @@ mod tests {
 
         refine(&mut store, &ctx, id, "follow the plan").unwrap();
 
-        let landed = project.join("refine-prompt.txt");
-        for _ in 0..100 {
-            if landed.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let prompt = std::fs::read_to_string(&landed).unwrap();
+        let prompt = read_captured_prompt(&project.join("refine-prompt.txt"));
         assert!(prompt.contains("Linked documents"), "{prompt}");
         assert!(prompt.contains("docs/PLAN.md"), "{prompt}");
     }
