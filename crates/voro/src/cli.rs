@@ -1742,7 +1742,14 @@ fn explain_verb(store: &mut Store, id: i64) -> Result<String, String> {
         b.state_bonus
     )
     .unwrap();
-    writeln!(out, "base w×(p+s)    {:>6.1}", b.base).unwrap();
+    writeln!(
+        out,
+        "blocks          {:>6}  (bonus +{}, 1/dependent, cap 2)",
+        format!("×{}", b.open_dependents),
+        b.unblock_bonus
+    )
+    .unwrap();
+    writeln!(out, "base w×(p+s+u)  {:>6.1}", b.base).unwrap();
     writeln!(out, "age             {:>6.1} days", b.age_days).unwrap();
     writeln!(
         out,
@@ -3436,8 +3443,20 @@ mod tests {
             &["add", "demo", "T", "--priority", "0", "--state", "ready"],
         );
         let out = ok(&mut s, &["explain", "1"]);
-        assert!(out.contains("base w×(p+s)      16.0"), "{out}");
+        assert!(out.contains("base w×(p+s+u)    16.0"), "{out}");
         assert!(out.contains("state            ready  (bonus +0)"), "{out}");
+        assert!(out.contains("blocks              ×0  (bonus +0"), "{out}");
+
+        // a task another one waits on shows the dependent count and its bonus
+        ok(
+            &mut s,
+            &[
+                "add", "demo", "blocker", "--state", "ready", "--blocks", "1",
+            ],
+        );
+        let out = ok(&mut s, &["explain", "2"]);
+        assert!(out.contains("blocks              ×1  (bonus +1"), "{out}");
+        assert!(out.contains("base w×(p+s+u)     6.0"), "{out}");
     }
 
     #[test]
