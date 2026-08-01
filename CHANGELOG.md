@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A pair of tasks carrying two edges keeps the one not named, so an edge
   authored by mistake no longer has to be removed with raw SQL; dropping a
   blocker reconciles readiness as any other blocker edit does.
+- **Body edits are recoverable and guarded.** Every edit that changes a
+  non-empty task body records the text it replaced as a `body` event, so a
+  rewrite is no longer irreversible; `voro show <id> --event <event-id>` prints
+  that text back, ready to redirect into `set --body-file`. A replacement that
+  would leave the body empty is refused unless `--allow-empty` is given, and
+  `voro set --append-body[-file]` adds to a body instead of replacing it.
 - **Document links**: register the plan or design doc a body of work derives
   from with `voro doc add <project> <path-or-url>`, and link it to the tasks it
   spawned (`voro doc link/unlink`, or `--doc` on `voro add`/`voro set`). `voro

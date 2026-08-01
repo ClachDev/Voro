@@ -867,7 +867,8 @@ impl Store {
                 });
             }
         }
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "UPDATE tasks SET title = ?1, body = ?2, priority = ?3, agent = ?4, human = ?5,
                               deep = ?6
              WHERE id = ?7",
@@ -881,6 +882,14 @@ impl Store {
                 id
             ],
         )?;
+        // A body edit overwrites the task's whole brief in place, so the log
+        // keeps the text it replaced (DESIGN.md §8) — the append-only audit
+        // covering the one field whose loss cannot be reconstructed from state.
+        // Only a real change is logged, since every `set` lands here.
+        if edit.body != current.body && !current.body.is_empty() {
+            log_event(&tx, id, "body", Some(&current.body))?;
+        }
+        tx.commit()?;
         self.task(id)
     }
 
@@ -1772,6 +1781,56 @@ mod tests {
         assert!(s.create_task(new_with(p, Some("codex"), false)).is_ok());
         let human = s.create_task(new_with(p, None, true)).unwrap();
         assert!(human.human);
+    }
+
+    /// The body is the one field an edit overwrites wholesale, so the log keeps
+    /// what each edit replaced (DESIGN.md §8) — and only that, since every `set`
+    /// passes through here whether or not it touched the body.
+    #[test]
+    fn update_task_logs_the_body_it_replaced_and_nothing_else() {
+        let (mut s, p) = human_fixture();
+        let task = s.create_task(new_with(p, None, false)).unwrap();
+
+        // an empty body destroys nothing on its way out
+        let write = TaskEdit {
+            body: "the brief".into(),
+            ..edit_of(&task, None, false)
+        };
+        let task = s.update_task(task.id, write).unwrap();
+        assert!(
+            !s.events_for(task.id)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "body")
+        );
+
+        // an edit that leaves the body alone logs nothing either
+        let retitle = TaskEdit {
+            title: "renamed".into(),
+            ..edit_of(&task, None, false)
+        };
+        let task = s.update_task(task.id, retitle).unwrap();
+        assert!(
+            !s.events_for(task.id)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "body")
+        );
+
+        let rewrite = TaskEdit {
+            body: "a rewrite".into(),
+            ..edit_of(&task, None, false)
+        };
+        let task = s.update_task(task.id, rewrite).unwrap();
+        assert_eq!(task.body, "a rewrite");
+        let logged: Vec<String> = s
+            .events_for(task.id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "body")
+            .map(|e| e.detail.unwrap_or_default())
+            .collect();
+        assert_eq!(logged, vec!["the brief".to_string()]);
     }
 
     #[test]

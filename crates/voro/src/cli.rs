@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use voro_core::{
-    Action, AgentsConfig, DepKind, Doc, NewTask, PrRef, Priority, Project, QueueRow, Repo,
+    Action, AgentsConfig, DepKind, Doc, Event, NewTask, PrRef, Priority, Project, QueueRow, Repo,
     ReviewAction, ReviewMedium, Store, Task, TaskEdit, TaskState, Triage, WipGate, scheduler,
 };
 
@@ -100,11 +100,18 @@ tasks
                                   discovered-from that task (dispatch renders
                                   the flag with the running task's id)
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
-      [--body TEXT | --body-file PATH] [--blocked-by IDS] [--blocks IDS]
-      [--unlink KIND:ID] [--pr URL | --no-pr] [--branch NAME | --no-branch]
+      [--body TEXT | --body-file PATH] [--append-body TEXT | --append-body-file PATH]
+      [--allow-empty] [--blocked-by IDS] [--blocks IDS] [--unlink KIND:ID]
+      [--pr URL | --no-pr] [--branch NAME | --no-branch]
       [--human | --no-human] [--deep | --no-deep]
       [--summary TEXT | --summary-file PATH]
       [--repo NAME | --no-repo] [--doc DOCS | --no-doc]
+                                  --body replaces the whole body; --append-body
+                                  adds to what is there, after a blank line.
+                                  A replacement that would leave the body empty
+                                  is refused unless --allow-empty; either way
+                                  the replaced text is kept on the event log
+                                  (`show` names the event to recover it from)
                                   --blocked-by replaces this task's own
                                   blocker list; --blocks adds this task as a
                                   blocker of each listed task
@@ -128,7 +135,11 @@ tasks
                                   --doc replaces the task's whole document list
                                   (`voro doc link` adds one without listing the
                                   rest); --no-doc clears it
-  show <task-id>                  full task: body, docs, deps, events
+  show <task-id> [--event EVENT-ID]
+                                  full task: body, docs, deps, events. --event
+                                  prints one event's recorded detail and nothing
+                                  else, which is how a replaced body comes back:
+                                  `voro show 62 --event 512 > body.md`
   list [--state STATE] [--project P] [--doc DOC]
                                   --doc answers 'which tasks derive from this
                                   plan?'
@@ -261,6 +272,8 @@ enum Verb {
     Set(SetArgs),
     Show {
         task_id: i64,
+        #[arg(long, value_name = "EVENT-ID")]
+        event: Option<i64>,
     },
     List(ListArgs),
     Inbox,
@@ -480,6 +493,12 @@ struct SetArgs {
     body: Option<String>,
     #[arg(long, conflicts_with = "body")]
     body_file: Option<String>,
+    #[arg(long, conflicts_with_all = ["body", "body_file"])]
+    append_body: Option<String>,
+    #[arg(long, conflicts_with_all = ["body", "body_file", "append_body"])]
+    append_body_file: Option<String>,
+    #[arg(long)]
+    allow_empty: bool,
     #[arg(long)]
     blocked_by: Option<String>,
     #[arg(long)]
@@ -624,7 +643,10 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Add(args) => add_verb(store, args),
         Verb::Propose(args) => propose_verb(store, args),
         Verb::Set(args) => set_verb(store, args),
-        Verb::Show { task_id } => show_verb(store, task_id),
+        Verb::Show { task_id, event } => match event {
+            Some(event_id) => show_event(store, task_id, event_id),
+            None => show_verb(store, task_id),
+        },
         Verb::List(args) => list_verb(store, &args),
         Verb::Inbox => inbox_verb(store, ctx),
         Verb::Next => next_verb(store),
@@ -756,6 +778,59 @@ fn text_or_file(text: Option<String>, path: Option<String>) -> Result<Option<Str
             .map(Some)
             .map_err(|e| format!("cannot read {path}: {e}")),
         (None, None) => Ok(None),
+    }
+}
+
+/// The body a `set` lands on (DESIGN.md §8). `--body`/`--body-file` replace it
+/// wholesale; `--append-body`/`--append-body-file` add to what is already there
+/// after a blank line, which is the "record a finding on the task" case that
+/// otherwise gets spelled as a replacement and loses the brief. A replacement
+/// that would leave a non-empty body empty is refused unless `--allow-empty`,
+/// since nothing legitimate reads as "blank the brief" and the commonest way to
+/// arrive at one is a slip. Emptying an already-empty body destroys nothing and
+/// is left alone.
+fn set_body(current: &str, args: &mut SetArgs, id: i64) -> Result<String, String> {
+    if let Some(added) = text_or_file(args.append_body.take(), args.append_body_file.take())? {
+        return Ok(appended_body(current, &added));
+    }
+    let Some(replacement) = text_or_file(args.body.take(), args.body_file.take())? else {
+        return Ok(current.to_string());
+    };
+    if replacement.trim().is_empty() && !current.trim().is_empty() && !args.allow_empty {
+        return Err(format!(
+            "refusing to empty the body of task {id} ({} lines) — pass --allow-empty if you mean it",
+            current.lines().count()
+        ));
+    }
+    Ok(replacement)
+}
+
+/// An addition to an existing body, separated from it by one blank line. An
+/// empty body takes the addition as-is, so the first append reads like a write.
+fn appended_body(current: &str, added: &str) -> String {
+    let base = current.trim_end();
+    if base.is_empty() {
+        return added.to_string();
+    }
+    format!("{base}\n\n{}", added.trim_start_matches('\n'))
+}
+
+/// How an event's recorded detail reads in a history listing. Everything is its
+/// own detail except a `body` event, whose detail is the whole text a body edit
+/// replaced (DESIGN.md §8) — bulk kept for recovery, not for reading, so the
+/// line says what is there and how to get it back instead of unrolling it.
+pub(crate) fn event_detail(event: &Event) -> String {
+    let detail = event.detail.clone().unwrap_or_default();
+    if event.kind != "body" {
+        return detail;
+    }
+    let lines = detail.lines().count();
+    match event.task_id {
+        Some(task_id) => format!(
+            "replaced body kept ({lines} lines) — voro show {task_id} --event {}",
+            event.id
+        ),
+        None => format!("replaced body kept ({lines} lines)"),
     }
 }
 
@@ -1338,9 +1413,10 @@ fn propose_verb(store: &mut Store, args: ProposeArgs) -> Result<String, String> 
     Ok(out)
 }
 
-fn set_verb(store: &mut Store, args: SetArgs) -> Result<String, String> {
+fn set_verb(store: &mut Store, mut args: SetArgs) -> Result<String, String> {
     let id = args.task_id;
     let current = store.task(id).map_err(|e| e.to_string())?;
+    let body = set_body(&current.body, &mut args, id)?;
     let agent = if args.no_agent {
         None
     } else {
@@ -1358,7 +1434,7 @@ fn set_verb(store: &mut Store, args: SetArgs) -> Result<String, String> {
     };
     let edit = TaskEdit {
         title: args.title.unwrap_or(current.title),
-        body: text_or_file(args.body, args.body_file)?.unwrap_or(current.body),
+        body,
         priority: args.priority.unwrap_or(current.priority),
         agent,
         human,
@@ -1661,16 +1737,22 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
     }
     writeln!(out, "\nevents:").unwrap();
     for e in store.events_for(id).map_err(|e| e.to_string())? {
-        writeln!(
-            out,
-            "  {}  {}  {}",
-            e.at,
-            e.kind,
-            e.detail.unwrap_or_default()
-        )
-        .unwrap();
+        writeln!(out, "  {}  {}  {}", e.at, e.kind, event_detail(&e)).unwrap();
     }
     Ok(out)
+}
+
+/// One event's recorded detail, alone and undecorated, so it can be redirected
+/// straight into a file: `voro show 62 --event 512 > body.md` is how the body a
+/// `set` replaced comes back (DESIGN.md §8). The event must belong to the task
+/// named, so a mistyped id reads as an error rather than another task's text.
+fn show_event(store: &mut Store, task_id: i64, event_id: i64) -> Result<String, String> {
+    let events = store.events_for(task_id).map_err(|e| e.to_string())?;
+    let event = events
+        .iter()
+        .find(|e| e.id == event_id)
+        .ok_or_else(|| format!("task {task_id} has no event {event_id}"))?;
+    Ok(event.detail.clone().unwrap_or_default())
 }
 
 fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
@@ -2600,6 +2682,74 @@ mod tests {
         assert_eq!(task.state, TaskState::Proposed);
         assert_eq!(task.priority, Priority::P2);
         assert!(s.refined_flag(1).unwrap());
+    }
+
+    /// A body replacement is destructive, so the two guards of DESIGN.md §8
+    /// hold: one that would leave the body empty is refused outright, and the
+    /// text any accepted replacement discards is recoverable from the log.
+    #[test]
+    fn emptying_a_body_is_refused_and_a_replaced_one_is_recoverable() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(
+            &mut s,
+            &["add", "demo", "An idea", "--body", "the brief\nline two"],
+        );
+
+        let e = err(&mut s, &["set", "1", "--body", ""]);
+        assert!(e.contains("--allow-empty"), "{e}");
+        assert_eq!(s.task(1).unwrap().body, "the brief\nline two");
+
+        ok(&mut s, &["set", "1", "--body", "a rewrite"]);
+        assert_eq!(s.task(1).unwrap().body, "a rewrite");
+
+        // The history says a body was replaced and names the event to get it
+        // back, rather than unrolling the old text into the listing.
+        let out = ok(&mut s, &["show", "1"]);
+        assert!(out.contains("replaced body kept (2 lines)"), "{out}");
+        assert!(!out.contains("line two"), "{out}");
+
+        let event = out
+            .lines()
+            .find(|l| l.contains("--event"))
+            .and_then(|l| l.rsplit(' ').next().map(str::to_string))
+            .expect("the body event names its own id");
+        assert_eq!(
+            ok(&mut s, &["show", "1", "--event", &event]),
+            "the brief\nline two"
+        );
+        assert!(err(&mut s, &["show", "1", "--event", "999"]).contains("no event 999"));
+
+        // Emptying it is allowed once said explicitly — and still recoverable.
+        ok(&mut s, &["set", "1", "--body", "", "--allow-empty"]);
+        assert_eq!(s.task(1).unwrap().body, "");
+    }
+
+    /// `--append-body-file` is the additive spelling for the common "record a
+    /// finding on the task" case, which otherwise gets written as a replacement
+    /// and takes the brief with it (DESIGN.md §8).
+    #[test]
+    fn append_body_adds_to_the_brief_instead_of_replacing_it() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "An idea", "--body", "the brief\n"]);
+
+        let path = std::env::temp_dir().join(format!("voro-append-{}.md", std::process::id()));
+        std::fs::write(&path, "a finding\n").unwrap();
+        ok(
+            &mut s,
+            &["set", "1", "--append-body-file", path.to_str().unwrap()],
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(s.task(1).unwrap().body, "the brief\n\na finding\n");
+
+        ok(&mut s, &["set", "1", "--append-body", "another"]);
+        assert_eq!(s.task(1).unwrap().body, "the brief\n\na finding\n\nanother");
+
+        // Replacement and addition are different intents, not two spellings of
+        // one, so asking for both at once is a parse error rather than a race.
+        let e = err(&mut s, &["set", "1", "--body", "x", "--append-body", "y"]);
+        assert!(e.contains("cannot be used with"), "{e}");
     }
 
     /// The inbox renders each row's next-action verb in place of the state,
