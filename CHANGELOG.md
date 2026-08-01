@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than the workhorse. Agent templates gained a `{model}` placeholder and
   a per-agent `model`/`model_deep`/`model_plan` map to fill it; an agent naming
   no models, such as the built-in `codex`, ignores the flag entirely.
+- `?` in the TUI opens the current screen's complete key map — actions,
+  navigation, and screen switching — including the keys no hint ever advertised
+  (`o` open in a viewer, `g` open the PR, `a` attach, `l` page the log, `J`/`K`
+  and the page keys, `ctrl-r`). Any key closes it again.
 
 ### Changed
 
@@ -66,6 +70,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body, branch name, document title or project name containing `{task_id}`,
   `{db}`, `{note}`, `{seed}`, `{branch}` or `{docs}` now reaches the agent
   verbatim instead of being rewritten before it is read.
+- The TUI's contextual key line is shorter and speaks one language. A lowercase
+  key and its shifted sibling now share a single slot labelled with the base
+  verb — `d/D dispatch`, `r/R refine`, `n/N new` — instead of three different
+  renderings of the same idea, and the line keeps only what changes a task's
+  state or destiny: `x` score, `h` history, `c` docs and `l` log still work but
+  are documented in the `?` map rather than on the line. No key was rebound.
 - `projects.path` is gone. Existing databases convert in place: every project's
   old path becomes its default repo, and existing tasks resolve to exactly the
   checkouts they had before. `voro project add` and `voro project path` keep
