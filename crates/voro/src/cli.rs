@@ -192,7 +192,7 @@ transitions
                                   and marked ↻ refined for a re-triage of the
                                   improved version. The note-less interactive
                                   variant is a conversation with the agent, so
-                                  it lives in the TUI's triage menu
+                                  it lives in the TUI, on `R` over a proposal
   start <task-id>                 ready → running
   ask <task-id> --question TEXT   running → needs-input
   resume <task-id>                needs-input → running, once you have answered
@@ -2088,7 +2088,7 @@ fn triage_verb(store: &mut Store, args: TriageArgs, ctx: &DispatchCtx) -> Result
                 return Err(format!(
                     "refine needs a note saying what to fix: `voro triage {} refine --note \
                      \"...\"`. The note-less interactive variant is a conversation with the \
-                     agent, so it lives in the TUI's triage menu",
+                     agent, so it lives in the TUI, on `R` over a proposal",
                     args.task_id
                 ));
             };
