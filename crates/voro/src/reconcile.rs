@@ -12,13 +12,14 @@
 //! finalised — neither needs a probe.
 //!
 //! Liveness has two sources per agent (task #75). An agent defining a
-//! `sessions` verb is queried directly — its listing once per pass — and a
-//! session is live while its captured ref appears there not-yet-`done`. This is
-//! the only correct source for supervisor-owned launches (`claude --bg`), whose
-//! spawned pid is a launcher that exits at birth: pid-checking would declare
-//! every such dispatch dead, so those sessions are *never* pid-checked, and
-//! undeterminable liveness (no ref, listing failed) is left alone rather than
-//! guessed. Agents without a `sessions` verb keep the pid check.
+//! `sessions` verb is queried through [`crate::session_probe`], its listing
+//! taken once per pass and cached here across the sessions sharing an agent.
+//! This is the only correct source for supervisor-owned launches (`claude
+//! --bg`), whose spawned pid is a launcher that exits at birth: pid-checking
+//! would declare every such dispatch dead, so those sessions are *never*
+//! pid-checked, and undeterminable liveness (no ref, listing failed) is left
+//! alone rather than guessed. Agents without a `sessions` verb keep the pid
+//! check.
 //!
 //! There is no daemon watching for process exit. Reconciliation runs on read:
 //! `App::refresh` and every CLI verb call [`reconcile_live_sessions`] before
@@ -28,9 +29,11 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
-use voro_core::{AgentSessionEntry, AgentsConfig, Result, Store, TaskState, parse_sessions_json};
+use voro_core::{AgentSessionEntry, AgentsConfig, Result, Store, TaskState};
+
+use crate::session_probe::{listing_says_live, run_sessions_command};
 
 /// How much of a session's log tail to scan for a usage-cap signature.
 const LOG_TAIL_BYTES: u64 = 4096;
@@ -83,13 +86,10 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
                 Some(session_ref) => {
                     let listing = listings
                         .entry(session.agent.clone())
-                        .or_insert_with(|| run_sessions_command(cmd));
-                    listing.as_ref().map(|entries| {
-                        entries
-                            .iter()
-                            .find(|e| e.matches_ref(session_ref))
-                            .is_some_and(|e| !e.is_finished())
-                    })
+                        .or_insert_with(|| run_sessions_command(cmd, None));
+                    listing
+                        .as_ref()
+                        .map(|entries| listing_says_live(entries, session_ref))
                 }
             },
             // No pid recorded means liveness can't be checked.
@@ -111,22 +111,6 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
         }
     }
     Ok(finalised)
-}
-
-/// Run an agent's `sessions` command and parse its listing. `None` on any
-/// failure — spawn error, non-zero exit, unparseable output — which the
-/// caller treats as "liveness unknowable", never as "no sessions".
-fn run_sessions_command(cmd: &str) -> Option<Vec<AgentSessionEntry>> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_sessions_json(&String::from_utf8_lossy(&output.stdout)).ok()
 }
 
 /// Whether a process with this pid still exists, via `kill -0` (existence
@@ -165,6 +149,7 @@ fn log_tail_looks_capped(path: &str) -> bool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::process::Stdio;
     use voro_core::{Action, NewTask, Priority, SessionOutcome, TaskState};
 
     /// An agents path that never exists — loads the built-ins, so a verb-less

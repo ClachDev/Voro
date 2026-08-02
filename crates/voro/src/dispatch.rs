@@ -19,8 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voro_core::{
     AgentsConfig, Launch, LaunchSpec, ResolvedAgent, ReviewAction, Store, TaskState,
-    VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER,
-    parse_sessions_json, render,
+    VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, render,
 };
 
 /// Command assembly owns its own quoting, so this is voro-core's; re-exported
@@ -1082,17 +1081,8 @@ fn capture_session_ref(
 /// little slack for the agent's own clock). `None` on any failure — capture
 /// is best-effort and the caller retries until its deadline.
 fn query_new_session(sessions_cmd: &str, repo_path: &str, spawn_ms: i64) -> Option<String> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(sessions_cmd)
-        .current_dir(repo_path)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let entries = parse_sessions_json(&String::from_utf8_lossy(&output.stdout)).ok()?;
+    let entries =
+        crate::session_probe::run_sessions_command(sessions_cmd, Some(Path::new(repo_path)))?;
     entries
         .into_iter()
         .filter(|e| e.cwd.as_deref() == Some(repo_path))
