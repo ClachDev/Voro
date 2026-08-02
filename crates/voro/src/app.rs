@@ -281,6 +281,51 @@ pub struct AttachRequest {
     pub cwd: String,
 }
 
+/// The two ways into an agent's own session (DESIGN.md §8): join one still
+/// running, or reopen one that has finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JumpVerb {
+    Attach,
+    Resume,
+}
+
+/// Which verb a task's state implies — the fallback for when the agent cannot
+/// say whether its session is still live. `None` for a state with no session
+/// worth jumping into, which is what gates the key.
+fn state_jump_verb(state: TaskState) -> Option<JumpVerb> {
+    match state {
+        TaskState::Running => Some(JumpVerb::Attach),
+        TaskState::Review | TaskState::Stalled => Some(JumpVerb::Resume),
+        _ => None,
+    }
+}
+
+/// The template to jump in with: liveness decides the verb wherever the agent
+/// can report it, and the task state stands in only when it cannot. The two
+/// come apart in both directions — a `claude --bg` session outlives the
+/// `running` state and refuses `--resume` while it does, and a session that
+/// died before its task left `running` has nothing left to attach to.
+///
+/// The choice then falls back to whichever verb the agent actually defines —
+/// the built-in `codex` defines only `resume` — so a one-verb agent jumps in
+/// with that verb rather than erroring; `None` only when it defines neither.
+fn jump_verb<'a>(
+    live: Option<bool>,
+    by_state: JumpVerb,
+    attach: Option<&'a str>,
+    resume: Option<&'a str>,
+) -> Option<&'a str> {
+    let want = match live {
+        Some(true) => JumpVerb::Attach,
+        Some(false) => JumpVerb::Resume,
+        None => by_state,
+    };
+    match want {
+        JumpVerb::Attach => attach.or(resume),
+        JumpVerb::Resume => resume.or(attach),
+    }
+}
+
 pub fn action_label(action: &Action) -> &'static str {
     match action {
         Action::Triage(Triage::Parked) => "triage → parked",
@@ -1404,26 +1449,27 @@ impl App {
         }
     }
 
-    /// Jump into the selected task's agent session (task #75): `attach` for a
-    /// running task, `resume` for a review or stalled one. The run happens in
-    /// main() via `pending_attach`, with the TUI torn down around it. Every
-    /// missing piece (state, session, captured ref, verb) reports via the
-    /// status line.
+    /// Jump into the selected task's agent session (task #75). Which verb that
+    /// takes is decided by the session itself where the agent can say: a live
+    /// session is `attach`ed to, a finished one `resume`d — task state only
+    /// standing in when liveness is unknowable. The two do not follow from each
+    /// other, since a `claude --bg` session commonly outlives the `running`
+    /// state (DESIGN.md §8's stale-review rebase attaches to a `review` task's
+    /// session) and `--resume` refuses a session still held by the supervisor.
+    /// The run happens in main() via `pending_attach`, with the TUI torn down
+    /// around it. Every missing piece (state, session, captured ref, verb)
+    /// reports via the status line.
     fn jump_into_session(&mut self) {
         let (task_id, state) = match self.selected_task() {
             Some(task) => (task.id, task.state),
             None => return,
         };
-        let attach = match state {
-            TaskState::Running => true,
-            TaskState::Review | TaskState::Stalled => false,
-            _ => {
-                self.status = Some(format!(
-                    "task is {state} — jump-in works on running, review, or \
-                     stalled tasks"
-                ));
-                return;
-            }
+        let Some(by_state) = state_jump_verb(state) else {
+            self.status = Some(format!(
+                "task is {state} — jump-in works on running, review, or \
+                 stalled tasks"
+            ));
+            return;
         };
         let sessions = match self.store.sessions_for(task_id) {
             Ok(sessions) => sessions,
@@ -1442,7 +1488,10 @@ impl App {
             self.status = Some(format!(
                 "no session reference was captured for session {} — nothing to {}",
                 session.id,
-                if attach { "attach to" } else { "resume" }
+                match by_state {
+                    JumpVerb::Attach => "attach to",
+                    JumpVerb::Resume => "resume",
+                }
             ));
             return;
         };
@@ -1453,13 +1502,22 @@ impl App {
                 return;
             }
         };
-        let verb_name = if attach { "attach" } else { "resume" };
-        let template = config
-            .agent(&session.agent)
-            .and_then(|a| if attach { a.attach() } else { a.resume() });
+        let agent = config.agent(&session.agent);
+        // A synchronous probe: the TUI is about to hand the terminal to a
+        // full-screen session anyway, so one listing costs nothing felt.
+        let live = crate::session_probe::session_is_live(
+            agent.and_then(|a| a.sessions()),
+            Some(&session_ref),
+        );
+        let template = jump_verb(
+            live,
+            by_state,
+            agent.and_then(|a| a.attach()),
+            agent.and_then(|a| a.resume()),
+        );
         let Some(template) = template else {
             self.status = Some(format!(
-                "agent '{}' defines no {verb_name} template in {}",
+                "agent '{}' defines no attach or resume template in {}",
                 session.agent,
                 self.dispatch_ctx.agents_path.display()
             ));
@@ -3681,22 +3739,48 @@ mod tests {
 
     // --- jump-in keybinding (task #75) ---
 
-    /// A project with one dispatched task whose agent defines the session
-    /// verbs, its session's ref recorded, and a canned `sessions` listing
-    /// that keeps reconciliation believing the session is live.
-    fn jump_in_env() -> (Store, crate::dispatch::DispatchCtx, i64, std::path::PathBuf) {
+    /// A listing showing the fixture's session still going, and one showing it
+    /// finished — what decides the jump-in verb (task #332).
+    const LIVE_LISTING: &str = r#"[{"sessionId": "ref-1", "state": "working"}]"#;
+    const FINISHED_LISTING: &str = r#"[{"sessionId": "ref-1", "state": "done"}]"#;
+
+    struct JumpIn {
+        store: Store,
+        ctx: crate::dispatch::DispatchCtx,
+        task_id: i64,
+        project_path: std::path::PathBuf,
+        listing: std::path::PathBuf,
+    }
+
+    /// Rewrite the canned listing, moving the session between live and
+    /// finished under a task whose state stays where it is.
+    fn write_listing(path: &std::path::Path, json: &str) {
+        std::fs::write(path, json).unwrap();
+    }
+
+    /// A project with one dispatched task, its session's ref recorded, and a
+    /// canned `sessions` listing the test can rewrite. `verbs` names the
+    /// session verbs the stub agent defines, so a test can take one away. The
+    /// stub lingers after printing its prompt, so a verb-less agent — whose
+    /// liveness is the pid — keeps its task `running` through reconcile.
+    fn jump_in_env(verbs: &[&str], listing_json: &str) -> JumpIn {
         let (mut store, ctx, project_path) = scratch_env("jumpin", None);
         let listing = project_path.parent().unwrap().join("listing.json");
-        std::fs::write(&listing, r#"[{"sessionId": "ref-1", "state": "working"}]"#).unwrap();
+        write_listing(&listing, listing_json);
+        let templates = [
+            ("sessions", format!("cat '{}'", listing.display())),
+            ("attach", "agent attach {session}".into()),
+            ("resume", "agent resume {session}".into()),
+        ]
+        .into_iter()
+        .filter(|(verb, _)| verbs.contains(verb))
+        .map(|(verb, template)| format!("{verb} = \"{template}\"\n"))
+        .collect::<String>();
         std::fs::write(
             &ctx.agents_path,
             format!(
                 "default_agent = \"stub\"\n\n[agents.stub]\n\
-                 dispatch = \"cat {{prompt_file}}\"\n\
-                 sessions = \"cat '{}'\"\n\
-                 attach = \"agent attach {{session}}\"\n\
-                 resume = \"agent resume {{session}}\"\n",
-                listing.display()
+                 dispatch = \"cat {{prompt_file}} && sleep 30\"\n{templates}"
             ),
         )
         .unwrap();
@@ -3719,16 +3803,28 @@ mod tests {
         crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
         let session_id = store.sessions_for(task.id).unwrap()[0].id;
         store.set_session_ref(session_id, "ref-1").unwrap();
-        (store, ctx, task.id, project_path)
+        JumpIn {
+            store,
+            ctx,
+            task_id: task.id,
+            project_path,
+            listing,
+        }
     }
 
-    /// `a` on a running task queues the agent's `attach` command — ref
-    /// substituted, project path as cwd — for main() to run with the TUI
-    /// suspended.
+    /// All three session verbs, the ordinary configuration.
+    fn all_verbs() -> &'static [&'static str] {
+        &["sessions", "attach", "resume"]
+    }
+
+    /// `a` on a running task whose session is still listed queues the agent's
+    /// `attach` command — ref substituted, project path as cwd — for main() to
+    /// run with the TUI suspended.
     #[test]
     fn attach_key_prepares_the_attach_command_for_a_running_task() {
-        let (store, ctx, _task_id, project_path) = jump_in_env();
-        let mut app = App::new(store, ctx).unwrap();
+        let env = jump_in_env(all_verbs(), LIVE_LISTING);
+        let project_path = env.project_path.clone();
+        let mut app = App::new(env.store, env.ctx).unwrap();
         app.toggle_screen();
         key(&mut app, KeyCode::Char('a'));
 
@@ -3739,14 +3835,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }
 
-    /// `a` on a review task uses `resume` — the session is finished; the
+    /// `a` on a review task whose session has finished uses `resume` — the
     /// point is reopening it, not attaching to a live one.
     #[test]
-    fn attach_key_uses_resume_for_a_review_task() {
-        let (mut store, ctx, task_id, project_path) = jump_in_env();
-        store.apply(task_id, Action::Complete(None)).unwrap();
+    fn attach_key_uses_resume_for_a_finished_review_session() {
+        let mut env = jump_in_env(all_verbs(), FINISHED_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        let project_path = env.project_path.clone();
 
-        let mut app = App::new(store, ctx).unwrap();
+        let mut app = App::new(env.store, env.ctx).unwrap();
         app.toggle_screen();
         key(&mut app, KeyCode::Char('a'));
 
@@ -3754,6 +3853,132 @@ mod tests {
         assert_eq!(request.command, "agent resume 'ref-1'");
 
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// The bug this key had (task #332): a `--bg` session commonly outlives
+    /// the `running` state, and `resume` refuses a session the supervisor
+    /// still holds. A review task whose session is listed live attaches.
+    #[test]
+    fn attach_key_attaches_to_a_review_tasks_live_session() {
+        let mut env = jump_in_env(all_verbs(), LIVE_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        let project_path = env.project_path.clone();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('a'));
+
+        let request = app.pending_attach.clone().expect("an attach request");
+        assert_eq!(request.command, "agent attach 'ref-1'");
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// And the mirror: a running task whose session has died since the last
+    /// refresh resumes rather than attaching to nothing.
+    #[test]
+    fn attach_key_resumes_a_running_tasks_finished_session() {
+        let env = jump_in_env(all_verbs(), LIVE_LISTING);
+        let (project_path, listing, task_id) =
+            (env.project_path.clone(), env.listing.clone(), env.task_id);
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        // the session ends after the refresh that left the task running
+        write_listing(&listing, FINISHED_LISTING);
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('a'));
+
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
+        let request = app.pending_attach.clone().expect("a resume request");
+        assert_eq!(request.command, "agent resume 'ref-1'");
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// An agent that cannot report liveness falls back to task state, exactly
+    /// as before liveness was consulted — the listing is not read, even
+    /// though this one would have said the session had finished.
+    #[test]
+    fn attach_key_without_a_sessions_verb_follows_task_state() {
+        let env = jump_in_env(&["attach", "resume"], FINISHED_LISTING);
+        let (project_path, task_id) = (env.project_path.clone(), env.task_id);
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('a'));
+
+        let request = app.pending_attach.clone().expect("an attach request");
+        assert_eq!(request.command, "agent attach 'ref-1'");
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// An agent defining only one of the two verbs jumps in with that one —
+    /// the built-in `codex` has no `attach` — rather than refusing a live
+    /// session it has a way into.
+    #[test]
+    fn attach_key_falls_back_to_the_verb_the_agent_defines() {
+        let env = jump_in_env(&["sessions", "resume"], LIVE_LISTING);
+        let project_path = env.project_path.clone();
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('a'));
+
+        let request = app.pending_attach.clone().expect("a resume request");
+        assert_eq!(request.command, "agent resume 'ref-1'");
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// With neither verb defined there is no way in, and the message names
+    /// both rather than only the one the state would have picked.
+    #[test]
+    fn attach_key_without_either_verb_reports_both() {
+        let env = jump_in_env(&["sessions"], LIVE_LISTING);
+        let project_path = env.project_path.clone();
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('a'));
+
+        assert!(app.pending_attach.is_none());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("no attach or resume template"),
+            "{:?}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// The verb choice itself, over the grid the App tests can only sample:
+    /// liveness wins where it is known, state stands in where it is not, and
+    /// either way the chosen verb degrades to the one the agent defines.
+    #[test]
+    fn jump_verb_prefers_liveness_then_state_then_availability() {
+        let (a, r) = (Some("attach {session}"), Some("resume {session}"));
+        assert_eq!(jump_verb(Some(true), JumpVerb::Resume, a, r), a);
+        assert_eq!(jump_verb(Some(false), JumpVerb::Attach, a, r), r);
+        assert_eq!(jump_verb(None, JumpVerb::Attach, a, r), a);
+        assert_eq!(jump_verb(None, JumpVerb::Resume, a, r), r);
+        // only one verb defined: take it whichever way the choice went
+        assert_eq!(jump_verb(Some(true), JumpVerb::Attach, None, r), r);
+        assert_eq!(jump_verb(Some(false), JumpVerb::Resume, a, None), a);
+        assert_eq!(jump_verb(Some(true), JumpVerb::Attach, None, None), None);
+    }
+
+    /// The state fallback, and the gate on which states offer a jump-in at all.
+    #[test]
+    fn state_jump_verb_covers_the_three_jumpable_states() {
+        assert_eq!(state_jump_verb(TaskState::Running), Some(JumpVerb::Attach));
+        assert_eq!(state_jump_verb(TaskState::Review), Some(JumpVerb::Resume));
+        assert_eq!(state_jump_verb(TaskState::Stalled), Some(JumpVerb::Resume));
+        assert_eq!(state_jump_verb(TaskState::Ready), None);
+        assert_eq!(state_jump_verb(TaskState::Done), None);
     }
 
     /// Without a captured ref there is nothing to substitute into the verb;

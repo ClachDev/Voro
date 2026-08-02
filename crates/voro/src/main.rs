@@ -7,6 +7,7 @@ mod markdown;
 mod pr;
 mod probe;
 mod reconcile;
+mod session_probe;
 mod ui;
 mod worktree;
 
