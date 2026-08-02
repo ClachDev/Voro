@@ -107,6 +107,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> HitMap {
 fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     match &app.mode {
         Mode::Normal => {}
+        Mode::KeyMap => draw_key_map(frame, app),
         Mode::AddProject {
             name,
             path,
@@ -191,14 +192,25 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 Some(last) => last.spans.push(Span::raw("▏")),
                 None => lines.push(Line::from("▏")),
             }
-            let height = (lines.len() as u16 + 2).clamp(3, 20);
-            let area = popup_area(frame, 72, height);
             let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(format!("{} — ⏎ to submit, esc to cancel", kind.title())),
             );
-            frame.render_widget(para, area);
+            // Typed text never contains a newline (⏎ submits), so the box has
+            // to be sized from the *wrapped* line count at the popup's inner
+            // width — counting `\n`s would leave a one-row box with the tail of
+            // a long note wrapped out of sight. `line_count` counts both, and
+            // includes the block's two border rows.
+            let width = 72.min(frame.area().width);
+            let rendered_rows = para.line_count(width.saturating_sub(2)) as u16;
+            let area = popup_area(frame, width, rendered_rows.clamp(3, 20));
+            // Past the clamp the box stops growing, so scroll to the end of the
+            // text: the cursor lives there, and the tail is what is being typed.
+            let overflow = rendered_rows
+                .saturating_sub(2)
+                .saturating_sub(area.height.saturating_sub(2));
+            frame.render_widget(para.scroll((overflow, 0)), area);
         }
         Mode::LinkPr { buffer, .. } => {
             let area = popup_area(frame, 72, 3);
@@ -537,7 +549,7 @@ fn history_lines(events: &[Event]) -> Vec<Line<'static>> {
             Line::from(vec![
                 Span::styled(format!("{:<19} ", e.at), Style::new().dim()),
                 Span::styled(format!("{:<10} ", e.kind), Style::new().bold()),
-                Span::raw(e.detail.clone().unwrap_or_default()),
+                Span::raw(crate::cli::event_detail(e)),
             ])
         }));
     }
@@ -1578,100 +1590,313 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Line::from(spans), area);
 }
 
-/// The contextual per-screen key line (ui-redesign §2): the actions that apply
-/// on the current screen and selection, as key/label pairs the caller renders
-/// key-bold, label-dim. It lists actions, not navigation (`j`/`k` and `ctrl-r`
-/// refresh are omitted); `q` and `tab` are always present. Selection-only
-/// actions drop out on the cockpit when nothing is selected, and the refine
-/// keys appear only on a proposal, which is all they act on.
 /// Whether the selection is a proposal, which is the only thing refine acts on.
 fn selection_is_proposed(app: &App) -> bool {
     app.selected_task_id().is_some_and(|id| app.is_proposed(id))
 }
 
-fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+/// Every slot the current screen's key line can hold, each flagged with whether
+/// this selection earns it. [`key_hints`] is this list filtered, so the two can
+/// never disagree about which keys the line advertises — which is what lets the
+/// drift test check the whole set against [`key_map`] from one App.
+fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
     // `enter_hint` yields "⏎ <verb>"; split the glyph from the verb so the
     // glyph renders as the bold key and the verb as the dim label.
-    let enter = app
-        .enter_hint()
-        .and_then(|h| h.split_once(' '))
-        .map(|(_, verb)| ("⏎", verb));
+    let enter = app.enter_hint().and_then(|h| h.split_once(' '));
+    let enter = ("⏎", enter.map_or("act", |(_, verb)| verb), enter.is_some());
+    let selected = app.selected_task_id().is_some();
     match app.screen {
-        Screen::Cockpit => {
-            let mut pairs: Vec<(&'static str, &'static str)> = Vec::new();
-            pairs.extend(enter);
-            if app.selected_task_id().is_some() {
-                pairs.push(("d", "dispatch"));
-                pairs.push(("D", "agent"));
-            }
-            if selection_is_proposed(app) {
-                pairs.push(("r/R", "refine"));
-            }
-            pairs.push(("s", "state"));
-            if app.selected_task_id().is_some() {
-                pairs.push(("!", "deep"));
-                pairs.push(("c", "docs"));
-                pairs.push(("x", "score"));
-                pairs.push(("h", "history"));
-            }
-            if app.selected_session_log().is_some() {
-                pairs.push(("l", "log"));
-            }
-            if app.selected_can_hand_off() {
-                pairs.push(("w", "wait"));
-            }
-            pairs.push(("n", "new"));
-            pairs.push(("N", "plan"));
-            pairs.push(("e", "edit"));
-            pairs.push(("tab", "tasks"));
-            pairs.push(("q", "quit"));
-            pairs
-        }
-        Screen::Tasks => {
-            let mut pairs: Vec<(&'static str, &'static str)> = Vec::new();
-            pairs.extend(enter);
-            if app.selected_session_log().is_some() {
-                pairs.push(("l", "log"));
-            }
-            if app.selected_can_hand_off() {
-                pairs.push(("w", "wait"));
-            }
-            if selection_is_proposed(app) {
-                pairs.push(("r/R", "refine"));
-            }
-            pairs.push(("s", "state"));
-            pairs.push(("!", "deep"));
-            pairs.push(("c", "docs"));
-            pairs.push(("n", "new"));
-            pairs.push(("N", "plan"));
-            pairs.push(("e", "edit"));
-            pairs.push(("tab", "projects"));
-            pairs.push(("q", "quit"));
-            pairs
-        }
+        Screen::Cockpit => vec![
+            enter,
+            ("d/D", "dispatch", selected),
+            ("r/R", "refine", selection_is_proposed(app)),
+            ("s", "state", true),
+            ("!", "deep", selected),
+            ("w", "wait", app.selected_can_hand_off()),
+            ("n/N", "new", true),
+            ("e", "edit", true),
+            ("?", "keys", true),
+            ("tab", "tasks", true),
+            ("q", "quit", true),
+        ],
+        Screen::Tasks => vec![
+            enter,
+            ("w", "wait", app.selected_can_hand_off()),
+            ("r/R", "refine", selection_is_proposed(app)),
+            ("s", "state", true),
+            ("!", "deep", true),
+            ("n/N", "new", true),
+            ("e", "edit", true),
+            ("?", "keys", true),
+            ("tab", "projects", true),
+            ("q", "quit", true),
+        ],
+        // `a`/`A` and the rest of this screen's uppercase keys are unrelated
+        // actions sharing a letter, not variants of one action, so they keep
+        // their own slots.
         Screen::Projects => vec![
-            ("0-5", "weight"),
-            ("r", "rename"),
-            ("a", "add"),
-            ("A", "archive"),
-            ("d", "delete"),
-            ("v", "review action"),
-            ("tab", "config"),
-            ("q", "quit"),
+            ("0-5", "weight", true),
+            ("r", "rename", true),
+            ("a", "add", true),
+            ("A", "archive", true),
+            ("d", "delete", true),
+            ("v", "review action", true),
+            ("?", "keys", true),
+            ("tab", "config", true),
+            ("q", "quit", true),
         ],
         Screen::Config => {
-            let mut pairs: Vec<(&'static str, &'static str)> = vec![("a", "add viewer")];
-            if !app.config_viewers.is_empty() {
-                pairs.push(("e", "edit"));
-                pairs.push(("d", "delete"));
-                pairs.push(("V", "default viewer"));
-            }
-            pairs.push(("A", "default agent"));
-            pairs.push(("tab", "cockpit"));
-            pairs.push(("q", "quit"));
-            pairs
+            let viewers = !app.config_viewers.is_empty();
+            vec![
+                ("a", "add viewer", true),
+                ("e", "edit", viewers),
+                ("d", "delete", viewers),
+                ("V", "default viewer", viewers),
+                ("A", "default agent", true),
+                ("?", "keys", true),
+                ("tab", "cockpit", true),
+                ("q", "quit", true),
+            ]
         }
     }
+}
+
+/// The contextual per-screen key line (DESIGN.md §9): the actions that apply on
+/// the current screen and selection, as key/label pairs the caller renders
+/// key-bold, label-dim. A lowercase/uppercase pair of one action takes a single
+/// slot keyed on the pair (`d/D dispatch`), with the uppercase variant's gloss
+/// left to `?`. The line carries what changes a task's state or destiny;
+/// navigation, display toggles and browsing conveniences live in the key map
+/// only, so `?` is always present. Selection-only actions drop out when there
+/// is nothing to act on, and the refine keys appear only on a proposal.
+fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    hint_candidates(app)
+        .into_iter()
+        .filter(|(_, _, shown)| *shown)
+        .map(|(key, label, _)| (key, label))
+        .collect()
+}
+
+/// The lowercase/uppercase pairs the key line renders as one slot (DESIGN.md
+/// §9). This map is the only place the uppercase variants are glossed, so the
+/// three lines are worded to one shape: each says what the shifted key does
+/// *differently* from its lowercase sibling.
+const DISPATCH_KEYS: [(&str, &str); 2] = [
+    ("d", "dispatch to the resolved agent"),
+    ("D", "dispatch, choosing the agent first"),
+];
+const REFINE_KEYS: [(&str, &str); 2] = [
+    ("r", "refine a proposal, leaving a note"),
+    ("R", "refine a proposal, talking to an agent"),
+];
+const NEW_KEYS: [(&str, &str); 2] = [
+    ("n", "new task, written in $EDITOR"),
+    ("N", "new task, planned with an agent"),
+];
+
+/// A titled group of key/label pairs in the key map.
+type KeySection = (&'static str, Vec<(&'static str, &'static str)>);
+
+/// A screen's complete key map (DESIGN.md §9), grouped into actions,
+/// navigation, and screen switching. Unlike [`key_hints`] it is ungated by
+/// selection — it is the map, so it lists every key the screen binds, including
+/// the ones the line has no room to advertise.
+fn key_map(screen: Screen) -> Vec<KeySection> {
+    let pairs = |set: [(&'static str, &'static str); 2]| set.into_iter();
+    let screens = |current: &'static str| {
+        (
+            "Screens",
+            vec![
+                ("tab", current),
+                ("1", "cockpit"),
+                ("2", "tasks"),
+                ("3", "projects"),
+                ("4", "config"),
+            ],
+        )
+    };
+    match screen {
+        Screen::Cockpit => {
+            let mut actions = vec![("⏎", "act on the selected row")];
+            actions.extend(pairs(DISPATCH_KEYS));
+            actions.extend(pairs(REFINE_KEYS));
+            actions.extend([
+                ("s", "change state"),
+                ("!", "toggle deep — the agent's strongest model"),
+                ("c", "link and unlink documents"),
+                ("x", "fold the score decomposition into the card"),
+                ("h", "fold the task's history into the card"),
+                ("o", "open the diff in a viewer"),
+                ("g", "open the tracked PR"),
+                ("a", "attach to the task's session"),
+                ("l", "page the session log"),
+                ("w", "hand a review task off, to wait"),
+            ]);
+            actions.extend(pairs(NEW_KEYS));
+            actions.push(("e", "edit the selected task"));
+            vec![
+                ("Actions", actions),
+                (
+                    "Navigation",
+                    vec![
+                        ("j/k", "move the selection"),
+                        ("J/K", "scroll the card"),
+                        ("PgUp/PgDn", "page the card"),
+                        ("ctrl-r", "refresh"),
+                        ("?", "this key map"),
+                        ("q", "quit"),
+                    ],
+                ),
+                screens("next screen"),
+            ]
+        }
+        Screen::Tasks => {
+            let mut actions = vec![("⏎", "open the task's detail")];
+            actions.extend(pairs(DISPATCH_KEYS));
+            actions.extend(pairs(REFINE_KEYS));
+            actions.extend([
+                ("s", "change state"),
+                ("!", "toggle deep — the agent's strongest model"),
+                ("c", "link and unlink documents"),
+                ("o", "open the diff in a viewer"),
+                ("g", "open the tracked PR"),
+                ("a", "attach to the task's session"),
+                ("l", "page the session log"),
+                ("w", "hand a review task off, to wait"),
+            ]);
+            actions.extend(pairs(NEW_KEYS));
+            actions.push(("e", "edit the selected task"));
+            vec![
+                ("Actions", actions),
+                (
+                    "Navigation",
+                    vec![
+                        ("j/k", "move the selection"),
+                        ("ctrl-r", "refresh"),
+                        ("?", "this key map"),
+                        ("q", "quit"),
+                    ],
+                ),
+                screens("next screen"),
+            ]
+        }
+        Screen::Projects => vec![
+            (
+                "Actions",
+                vec![
+                    ("0-5", "set the project's weight"),
+                    ("r", "rename or re-path the project"),
+                    ("a", "add a project"),
+                    ("A", "archive or unarchive the project"),
+                    ("d", "delete the project — only when it is empty"),
+                    ("v", "pick the project's review action"),
+                ],
+            ),
+            (
+                "Navigation",
+                vec![
+                    ("j/k", "move the selection"),
+                    ("?", "this key map"),
+                    ("q", "quit"),
+                ],
+            ),
+            // The digit keys are weights here, so tab is the only way out.
+            ("Screens", vec![("tab", "next screen")]),
+        ],
+        Screen::Config => vec![
+            (
+                "Actions",
+                vec![
+                    ("a", "add a viewer"),
+                    ("⏎/e", "edit the selected viewer's command"),
+                    ("d", "delete the selected viewer"),
+                    ("V", "pick the default viewer"),
+                    ("A", "pick the default agent"),
+                ],
+            ),
+            (
+                "Navigation",
+                vec![
+                    ("j/k", "move the selection"),
+                    ("?", "this key map"),
+                    ("q", "quit"),
+                ],
+            ),
+            (
+                "Screens",
+                vec![
+                    ("tab", "next screen"),
+                    ("1", "cockpit"),
+                    ("2", "tasks"),
+                    ("3", "projects"),
+                ],
+            ),
+        ],
+    }
+}
+
+/// The key map's rows for one column, keys right-aligned to the column's widest.
+fn key_map_column(sections: &[KeySection]) -> Vec<Vec<Span<'static>>> {
+    let key_w = sections
+        .iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .map(|(key, _)| key.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    for (i, (title, entries)) in sections.iter().enumerate() {
+        if i > 0 {
+            rows.push(Vec::new());
+        }
+        rows.push(vec![Span::styled(*title, Style::new().bold())]);
+        for (key, label) in entries {
+            rows.push(vec![
+                Span::styled(format!("{key:>key_w$}  "), Style::new().bold()),
+                Span::styled(*label, Style::new().dim()),
+            ]);
+        }
+    }
+    rows
+}
+
+/// The `?` overlay: the current screen's whole key map, actions in one column
+/// and navigation over screen switching in the other so a screenful fits.
+fn draw_key_map(frame: &mut Frame, app: &App) {
+    let sections = key_map(app.screen);
+    let (actions, rest) = sections.split_at(1);
+    let (left, right) = (key_map_column(actions), key_map_column(rest));
+    let width_of =
+        |row: &Vec<Span<'static>>| -> usize { row.iter().map(|s| s.content.chars().count()).sum() };
+    let left_w = left.iter().map(width_of).max().unwrap_or(0);
+    let right_w = right.iter().map(width_of).max().unwrap_or(0);
+    const GAP: usize = 3;
+
+    let lines: Vec<Line<'static>> = (0..left.len().max(right.len()))
+        .map(|i| {
+            let mut spans = left.get(i).cloned().unwrap_or_default();
+            if let Some(row) = right.get(i) {
+                let pad = (left_w + GAP).saturating_sub(width_of(&spans));
+                spans.push(Span::raw(" ".repeat(pad)));
+                spans.extend(row.iter().cloned());
+            }
+            Line::from(spans)
+        })
+        .collect();
+
+    let screen = match app.screen {
+        Screen::Cockpit => "cockpit",
+        Screen::Tasks => "tasks",
+        Screen::Projects => "projects",
+        Screen::Config => "config",
+    };
+    let width = (left_w + GAP + right_w + 2) as u16;
+    let area = popup_area(frame, width, lines.len() as u16 + 2);
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Keys — {screen} — any key closes")),
+    );
+    frame.render_widget(para, area);
 }
 
 /// A centred popup rect, cleared of what is beneath it.
@@ -2538,6 +2763,45 @@ mod tests {
         assert_eq!(app.detail_scroll, 0, "a new selection starts at the top");
     }
 
+    /// A `body` event's detail is a whole replaced brief (DESIGN.md §8), so the
+    /// history folds it to a marker naming the event that holds it rather than
+    /// spilling a superseded body across the pane. Every other kind reads as-is.
+    #[test]
+    fn history_folds_a_replaced_body_to_a_recovery_marker() {
+        let events = vec![
+            Event {
+                id: 4,
+                task_id: Some(62),
+                at: "2026-08-01 10:00:00".into(),
+                kind: "priority".into(),
+                detail: Some("P1".into()),
+            },
+            Event {
+                id: 5,
+                task_id: Some(62),
+                at: "2026-08-01 10:01:00".into(),
+                kind: "body".into(),
+                detail: Some("the brief\nline two\nline three".into()),
+            },
+        ];
+        let rendered: Vec<String> = history_lines(&events)
+            .iter()
+            .map(ratatui::text::Line::to_string)
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|l| l.contains("priority") && l.contains("P1"))
+        );
+        let body = rendered
+            .iter()
+            .find(|l| l.contains("body"))
+            .expect("the body event renders");
+        assert!(body.contains("replaced body kept (3 lines)"), "{body}");
+        assert!(body.contains("voro show 62 --event 5"), "{body}");
+        assert!(!body.contains("line two"), "{body}");
+    }
+
     /// End-to-end: on the tasks screen the same sections fold into the Detail
     /// popup — `x`/`h` inside the popup drive the same shared flags — so score
     /// and history render inline on this screen too, never as separate popups.
@@ -2601,8 +2865,8 @@ mod tests {
 
     /// The cockpit detail pane answers "what happened" for a stalled task
     /// (task #73): the dead session's outcome, agent, end time, and log path
-    /// render under the metadata, and the key line advertises `l`. A capped
-    /// session reads `capped`; a clean ready task carries none of it.
+    /// render under the metadata. A capped session reads `capped`; a clean
+    /// ready task carries none of it.
     #[test]
     fn detail_pane_shows_a_stalled_tasks_session_post_mortem() {
         use crate::app::App;
@@ -2660,8 +2924,6 @@ mod tests {
         assert!(rendered.contains("claude"), "{rendered}");
         assert!(rendered.contains("ended 2"), "{rendered}");
         assert!(rendered.contains("log: /tmp/voro/s.log"), "{rendered}");
-        let labels: Vec<&str> = key_hints(&failed).iter().map(|(_, l)| *l).collect();
-        assert!(labels.contains(&"log"), "{labels:?}");
 
         let capped = app_with_session(true);
         assert!(render(&capped).contains("last session: capped"));
@@ -2742,8 +3004,6 @@ mod tests {
         assert!(rendered.contains("started 2"), "{rendered}");
         assert!(rendered.contains("log: /tmp/voro/open.log"), "{rendered}");
         assert!(!rendered.contains("last session:"), "{rendered}");
-        let labels: Vec<&str> = key_hints(&app).iter().map(|(_, l)| *l).collect();
-        assert!(labels.contains(&"log"), "{labels:?}");
     }
 
     /// A multi-line question renders across multiple lines in the cockpit
@@ -2810,11 +3070,11 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("Bravo option")), "{rows:?}");
     }
 
-    /// The cockpit key line only advertises the score/history toggles and the
-    /// dispatch keys while a task is selected — with an empty queue there is
-    /// nothing for them to act on, so they drop out.
+    /// The cockpit key line only advertises the selection-only actions while a
+    /// task is selected — with an empty queue there is nothing for them to act
+    /// on, so they drop out.
     #[test]
-    fn cockpit_key_line_drops_score_and_history_without_a_selection() {
+    fn cockpit_key_line_drops_the_selection_only_actions_without_a_selection() {
         use crate::app::App;
         use voro_core::{NewTask, Store};
 
@@ -2828,7 +3088,7 @@ mod tests {
         assert_eq!(empty.screen, Screen::Cockpit);
         assert!(empty.selected_task_id().is_none());
         let labels: Vec<&str> = key_hints(&empty).iter().map(|(_, l)| *l).collect();
-        for dropped in ["score", "history", "dispatch", "agent"] {
+        for dropped in ["dispatch", "deep"] {
             assert!(
                 !labels.contains(&dropped),
                 "empty cockpit should not advertise {dropped}: {labels:?}"
@@ -2854,10 +3114,235 @@ mod tests {
         let selected = App::new(store, ctx()).unwrap();
         assert!(selected.selected_task_id().is_some());
         let labels: Vec<&str> = key_hints(&selected).iter().map(|(_, l)| *l).collect();
-        for shown in ["score", "history", "dispatch", "agent"] {
+        for shown in ["dispatch", "deep"] {
             assert!(
                 labels.contains(&shown),
                 "cockpit with a selection should advertise {shown}: {labels:?}"
+            );
+        }
+    }
+
+    /// A lowercase/uppercase pair of one action takes a single slot keyed on
+    /// the pair, and the line stays short enough to scan: ten slots or fewer on
+    /// every row of a queue holding one of each kind (DESIGN.md §9).
+    #[test]
+    fn the_key_line_pairs_its_slots_and_stays_at_ten() {
+        use crate::app::App;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store.set_weight(p.id, 3).unwrap();
+        // A proposal earns the refine slot and a review task the hand-off slot;
+        // between them every conditional cockpit slot is covered.
+        let task = |title: &str, state: TaskState| NewTask {
+            project_id: p.id,
+            repo_id: None,
+            title: title.into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state,
+            agent: None,
+            human: false,
+            deep: false,
+        };
+        store
+            .create_task(task("a proposal", TaskState::Proposed))
+            .unwrap();
+        store
+            .create_task(task("ready to go", TaskState::Ready))
+            .unwrap();
+        let reviewed = store
+            .create_task(task("in review", TaskState::Ready))
+            .unwrap();
+        store.apply(reviewed.id, Action::Start).unwrap();
+        store.apply(reviewed.id, Action::Complete(None)).unwrap();
+        let mut app = App::new(
+            store,
+            crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                "/nonexistent/voro.db",
+            )),
+        )
+        .unwrap();
+
+        let mut seen_refine = false;
+        let mut seen_wait = false;
+        for screen in [
+            Screen::Cockpit,
+            Screen::Tasks,
+            Screen::Projects,
+            Screen::Config,
+        ] {
+            app.screen = screen;
+            let mut i = 0;
+            loop {
+                let rows = match screen {
+                    // Re-read each time: folding a digest open below adds rows.
+                    Screen::Cockpit => app.cockpit_rows.len(),
+                    Screen::Tasks => app.all.len(),
+                    _ => 1,
+                };
+                if i >= rows {
+                    break;
+                }
+                match screen {
+                    Screen::Cockpit => app.cockpit_sel = i,
+                    Screen::Tasks => app.tasks_sel = i,
+                    _ => {}
+                }
+                // Proposals ride as a digest row; fold it open so the proposal
+                // itself — the row the refine slot answers on — is selectable.
+                if app.enter_hint() == Some("⏎ expand") {
+                    app.on_key(KeyEvent::from(KeyCode::Enter));
+                }
+                let keys: Vec<&str> = key_hints(&app).iter().map(|(k, _)| *k).collect();
+                assert!(
+                    keys.len() <= 10,
+                    "{screen:?} row {i} shows {} slots: {keys:?}",
+                    keys.len()
+                );
+                assert!(keys.contains(&"?"), "{screen:?} must advertise ?: {keys:?}");
+                // The task screens pair a lowercase key with its uppercase
+                // variant; the other two bind unrelated actions to the same
+                // letter, so their slots stay apart.
+                if matches!(screen, Screen::Cockpit | Screen::Tasks) {
+                    for lone in ["d", "D", "r", "R", "n", "N"] {
+                        assert!(
+                            !keys.contains(&lone),
+                            "{screen:?} should pair {lone} into one slot: {keys:?}"
+                        );
+                    }
+                }
+                seen_refine |= keys.contains(&"r/R");
+                seen_wait |= keys.contains(&"w");
+                i += 1;
+            }
+        }
+        assert!(
+            seen_refine && seen_wait,
+            "the conditional slots never showed"
+        );
+    }
+
+    /// The line may drop a key, but the map may not: every key the hint line
+    /// can show is in that screen's key map, so trimming the line never makes
+    /// a key undiscoverable (DESIGN.md §9).
+    #[test]
+    fn every_hinted_key_appears_in_the_key_map() {
+        use crate::app::App;
+
+        // A combined slot (`d/D`, `j/k`) stands for its individual keys on both
+        // sides, so compare key by key.
+        let split = |key: &'static str| key.split('/').collect::<Vec<_>>();
+        for screen in [
+            Screen::Cockpit,
+            Screen::Tasks,
+            Screen::Projects,
+            Screen::Config,
+        ] {
+            let mut app = App::new(
+                voro_core::Store::open_in_memory().unwrap(),
+                crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                    "/nonexistent/voro.db",
+                )),
+            )
+            .unwrap();
+            app.screen = screen;
+            let mapped: Vec<&str> = key_map(screen)
+                .iter()
+                .flat_map(|(_, entries)| entries.iter())
+                .flat_map(|(key, _)| split(key))
+                .collect();
+            for (key, ..) in hint_candidates(&app) {
+                for one in split(key) {
+                    assert!(
+                        mapped.contains(&one),
+                        "{screen:?} hints {key:?} but its key map omits {one:?}: {mapped:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `?` opens the current screen's map from any screen, listing the keys the
+    /// line has no room for and the gloss for each uppercase variant; any key
+    /// closes it again (DESIGN.md §9).
+    #[test]
+    fn the_key_map_overlay_opens_on_question_mark_and_closes_on_any_key() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+        let mut app = App::new(
+            voro_core::Store::open_in_memory().unwrap(),
+            crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                "/nonexistent/voro.db",
+            )),
+        )
+        .unwrap();
+        app.screen = Screen::Projects;
+        app.on_key(KeyEvent::from(KeyCode::Char('?')));
+        assert!(matches!(app.mode, Mode::KeyMap));
+
+        let width: u16 = 120;
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Keys — projects"), "{rendered}");
+        assert!(rendered.contains("archive or unarchive"), "{rendered}");
+
+        // Any key is a dismissal, including one the screen binds.
+        app.on_key(KeyEvent::from(KeyCode::Char('a')));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // The cockpit's map is the longest, and it has to fit the smallest
+        // terminal worth supporting — 80x24 clips nothing.
+        app.screen = Screen::Cockpit;
+        app.on_key(KeyEvent::from(KeyCode::Char('?')));
+        let width: u16 = 80;
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The keys the trimmed line no longer carries, and the uppercase
+        // glosses it never carried.
+        for expected in [
+            "attach to the task's session",
+            "page the session log",
+            "fold the score decomposition",
+            "dispatch, choosing the agent first",
+            "new task, planned with an agent",
+            "refine a proposal, talking to an agent",
+            // The right-hand column, whole — nothing clipped at 80 columns.
+            "page the card",
+            "next screen",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "{expected:?} missing:\n{rendered}"
             );
         }
     }
@@ -3325,5 +3810,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A prompt buffer wider than the popup wraps, and the box grows with the
+    /// wrapped text so the tail being typed — and the cursor — stay on screen.
+    #[test]
+    fn prompt_popup_grows_with_wrapped_text() {
+        let buffer = format!("HEADMARK {}TAILMARK", "padding ".repeat(12));
+        let rendered = render_prompt(&buffer);
+        assert!(
+            rendered.contains("HEADMARK"),
+            "the start of a wrapped note stays visible: {rendered}"
+        );
+        assert!(
+            rendered.contains("TAILMARK▏"),
+            "the tail and the cursor stay visible: {rendered}"
+        );
+    }
+
+    /// Past the height clamp the popup stops growing, so it scrolls to the end
+    /// of the text: the tail shows, the head scrolls away.
+    #[test]
+    fn prompt_popup_scrolls_to_the_tail_when_it_overflows() {
+        let buffer = format!("HEADMARK {}TAILMARK", "padding ".repeat(200));
+        let rendered = render_prompt(&buffer);
+        assert!(
+            rendered.contains("TAILMARK▏"),
+            "the tail and the cursor stay visible: {rendered}"
+        );
+        assert!(
+            !rendered.contains("HEADMARK"),
+            "the head scrolls out of the clamped box: {rendered}"
+        );
+    }
+
+    /// Draws a `Mode::Prompt` over an otherwise empty app and returns the
+    /// terminal's cells as one string.
+    fn render_prompt(buffer: &str) -> String {
+        use crate::app::{App, Mode, PromptKind};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::Store;
+
+        let store = Store::open_in_memory().unwrap();
+        let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+        app.mode = Mode::Prompt {
+            task_id: 1,
+            kind: PromptKind::RefineNote,
+            buffer: buffer.to_string(),
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
     }
 }

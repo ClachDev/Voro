@@ -202,6 +202,10 @@ pub enum Mode {
         editing: bool,
         review_project: Option<i64>,
     },
+    /// The current screen's full key map (DESIGN.md §9), opened with `?`. It is
+    /// a peek rather than a screen — any key dismisses it — and it carries no
+    /// state of its own, since the screen it describes is the App's.
+    KeyMap,
     /// Picking `default_agent` or `default_viewer` from the configured set
     /// (DESIGN.md §5), on the Config screen.
     DefaultPicker {
@@ -1001,6 +1005,9 @@ impl App {
                 editing,
                 review_project,
             } => self.key_viewer_form(key, name, cmd, on_cmd, editing, review_project),
+            // The key map is dismissed by any key, and `on_key` has already
+            // restored `Mode::Normal`, so there is nothing left to do.
+            Mode::KeyMap => {}
             Mode::DefaultPicker {
                 kind,
                 names,
@@ -1046,11 +1053,16 @@ impl App {
     }
 
     fn key_normal(&mut self, key: KeyEvent) {
-        // Navigation shared by every screen: quit, tab cycling, and moving the
-        // selection.
+        // Navigation shared by every screen: quit, the key map, tab cycling,
+        // and moving the selection. `?` belongs here rather than in the
+        // trailing match, which the projects and Config screens never reach.
         match key.code {
             KeyCode::Char('q') => {
                 self.should_quit = true;
+                return;
+            }
+            KeyCode::Char('?') => {
+                self.mode = Mode::KeyMap;
                 return;
             }
             KeyCode::Tab => {
@@ -1281,13 +1293,6 @@ impl App {
     /// How many repos a project has, for the projects screen's `+N repos` tag.
     pub fn repo_count(&self, project_id: i64) -> usize {
         self.store.repos(project_id).map(|r| r.len()).unwrap_or(1)
-    }
-
-    /// The selected task's newest-session log path, whatever its state — what
-    /// gates the `l` key and its key-line hint.
-    pub fn selected_session_log(&self) -> Option<&str> {
-        let id = self.selected_task_id()?;
-        self.last_sessions.get(&id)?.log_path.as_deref()
     }
 
     /// Whether the selection is a review task, so it can be handed off with
@@ -3835,7 +3840,6 @@ mod tests {
         assert_eq!(session.outcome, Some(voro_core::SessionOutcome::Failed));
         assert!(session.ended_at.is_some());
         assert_eq!(session.log_path.as_deref(), Some("/tmp/demo/s.log"));
-        assert_eq!(app.selected_session_log(), Some("/tmp/demo/s.log"));
     }
 
     /// `l` on a stalled task queues `$PAGER <log>` for main() to run with the
@@ -3880,7 +3884,6 @@ mod tests {
             app.store.task(task.id).unwrap().state,
             TaskState::NeedsInput
         );
-        assert_eq!(app.selected_session_log(), Some("/tmp/demo/open.log"));
         key(&mut app, KeyCode::Char('l'));
 
         let request = app.pending_attach.clone().expect("a pager request");
@@ -3893,7 +3896,6 @@ mod tests {
     #[test]
     fn log_key_on_a_ready_task_reports_and_does_nothing() {
         let mut app = app_with(&[TaskState::Ready]);
-        assert!(app.selected_session_log().is_none());
         key(&mut app, KeyCode::Char('l'));
 
         assert!(app.pending_attach.is_none());

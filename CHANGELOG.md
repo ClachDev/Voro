@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A pair of tasks carrying two edges keeps the one not named, so an edge
   authored by mistake no longer has to be removed with raw SQL; dropping a
   blocker reconciles readiness as any other blocker edit does.
+- **Body edits are recoverable and guarded.** Every edit that changes a
+  non-empty task body records the text it replaced as a `body` event, so a
+  rewrite is no longer irreversible; `voro show <id> --event <event-id>` prints
+  that text back, ready to redirect into `set --body-file`. A replacement that
+  would leave the body empty is refused unless `--allow-empty` is given, and
+  `voro set --append-body[-file]` adds to a body instead of replacing it.
 - **Document links**: register the plan or design doc a body of work derives
   from with `voro doc add <project> <path-or-url>`, and link it to the tasks it
   spawned (`voro doc link/unlink`, or `--doc` on `voro add`/`voro set`). `voro
@@ -41,9 +47,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than the workhorse. Agent templates gained a `{model}` placeholder and
   a per-agent `model`/`model_deep`/`model_plan` map to fill it; an agent naming
   no models, such as the built-in `codex`, ignores the flag entirely.
+- `?` in the TUI opens the current screen's complete key map — actions,
+  navigation, and screen switching — including the keys no hint ever advertised
+  (`o` open in a viewer, `g` open the PR, `a` attach, `l` page the log, `J`/`K`
+  and the page keys, `ctrl-r`). Any key closes it again.
 
 ### Changed
 
+- **Agent contract**: verb templates gain a `{session_name}` placeholder, and
+  the built-in `claude` agent now names its session with it instead of spelling
+  `voro-{task_id}` itself. Every session Voro launches carries a name it
+  composed — `voro-<id>` for a dispatch (unchanged), `voro-<id>-refine` for a
+  refine, `voro-plan-<project>` for a planning session — so a refine no longer
+  launches under the literal, shared name `voro-{task_id}` and can be found and
+  attached to in `claude agents`. `{session_name}` is honoured on `dispatch` and
+  `plan` and refused elsewhere, the same rule `{model}` follows; `{task_id}` is
+  now refused on `plan`, whose target may be a project with no task. No verb was
+  added: an agent defining only `dispatch` (or `cmd`) refines exactly as before.
+  A wholesale `[agents.claude]` override copied from an older `voro.toml` keeps
+  working, and keeps its old naming.
+- Prompts and command lines are filled by a single-pass renderer, so a task
+  body, branch name, document title or project name containing `{task_id}`,
+  `{db}`, `{note}`, `{seed}`, `{branch}` or `{docs}` now reaches the agent
+  verbatim instead of being rewritten before it is read.
+- The TUI's contextual key line is shorter and speaks one language. A lowercase
+  key and its shifted sibling now share a single slot labelled with the base
+  verb — `d/D dispatch`, `r/R refine`, `n/N new` — instead of three different
+  renderings of the same idea, and the line keeps only what changes a task's
+  state or destiny: `x` score, `h` history, `c` docs and `l` log still work but
+  are documented in the `?` map rather than on the line. No key was rebound.
 - `projects.path` is gone. Existing databases convert in place: every project's
   old path becomes its default repo, and existing tasks resolve to exactly the
   checkouts they had before. `voro project add` and `voro project path` keep

@@ -11,12 +11,14 @@ mod model;
 mod pr;
 pub mod scheduler;
 mod store;
+mod template;
 mod transition;
 
 pub use agent::{
-    AgentSessionEntry, AgentTemplate, AgentsConfig, PROMPT_FILE_PLACEHOLDER, Provenance,
-    ResolvedAgent, SESSION_PLACEHOLDER, TASK_ID_PLACEHOLDER, VIEWER_BASE_PLACEHOLDER,
-    VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, ViewerTemplate, parse_sessions_json,
+    AgentSessionEntry, AgentTemplate, AgentsConfig, Launch, LaunchSpec, PROMPT_FILE_PLACEHOLDER,
+    Provenance, ResolvedAgent, SESSION_NAME_PLACEHOLDER, SESSION_PLACEHOLDER, TASK_ID_PLACEHOLDER,
+    VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, ViewerTemplate,
+    parse_sessions_json,
 };
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};
@@ -30,6 +32,7 @@ pub use scheduler::{
     ScoreBreakdown, StateCounts, WipGate,
 };
 pub use store::{NewTask, Store, TaskEdit};
+pub use template::{render, shell_quote};
 pub use transition::{Action, Triage};
 
 #[cfg(test)]

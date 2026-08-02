@@ -18,10 +18,14 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voro_core::{
-    AgentsConfig, PROMPT_FILE_PLACEHOLDER, ReviewAction, Store, TASK_ID_PLACEHOLDER, TaskState,
+    AgentsConfig, Launch, LaunchSpec, ResolvedAgent, ReviewAction, Store, TaskState,
     VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER,
-    parse_sessions_json,
+    parse_sessions_json, render,
 };
+
+/// Command assembly owns its own quoting, so this is voro-core's; re-exported
+/// here because the TUI reaches it through this module.
+pub(crate) use voro_core::shell_quote;
 
 /// Prepended to every dispatched prompt so the agent learns the return-path
 /// verbs (DESIGN.md §8). [`render_preamble`] fills the `{task_id}` and `{db}`
@@ -245,20 +249,34 @@ fn render_preamble(
     docs: &[(String, String)],
 ) -> String {
     let db_flag = db_flag(db_path);
+    let task_id = task_id.to_string();
     let name = branch.unwrap_or("<name>");
-    let register = BRANCH_REGISTER_SENTENCE.replace("{name}", name);
-    let isolate = BRANCH_ISOLATE_SENTENCE.replace("{name}", name);
-    let branch_block = match branch {
-        Some(name) => ASSIGNED_BRANCH_TEMPLATE
-            .replace("{isolate}", &isolate)
-            .replace("{register}", &register)
-            .replace("{rebase}", BRANCH_REBASE_SENTENCE)
-            .replace("{name}", name),
-        None => UNASSIGNED_BRANCH_TEMPLATE
-            .replace("{isolate}", &isolate)
-            .replace("{register}", &register)
-            .replace("{rebase}", BRANCH_REBASE_SENTENCE),
+    // Rendered innermost-first, each block finished before it is bound into the
+    // next: a single pass emits a value verbatim, so a branch name spelling
+    // `{task_id}` survives composition rather than being rewritten by the outer
+    // template's own bindings.
+    let leaf = [
+        ("{name}", name),
+        ("{task_id}", task_id.as_str()),
+        ("{db}", db_flag.as_str()),
+    ];
+    let register = render(BRANCH_REGISTER_SENTENCE, &leaf);
+    let isolate = render(BRANCH_ISOLATE_SENTENCE, &leaf);
+    let branch_template = match branch {
+        Some(_) => ASSIGNED_BRANCH_TEMPLATE,
+        None => UNASSIGNED_BRANCH_TEMPLATE,
     };
+    let branch_block = render(
+        branch_template,
+        &[
+            ("{isolate}", isolate.as_str()),
+            ("{register}", register.as_str()),
+            ("{rebase}", BRANCH_REBASE_SENTENCE),
+            ("{name}", name),
+            ("{task_id}", task_id.as_str()),
+            ("{db}", db_flag.as_str()),
+        ],
+    );
     // A task with no linked document renders no block at all, so an unlinked
     // dispatch's prompt is byte-for-byte what it was before docs existed.
     let docs_block = if docs.is_empty() {
@@ -275,13 +293,17 @@ fn render_preamble(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        LINKED_DOCS_TEMPLATE.replace("{list}", &list)
+        render(LINKED_DOCS_TEMPLATE, &[("{list}", list.as_str())])
     };
-    RETURN_PATH_PREAMBLE_TEMPLATE
-        .replace("{branch}", &branch_block)
-        .replace("{docs}", &docs_block)
-        .replace("{task_id}", &task_id.to_string())
-        .replace("{db}", &db_flag)
+    render(
+        RETURN_PATH_PREAMBLE_TEMPLATE,
+        &[
+            ("{branch}", branch_block.as_str()),
+            ("{docs}", docs_block.as_str()),
+            ("{task_id}", task_id.as_str()),
+            ("{db}", db_flag.as_str()),
+        ],
+    )
 }
 
 /// Fill [`PLANNING_PROMPT_TEMPLATE`] for a concrete project: the `voro add`
@@ -289,10 +311,14 @@ fn render_preamble(
 /// [`render_preamble`] does, a `--db` flag only when the database is not the
 /// default one the verb resolves to unaided.
 fn render_planning_prompt(project: &str, db_path: &Path) -> String {
-    PLANNING_PROMPT_TEMPLATE
-        .replace("{project_arg}", &shell_quote(Path::new(project)))
-        .replace("{project}", project)
-        .replace("{db}", &db_flag(db_path))
+    render(
+        PLANNING_PROMPT_TEMPLATE,
+        &[
+            ("{project_arg}", shell_quote(Path::new(project)).as_str()),
+            ("{project}", project),
+            ("{db}", db_flag(db_path).as_str()),
+        ],
+    )
 }
 
 /// The seed context both refine flavours open with: the task as it stands, the
@@ -346,7 +372,10 @@ fn refine_seed(store: &Store, task: &voro_core::Task) -> Result<String, String> 
 
 /// Fill a refine template for a concrete task: the literal task id in the `set`
 /// command, the same conditional `--db` flag the other prompts render, the seed
-/// context, and — for the note-driven flavour — the operator's note.
+/// context, and — for the note-driven flavour — the operator's note. The seed
+/// carries the task's own body, so it goes through the single-pass renderer:
+/// a body that discusses `{task_id}` or `{db}` must reach the agent as written,
+/// and rewriting the subject of a rewrite is the one thing this must not do.
 fn render_refine_prompt(
     template: &str,
     task_id: i64,
@@ -354,11 +383,15 @@ fn render_refine_prompt(
     seed: &str,
     note: &str,
 ) -> String {
-    template
-        .replace("{seed}", seed)
-        .replace("{note}", note.trim())
-        .replace("{task_id}", &task_id.to_string())
-        .replace("{db}", &db_flag(db_path))
+    render(
+        template,
+        &[
+            ("{seed}", seed),
+            ("{note}", note.trim()),
+            ("{task_id}", task_id.to_string().as_str()),
+            ("{db}", db_flag(db_path).as_str()),
+        ],
+    )
 }
 
 /// The assembled launch of a planning session: the agent's `plan` template
@@ -403,7 +436,7 @@ pub fn plan_session(
 ) -> Result<PlanLaunch, String> {
     let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     let agent = config.resolve(None).map_err(|e| e.to_string())?;
-    let Some(plan_cmd) = agent.plan_command() else {
+    if agent.plan.is_none() {
         return Err(format!(
             "agent '{}' defines no plan template in {} — add plan = \"<interactive command> \
              {{prompt_file}}\" to its [agents.{}] table to plan tasks with it",
@@ -411,14 +444,14 @@ pub fn plan_session(
             ctx.agents_path.display(),
             agent.name
         ));
-    };
-    let (label, name, cwd, prompt) = match target {
+    }
+    let (label, launch, cwd, prompt) = match target {
         PlanTarget::Create { project_id } => {
             let project = store.project(project_id).map_err(|e| e.to_string())?;
             let repo = store.default_repo(project_id).map_err(|e| e.to_string())?;
             (
                 "plan",
-                format!("plan-{project_id}"),
+                Launch::Plan { project_id },
                 repo.path,
                 render_planning_prompt(&project.name, &ctx.db_path),
             )
@@ -429,7 +462,7 @@ pub fn plan_session(
             let seed = refine_seed(store, &task)?;
             (
                 "refine",
-                format!("refine-{task_id}"),
+                Launch::Refine { task_id },
                 repo.path,
                 render_refine_prompt(
                     REFINE_PLAN_PROMPT_TEMPLATE,
@@ -441,9 +474,16 @@ pub fn plan_session(
             )
         }
     };
-    let prompt_path = write_prompt(ctx, &name, &prompt)?;
+    let prompt_path = write_prompt(ctx, &launch.slug(), &prompt)?;
+    let command = agent
+        .plan_launch_command(&LaunchSpec {
+            launch,
+            prompt_file: &prompt_path,
+            deep: false,
+        })
+        .expect("the plan verb is checked above");
     Ok(PlanLaunch {
-        command: plan_cmd.replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path)),
+        command,
         cwd,
         label,
     })
@@ -485,26 +525,35 @@ fn write_prompt(ctx: &DispatchCtx, name: &str, prompt: &str) -> Result<PathBuf, 
 /// feedback the same way is the next one. Unlike a dispatch this opens no
 /// session row and moves no task state: what comes back is whatever the verb the
 /// agent calls does, so nothing here has to observe the process.
-struct Expansion {
-    /// Names the prompt and log files and the launch-log line, e.g. `refine-314`.
-    label: String,
-    /// The agent's headless command template, still carrying `{prompt_file}`.
-    command: String,
+struct Expansion<'a> {
+    /// Who this launch is, which names its session, its prompt and log files,
+    /// and its launch-log lines (DESIGN.md §8).
+    launch: Launch,
+    /// The agent that will run it — the *default* one, since expanding an
+    /// intent is not executing the task.
+    agent: &'a ResolvedAgent,
+    /// Whether the task carries `deep`, so the brief is written with the same
+    /// model the work would be.
+    deep: bool,
     prompt: String,
     cwd: String,
 }
 
 /// Spawn an [`Expansion`] detached, with its output captured to a log beside the
-/// session logs, and return a summary line naming that log. The child is reaped
-/// in a thread — nothing waits on it, and a zombie would otherwise linger for
-/// the life of a long-running TUI (DESIGN.md §8).
+/// session logs, and return the tail of a summary line naming the session and
+/// that log. Both halves matter: the launcher exits at birth, so the log holds
+/// its banner rather than the rewrite, and the session name is what the operator
+/// attaches to. The child is reaped in a thread — nothing waits on it, and a
+/// zombie would otherwise linger for the life of a long-running TUI
+/// (DESIGN.md §8).
 fn spawn_expansion(ctx: &DispatchCtx, exp: Expansion) -> Result<String, String> {
-    let prompt_path = write_prompt(ctx, &exp.label, &exp.prompt)?;
+    let label = exp.launch.slug();
+    let prompt_path = write_prompt(ctx, &label, &exp.prompt)?;
     let stamp = prompt_path
         .file_stem()
         .and_then(|s| s.to_str())
         .map(|s| s.trim_end_matches(".prompt").to_string())
-        .unwrap_or_else(|| exp.label.clone());
+        .unwrap_or_else(|| label.clone());
     let log_path = ctx.runtime_dir.join(format!("{stamp}.log"));
     let log = File::create(&log_path)
         .map_err(|e| format!("cannot create log {}: {e}", log_path.display()))?;
@@ -512,13 +561,15 @@ fn spawn_expansion(ctx: &DispatchCtx, exp: Expansion) -> Result<String, String> 
         .try_clone()
         .map_err(|e| format!("cannot open log {}: {e}", log_path.display()))?;
 
-    let command = exp
-        .command
-        .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path));
+    let command = exp.agent.launch_command(&LaunchSpec {
+        launch: exp.launch,
+        prompt_file: &prompt_path,
+        deep: exp.deep,
+    });
     let launch_log = ctx.launch_log_path();
     append_launch_log(
         &launch_log,
-        &format!("{}: {command} (cwd {})", exp.label, exp.cwd),
+        &format!("{label}: {command} (cwd {})", exp.cwd),
     );
     let mut child = Command::new("sh")
         .arg("-c")
@@ -533,7 +584,7 @@ fn spawn_expansion(ctx: &DispatchCtx, exp: Expansion) -> Result<String, String> 
         .map_err(|e| format!("cannot spawn agent in {}: {e}", exp.cwd))?;
     let pid = i64::from(child.id());
 
-    let reap_label = exp.label.clone();
+    let reap_label = label.clone();
     std::thread::spawn(move || {
         let line = match child.wait() {
             Ok(status) => format!("{reap_label}: exited with {status}"),
@@ -543,8 +594,8 @@ fn spawn_expansion(ctx: &DispatchCtx, exp: Expansion) -> Result<String, String> 
     });
 
     Ok(format!(
-        "{} launched (pid {pid}) — log {}",
-        exp.label,
+        "as {} (pid {pid}) — log {}",
+        exp.launch.session_name(),
         log_path.display()
     ))
 }
@@ -559,6 +610,11 @@ fn spawn_expansion(ctx: &DispatchCtx, exp: Expansion) -> Result<String, String> 
 /// `deep` flag still applies, because a task worth the strongest model is worth
 /// a brief written with it. A human task refines like any other: no agent can
 /// *execute* it, but its brief is still text an agent can write.
+///
+/// The session is named `voro-<id>-refine` ([`Launch::Refine`]), so it is
+/// findable in the agent's fleet listing and cannot collide with the dispatch of
+/// the same task; it still opens no session row, because naming is fleet
+/// legibility and a session row is Voro's bookkeeping (DESIGN.md §6).
 pub fn refine(
     store: &mut Store,
     ctx: &DispatchCtx,
@@ -582,24 +638,26 @@ pub fn refine(
     let seed = refine_seed(store, &task)?;
     let prompt = render_refine_prompt(REFINE_PROMPT_TEMPLATE, task_id, &ctx.db_path, &seed, note);
 
-    let summary = spawn_expansion(
+    let launched = spawn_expansion(
         ctx,
         Expansion {
-            label: format!("refine-{task_id}"),
-            command: agent.dispatch_command(task.deep),
+            launch: Launch::Refine { task_id },
+            agent: &agent,
+            deep: task.deep,
             prompt,
             cwd: repo.path,
         },
     )?;
+    let summary = format!(
+        "task {task_id} sent for refinement by '{}' {launched}",
+        agent.name
+    );
     // Recorded after the spawn, so a refine that never launched leaves no
     // marker; the agent rewriting the body is what the marker is about.
     store
         .record_refine(task_id, note)
         .map_err(|e| format!("{summary}, but recording the refine event failed: {e}"))?;
-    Ok(format!(
-        "task {task_id} sent for refinement by '{}' — {summary}",
-        agent.name
-    ))
+    Ok(summary)
 }
 
 /// Where dispatch finds its inputs and puts its artefacts. Built from the
@@ -858,9 +916,10 @@ fn spawn_session(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let launch = Launch::Dispatch { task_id };
     let prompt_path = ctx
         .runtime_dir
-        .join(format!("task-{task_id}-{stamp}.prompt.md"));
+        .join(format!("{}-{stamp}.prompt.md", launch.slug()));
     let body = if task.body.is_empty() {
         format!("# {}\n", task.title)
     } else {
@@ -886,20 +945,25 @@ fn spawn_session(
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("cannot write prompt {}: {e}", prompt_path.display()))?;
 
-    let log_path = ctx.runtime_dir.join(format!("task-{task_id}-{stamp}.log"));
+    let log_path = ctx
+        .runtime_dir
+        .join(format!("{}-{stamp}.log", launch.slug()));
     let log = File::create(&log_path)
         .map_err(|e| format!("cannot create log {}: {e}", log_path.display()))?;
     let log_err = log
         .try_clone()
         .map_err(|e| format!("cannot open log {}: {e}", log_path.display()))?;
 
-    // `dispatch_command` resolves `{model}` from the task's depth: the deeper
-    // model for a deep task, the workhorse otherwise, and nothing at all for an
-    // agent whose template names no model (DESIGN.md §8).
-    let command = agent
-        .dispatch_command(task.deep)
-        .replace(PROMPT_FILE_PLACEHOLDER, &shell_quote(&prompt_path))
-        .replace(TASK_ID_PLACEHOLDER, &task_id.to_string());
+    // `launch_command` binds every placeholder the template may carry in one
+    // pass: the prompt file, the session name `voro-<id>`, the task id, and
+    // `{model}` resolved from the task's depth — the deeper model for a deep
+    // task, the workhorse otherwise, and nothing at all for an agent whose
+    // template names no model (DESIGN.md §8).
+    let command = agent.launch_command(&LaunchSpec {
+        launch,
+        prompt_file: &prompt_path,
+        deep: task.deep,
+    });
     let spawn_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1122,11 +1186,6 @@ fn default_base_branch(repo_path: &str) -> String {
         }
         _ => "main".to_string(),
     }
-}
-
-/// Single-quote a path for safe substitution into the `sh -c` command line.
-pub(crate) fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -2142,6 +2201,127 @@ mod tests {
         let prompt = read_captured_prompt(&project.join("refine-prompt.txt"));
         assert!(prompt.contains("Linked documents"), "{prompt}");
         assert!(prompt.contains("docs/PLAN.md"), "{prompt}");
+    }
+
+    // --- launch identity (task #326) ---
+
+    /// Wait for a file the stub agent wrote to hold `until`, so an assertion
+    /// about a detached launch races neither the spawn nor the write: the shell
+    /// creates a redirect target before the command behind it produces
+    /// anything, so mere existence is not enough.
+    fn read_marker(path: &Path, until: &str) -> String {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && text.contains(until)
+            {
+                return text.trim().to_string();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for {} to be written", path.display())
+    }
+
+    /// The defect this task fixes: a refine borrowed the dispatch template and
+    /// left `{task_id}` unsubstituted, so every refine of every task launched a
+    /// session called, literally, `voro-{task_id}`. Now each launch composes its
+    /// own name, and the refine of a task cannot collide with its dispatch.
+    #[test]
+    fn a_refine_and_a_dispatch_of_one_task_carry_distinct_rendered_names() {
+        // Each launch writes a marker named for its own session, so the two
+        // cannot race over one file and the filenames themselves prove the
+        // names differ.
+        let (mut store, ctx, project) = fixture(
+            "echo --name {session_name} --for {task_id} > {session_name}.txt; : {prompt_file}",
+        );
+        let id = proposal(&mut store, &project, false);
+
+        refine(&mut store, &ctx, id, "sharpen it").unwrap();
+        let refine_marker = read_marker(&project.join(format!("voro-{id}-refine.txt")), "--for");
+        assert_eq!(refine_marker, format!("--name voro-{id}-refine --for {id}"));
+
+        store
+            .apply(id, voro_core::Action::Triage(voro_core::Triage::Ready))
+            .unwrap();
+        dispatch(&mut store, &ctx, id, None).unwrap();
+        let dispatch_marker = read_marker(&project.join(format!("voro-{id}.txt")), "--for");
+        assert_eq!(dispatch_marker, format!("--name voro-{id} --for {id}"));
+
+        assert_ne!(refine_marker, dispatch_marker);
+        for rendered in [&refine_marker, &dispatch_marker] {
+            assert!(!rendered.contains('{'), "unsubstituted: {rendered}");
+        }
+
+        // The refine's whole command line is in the launch log, named for the
+        // session the operator can attach to.
+        let log = std::fs::read_to_string(ctx.launch_log_path()).unwrap();
+        let launched = log
+            .lines()
+            .find(|l| l.contains(&format!("refine-{id}: echo")))
+            .unwrap_or_else(|| panic!("no launch line in {log}"));
+        assert!(
+            launched.contains(&format!("voro-{id}-refine")),
+            "{launched}"
+        );
+        assert!(!launched.contains('{'), "unsubstituted: {launched}");
+    }
+
+    /// Defect 3: the refine prompt used to substitute into the seed, so a task
+    /// body discussing a command template was rewritten before the agent read
+    /// it — corrupting the very subject of the rewrite.
+    #[test]
+    fn a_refine_hands_the_agent_a_body_full_of_placeholders_unchanged() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file} > refine-prompt.txt");
+        let id = proposal(&mut store, &project, false);
+        let body = "the template says voro-{task_id} and the flag is {db}, verbatim";
+        let task = store.task(id).unwrap();
+        store
+            .update_task(
+                id,
+                voro_core::TaskEdit {
+                    title: task.title,
+                    body: body.into(),
+                    priority: task.priority,
+                    agent: task.agent,
+                    human: task.human,
+                    deep: task.deep,
+                },
+            )
+            .unwrap();
+
+        refine(&mut store, &ctx, id, "keep the {task_id} in the body").unwrap();
+
+        let prompt = read_captured_prompt(&project.join("refine-prompt.txt"));
+        assert!(prompt.contains(body), "{prompt}");
+        assert!(
+            prompt.contains("keep the {task_id} in the body"),
+            "{prompt}"
+        );
+        // ...while the template's own placeholders still resolved around it.
+        assert!(prompt.contains(&format!("voro set {id} --db")), "{prompt}");
+    }
+
+    /// The same guarantee on the dispatch preamble, whose untrusted values are
+    /// the branch name and the linked documents' titles.
+    #[test]
+    fn a_dispatch_hands_the_agent_branch_and_doc_names_unchanged() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file} > dispatch-prompt.txt");
+        let id = ready_task(&mut store, &project);
+        let project_id = store.task(id).unwrap().project_id;
+        store.set_branch(id, Some("feat/{task_id}")).unwrap();
+        let doc = store
+            .create_doc(project_id, None, "docs/{db}.md", Some("Plan for {task_id}"))
+            .unwrap();
+        store.link_doc(id, doc.id).unwrap();
+
+        dispatch(&mut store, &ctx, id, None).unwrap();
+
+        let prompt = read_marker(&project.join("dispatch-prompt.txt"), "Detailed prompt.");
+        assert!(prompt.contains("git branch `feat/{task_id}`"), "{prompt}");
+        assert!(prompt.contains("Plan for {task_id}"), "{prompt}");
+        assert!(prompt.contains("docs/{db}.md"), "{prompt}");
+        // and the preamble's own placeholders still resolved
+        assert!(prompt.contains(&format!("voro ask {id} --db")), "{prompt}");
+        assert!(prompt.contains("--branch feat/{task_id}"), "{prompt}");
     }
 
     #[test]
