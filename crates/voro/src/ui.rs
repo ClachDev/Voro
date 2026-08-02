@@ -629,6 +629,10 @@ fn counts_line(counts: &StateCounts) -> Line<'static> {
         counts.proposed,
         Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
     );
+    // A proposal being refined has left the triage count, so it is named here
+    // rather than silently missing from the backlog the header exists to keep
+    // felt (DESIGN.md §6/§12).
+    push("refining", counts.refining, dim);
     push("input", counts.needs_input, dim);
     push("review", counts.review, dim);
     push("waiting", counts.waiting, dim);
@@ -652,12 +656,33 @@ fn incomplete_report_span() -> Span<'static> {
     )
 }
 
-/// The refine marker (DESIGN.md §6): a proposal whose body an agent has
-/// reworked against the operator's note, so this row is an improved version
-/// awaiting a fresh verdict. A property of the row rather than an anomaly —
-/// cyan like the question text, not the warning yellow.
+/// The refine marker (DESIGN.md §6): a proposal whose last refine round
+/// reworked its body against the operator's note, so this row is an improved
+/// version awaiting a fresh verdict. A property of the row rather than an
+/// anomaly — cyan like the question text, not the warning yellow.
 fn refined_span() -> Span<'static> {
     Span::styled("  ↻ refined", Style::new().fg(Color::Cyan))
+}
+
+/// Its counterpart (DESIGN.md §6): a proposal whose last refine round died
+/// without rewriting anything. Red rather than cyan, because the body the
+/// operator is about to read is the *old* one and the rewrite they asked for
+/// never happened — an absence they should never have to notice for themselves.
+fn refine_failed_span() -> Span<'static> {
+    Span::styled(
+        "  ⚠ refine failed",
+        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )
+}
+
+/// A refine in flight on the running strip (DESIGN.md §9), where it sits beside
+/// dispatched work: same columns, but named for what it is, since the keys that
+/// act on a dispatch do not act on this.
+fn refining_span() -> Span<'static> {
+    Span::styled(
+        format!("{:11} ", "⟳ refining"),
+        Style::new().fg(Color::Cyan),
+    )
 }
 
 /// The stale-branch marker (DESIGN.md §8): a review task whose tracked PR
@@ -905,6 +930,9 @@ fn action_row_line(app: &App, row: &ActionRow, indent: &str) -> Line<'static> {
     if app.refined.contains(&c.task.id) {
         spans.push(refined_span());
     }
+    if app.refine_failed.contains(&c.task.id) {
+        spans.push(refine_failed_span());
+    }
     if app.incomplete_report.contains(&c.task.id) {
         // The verb column says "pr", but a PR cannot be opened
         // from a half-finished report, so name the gap too.
@@ -939,6 +967,17 @@ fn digest_line(app: &App, digest: &DigestRow) -> Line<'static> {
         spans.push(Span::styled(
             format!("  ↻ {refined} refined"),
             Style::new().fg(Color::Cyan),
+        ));
+    }
+    let failed = digest
+        .tasks
+        .iter()
+        .filter(|row| app.refine_failed.contains(&row.candidate.task.id))
+        .count();
+    if failed > 0 {
+        spans.push(Span::styled(
+            format!("  ⚠ {failed} refine failed"),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
     Line::from(spans)
@@ -1119,6 +1158,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     if app.refined.contains(&task.id) {
         lines.push(Line::from(refined_span()));
     }
+    if app.refine_failed.contains(&task.id) {
+        lines.push(Line::from(refine_failed_span()));
+    }
     if let Some(pr) = &task.pr_url {
         lines.push(Line::from(pr_span(pr)));
         // A review branch that no longer merges with the base (DESIGN.md §8):
@@ -1195,9 +1237,10 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para.scroll((scroll, 0)).block(block), area);
 }
 
-/// Live sessions (DESIGN.md §9): agent, task state, and elapsed time since
-/// dispatch. `draw_cockpit` collapses this to a zero-height area when nothing
-/// is running.
+/// Work under way (DESIGN.md §9): agent, task state, and elapsed time since the
+/// session opened — dispatched `running` tasks and the refine rounds rewriting a
+/// proposal's body alike. `draw_cockpit` collapses this to a zero-height area
+/// when nothing is under way.
 fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     if area.height == 0 {
         return;
@@ -1216,10 +1259,15 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                 Some(agent) => Span::styled(format!("{agent:8} "), Style::new().fg(Color::Magenta)),
                 None => Span::styled(format!("{:8} ", "—"), Style::new().dim()),
             };
+            let state = if r.task_state == TaskState::Refining {
+                refining_span()
+            } else {
+                Span::raw(format!("{:11} ", r.task_state.to_string()))
+            };
             let mut spans = vec![
                 Span::raw(format!("{} ", task_ref(r.task_id))),
                 agent,
-                Span::raw(format!("{:11} ", r.task_state.to_string())),
+                state,
                 Span::styled(
                     format!("{:>6}  ", format_elapsed(r.elapsed_secs)),
                     Style::new().dim(),
@@ -1294,6 +1342,9 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             }
             if app.refined.contains(&r.task.id) {
                 spans.push(refined_span());
+            }
+            if app.refine_failed.contains(&r.task.id) {
+                spans.push(refine_failed_span());
             }
             if app.incomplete_report.contains(&r.task.id) {
                 spans.push(incomplete_report_span());
@@ -1610,6 +1661,7 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
             enter,
             ("d/D", "dispatch", selected),
             ("r/R", "refine", selection_is_proposed(app)),
+            ("C", "cancel refine", app.selected_is_refining()),
             ("s", "state", true),
             ("!", "deep", selected),
             ("w", "wait", app.selected_can_hand_off()),
@@ -1623,6 +1675,7 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
             enter,
             ("w", "wait", app.selected_can_hand_off()),
             ("r/R", "refine", selection_is_proposed(app)),
+            ("C", "cancel refine", app.selected_is_refining()),
             ("s", "state", true),
             ("!", "deep", true),
             ("n/N", "new", true),
@@ -1724,6 +1777,7 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                 ("s", "change state"),
                 ("!", "toggle deep — the agent's strongest model"),
                 ("c", "link and unlink documents"),
+                ("C", "cancel a refine in flight"),
                 ("x", "fold the score decomposition into the card"),
                 ("h", "fold the task's history into the card"),
                 ("o", "open the diff in a viewer"),
@@ -1758,6 +1812,7 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                 ("s", "change state"),
                 ("!", "toggle deep — the agent's strongest model"),
                 ("c", "link and unlink documents"),
+                ("C", "cancel a refine in flight"),
                 ("o", "open the diff in a viewer"),
                 ("g", "open the tracked PR"),
                 ("a", "attach to the task's session"),
@@ -2102,6 +2157,124 @@ mod tests {
             rendered.contains(&format!("blocked by #{}, #{}", open.id, closed.id)),
             "browser did not annotate the parked row with its blockers: {rendered}"
         );
+    }
+
+    /// End-to-end through the real cockpit draw (DESIGN.md §6/§9): a refine
+    /// round shows on the running strip as its own kind of row with elapsed
+    /// time, and the proposal it holds is nowhere in the triage queue. Once the
+    /// round concludes, the row is gone and the proposal is back, marked.
+    #[test]
+    fn a_refine_round_renders_on_the_strip_and_leaves_the_queue() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{NewTask, RefineOutcome, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "sloppy proposal".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Proposed,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        store
+            .record_refine_launch(task.id, "name the files", "claude", None, None)
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        let render = |app: &App, terminal: &mut Terminal<TestBackend>| -> String {
+            terminal
+                .draw(|f| draw_cockpit(f, app, &mut HitMap::default()))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        let out = render(&app, &mut terminal);
+        assert!(out.contains("⟳ refining"), "{out}");
+        assert!(out.contains("sloppy proposal"), "{out}");
+        assert!(out.contains("refining 1"), "the header counts it: {out}");
+        assert!(
+            !out.contains("awaiting triage"),
+            "a refining proposal must not ride the triage digest: {out}"
+        );
+
+        app.store
+            .conclude_refine(task.id, RefineOutcome::Applied)
+            .unwrap();
+        app.refresh().unwrap();
+        let out = render(&app, &mut terminal);
+        assert!(!out.contains("⟳ refining"), "{out}");
+        assert!(out.contains("↻ 1 refined"), "{out}");
+    }
+
+    /// A round that died says so where the operator triages, in its own words —
+    /// a failed refine must never read as a proposal nobody refined.
+    #[test]
+    fn a_failed_refine_round_renders_its_own_marker() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{NewTask, RefineOutcome, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "sloppy proposal".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Proposed,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        store
+            .record_refine_launch(task.id, "name the files", "claude", None, None)
+            .unwrap();
+        store
+            .conclude_refine(task.id, RefineOutcome::Failed)
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+        app.toggle_screen();
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal
+            .draw(|f| draw_tasks(f, &app, &mut HitMap::default()))
+            .unwrap();
+        let out: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(out.contains("⚠ refine failed"), "{out}");
+        assert!(!out.contains("↻ refined"), "{out}");
     }
 
     /// End-to-end: a human-only task carries the `[human]` marker on its queue
@@ -3158,6 +3331,14 @@ mod tests {
             .unwrap();
         store.apply(reviewed.id, Action::Start).unwrap();
         store.apply(reviewed.id, Action::Complete(None)).unwrap();
+        // ...and a refine in flight for the cancel slot, which rides the strip
+        // rather than the queue.
+        let refining = store
+            .create_task(task("being rewritten", TaskState::Proposed))
+            .unwrap();
+        store
+            .record_refine_launch(refining.id, "thin body", "claude", None, None)
+            .unwrap();
         let mut app = App::new(
             store,
             crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
@@ -3168,6 +3349,7 @@ mod tests {
 
         let mut seen_refine = false;
         let mut seen_wait = false;
+        let mut seen_cancel = false;
         for screen in [
             Screen::Cockpit,
             Screen::Tasks,
@@ -3216,11 +3398,18 @@ mod tests {
                 }
                 seen_refine |= keys.contains(&"r/R");
                 seen_wait |= keys.contains(&"w");
+                seen_cancel |= keys.contains(&"C");
+                // The refine keys and the cancel are mutually exclusive by
+                // state, which is what keeps the line within its ten slots.
+                assert!(
+                    !(keys.contains(&"r/R") && keys.contains(&"C")),
+                    "{screen:?} row {i}: {keys:?}"
+                );
                 i += 1;
             }
         }
         assert!(
-            seen_refine && seen_wait,
+            seen_refine && seen_wait && seen_cancel,
             "the conditional slots never showed"
         );
     }
@@ -3359,6 +3548,7 @@ mod tests {
     fn header_counts_show_nonzero_states_and_omit_the_rest() {
         let counts = voro_core::StateCounts {
             proposed: 3,
+            refining: 2,
             ready: 5,
             running: 2,
             needs_input: 1,
@@ -3372,6 +3562,9 @@ mod tests {
         assert!(text.contains("triage 3"), "{text}");
         assert!(text.contains("ready 5"), "{text}");
         assert!(text.contains("input 1"), "{text}");
+        // A proposal mid-rewrite has left the triage count, so it is named here
+        // rather than silently missing from the backlog (DESIGN.md §6/§12).
+        assert!(text.contains("refining 2"), "{text}");
         // Zero-count states never render, and `running` is not a header stat.
         assert!(!text.contains("review"), "{text}");
         assert!(!text.contains("waiting"), "{text}");

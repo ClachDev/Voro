@@ -436,6 +436,7 @@ impl Store {
             let (state, n) = row?;
             match state {
                 TaskState::Proposed => counts.proposed = n,
+                TaskState::Refining => counts.refining = n,
                 TaskState::Ready => counts.ready = n,
                 TaskState::Running => counts.running = n,
                 TaskState::NeedsInput => counts.needs_input = n,
@@ -455,6 +456,10 @@ impl Store {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StateCounts {
     pub proposed: i64,
+    /// Proposals an agent is rewriting right now (DESIGN.md §6). Counted apart
+    /// from `proposed`, which they have temporarily left, so the triage backlog
+    /// stays felt while a round is in flight.
+    pub refining: i64,
     pub ready: i64,
     pub running: i64,
     pub needs_input: i64,
@@ -1072,6 +1077,39 @@ mod tests {
 
         // but it is felt in the state counts
         assert_eq!(s.state_counts().unwrap().waiting, 1);
+    }
+
+    /// A proposal being refined is out of the triage queue for the duration
+    /// (DESIGN.md §6): the operator cannot triage a body an agent is mid-way
+    /// through rewriting, and the state — not a guard in the TUI — is what takes
+    /// it out, so it is gone in every window at once.
+    #[test]
+    fn a_refining_proposal_leaves_the_queue_and_is_counted_apart() {
+        let mut s = setup();
+        let p = add_project(&mut s, "p", 5);
+        let refining = add_proposed(&mut s, p, "being rewritten", Priority::P0);
+        s.record_refine_launch(refining, "thin body", "claude", Some(1), None)
+            .unwrap();
+        let ready = add_task(&mut s, p, "startable", Priority::P3);
+
+        let candidates = s.candidates().unwrap();
+        assert!(candidates.iter().all(|c| c.task.id != refining));
+        assert_eq!(task_ids(&default_queue(&s)), vec![ready]);
+
+        let counts = s.state_counts().unwrap();
+        assert_eq!(counts.refining, 1);
+        assert_eq!(counts.proposed, 0);
+
+        // and it is back the moment the round concludes
+        s.conclude_refine(refining, crate::RefineOutcome::Applied)
+            .unwrap();
+        assert_eq!(s.state_counts().unwrap().refining, 0);
+        assert!(
+            s.candidates()
+                .unwrap()
+                .iter()
+                .any(|c| c.task.id == refining)
+        );
     }
 
     #[test]

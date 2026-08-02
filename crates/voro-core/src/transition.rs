@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use rusqlite::{Connection, params};
 
 use crate::error::{Error, Result};
-use crate::model::{Session, SessionOutcome, Task, TaskState};
+use crate::model::{RefineOutcome, Session, SessionOutcome, Task, TaskState};
 use crate::store::{
     Store, close_open_session, get_session, get_task, insert_session, log_event,
     set_session_outcome,
@@ -27,6 +27,12 @@ pub enum Triage {
 pub enum Action {
     /// proposed → parked | ready | rejected
     Triage(Triage),
+    /// proposed → refining; the string is the operator's refine note, which
+    /// rides the transition as a `refined` event (empty for the interactive
+    /// flavour, which is a conversation rather than a brief).
+    Refine(String),
+    /// refining → proposed; the round is over, however it ended.
+    ConcludeRefine(RefineOutcome),
     /// ready | stalled → running (dispatch or redispatch, or the human
     /// starting by hand)
     Start,
@@ -65,6 +71,8 @@ impl Action {
     fn name(&self) -> &'static str {
         match self {
             Action::Triage(_) => "triage",
+            Action::Refine(_) => "refine",
+            Action::ConcludeRefine(_) => "conclude the refine of",
             Action::Start => "start",
             Action::Ask(_) => "ask",
             Action::Resume => "resume",
@@ -96,6 +104,10 @@ impl Store {
                 Action::Triage(Triage::Parked),
                 Action::Triage(Triage::Reject),
             ],
+            // A refine in flight offers only its escape hatch. Triage verdicts
+            // are illegal by construction, which is what closes the race
+            // between the operator and the rewriting agent (DESIGN.md §6).
+            Refining => vec![Action::ConcludeRefine(RefineOutcome::Cancelled)],
             Parked => vec![Action::Unpark, Action::Abandon],
             Ready => vec![Action::Start, Action::Park, Action::Abandon],
             Running if human => vec![Action::Complete(None), Action::Abort],
@@ -154,6 +166,41 @@ impl Store {
         Ok((self.task(task_id)?, self.session(session_id)?))
     }
 
+    /// Refine's atomic write (DESIGN.md §6), the shape [`record_dispatch`]
+    /// established: move the task `proposed → refining` and open the round's
+    /// session in one transaction, so a refining task always has a session to
+    /// probe and a refine session always names a task that is refining. The
+    /// note rides the transition; the empty string is the interactive flavour,
+    /// which is a conversation rather than a brief. Spawning the process is the
+    /// caller's job, before this commits.
+    ///
+    /// [`record_dispatch`]: Store::record_dispatch
+    pub fn record_refine_launch(
+        &mut self,
+        task_id: i64,
+        note: &str,
+        agent: &str,
+        pid: Option<i64>,
+        log_path: Option<&str>,
+    ) -> Result<(Task, Session)> {
+        let tx = self.conn.transaction()?;
+        apply_action(&tx, task_id, Action::Refine(note.to_string()))?;
+        let session_id = insert_session(&tx, task_id, agent, pid, log_path)?;
+        tx.commit()?;
+        Ok((self.task(task_id)?, self.session(session_id)?))
+    }
+
+    /// End a refine round (DESIGN.md §6): `refining → proposed`, logging how it
+    /// ended and closing the round's session with the matching outcome. Every
+    /// trigger comes through here — the agent's own `set --body-file`
+    /// (`Applied`), a reconciled dead agent (`Failed`), a quit or cancelled
+    /// session (`Cancelled`) — so the returned proposal's markers read from one
+    /// place. Refused on a task that is not refining, like any other
+    /// transition.
+    pub fn conclude_refine(&mut self, task_id: i64, outcome: RefineOutcome) -> Result<Task> {
+        self.apply(task_id, Action::ConcludeRefine(outcome))
+    }
+
     /// Reconcile an open session against its task's state (DESIGN.md §8). The
     /// session's life follows the task, not the process listing, so the terminal
     /// transitions close healthy sessions; reconciliation only catches a crash
@@ -169,6 +216,9 @@ impl Store {
     ///   handed out by `voro next`; a late `done` lands it in `review` on the
     ///   dead session's behalf. A stalled task with an open blocker demotes to
     ///   `parked`.
+    /// - `refining`, process gone: the agent died without rewriting anything, so
+    ///   the round concludes `failed` and the task goes back to `proposed`
+    ///   carrying the failed-round marker (DESIGN.md §6).
     /// - `needs-input`/`review`/`waiting`: the session stays open on purpose
     ///   (the operator answers in it, or a reject returns the work to it), so
     ///   this leaves it alone (`Ok(None)`) regardless of liveness.
@@ -188,7 +238,9 @@ impl Store {
         let task = get_task(&tx, session.task_id)?.ok_or(Error::TaskNotFound(session.task_id))?;
 
         let outcome = match task.state {
-            TaskState::Running => {
+            // A refine round's agent is probed exactly like a dispatch's: gone
+            // means the body was never rewritten (DESIGN.md §6).
+            TaskState::Running | TaskState::Refining => {
                 if pid_alive {
                     return Ok(None);
                 }
@@ -213,7 +265,7 @@ impl Store {
         };
         set_session_outcome(&tx, session_id, outcome)?;
 
-        if task.state == TaskState::Running {
+        if matches!(task.state, TaskState::Running | TaskState::Refining) {
             log_event(
                 &tx,
                 task.id,
@@ -222,6 +274,8 @@ impl Store {
                     "session {session_id} ended without reporting ({outcome})"
                 )),
             )?;
+        }
+        if task.state == TaskState::Running {
             tx.execute(
                 "UPDATE tasks SET state = ?1, state_since = datetime('now') WHERE id = ?2",
                 params![TaskState::Stalled, task.id],
@@ -233,6 +287,16 @@ impl Store {
                 Some(&format!("{} -> {}", task.state, TaskState::Stalled)),
             )?;
             reconcile_readiness(&tx, task.id)?;
+        }
+        // The refine round has a transition of its own, so it goes through the
+        // machine rather than a raw update; the session is already stamped
+        // above, so the conclusion's close finds nothing left open.
+        if task.state == TaskState::Refining {
+            apply_action(
+                &tx,
+                task.id,
+                Action::ConcludeRefine(crate::model::RefineOutcome::Failed),
+            )?;
         }
         tx.commit()?;
         Ok(Some((
@@ -321,6 +385,11 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         (Proposed, Action::Triage(Triage::Parked)) => Parked,
         (Proposed, Action::Triage(Triage::Ready)) => Ready,
         (Proposed, Action::Triage(Triage::Reject)) => Rejected,
+        // A refine round: out of the triage queue while an agent rewrites the
+        // body, back to `proposed` for a real verdict when it concludes
+        // (DESIGN.md §6).
+        (Proposed, Action::Refine(_)) => Refining,
+        (Refining, Action::ConcludeRefine(_)) => Proposed,
         (Ready | Stalled, Action::Start) => Running,
         // A human task cannot be blocked on a decision — the executor *is* the
         // human (DESIGN.md §6).
@@ -395,6 +464,17 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         Action::Complete(Some(s)) if !s.trim().is_empty() => {
             log_event(tx, task_id, "summary", Some(s.trim()))?;
         }
+        // The operator's note rides the launch, exactly as a completion summary
+        // rides `done`; the interactive flavour carries none, since the brief
+        // is the conversation itself.
+        Action::Refine(note) if !note.trim().is_empty() => {
+            log_event(tx, task_id, "refined", Some(note.trim()))?;
+        }
+        // How the round ended, which is what the markers on the returned
+        // proposal are derived from (DESIGN.md §6).
+        Action::ConcludeRefine(outcome) => {
+            log_event(tx, task_id, "refine", Some(outcome.as_str()))?;
+        }
         _ => {}
     }
 
@@ -415,6 +495,12 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         }
         Action::Abort | Action::Abandon => {
             close_open_session(tx, task_id, SessionOutcome::Aborted)?;
+        }
+        // A concluded refine tears its round down whichever trigger fired
+        // (DESIGN.md §6): the agent's own `set --body-file` lands here as much
+        // as a cancel does, so all four triggers close the session identically.
+        Action::ConcludeRefine(outcome) => {
+            close_open_session(tx, task_id, outcome.session_outcome())?;
         }
         _ => {}
     }
@@ -635,6 +721,12 @@ mod tests {
         use TaskState::*;
         match state {
             Proposed | Parked | Ready => create(s, project_id, state),
+            Refining => {
+                let id = create(s, project_id, Proposed);
+                s.record_refine_launch(id, "thin body", "claude", Some(1), None)
+                    .unwrap();
+                id
+            }
             Running => {
                 let id = create(s, project_id, Ready);
                 s.apply(id, Action::Start).unwrap();
@@ -679,6 +771,8 @@ mod tests {
             Action::Triage(Triage::Parked),
             Action::Triage(Triage::Ready),
             Action::Triage(Triage::Reject),
+            Action::Refine("thin body".into()),
+            Action::ConcludeRefine(RefineOutcome::Applied),
             Action::Start,
             Action::Ask("q?".into()),
             Action::Resume,
@@ -702,6 +796,8 @@ mod tests {
             (Proposed, Action::Triage(Triage::Parked)) => Some(Parked),
             (Proposed, Action::Triage(Triage::Ready)) => Some(Ready),
             (Proposed, Action::Triage(Triage::Reject)) => Some(Rejected),
+            (Proposed, Action::Refine(_)) => Some(Refining),
+            (Refining, Action::ConcludeRefine(_)) => Some(Proposed),
             (Ready | Stalled, Action::Start) => Some(Running),
             (Ready | Stalled, Action::Park) => Some(Parked),
             (Parked, Action::Unpark) => Some(Ready),
@@ -745,11 +841,22 @@ mod tests {
         }
     }
 
+    /// `legal_actions` is the transition *menu*, so it matches `apply` on every
+    /// action but one: launching a refine is a legal transition the menu
+    /// deliberately withholds, because that menu collects verdicts and refine is
+    /// not one (DESIGN.md §6) — it answers from its own key over the proposal.
     #[test]
     fn legal_actions_agrees_with_apply() {
         for state in TaskState::ALL {
             let legal = Store::legal_actions(state, false);
             for action in all_actions() {
+                if matches!(action, Action::Refine(_)) {
+                    assert!(
+                        !legal.iter().any(|l| matches!(l, Action::Refine(_))),
+                        "the verdict menu must not offer refine ({state})"
+                    );
+                    continue;
+                }
                 let in_legal = legal
                     .iter()
                     .any(|l| std::mem::discriminant(l) == std::mem::discriminant(&action))
@@ -757,6 +864,10 @@ mod tests {
                         // Triage variants share a discriminant; all are legal
                         // exactly when the state is proposed.
                         (Action::Triage(_), s) => s == TaskState::Proposed,
+                        // As do the refine outcomes, all legal exactly when a
+                        // round is in flight — `legal_actions` offers the one
+                        // the operator can pick, which is the cancel.
+                        (Action::ConcludeRefine(_), s) => s == TaskState::Refining,
                         _ => true,
                     };
                 assert_eq!(
@@ -1701,6 +1812,50 @@ mod tests {
             let detail = reconcile.detail.as_deref().unwrap();
             assert!(detail.contains("without reporting"), "{detail}");
             assert!(detail.contains("failed"), "{detail}");
+        }
+
+        /// A refine round's agent dying is the same probe with a different
+        /// landing (DESIGN.md §6): the round concludes `failed` and the task
+        /// returns to `proposed` carrying the failed-round marker, so the
+        /// operator reads the *old* body knowing the rewrite never happened.
+        #[test]
+        fn dead_pid_on_a_refining_task_returns_it_to_proposed() {
+            let (mut s, p) = store_with_project();
+            let task_id = create(&mut s, p, TaskState::Proposed);
+            let (_, session) = s
+                .record_refine_launch(task_id, "thin body", "claude", Some(4242), None)
+                .unwrap();
+
+            // a live agent is left alone: the rewrite may still land
+            assert!(
+                s.reconcile_session(session.id, true, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(s.task(task_id).unwrap().state, TaskState::Refining);
+
+            let (session, task) = s
+                .reconcile_session(session.id, false, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(session.outcome, Some(SessionOutcome::Failed));
+            assert!(session.ended_at.is_some());
+            assert_eq!(task.state, TaskState::Proposed);
+            assert!(s.refine_failed_flag(task_id).unwrap());
+            assert!(!s.refined_flag(task_id).unwrap());
+
+            let events = s.events_for(task_id).unwrap();
+            assert!(
+                events.iter().any(|e| e.kind == "reconcile"
+                    && e.detail.as_deref().is_some_and(|d| d.contains("failed"))),
+                "{events:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.detail.as_deref() == Some("refining -> proposed")),
+                "{events:?}"
+            );
         }
 
         #[test]

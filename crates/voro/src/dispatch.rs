@@ -14,7 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voro_core::{
@@ -404,6 +404,19 @@ pub struct PlanLaunch {
     /// Which flow this is — `plan` or `refine` — for the launch log's
     /// breadcrumbs, since both run through the same foreground round-trip.
     pub label: &'static str,
+    /// The refine round this launch opens, when it is one (DESIGN.md §6). The
+    /// round-trip records the round once the child's pid is known and concludes
+    /// it on return; a `Create` session carries `None`, having no task to
+    /// transition and so earning no session row.
+    pub refine: Option<RefineLaunch>,
+}
+
+/// What the foreground round-trip needs to open a refine round's session once
+/// it knows the child's pid: which task is being refined, and by whom.
+#[derive(Debug, Clone)]
+pub struct RefineLaunch {
+    pub task_id: i64,
+    pub agent: String,
 }
 
 /// What an interactive agent session is pointed at (DESIGN.md §8/§6): the front
@@ -418,14 +431,17 @@ pub enum PlanTarget {
 
 /// Assemble an interactive planning session (DESIGN.md §8): resolve the default
 /// agent, require its `plan` verb, write the prompt outside the checkout, and
-/// substitute it into the template. No session row is recorded and no task state
-/// changes — the session's deliverable is a `proposed` task the agent creates
-/// through `voro add`, or (for [`PlanTarget::Refine`]) a rewritten body it
-/// applies through `voro set --body-file` — so one that exits without doing
-/// either has simply done nothing. There is deliberately no dispatch-style
-/// guard: planning only reads the checkout and writes nothing to it. A `Create`
-/// session runs in the project's *default* repo, since it drafts a task rather
-/// than executing one and the drafted task picks its own repo with `voro add
+/// substitute it into the template. A `Create` session records nothing and
+/// changes no task state — its deliverable is a `proposed` task the agent
+/// creates through `voro add`, so one that exits without creating anything has
+/// simply done nothing. A [`PlanTarget::Refine`] session is a refine round like
+/// the headless one: the caller's round-trip moves the task `proposed →
+/// refining` and opens its session once the child's pid is known, and the round
+/// ends either with the agent's `voro set --body-file` or with the quit that
+/// concludes it as cancelled. There is deliberately no dispatch-style guard:
+/// planning only reads the checkout and writes nothing to it. A `Create` session
+/// runs in the project's *default* repo, since it drafts a task rather than
+/// executing one and the drafted task picks its own repo with `voro add
 /// --repo`; a `Refine` runs in the task's resolved repo, which is where the code
 /// its body must name actually lives.
 pub fn plan_session(
@@ -444,7 +460,7 @@ pub fn plan_session(
             agent.name
         ));
     }
-    let (label, launch, cwd, prompt) = match target {
+    let (label, launch, cwd, prompt, refine) = match target {
         PlanTarget::Create { project_id } => {
             let project = store.project(project_id).map_err(|e| e.to_string())?;
             let repo = store.default_repo(project_id).map_err(|e| e.to_string())?;
@@ -453,6 +469,7 @@ pub fn plan_session(
                 Launch::Plan { project_id },
                 repo.path,
                 render_planning_prompt(&project.name, &ctx.db_path),
+                None,
             )
         }
         PlanTarget::Refine { task_id } => {
@@ -470,6 +487,10 @@ pub fn plan_session(
                     &seed,
                     "",
                 ),
+                Some(RefineLaunch {
+                    task_id,
+                    agent: agent.name.clone(),
+                }),
             )
         }
     };
@@ -485,14 +506,22 @@ pub fn plan_session(
         command,
         cwd,
         label,
+        refine,
     })
 }
 
-/// The precondition both refine flavours share: refine is an event on a
-/// `proposed` task, not a state (DESIGN.md §6), so anything else is refused
-/// before a prompt is written or a process spawned.
+/// The precondition both refine flavours share: a refine round starts from
+/// `proposed` (DESIGN.md §6), so anything else is refused before a prompt is
+/// written or a process spawned. The transition API refuses it again when the
+/// round is recorded; this is the early, spelled-out refusal — including of a
+/// task already `refining`, whose round the operator can only cancel.
 fn guard_refinable(store: &Store, task_id: i64) -> Result<voro_core::Task, String> {
     let task = store.task(task_id).map_err(|e| e.to_string())?;
+    if task.state == TaskState::Refining {
+        return Err(format!(
+            "task {task_id} is already being refined — cancel that round first"
+        ));
+    }
     if task.state != TaskState::Proposed {
         return Err(format!(
             "only a proposed task can be refined; task {task_id} is {}",
@@ -538,14 +567,23 @@ struct Expansion<'a> {
     cwd: String,
 }
 
+/// A spawned [`Expansion`], handed back so the caller can record it before
+/// letting it run: the pid and log path the session row wants, the session name
+/// the summary line names, and the child itself, which is either reaped
+/// ([`reap_expansion`]) or killed if the recording fails.
+struct Spawned {
+    pid: i64,
+    log_path: PathBuf,
+    session_name: String,
+    label: String,
+    child: Child,
+}
+
 /// Spawn an [`Expansion`] detached, with its output captured to a log beside the
-/// session logs, and return the tail of a summary line naming the session and
-/// that log. Both halves matter: the launcher exits at birth, so the log holds
-/// its banner rather than the rewrite, and the session name is what the operator
-/// attaches to. The child is reaped in a thread — nothing waits on it, and a
-/// zombie would otherwise linger for the life of a long-running TUI
-/// (DESIGN.md §8).
-fn spawn_expansion(ctx: &DispatchCtx, exp: Expansion) -> Result<String, String> {
+/// session logs. Both the log and the session name matter to the operator: the
+/// launcher exits at birth, so the log holds its banner rather than the rewrite,
+/// and the session name is what they attach to.
+fn spawn_expansion(ctx: &DispatchCtx, exp: Expansion) -> Result<Spawned, String> {
     let label = exp.launch.slug();
     let prompt_path = write_prompt(ctx, &label, &exp.prompt)?;
     let stamp = prompt_path
@@ -570,7 +608,7 @@ fn spawn_expansion(ctx: &DispatchCtx, exp: Expansion) -> Result<String, String> 
         &launch_log,
         &format!("{label}: {command} (cwd {})", exp.cwd),
     );
-    let mut child = Command::new("sh")
+    let child = Command::new("sh")
         .arg("-c")
         .arg(&command)
         .current_dir(&exp.cwd)
@@ -581,39 +619,60 @@ fn spawn_expansion(ctx: &DispatchCtx, exp: Expansion) -> Result<String, String> 
         .process_group(0)
         .spawn()
         .map_err(|e| format!("cannot spawn agent in {}: {e}", exp.cwd))?;
-    let pid = i64::from(child.id());
 
-    let reap_label = label.clone();
+    Ok(Spawned {
+        pid: i64::from(child.id()),
+        log_path,
+        session_name: exp.launch.session_name(),
+        label,
+        child,
+    })
+}
+
+/// Hand a spawned expansion to a detached reaper thread, which records its exit
+/// in the launch log. Nothing waits on it otherwise, and a zombie would linger
+/// for the life of a long-running TUI — and `kill -0` on a zombie still reports
+/// it alive, which would defeat the reconciler's probe (DESIGN.md §8).
+fn reap_expansion(spawned: Spawned, launch_log: PathBuf) {
+    let Spawned {
+        mut child, label, ..
+    } = spawned;
     std::thread::spawn(move || {
         let line = match child.wait() {
-            Ok(status) => format!("{reap_label}: exited with {status}"),
-            Err(e) => format!("{reap_label}: could not be waited on: {e}"),
+            Ok(status) => format!("{label}: exited with {status}"),
+            Err(e) => format!("{label}: could not be waited on: {e}"),
         };
         append_launch_log(&launch_log, &line);
     });
+}
 
-    Ok(format!(
-        "as {} (pid {pid}) — log {}",
-        exp.launch.session_name(),
-        log_path.display()
-    ))
+/// Kill a spawned expansion's process group and reap it, for the case where the
+/// store write that should have recorded it failed: an agent whose round was
+/// never recorded must not keep rewriting a body unobserved.
+fn kill_expansion(spawned: Spawned) {
+    let Spawned { mut child, pid, .. } = spawned;
+    let _ = Command::new("kill")
+        .args(["-TERM", "--"])
+        .arg(format!("-{pid}"))
+        .status();
+    let _ = child.wait();
 }
 
 /// Note-driven refine (DESIGN.md §6): hand a proposed task's body, the
 /// operator's note, and the context of the task it was discovered from to a
 /// headless agent, which rewrites the body and applies it with `voro set
-/// --body-file`. The task stays `proposed` throughout — the only store write
-/// here is the `refined` event that marks the row for re-triage. The *default*
-/// agent runs it whatever override the task carries, since a task's agent
-/// override picks who executes the task, not who writes its brief; the task's
-/// `deep` flag still applies, because a task worth the strongest model is worth
-/// a brief written with it. A human task refines like any other: no agent can
-/// *execute* it, but its brief is still text an agent can write.
+/// --body-file`. The task moves `proposed → refining` and opens a session row in
+/// one write, so the rewrite is visible in every window and out of the triage
+/// queue until it concludes. The *default* agent runs it whatever override the
+/// task carries, since a task's agent override picks who executes the task, not
+/// who writes its brief; the task's `deep` flag still applies, because a task
+/// worth the strongest model is worth a brief written with it. A human task
+/// refines like any other: no agent can *execute* it, but its brief is still
+/// text an agent can write.
 ///
 /// The session is named `voro-<id>-refine` ([`Launch::Refine`]), so it is
 /// findable in the agent's fleet listing and cannot collide with the dispatch of
-/// the same task; it still opens no session row, because naming is fleet
-/// legibility and a session row is Voro's bookkeeping (DESIGN.md §6).
+/// the same task.
 pub fn refine(
     store: &mut Store,
     ctx: &DispatchCtx,
@@ -637,7 +696,7 @@ pub fn refine(
     let seed = refine_seed(store, &task)?;
     let prompt = render_refine_prompt(REFINE_PROMPT_TEMPLATE, task_id, &ctx.db_path, &seed, note);
 
-    let launched = spawn_expansion(
+    let spawned = spawn_expansion(
         ctx,
         Expansion {
             launch: Launch::Refine { task_id },
@@ -647,15 +706,33 @@ pub fn refine(
             cwd: repo.path,
         },
     )?;
-    let summary = format!(
-        "task {task_id} sent for refinement by '{}' {launched}",
-        agent.name
+
+    // Recorded after the spawn, exactly as dispatch records its session, so the
+    // pid the reconciler probes is the real one; a round that could not be
+    // recorded takes its agent down with it rather than rewriting a body no
+    // window knows is being rewritten.
+    let recorded = store.record_refine_launch(
+        task_id,
+        note,
+        &agent.name,
+        Some(spawned.pid),
+        Some(spawned.log_path.to_string_lossy().as_ref()),
     );
-    // Recorded after the spawn, so a refine that never launched leaves no
-    // marker; the agent rewriting the body is what the marker is about.
-    store
-        .record_refine(task_id, note)
-        .map_err(|e| format!("{summary}, but recording the refine event failed: {e}"))?;
+    let summary = format!(
+        "task {task_id} sent for refinement by '{}' as {} (pid {}) — log {}",
+        agent.name,
+        spawned.session_name,
+        spawned.pid,
+        spawned.log_path.display()
+    );
+    if let Err(e) = recorded {
+        let pid = spawned.pid;
+        kill_expansion(spawned);
+        return Err(format!(
+            "recording the refine failed ({e}); the spawned agent (pid {pid}) was killed"
+        ));
+    }
+    reap_expansion(spawned, ctx.launch_log_path());
     Ok(summary)
 }
 
@@ -2124,7 +2201,7 @@ mod tests {
     }
 
     #[test]
-    fn refine_spawns_the_agent_seeds_it_and_records_the_event() {
+    fn refine_spawns_the_agent_seeds_it_and_opens_the_round() {
         // The stub copies the prompt it was handed, so the file it writes is
         // exactly what reached the agent.
         let (mut store, ctx, project) = fixture("cat {prompt_file} > refine-prompt.txt");
@@ -2160,17 +2237,33 @@ mod tests {
         );
         assert!(prompt.contains("no `voro triage`"), "{prompt}");
 
-        // Voro's own half changed nothing but the marker event.
+        // Voro's own half opened the round: the task is out of the triage queue
+        // with the body still the one the agent was handed, and the round has a
+        // session carrying the pid the reconciler probes (DESIGN.md §6).
         let task = store.task(id).unwrap();
-        assert_eq!(task.state, TaskState::Proposed);
+        assert_eq!(task.state, TaskState::Refining);
         assert_eq!(task.body, "make it better");
-        assert!(store.refined_flag(id).unwrap());
         assert_eq!(
             store.latest_refine_note(id).unwrap().as_deref(),
             Some("name the files it touches")
         );
-        // no session row: a refine is not a dispatch (DESIGN.md §6)
-        assert!(store.sessions_for(id).unwrap().is_empty());
+        // and neither marker yet — the rewrite has not landed
+        assert!(!store.refined_flag(id).unwrap());
+        assert!(!store.refine_failed_flag(id).unwrap());
+
+        let sessions = store.sessions_for(id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].agent, "stub");
+        assert!(sessions[0].pid.is_some());
+        assert!(sessions[0].ended_at.is_none());
+        assert!(
+            sessions[0]
+                .log_path
+                .as_deref()
+                .is_some_and(|p| p.contains(&format!("refine-{id}"))),
+            "{:?}",
+            sessions[0].log_path
+        );
     }
 
     /// A proposal linked to a plan document is refined against that plan — the
@@ -2229,6 +2322,11 @@ mod tests {
         let refine_marker = read_marker(&project.join(format!("voro-{id}-refine.txt")), "--for");
         assert_eq!(refine_marker, format!("--name voro-{id}-refine --for {id}"));
 
+        // The round has to end before a verdict is legal — a refining task is
+        // out of the queue by construction (DESIGN.md §6).
+        store
+            .conclude_refine(id, voro_core::RefineOutcome::Applied)
+            .unwrap();
         store
             .apply(id, voro_core::Action::Triage(voro_core::Triage::Ready))
             .unwrap();
@@ -2356,10 +2454,30 @@ mod tests {
         assert!(!prompt.contains("voro add"), "{prompt}");
         assert!(prompt.contains("interactive"), "{prompt}");
 
-        // assembling it is not a refine: no event, no state change, no session
+        // Assembling the launch opens no round: the round-trip does that once
+        // the child has a pid, so a launch that never runs leaves the proposal
+        // exactly where it was (DESIGN.md §6).
         assert_eq!(store.task(id).unwrap().state, TaskState::Proposed);
-        assert!(!store.refined_flag(id).unwrap());
         assert!(store.sessions_for(id).unwrap().is_empty());
+        // ...and it carries what the round-trip needs to open one.
+        let refine = launch.refine.expect("a refine launch names its round");
+        assert_eq!(refine.task_id, id);
+        assert_eq!(refine.agent, "stub");
+    }
+
+    /// A planning session has no task to transition, so it earns no session row
+    /// and names no round (DESIGN.md §8).
+    #[test]
+    fn a_planning_session_names_no_refine_round() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file}\"\nplan = \"stub --interactive {prompt_file}\"\n",
+        );
+        let p = store
+            .create_project("proj", project.to_str().unwrap())
+            .unwrap();
+        let launch = plan_session(&store, &ctx, PlanTarget::Create { project_id: p.id }).unwrap();
+        assert!(launch.refine.is_none());
     }
 
     #[test]
@@ -2375,6 +2493,27 @@ mod tests {
 
         let err = plan_session(&store, &ctx, PlanTarget::Refine { task_id: id }).unwrap_err();
         assert!(err.contains("proposed"), "{err}");
+    }
+
+    /// A round already in flight is not refinable either — the second launch is
+    /// refused before it can supersede the first (DESIGN.md §6).
+    #[test]
+    fn refine_is_refused_on_a_task_already_refining() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file}\"\nplan = \"stub --interactive {prompt_file}\"\n",
+        );
+        let id = proposal(&mut store, &project, false);
+        store
+            .record_refine_launch(id, "first round", "stub", None, None)
+            .unwrap();
+
+        let err = refine(&mut store, &ctx, id, "second round").unwrap_err();
+        assert!(err.contains("already being refined"), "{err}");
+        let err = plan_session(&store, &ctx, PlanTarget::Refine { task_id: id }).unwrap_err();
+        assert!(err.contains("already being refined"), "{err}");
+        // one round, one session
+        assert_eq!(store.sessions_for(id).unwrap().len(), 1);
     }
 
     // --- planning sessions (task #112) ---
