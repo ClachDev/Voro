@@ -6,10 +6,11 @@
 //! that bool, plus a best-effort read of whether the log looks usage-capped,
 //! the inputs that need process or filesystem I/O.
 //!
-//! A liveness probe runs only for a `running` task. `needs-input`/`review`
-//! keep their session open on purpose (reused when the answer or feedback
-//! continues the work), and a session still open on a closed task is stale and
-//! finalised — neither needs a probe.
+//! A liveness probe runs for a `running` task and for a `refining` one — the
+//! two states with work actually under way (DESIGN.md §6/§9).
+//! `needs-input`/`review` keep their session open on purpose (reused when the
+//! answer or feedback continues the work), and a session still open on a closed
+//! task is stale and finalised — neither needs a probe.
 //!
 //! Liveness has two sources per agent (task #75). An agent defining a
 //! `sessions` verb is queried through [`crate::session_probe`], its listing
@@ -20,6 +21,12 @@
 //! pid-checked, and undeterminable liveness (no ref, listing failed) is left
 //! alone rather than guessed. Agents without a `sessions` verb keep the pid
 //! check.
+//!
+//! A refine round is the exception that check exists to avoid guessing about,
+//! and it is not a guess: refine spawns its agent as a direct `sh -c` child
+//! whose pid Voro holds, captures no session ref, and hands the process to no
+//! supervisor — so the pid *is* the round, and a refining session is pid-checked
+//! whatever verbs its agent defines.
 //!
 //! There is no daemon watching for process exit. Reconciliation runs on read:
 //! `App::refresh` and every CLI verb call [`reconcile_live_sessions`] before
@@ -63,7 +70,7 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
     let mut finalised = 0;
     for session in live {
         let task_state = store.task(session.task_id)?.state;
-        if task_state != TaskState::Running {
+        if !matches!(task_state, TaskState::Running | TaskState::Refining) {
             // needs-input / review keep their session open (reconcile_session
             // returns None); a session on a closed task is stale and finalised.
             if store.reconcile_session(session.id, false, false)?.is_some() {
@@ -72,12 +79,17 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
             continue;
         }
 
-        // A running task: probe liveness. `None` (no ref, listing failed, no
-        // pid) leaves the session alone rather than wrongly finalising it.
-        let sessions_cmd = config
-            .as_ref()
-            .and_then(|c| c.agent(&session.agent))
-            .and_then(|a| a.sessions());
+        // Work under way: probe liveness. `None` (no ref, listing failed, no
+        // pid) leaves the session alone rather than wrongly finalising it. A
+        // refine round is always its own pid — no supervisor holds it — so the
+        // listing path, which exists for launches whose pid lies, is skipped.
+        let sessions_cmd = match task_state {
+            TaskState::Refining => None,
+            _ => config
+                .as_ref()
+                .and_then(|c| c.agent(&session.agent))
+                .and_then(|a| a.sessions()),
+        };
         let alive: Option<bool> = match sessions_cmd {
             Some(cmd) => match session.session_ref.as_deref() {
                 // No ref: not findable in the listing, and pid-checking a
@@ -270,6 +282,78 @@ mod tests {
             assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 0);
             assert!(s.session(session.id).unwrap().ended_at.is_none());
         }
+    }
+
+    /// A refine round whose agent has gone (DESIGN.md §6): the proposal is back
+    /// in the triage queue within one pass, marked as a failed round, and the
+    /// session is closed. This is the pid probe doing for a rewrite exactly what
+    /// it does for a dispatch.
+    #[test]
+    fn a_dead_refine_agent_returns_the_proposal() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("proj", "/tmp/proj").unwrap();
+        let t = s
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "sloppy".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Proposed,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        let mut child = Command::new("true").stdout(Stdio::null()).spawn().unwrap();
+        let dead_pid = child.id() as i64;
+        child.wait().unwrap();
+        // `claude` defines a `sessions` verb, so a *dispatch* of its with no
+        // captured ref would be left alone. A refine round is a plain child
+        // whose pid Voro holds, so it is pid-checked regardless.
+        let (_, session) = s
+            .record_refine_launch(t.id, "thin body", "claude", Some(dead_pid), None)
+            .unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 1);
+        assert_eq!(s.task(t.id).unwrap().state, TaskState::Proposed);
+        assert!(s.refine_failed_flag(t.id).unwrap());
+        assert_eq!(
+            s.session(session.id).unwrap().outcome,
+            Some(SessionOutcome::Failed)
+        );
+    }
+
+    /// The live half: a round still running is left alone, so a rewrite in
+    /// progress is never yanked back into the queue mid-flight.
+    #[test]
+    fn a_live_refine_agent_is_left_alone() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("proj", "/tmp/proj").unwrap();
+        let t = s
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "sloppy".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Proposed,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        s.record_refine_launch(
+            t.id,
+            "thin body",
+            "claude",
+            Some(std::process::id() as i64),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 0);
+        assert_eq!(s.task(t.id).unwrap().state, TaskState::Refining);
     }
 
     // --- sessions-verb liveness (task #75) ---

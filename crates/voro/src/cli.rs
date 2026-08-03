@@ -9,8 +9,9 @@ use std::fmt::Write as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use voro_core::{
-    Action, AgentsConfig, DepKind, Doc, Event, NewTask, PrRef, Priority, Project, QueueRow, Repo,
-    ReviewAction, ReviewMedium, Store, Task, TaskEdit, TaskState, Triage, WipGate, scheduler,
+    Action, AgentsConfig, DepKind, Doc, Event, NewTask, PrRef, Priority, Project, QueueRow,
+    RefineOutcome, Repo, ReviewAction, ReviewMedium, Store, Task, TaskEdit, TaskState, Triage,
+    WipGate, scheduler,
 };
 
 use crate::dispatch::{self, DispatchCtx};
@@ -111,7 +112,10 @@ tasks
                                   A replacement that would leave the body empty
                                   is refused unless --allow-empty; either way
                                   the replaced text is kept on the event log
-                                  (`show` names the event to recover it from)
+                                  (`show` names the event to recover it from).
+                                  On a refining task a replacement ends the
+                                  round: the task returns to proposed, marked
+                                  ↻ refined for a fresh verdict
                                   --blocked-by replaces this task's own
                                   blocker list; --blocks adds this task as a
                                   blocker of each listed task
@@ -199,11 +203,16 @@ transitions
                                   the three verdicts move the proposal; refine
                                   is not a verdict — it dispatches an agent to
                                   rewrite the body against --note TEXT (or
-                                  --note-file PATH), leaving the task proposed
-                                  and marked ↻ refined for a re-triage of the
-                                  improved version. The note-less interactive
-                                  variant is a conversation with the agent, so
-                                  it lives in the TUI, on `R` over a proposal
+                                  --note-file PATH), moving the task proposed →
+                                  refining until the round concludes. It returns
+                                  to proposed marked ↻ refined for a re-triage
+                                  of the improved version, or ⚠ refine failed if
+                                  the agent died having written nothing. A
+                                  verdict on a refining task is refused: it is
+                                  out of the queue while the rewrite is in
+                                  flight. The note-less interactive variant is a
+                                  conversation with the agent, so it lives in
+                                  the TUI, on `R` over a proposal
   start <task-id>                 ready → running
   ask <task-id> --question TEXT   running → needs-input
   resume <task-id>                needs-input → running, once you have answered
@@ -1416,6 +1425,12 @@ fn propose_verb(store: &mut Store, args: ProposeArgs) -> Result<String, String> 
 fn set_verb(store: &mut Store, mut args: SetArgs) -> Result<String, String> {
     let id = args.task_id;
     let current = store.task(id).map_err(|e| e.to_string())?;
+    // A refine round ends when the rewritten body lands (DESIGN.md §6), which is
+    // the verb the refine prompts already end with — so a `set` that *replaces*
+    // the body concludes the round. An append, or a `set` touching anything else,
+    // leaves the round running.
+    let concludes_refine =
+        (args.body.is_some() || args.body_file.is_some()) && current.state == TaskState::Refining;
     let body = set_body(&current.body, &mut args, id)?;
     let agent = if args.no_agent {
         None
@@ -1441,6 +1456,13 @@ fn set_verb(store: &mut Store, mut args: SetArgs) -> Result<String, String> {
         deep,
     };
     let task = store.update_task(id, edit).map_err(|e| e.to_string())?;
+    let task = if concludes_refine {
+        store
+            .conclude_refine(id, RefineOutcome::Applied)
+            .map_err(|e| e.to_string())?
+    } else {
+        task
+    };
     let task = match &args.blocked_by {
         Some(raw) => store
             .set_blocks_deps(id, &parse_ids("blocked-by", raw)?)
@@ -1690,14 +1712,24 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
         )
         .unwrap();
     }
-    // The refine marker (DESIGN.md §6): a proposal whose body an agent has
-    // reworked, so the operator triages the improved version knowing it moved.
+    // The refine markers (DESIGN.md §6): whether the last round on this proposal
+    // reworked the body — so the operator triages the improved version knowing
+    // it moved — or died having applied nothing, which must not read as a
+    // proposal nobody refined.
     if store.refined_flag(id).map_err(|e| e.to_string())? {
         let note = store
             .latest_refine_note(id)
             .map_err(|e| e.to_string())?
             .unwrap_or_default();
         writeln!(out, "refined: {note}").unwrap();
+    }
+    if store.refine_failed_flag(id).map_err(|e| e.to_string())? {
+        writeln!(
+            out,
+            "refine failed: the agent ended without rewriting the body — the brief below is \
+             the one it was given"
+        )
+        .unwrap();
     }
     // The stale-branch marker (DESIGN.md §8): one on-demand `gh` probe of the
     // tracked PR's mergeability, only for a review task that has one. Purely
@@ -1855,14 +1887,28 @@ fn inbox_verb(store: &mut Store, ctx: &DispatchCtx) -> Result<String, String> {
                     .iter()
                     .filter(|row| store.refined_flag(row.candidate.task.id).unwrap_or(false))
                     .count();
+                let failed = digest
+                    .tasks
+                    .iter()
+                    .filter(|row| {
+                        store
+                            .refine_failed_flag(row.candidate.task.id)
+                            .unwrap_or(false)
+                    })
+                    .count();
                 writeln!(
                     out,
-                    "{:5.1}  ▲ {} awaiting triage ({}){}",
+                    "{:5.1}  ▲ {} awaiting triage ({}){}{}",
                     digest.effective,
                     plural(digest.tasks.len(), "proposal"),
                     digest.project_name,
                     if refined > 0 {
                         format!("  ↻ {refined} refined")
+                    } else {
+                        String::new()
+                    },
+                    if failed > 0 {
+                        format!("  ⚠ {failed} refine failed")
                     } else {
                         String::new()
                     }
@@ -1916,6 +1962,7 @@ fn stats_verb(store: &mut Store) -> Result<String, String> {
     let mut out = String::new();
     for (label, n) in [
         ("triage", c.proposed),
+        ("refining", c.refining),
         ("ready", c.ready),
         ("running", c.running),
         ("needs-input", c.needs_input),
@@ -1962,13 +2009,17 @@ fn incomplete_report_suffix(store: &Store, task_id: i64) -> &'static str {
     }
 }
 
-/// `  ↻ refined` when a proposal's body has been through a refine (DESIGN.md
-/// §6), else empty — so the triage queue shows which rows are an improved
-/// version awaiting a fresh verdict. Cleared by triage, since the flag is gated
-/// on `proposed`.
+/// How the last refine round on a proposal ended (DESIGN.md §6), as a row
+/// suffix: `  ↻ refined` for a body that was reworked — so the triage queue
+/// shows which rows are an improved version awaiting a fresh verdict — and
+/// `  ⚠ refine failed` for a round that died having applied nothing, which must
+/// not read as a proposal nobody refined. Both are cleared by triage, since
+/// they are gated on `proposed`.
 fn refined_suffix(store: &Store, task_id: i64) -> &'static str {
     if store.refined_flag(task_id).unwrap_or(false) {
         "  ↻ refined"
+    } else if store.refine_failed_flag(task_id).unwrap_or(false) {
+        "  ⚠ refine failed"
     } else {
         ""
     }
@@ -2633,8 +2684,9 @@ mod tests {
         assert_eq!(s.task(1).unwrap().state, TaskState::Parked);
     }
 
-    /// The `↻ refined` marker (DESIGN.md §6) rides the event, so it shows on
-    /// every proposal view until triage takes the task out of `proposed`.
+    /// The `↻ refined` marker (DESIGN.md §6) rides the concluded round, so it
+    /// shows on every proposal view until triage takes the task out of
+    /// `proposed` — and never while the round is still in flight.
     #[test]
     fn a_refined_proposal_is_marked_until_it_is_triaged() {
         let mut s = store();
@@ -2642,7 +2694,15 @@ mod tests {
         ok(&mut s, &["add", "demo", "An idea"]);
         assert!(!ok(&mut s, &["inbox"]).contains("refined"));
 
-        s.record_refine(1, "name the files it touches").unwrap();
+        s.record_refine_launch(1, "name the files it touches", "claude", None, None)
+            .unwrap();
+        // Mid-round the proposal is out of the queue entirely, and nothing
+        // claims a rewrite that has not landed.
+        assert!(!ok(&mut s, &["inbox"]).contains("awaiting triage"));
+        assert!(!ok(&mut s, &["list"]).contains("↻ refined"));
+        assert!(ok(&mut s, &["stats"]).contains("refining    1"));
+
+        s.conclude_refine(1, RefineOutcome::Applied).unwrap();
         // The inbox collapses proposals into their project's digest row, so
         // the marker rides that row as a count; `list` carries it per task.
         assert!(ok(&mut s, &["inbox"]).contains("↻ 1 refined"));
@@ -2662,26 +2722,100 @@ mod tests {
         assert!(!ok(&mut s, &["list"]).contains("↻ refined"));
     }
 
-    /// The agent's half of a refine: it applies the rewritten body through the
-    /// ordinary `set --body-file`, which leaves the task `proposed` for a
-    /// re-triage of the improved version.
+    /// A round that died having applied nothing must not read as a proposal
+    /// nobody refined (DESIGN.md §6) — the operator should never have to notice
+    /// an absence.
     #[test]
-    fn a_refine_agent_applies_the_body_through_set_without_moving_the_task() {
+    fn a_failed_refine_round_is_marked_distinctly() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "An idea"]);
+        s.record_refine_launch(1, "name the files", "claude", None, None)
+            .unwrap();
+        s.conclude_refine(1, RefineOutcome::Failed).unwrap();
+
+        assert!(ok(&mut s, &["inbox"]).contains("⚠ 1 refine failed"));
+        assert!(ok(&mut s, &["list"]).contains("⚠ refine failed"));
+        let out = ok(&mut s, &["show", "1"]);
+        assert!(out.contains("refine failed"), "{out}");
+        assert!(!out.contains("↻ refined"), "{out}");
+
+        // A quit that concluded nothing is a no-op, not a failure: no marker.
+        s.record_refine_launch(1, "again", "claude", None, None)
+            .unwrap();
+        s.conclude_refine(1, RefineOutcome::Cancelled).unwrap();
+        assert!(!ok(&mut s, &["list"]).contains("refine failed"));
+        assert!(!ok(&mut s, &["list"]).contains("↻ refined"));
+
+        ok(&mut s, &["triage", "1", "ready"]);
+        assert!(!ok(&mut s, &["list"]).contains("refine failed"));
+    }
+
+    /// The agent's half of a refine: it applies the rewritten body through the
+    /// ordinary `set --body-file`, which is what concludes the round — the task
+    /// returns to `proposed` marked for a re-triage of the improved version.
+    #[test]
+    fn a_refine_agent_applies_the_body_through_set_which_ends_the_round() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "An idea", "--body", "thin"]);
-        s.record_refine(1, "make it dispatchable").unwrap();
+        s.record_refine_launch(1, "make it dispatchable", "claude", None, None)
+            .unwrap();
+        let session = s.sessions_for(1).unwrap()[0].id;
 
         let path = std::env::temp_dir().join(format!("voro-refine-{}.md", std::process::id()));
         std::fs::write(&path, "# Rewritten\n\nNames real files and criteria.\n").unwrap();
-        ok(&mut s, &["set", "1", "--body-file", path.to_str().unwrap()]);
+        let out = ok(&mut s, &["set", "1", "--body-file", path.to_str().unwrap()]);
         std::fs::remove_file(&path).unwrap();
 
+        assert!(out.contains("(proposed)"), "{out}");
         let task = s.task(1).unwrap();
         assert!(task.body.contains("Names real files"), "{}", task.body);
         assert_eq!(task.state, TaskState::Proposed);
         assert_eq!(task.priority, Priority::P2);
         assert!(s.refined_flag(1).unwrap());
+        // the round's session closed with it
+        let session = s.session(session).unwrap();
+        assert_eq!(session.outcome, Some(voro_core::SessionOutcome::Completed));
+    }
+
+    /// Only a body *replacement* ends the round: a `set` touching anything else
+    /// leaves the agent to carry on, since the rewrite has not landed yet.
+    #[test]
+    fn a_set_without_a_body_leaves_the_round_running() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "An idea", "--body", "thin"]);
+        s.record_refine_launch(1, "make it dispatchable", "claude", None, None)
+            .unwrap();
+
+        ok(&mut s, &["set", "1", "--priority", "1"]);
+        assert_eq!(s.task(1).unwrap().state, TaskState::Refining);
+
+        ok(&mut s, &["set", "1", "--append-body", "a finding"]);
+        assert_eq!(s.task(1).unwrap().state, TaskState::Refining);
+    }
+
+    /// A verdict on a refining task is refused by the transition API itself
+    /// (DESIGN.md §6) — the mid-refine race closes at the store layer, with no
+    /// guard code in the verb.
+    #[test]
+    fn triage_is_refused_on_a_refining_task() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "An idea"]);
+        s.record_refine_launch(1, "thin body", "claude", None, None)
+            .unwrap();
+
+        for verdict in ["ready", "parked", "reject"] {
+            let e = err(&mut s, &["triage", "1", verdict]);
+            assert!(e.contains("refining"), "{e}");
+            assert_eq!(s.task(1).unwrap().state, TaskState::Refining);
+        }
+
+        // and a second round cannot be started on top of the first
+        let e = err(&mut s, &["triage", "1", "refine", "--note", "again"]);
+        assert!(e.contains("already being refined"), "{e}");
     }
 
     /// A body replacement is destructive, so the two guards of DESIGN.md §8
@@ -3664,7 +3798,7 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
-        let (_, session) = s.record_dispatch(1, "claude", Some(1), None).unwrap();
+        let (_, session) = s.record_dispatch(1, "claude", None, None).unwrap();
         s.reconcile_session(session.id, false, false).unwrap();
         assert_eq!(s.task(1).unwrap().state, TaskState::Stalled);
 

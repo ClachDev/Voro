@@ -3,8 +3,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::ui::Hit;
 use voro_core::{
     Action, ActionRow, AgentsConfig, DepKind, DepRef, DigestRow, Event, PrRef, Priority, Project,
-    Queue, QueueRow, ReviewAction, ReviewMedium, RunningRow, ScoreBreakdown, StateCounts, Store,
-    Task, TaskState, Triage, WipGate, scheduler,
+    Queue, QueueRow, RefineOutcome, ReviewAction, ReviewMedium, RunningRow, ScoreBreakdown,
+    StateCounts, Store, Task, TaskState, Triage, WipGate, scheduler,
 };
 
 /// Lines `PgDn`/`PgUp` move the focus card in one press. A fixed step, since
@@ -331,6 +331,8 @@ pub fn action_label(action: &Action) -> &'static str {
         Action::Triage(Triage::Parked) => "triage → parked",
         Action::Triage(Triage::Ready) => "triage → ready",
         Action::Triage(Triage::Reject) => "triage → rejected",
+        Action::Refine(_) => "refine → refining",
+        Action::ConcludeRefine(_) => "cancel the refine → proposed",
         Action::Start => "start → running",
         Action::Ask(_) => "ask a question → needs-input",
         Action::Resume => "resume (answered in-session) → running",
@@ -379,11 +381,16 @@ pub struct App {
     /// the half-finished done report a dispatched session left behind, which a
     /// PR cannot be opened from. Re-derived per refresh, never stored.
     pub incomplete_report: std::collections::HashSet<i64>,
-    /// Proposals whose body an agent has reworked (DESIGN.md §6): what renders
-    /// the `↻ refined` marker, so the operator triages the improved version
-    /// knowing it moved. Re-derived per refresh and cleared by triage itself,
-    /// since the flag is gated on `proposed`.
+    /// Proposals whose last refine round rewrote the body (DESIGN.md §6): what
+    /// renders the `↻ refined` marker, so the operator triages the improved
+    /// version knowing it moved. Re-derived per refresh and cleared by triage
+    /// itself, since the flag is gated on `proposed`.
     pub refined: std::collections::HashSet<i64>,
+    /// Proposals whose last refine round died without rewriting anything: the
+    /// `⚠ refine failed` marker, same lifecycle as `refined`. A failed round has
+    /// to look different from a proposal nobody refined — the operator should
+    /// never have to notice an absence.
+    pub refine_failed: std::collections::HashSet<i64>,
     /// Every dependency edge, both directions, keyed by task id — what the
     /// detail views render as `blocked by #N` / `blocks #N` (task #103).
     /// Loaded whole per refresh so the render path never queries the store.
@@ -463,15 +470,16 @@ pub struct App {
 fn browse_order(state: TaskState) -> u8 {
     match state {
         TaskState::Proposed => 0,
-        TaskState::NeedsInput => 1,
-        TaskState::Review => 2,
-        TaskState::Stalled => 3,
-        TaskState::Ready => 4,
-        TaskState::Running => 5,
-        TaskState::Waiting => 6,
-        TaskState::Parked => 7,
-        TaskState::Done => 8,
-        TaskState::Rejected => 9,
+        TaskState::Refining => 1,
+        TaskState::NeedsInput => 2,
+        TaskState::Review => 3,
+        TaskState::Stalled => 4,
+        TaskState::Ready => 5,
+        TaskState::Running => 6,
+        TaskState::Waiting => 7,
+        TaskState::Parked => 8,
+        TaskState::Done => 9,
+        TaskState::Rejected => 10,
     }
 }
 
@@ -495,6 +503,7 @@ impl App {
             all: Vec::new(),
             incomplete_report: std::collections::HashSet::new(),
             refined: std::collections::HashSet::new(),
+            refine_failed: std::collections::HashSet::new(),
             deps: std::collections::HashMap::new(),
             dependents: std::collections::HashMap::new(),
             docs: std::collections::HashMap::new(),
@@ -612,12 +621,19 @@ impl App {
                     .then_some(r.task.id)
             })
             .collect();
-        self.refined = all
-            .iter()
-            .filter(|r| r.task.state == TaskState::Proposed)
+        let proposals = || all.iter().filter(|r| r.task.state == TaskState::Proposed);
+        self.refined = proposals()
             .filter_map(|r| {
                 self.store
                     .refined_flag(r.task.id)
+                    .ok()?
+                    .then_some(r.task.id)
+            })
+            .collect();
+        self.refine_failed = proposals()
+            .filter_map(|r| {
+                self.store
+                    .refine_failed_flag(r.task.id)
                     .ok()?
                     .then_some(r.task.id)
             })
@@ -1225,6 +1241,10 @@ impl App {
                     self.open_doc_picker(id, None);
                 }
             }
+            // `C` is not a variant of `c` — cancelling a refine and linking a
+            // document merely share a letter, so they keep their own slots
+            // (DESIGN.md §9).
+            KeyCode::Char('C') => self.cancel_refine_selected(),
             KeyCode::Char('o') => self.open_selected_in_viewer(),
             KeyCode::Char('g') => self.open_selected_pr(),
             KeyCode::Char('a') => self.jump_into_session(),
@@ -1347,6 +1367,13 @@ impl App {
             .is_some_and(|t| t.state == TaskState::Review)
     }
 
+    /// Whether the selection is a refine in flight, so `C` can cancel it — what
+    /// gates that key's key-line hint.
+    pub fn selected_is_refining(&self) -> bool {
+        self.selected_task()
+            .is_some_and(|t| t.state == TaskState::Refining)
+    }
+
     /// Begin creating a task in one of the two flows (DESIGN.md §9): straight
     /// into it when there is exactly one project, via the project picker when
     /// there are several, and a pointer to the projects screen when there are
@@ -1401,6 +1428,12 @@ impl App {
             return;
         };
         let (task_id, state) = (task.id, task.state);
+        if state == TaskState::Refining {
+            self.status = Some(format!(
+                "task {task_id} is already being refined — C cancels the round"
+            ));
+            return;
+        }
         if state != TaskState::Proposed {
             self.status = Some(format!(
                 "task is {state} — refine works on a proposal awaiting triage"
@@ -1431,6 +1464,100 @@ impl App {
                 self.report(result);
             }
             Err(e) => self.status = Some(e),
+        }
+    }
+
+    /// Open an interactive refine round once its child has a pid (DESIGN.md
+    /// §6): `proposed → refining` plus the session row, in one write. A refusal
+    /// — the operator triaged the proposal from another window between assembly
+    /// and spawn — reports on the status line and leaves the session running,
+    /// since pulling the terminal out from under a conversation the operator is
+    /// already in would be the worse failure.
+    pub fn open_refine_round(&mut self, refine: &crate::dispatch::RefineLaunch, pid: i64) {
+        if let Err(e) =
+            self.store
+                .record_refine_launch(refine.task_id, "", &refine.agent, Some(pid), None)
+        {
+            self.status = Some(format!("refine of task {} unrecorded: {e}", refine.task_id));
+        }
+    }
+
+    /// Close an interactive refine round when its session returns. The agent's
+    /// own `voro set --body-file` concludes the round as it applies the rewrite,
+    /// so a task that has already left `refining` needs nothing here; one still
+    /// in it means the operator quit without concluding, which is a no-op rather
+    /// than a failure (DESIGN.md §6) — `cancelled`, no marker.
+    pub fn close_refine_round(&mut self, task_id: i64) {
+        let Ok(task) = self.store.task(task_id) else {
+            return;
+        };
+        if task.state != TaskState::Refining {
+            return;
+        }
+        if let Err(e) = self
+            .store
+            .conclude_refine(task_id, RefineOutcome::Cancelled)
+        {
+            self.status = Some(e.to_string());
+        }
+    }
+
+    /// Cancel a refine round in flight (DESIGN.md §6): kill the agent, close its
+    /// session `aborted`, and return the task to `proposed` unmarked. This is
+    /// the escape hatch for an agent that is *hung* — still alive, so reconcile
+    /// will never catch it — which is why it kills the process rather than only
+    /// moving the state. A selection that is not refining reports why, the same
+    /// no-op-with-explanation style as the other action keys.
+    fn cancel_refine_selected(&mut self) {
+        let Some(task) = self.selected_task() else {
+            return;
+        };
+        let (task_id, state) = (task.id, task.state);
+        if state != TaskState::Refining {
+            self.status = Some(format!(
+                "task is {state} — cancel works on a refine in flight"
+            ));
+            return;
+        }
+        let killed = self.kill_open_session(task_id);
+        let result = self
+            .store
+            .conclude_refine(task_id, RefineOutcome::Cancelled)
+            .and_then(|_| self.refresh());
+        if self.report(result).is_some() {
+            self.status = Some(format!("refine of task {task_id} cancelled{killed}"));
+        }
+    }
+
+    /// Kill the process *group* of a task's open session, best-effort,
+    /// returning what to say about it. A headless expansion is spawned into its
+    /// own group (pgid = pid), so the negated pid reaches the agent under the
+    /// launching shell rather than only the shell — which is the case this key
+    /// exists for, a detached round nobody is watching. Deliberately no
+    /// plain-pid fallback: a recorded pid outlives its process and can be
+    /// recycled, and signalling a stranger is worse than the round the operator
+    /// can end by quitting it. An interactive round's child is in voro's own
+    /// group (it must be, to own the terminal) and so names no group here; that
+    /// round ends by the operator leaving the session, which concludes it.
+    fn kill_open_session(&self, task_id: i64) -> String {
+        let Some(pid) = self
+            .store
+            .sessions_for(task_id)
+            .ok()
+            .and_then(|sessions| sessions.into_iter().find(|s| s.ended_at.is_none()))
+            .and_then(|session| session.pid)
+        else {
+            return String::new();
+        };
+        let killed = std::process::Command::new("kill")
+            .args(["-TERM", "--"])
+            .arg(format!("-{pid}"))
+            .status()
+            .is_ok_and(|status| status.success());
+        if killed {
+            format!(" — agent (pid {pid}) killed")
+        } else {
+            format!(" — agent (pid {pid}) could not be killed")
         }
     }
 
@@ -2667,10 +2794,9 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let project = store.create_project("demo", "/tmp/demo").unwrap();
         for state in states {
-            let created = if *state == TaskState::Proposed {
-                TaskState::Proposed
-            } else {
-                TaskState::Ready
+            let created = match state {
+                TaskState::Proposed | TaskState::Refining => TaskState::Proposed,
+                _ => TaskState::Ready,
             };
             let task = store
                 .create_task(NewTask {
@@ -2707,6 +2833,21 @@ mod tests {
                         .record_dispatch(task.id, "claude", Some(1), Some("/tmp/demo/s.log"))
                         .unwrap();
                     store.reconcile_session(session.id, false, false).unwrap();
+                }
+                // A refine round in flight. No pid: liveness is then unknowable,
+                // so reconcile-on-read leaves the round alone instead of
+                // finalising it out from under the test — and the cancel key's
+                // kill has no real process to aim at.
+                TaskState::Refining => {
+                    store
+                        .record_refine_launch(
+                            task.id,
+                            "thin body",
+                            "claude",
+                            None,
+                            Some("/tmp/demo/refine.log"),
+                        )
+                        .unwrap();
                 }
                 other => panic!("fixture does not build {other} tasks"),
             }
@@ -3023,6 +3164,155 @@ mod tests {
             "expected a status line explaining refine, got {:?}",
             app.status
         );
+    }
+
+    /// A refine in flight is out of the triage queue and on the running strip
+    /// instead (DESIGN.md §6/§9) — in *this* window whether or not it launched
+    /// the round, because the state is in the store rather than in a flag the
+    /// launching process holds.
+    #[test]
+    fn a_refining_proposal_leaves_the_queue_for_the_running_strip() {
+        let mut app = app_with(&[TaskState::Refining, TaskState::Ready]);
+        let refining = app.all[0].task.id;
+
+        assert!(
+            !app.queue_task_ids().contains(&refining),
+            "{:?}",
+            app.queue_task_ids()
+        );
+        assert!(
+            app.queue
+                .rows
+                .iter()
+                .all(|row| !matches!(row, QueueRow::Digest(_))),
+            "a refining proposal must not ride the triage digest either"
+        );
+        assert_eq!(app.running.len(), 1);
+        assert_eq!(app.running[0].task_state, TaskState::Refining);
+        assert_eq!(app.counts.refining, 1);
+        assert_eq!(app.counts.proposed, 0);
+
+        // and the strip row is selectable, so the detail card and `C` reach it
+        let strip = app
+            .cockpit_rows
+            .iter()
+            .position(|r| matches!(r, CockpitRow::Running(_)))
+            .expect("the refine rides the strip");
+        app.cockpit_sel = strip;
+        assert!(app.selected_is_refining());
+    }
+
+    /// The cancel key (DESIGN.md §6): the escape hatch for a hung agent
+    /// reconcile cannot catch. The round ends unmarked — a cancel is a no-op,
+    /// not a failure — and the proposal is back in the queue.
+    #[test]
+    fn the_cancel_key_ends_a_refine_round_and_returns_the_proposal() {
+        let mut app = app_with(&[TaskState::Refining]);
+        let task_id = app.running[0].task_id;
+        let session = app.store.sessions_for(task_id).unwrap()[0].id;
+        app.cockpit_sel = app
+            .cockpit_rows
+            .iter()
+            .position(|r| matches!(r, CockpitRow::Running(_)))
+            .unwrap();
+
+        key(&mut app, KeyCode::Char('C'));
+
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Proposed);
+        assert!(app.running.is_empty());
+        assert!(!app.refined.contains(&task_id));
+        assert!(!app.refine_failed.contains(&task_id));
+        let session = app.store.session(session).unwrap();
+        assert_eq!(session.outcome, Some(voro_core::SessionOutcome::Aborted));
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("cancelled")),
+            "{:?}",
+            app.status
+        );
+    }
+
+    /// On anything else `C` says so rather than swallowing the keypress, the
+    /// same no-op-with-explanation style as the other action keys.
+    #[test]
+    fn the_cancel_key_explains_itself_off_a_refine() {
+        let mut app = app_with(&[TaskState::Ready]);
+        key(&mut app, KeyCode::Char('C'));
+        assert_eq!(app.store.task(1).unwrap().state, TaskState::Ready);
+        assert!(
+            app.status.as_deref().is_some_and(|s| s.contains("refine")),
+            "{:?}",
+            app.status
+        );
+    }
+
+    /// The refine keys on a task already refining point at the cancel rather
+    /// than reading as the generic "not a proposal" refusal.
+    #[test]
+    fn the_refine_keys_name_the_cancel_on_a_round_in_flight() {
+        let mut app = app_with(&[TaskState::Refining]);
+        app.cockpit_sel = app
+            .cockpit_rows
+            .iter()
+            .position(|r| matches!(r, CockpitRow::Running(_)))
+            .unwrap();
+
+        for k in ['r', 'R'] {
+            key(&mut app, KeyCode::Char(k));
+            assert!(matches!(app.mode, Mode::Normal));
+            let status = app.status.as_deref().unwrap_or_default().to_string();
+            assert!(status.contains("already being refined"), "{k}: {status}");
+        }
+        assert_eq!(app.store.task(1).unwrap().state, TaskState::Refining);
+    }
+
+    /// The verdict keys cannot reach a refining task at all: `legal_actions`
+    /// offers only the cancel, so the mid-refine race closes at the store layer
+    /// with no guard code in the TUI (DESIGN.md §6).
+    #[test]
+    fn the_transition_menu_on_a_refining_task_offers_only_the_cancel() {
+        let mut app = app_with(&[TaskState::Refining]);
+        app.cockpit_sel = app
+            .cockpit_rows
+            .iter()
+            .position(|r| matches!(r, CockpitRow::Running(_)))
+            .unwrap();
+
+        key(&mut app, KeyCode::Char('s'));
+        match &app.mode {
+            Mode::Transition { actions, .. } => {
+                assert_eq!(actions.len(), 1, "{actions:?}");
+                assert!(
+                    matches!(actions[0], Action::ConcludeRefine(_)),
+                    "{actions:?}"
+                );
+            }
+            _ => panic!("s on a refining task should open the transition menu"),
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.store.task(1).unwrap().state, TaskState::Proposed);
+    }
+
+    /// Dispatch-oriented keys no-op with an explanation on a strip row that is a
+    /// refine rather than a dispatch (DESIGN.md §9).
+    #[test]
+    fn dispatch_keys_explain_themselves_on_a_refining_row() {
+        let mut app = app_with(&[TaskState::Refining]);
+        app.cockpit_sel = app
+            .cockpit_rows
+            .iter()
+            .position(|r| matches!(r, CockpitRow::Running(_)))
+            .unwrap();
+
+        for (k, expected) in [('d', "dispatched"), ('a', "jump-in"), ('o', "viewer")] {
+            app.status = None;
+            key(&mut app, KeyCode::Char(k));
+            let status = app.status.as_deref().unwrap_or_default().to_string();
+            assert!(status.contains("refining"), "{k}: {status}");
+            assert!(status.contains(expected), "{k}: {status}");
+        }
+        assert_eq!(app.store.task(1).unwrap().state, TaskState::Refining);
     }
 
     /// Refresh keeps a key, one modifier along: `ctrl-r` refreshes and does not

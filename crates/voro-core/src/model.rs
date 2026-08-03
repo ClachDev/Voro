@@ -7,6 +7,10 @@ use crate::error::{Error, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskState {
     Proposed,
+    /// An agent is rewriting this proposal's body right now (DESIGN.md §6). It
+    /// is out of the triage queue until the round concludes and the task
+    /// returns to `proposed`.
+    Refining,
     Parked,
     Ready,
     Running,
@@ -19,8 +23,9 @@ pub enum TaskState {
 }
 
 impl TaskState {
-    pub const ALL: [TaskState; 10] = [
+    pub const ALL: [TaskState; 11] = [
         TaskState::Proposed,
+        TaskState::Refining,
         TaskState::Parked,
         TaskState::Ready,
         TaskState::Running,
@@ -35,6 +40,7 @@ impl TaskState {
     pub fn as_str(self) -> &'static str {
         match self {
             TaskState::Proposed => "proposed",
+            TaskState::Refining => "refining",
             TaskState::Parked => "parked",
             TaskState::Ready => "ready",
             TaskState::Running => "running",
@@ -244,6 +250,61 @@ impl FromSql for SessionOutcome {
 impl ToSql for SessionOutcome {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(self.as_str().into())
+    }
+}
+
+/// How a refine round ended (DESIGN.md §6). It rides the `refining → proposed`
+/// transition, is logged as the detail of a `refine` event, and picks the
+/// outcome the round's session closes with — so the markers on the returned
+/// proposal are derived from the round that just concluded rather than from
+/// the whole history of the task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefineOutcome {
+    /// The agent rewrote the body and applied it with `set --body-file`.
+    Applied,
+    /// The agent died without applying anything (reconcile, DESIGN.md §8).
+    Failed,
+    /// The operator quit the session or cancelled the round; nothing landed,
+    /// which is a no-op rather than a failure.
+    Cancelled,
+}
+
+impl RefineOutcome {
+    pub const ALL: [RefineOutcome; 3] = [
+        RefineOutcome::Applied,
+        RefineOutcome::Failed,
+        RefineOutcome::Cancelled,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefineOutcome::Applied => "applied",
+            RefineOutcome::Failed => "failed",
+            RefineOutcome::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<RefineOutcome> {
+        Self::ALL
+            .into_iter()
+            .find(|outcome| outcome.as_str() == s)
+            .ok_or_else(|| Error::Invalid(format!("unknown refine outcome '{s}'")))
+    }
+
+    /// The outcome the round's session closes with, since a session's life
+    /// follows its task (DESIGN.md §8).
+    pub fn session_outcome(self) -> SessionOutcome {
+        match self {
+            RefineOutcome::Applied => SessionOutcome::Completed,
+            RefineOutcome::Failed => SessionOutcome::Failed,
+            RefineOutcome::Cancelled => SessionOutcome::Aborted,
+        }
+    }
+}
+
+impl fmt::Display for RefineOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -497,10 +558,10 @@ impl fmt::Display for NextAction {
 impl Task {
     /// The single next-action derivation (DESIGN.md §3): what the human does
     /// next, from state × fields. `None` for states that ask nothing of the
-    /// human — `running` belongs to the running strip, `parked`/`done`/`rejected`
-    /// wait on nothing. `stalled` always means a dead agent dispatch, since
-    /// dispatch refuses human tasks. `waiting` is handed off to an external
-    /// party (DESIGN.md §6) and asks nothing of the operator.
+    /// human — `running` and `refining` belong to the running strip,
+    /// `parked`/`done`/`rejected` wait on nothing. `stalled` always means a dead
+    /// agent dispatch, since dispatch refuses human tasks. `waiting` is handed
+    /// off to an external party (DESIGN.md §6) and asks nothing of the operator.
     pub fn next_action(&self) -> Option<NextAction> {
         match self.state {
             TaskState::Proposed => Some(NextAction::Triage),
@@ -511,6 +572,7 @@ impl Task {
             TaskState::Ready if self.human => Some(NextAction::Do),
             TaskState::Ready => Some(NextAction::Dispatch),
             TaskState::Running
+            | TaskState::Refining
             | TaskState::Waiting
             | TaskState::Parked
             | TaskState::Done
@@ -572,9 +634,9 @@ pub struct Session {
     pub outcome: Option<SessionOutcome>,
 }
 
-/// A row of the cockpit's running strip (DESIGN.md §9): one per `running` task,
-/// joined with its open session if it has one. A task with no open session
-/// (started by hand) still shows, with `session_id`/`agent` set to `None`.
+/// A row of the cockpit's running strip (DESIGN.md §9): one per `running` or
+/// `refining` task, joined with its open session if it has one. A task with no
+/// open session (started by hand) still shows, with `session_id`/`agent` `None`.
 /// `elapsed_secs` is computed in SQL against the database's clock, so the TUI
 /// only has to format it.
 #[derive(Debug, Clone, PartialEq, Eq)]

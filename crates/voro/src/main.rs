@@ -101,14 +101,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // attach/resume are full-screen interactive sessions that own the
             // terminal until the user detaches, same treatment as $EDITOR.
             restore_terminal();
-            foreground_session(&mut app, "attach", &request.command, &request.cwd);
+            foreground_session(&mut app, "attach", &request.command, &request.cwd, None);
             terminal = init_terminal();
         }
         if let Some(launch) = app.pending_plan.take() {
             // a planning session is interactive in the same way; the refresh
             // on return is what makes the task it proposed appear in the queue.
             restore_terminal();
-            foreground_session(&mut app, launch.label, &launch.command, &launch.cwd);
+            foreground_session(
+                &mut app,
+                launch.label,
+                &launch.command,
+                &launch.cwd,
+                launch.refine,
+            );
             terminal = init_terminal();
         }
         if app.should_quit {
@@ -159,12 +165,39 @@ fn install_mouse_panic_hook() {
 /// the launch log's breadcrumbs. On a non-zero exit the outcome is held on
 /// screen until a keypress, and every round-trip is appended to the launch log
 /// so even a swallowed failure is recoverable.
-fn foreground_session(app: &mut App, label: &str, command: &str, cwd: &str) {
-    let status = std::process::Command::new("sh")
+///
+/// `refine` marks the round-trip as an interactive refine round (DESIGN.md §6),
+/// which is why this spawns rather than simply running to completion: the
+/// child's pid is what the round's session row records, and what another
+/// window's reconcile probes if this voro dies mid-session. On return the round
+/// is closed as cancelled if it is still open — the agent's own `set
+/// --body-file` concludes it as applied the moment the rewrite lands, so a task
+/// that has already left `refining` needs nothing here.
+fn foreground_session(
+    app: &mut App,
+    label: &str,
+    command: &str,
+    cwd: &str,
+    refine: Option<dispatch::RefineLaunch>,
+) {
+    let status = match std::process::Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
-        .status();
+        .spawn()
+    {
+        Ok(mut child) => {
+            if let Some(refine) = &refine {
+                app.open_refine_round(refine, i64::from(child.id()));
+            }
+            let status = child.wait();
+            if let Some(refine) = &refine {
+                app.close_refine_round(refine.task_id);
+            }
+            status
+        }
+        Err(e) => Err(e),
+    };
 
     let succeeded = matches!(&status, Ok(s) if s.success());
     let message = match &status {

@@ -5,8 +5,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    Dep, DepKind, DepRef, Doc, Event, Priority, Project, Repo, ReviewAction, RunningRow, Session,
-    SessionOutcome, Task, TaskState, location_is_url,
+    Dep, DepKind, DepRef, Doc, Event, Priority, Project, RefineOutcome, Repo, ReviewAction,
+    RunningRow, Session, SessionOutcome, Task, TaskState, location_is_url,
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -25,6 +25,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0013_add_deep.sql"),
     include_str!("../migrations/0014_docs.sql"),
     include_str!("../migrations/0015_dep_kind_in_key.sql"),
+    include_str!("../migrations/0016_add_refining_state.sql"),
 ];
 
 /// Owns the SQLite database. All writes go through this type; task state in
@@ -991,31 +992,47 @@ impl Store {
         self.task(id)
     }
 
-    /// Record that a `proposed` task's body has been sent for agent refinement
-    /// (DESIGN.md §6): a `refined` event carrying the operator's note, and
-    /// nothing else — refine is an event on a proposed task, not a state, so
-    /// this touches neither `tasks.state` nor priority nor deps. The event is
-    /// what marks the row `↻ refined` in the triage queue until the task is
-    /// triaged out of `proposed`.
-    pub fn record_refine(&mut self, id: i64, note: &str) -> Result<Task> {
-        if note.trim().is_empty() {
-            return Err(Error::Invalid("a refine note is required".into()));
-        }
-        let task = self.task(id)?;
-        if task.state != TaskState::Proposed {
-            return Err(Error::Invalid(format!(
-                "only a proposed task can be refined; task {} is {}",
-                id, task.state
-            )));
-        }
-        log_event(&self.conn, id, "refined", Some(note.trim()))?;
-        self.task(id)
+    /// How the newest concluded refine round on a task ended (DESIGN.md §6),
+    /// read off the `refine` event the `refining → proposed` transition logs.
+    /// `None` for a task no round has ever concluded on. This is what the two
+    /// row markers are derived from, so a proposal says which of "reworked" and
+    /// "the rewrite died" it is rather than leaving the operator to notice an
+    /// absence.
+    pub fn latest_refine_outcome(&self, task_id: i64) -> Result<Option<RefineOutcome>> {
+        let detail: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT detail FROM events WHERE task_id = ?1 AND kind = 'refine'
+                 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        detail.map(|d| RefineOutcome::parse(&d)).transpose()
     }
 
-    /// Whether `task_id` is a `proposed` task whose body has been through a
-    /// refine (DESIGN.md §6) — what renders the `↻ refined` marker. Gated on
-    /// `proposed`, so triaging the task clears it; derived fresh, never stored.
+    /// Whether `task_id` is a `proposed` task whose last refine round rewrote
+    /// its body (DESIGN.md §6) — what renders the `↻ refined` marker. Gated on
+    /// `proposed`, so triaging the task clears it, and on the *concluded* round,
+    /// so a proposal is only marked once the improved body exists. Derived
+    /// fresh, never stored.
     pub fn refined_flag(&self, task_id: i64) -> Result<bool> {
+        self.refine_marker(task_id, RefineOutcome::Applied)
+    }
+
+    /// The other half of [`refined_flag`]: a `proposed` task whose last refine
+    /// round died without applying anything, which renders the `⚠ refine
+    /// failed` marker. Same lifecycle — shown while `proposed`, cleared by
+    /// triage — because a failed refine must be visibly different from a
+    /// proposal nobody has refined.
+    ///
+    /// [`refined_flag`]: Store::refined_flag
+    pub fn refine_failed_flag(&self, task_id: i64) -> Result<bool> {
+        self.refine_marker(task_id, RefineOutcome::Failed)
+    }
+
+    fn refine_marker(&self, task_id: i64, wanted: RefineOutcome) -> Result<bool> {
         let state: Option<TaskState> = self
             .conn
             .query_row("SELECT state FROM tasks WHERE id = ?1", [task_id], |r| {
@@ -1025,16 +1042,12 @@ impl Store {
         if state != Some(TaskState::Proposed) {
             return Ok(false);
         }
-        let refines: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE task_id = ?1 AND kind = 'refined'",
-            [task_id],
-            |r| r.get(0),
-        )?;
-        Ok(refines > 0)
+        Ok(self.latest_refine_outcome(task_id)? == Some(wanted))
     }
 
-    /// The newest refine note recorded on a task, for the seed context a refine
-    /// agent is launched with and for the detail views.
+    /// The newest refine note recorded on a task — the note that rode the
+    /// `proposed → refining` transition — for the seed context a refine agent is
+    /// launched with and for the detail views.
     pub fn latest_refine_note(&self, task_id: i64) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -1275,10 +1288,12 @@ impl Store {
         Ok(has_branch != has_summary)
     }
 
-    /// Rows for the cockpit's running strip (DESIGN.md §9): every `running`
-    /// task, joined with its open session if it has one. The strip filters on
-    /// task *state*, so `review`/`needs-input` tasks (session still open) do not
-    /// appear. A hand-started task with no session shows with `session_id`/
+    /// Rows for the cockpit's running strip (DESIGN.md §9): every `running` or
+    /// `refining` task, joined with its open session if it has one. The strip
+    /// filters on task *state*, so `review`/`needs-input` tasks (session still
+    /// open) do not appear, while a refine in flight does — an open session no
+    /// longer implies executing the task (§8), and what the strip shows is work
+    /// under way. A hand-started task with no session shows with `session_id`/
     /// `agent` `NULL`. The one-open-session invariant (§8) bounds the join to one
     /// row per task; elapsed is computed in SQL so the TUI only formats it.
     /// Archived projects leave the cockpit entirely (§5), the strip included.
@@ -1291,7 +1306,7 @@ impl Store {
              FROM tasks t
              JOIN projects p ON p.id = t.project_id
              LEFT JOIN sessions s ON s.task_id = t.id AND s.ended_at IS NULL
-             WHERE t.state = 'running' AND p.archived = 0
+             WHERE t.state IN ('running','refining') AND p.archived = 0
              ORDER BY (s.id IS NULL), s.id DESC, t.id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -2325,6 +2340,12 @@ mod tests {
         };
         match state {
             Proposed | Parked | Ready => create(s, state),
+            Refining => {
+                let id = create(s, Proposed);
+                s.record_refine_launch(id, "thin body", "claude", Some(1), None)
+                    .unwrap();
+                id
+            }
             Running => {
                 let id = create(s, Ready);
                 s.apply(id, Action::Start).unwrap();
@@ -2826,6 +2847,63 @@ mod tests {
         assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
+    /// A database from before migration 0016 must open with every existing task
+    /// intact, and the widened CHECK must admit `refining` while still rejecting
+    /// junk (DESIGN.md §6).
+    #[test]
+    fn migration_0016_admits_refining_and_preserves_existing_tasks() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..15] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 15).unwrap();
+        conn.execute("INSERT INTO projects (name) VALUES ('voro')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO repos (project_id, name, path, is_default)
+             VALUES (1, 'voro', '/tmp/voro', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (project_id, repo_id, title, state, agent, pr_url, branch,
+                                human, deep, state_since, created_at)
+             VALUES (1, 1, 'in review', 'review', 'claude', 'https://x/pull/1', 'feat/x', 1, 1,
+                     datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let store = Store::from_connection(conn).unwrap();
+        // the pre-existing row survives the rebuild with every column intact
+        let task = store.task(1).unwrap();
+        assert_eq!(task.state, TaskState::Review);
+        assert_eq!(task.pr_url.as_deref(), Some("https://x/pull/1"));
+        assert_eq!(task.branch.as_deref(), Some("feat/x"));
+        assert_eq!(task.repo_id, Some(1));
+        assert!(task.human);
+        assert!(task.deep);
+
+        assert!(
+            store
+                .conn
+                .execute("UPDATE tasks SET state = 'refining' WHERE id = 1", [])
+                .is_ok()
+        );
+        assert!(
+            store
+                .conn
+                .execute("UPDATE tasks SET state = 'bogus' WHERE id = 1", [])
+                .is_err()
+        );
+
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
     /// A project + running task to hang sessions off of.
     fn task_fixture(s: &mut Store) -> i64 {
         s.conn
@@ -3027,68 +3105,129 @@ mod tests {
         .unwrap()
     }
 
+    /// A refine round launch (DESIGN.md §6): the note rides the transition, the
+    /// task leaves the triage queue for `refining`, and everything else about
+    /// it — priority, deps, the body being rewritten — is untouched.
     #[test]
-    fn record_refine_logs_the_note_and_changes_nothing_else() {
-        use crate::transition::Action;
-
+    fn record_refine_launch_moves_the_task_and_logs_the_note() {
         let mut s = Store::open_in_memory().unwrap();
         let blocker = proposal(&mut s, "blocker");
         let t = proposal(&mut s, "refine me");
         s.add_dep(t.id, blocker.id, DepKind::Blocks).unwrap();
         let before = s.task(t.id).unwrap();
 
-        let after = s
-            .record_refine(t.id, "  name the files it touches  ")
+        let (after, session) = s
+            .record_refine_launch(
+                t.id,
+                "  name the files it touches  ",
+                "claude",
+                Some(4321),
+                Some("/var/log/refine.log"),
+            )
             .unwrap();
 
-        // An event on a proposed task, not a state (DESIGN.md §6): state,
-        // priority, deps, and the body itself are all untouched.
-        assert_eq!(after.state, TaskState::Proposed);
+        assert_eq!(after.state, TaskState::Refining);
         assert_eq!(after.priority, before.priority);
         assert_eq!(after.body, before.body);
         assert_eq!(s.deps_of(t.id).unwrap().len(), 1);
-        assert!(s.refined_flag(t.id).unwrap());
+        assert_eq!(session.pid, Some(4321));
+        assert_eq!(session.log_path.as_deref(), Some("/var/log/refine.log"));
+        assert!(session.ended_at.is_none());
         assert_eq!(
             s.latest_refine_note(t.id).unwrap().as_deref(),
             Some("name the files it touches")
         );
-        let refines: Vec<_> = s
-            .events_for(t.id)
-            .unwrap()
-            .into_iter()
-            .filter(|e| e.kind == "refined")
-            .collect();
-        assert_eq!(refines.len(), 1);
-
-        // A second pass supersedes the note the flag reads, keeping both events.
-        s.record_refine(t.id, "and the acceptance criteria")
-            .unwrap();
-        assert_eq!(
-            s.latest_refine_note(t.id).unwrap().as_deref(),
-            Some("and the acceptance criteria")
-        );
-
-        // Triage is what clears the marker — the flag is gated on `proposed`.
-        s.apply(t.id, Action::Triage(crate::transition::Triage::Parked))
-            .unwrap();
+        // Neither marker shows while the round is in flight — there is nothing
+        // to say about a rewrite that has not happened yet.
         assert!(!s.refined_flag(t.id).unwrap());
+        assert!(!s.refine_failed_flag(t.id).unwrap());
     }
 
+    /// The interactive flavour carries no note, so nothing is logged for one —
+    /// the brief is the conversation itself.
     #[test]
-    fn record_refine_is_refused_outside_proposed_and_without_a_note() {
-        use crate::transition::Action;
+    fn a_note_less_refine_launch_logs_no_note() {
+        let mut s = Store::open_in_memory().unwrap();
+        let t = proposal(&mut s, "refine me");
+        s.record_refine_launch(t.id, "", "claude", Some(1), None)
+            .unwrap();
+        assert_eq!(s.latest_refine_note(t.id).unwrap(), None);
+        assert_eq!(s.task(t.id).unwrap().state, TaskState::Refining);
+    }
+
+    /// Each conclusion picks the marker the returned proposal carries, and the
+    /// newest round wins — a failed round after a successful one says so.
+    #[test]
+    fn the_markers_read_the_round_that_just_concluded() {
+        use crate::transition::{Action, Triage};
 
         let mut s = Store::open_in_memory().unwrap();
         let t = proposal(&mut s, "refine me");
 
-        let err = s.record_refine(t.id, "   ").unwrap_err().to_string();
-        assert!(err.contains("note"), "{err}");
-        assert!(!s.refined_flag(t.id).unwrap());
+        for (outcome, refined, failed) in [
+            (RefineOutcome::Applied, true, false),
+            (RefineOutcome::Failed, false, true),
+            (RefineOutcome::Cancelled, false, false),
+            (RefineOutcome::Applied, true, false),
+        ] {
+            s.record_refine_launch(t.id, "note", "claude", Some(1), None)
+                .unwrap();
+            let after = s.conclude_refine(t.id, outcome).unwrap();
+            assert_eq!(after.state, TaskState::Proposed, "{outcome}");
+            assert_eq!(s.refined_flag(t.id).unwrap(), refined, "{outcome}");
+            assert_eq!(s.refine_failed_flag(t.id).unwrap(), failed, "{outcome}");
+            assert_eq!(s.latest_refine_outcome(t.id).unwrap(), Some(outcome));
+        }
 
-        s.apply(t.id, Action::Triage(crate::transition::Triage::Ready))
-            .unwrap();
-        let err = s.record_refine(t.id, "too late").unwrap_err().to_string();
-        assert!(err.contains("proposed"), "{err}");
+        // Triage is what clears the markers — both are gated on `proposed`.
+        s.apply(t.id, Action::Triage(Triage::Parked)).unwrap();
+        assert!(!s.refined_flag(t.id).unwrap());
+        assert!(!s.refine_failed_flag(t.id).unwrap());
+    }
+
+    /// A concluded round closes its session with the matching outcome, whichever
+    /// trigger fired (DESIGN.md §6/§8).
+    #[test]
+    fn concluding_a_round_closes_its_session_with_the_matching_outcome() {
+        for (outcome, session_outcome) in [
+            (RefineOutcome::Applied, SessionOutcome::Completed),
+            (RefineOutcome::Failed, SessionOutcome::Failed),
+            (RefineOutcome::Cancelled, SessionOutcome::Aborted),
+        ] {
+            let mut s = Store::open_in_memory().unwrap();
+            let t = proposal(&mut s, "refine me");
+            let (_, session) = s
+                .record_refine_launch(t.id, "note", "claude", Some(1), None)
+                .unwrap();
+
+            s.conclude_refine(t.id, outcome).unwrap();
+            let closed = s.session(session.id).unwrap();
+            assert!(closed.ended_at.is_some(), "{outcome}");
+            assert_eq!(closed.outcome, Some(session_outcome), "{outcome}");
+        }
+    }
+
+    /// The round's guard rails: a task that is not `proposed` cannot start one,
+    /// and one that is not `refining` cannot conclude one.
+    #[test]
+    fn refine_transitions_are_refused_from_the_wrong_state() {
+        use crate::transition::{Action, Triage};
+
+        let mut s = Store::open_in_memory().unwrap();
+        let t = proposal(&mut s, "refine me");
+        assert!(matches!(
+            s.conclude_refine(t.id, RefineOutcome::Applied),
+            Err(Error::InvalidTransition { .. })
+        ));
+
+        s.apply(t.id, Action::Triage(Triage::Ready)).unwrap();
+        assert!(matches!(
+            s.record_refine_launch(t.id, "too late", "claude", None, None),
+            Err(Error::InvalidTransition { .. })
+        ));
+        // The refused launch wrote nothing — no session, no state change.
+        assert_eq!(s.task(t.id).unwrap().state, TaskState::Ready);
+        assert!(s.sessions_for(t.id).unwrap().is_empty());
     }
 
     #[test]
@@ -3345,6 +3484,28 @@ mod tests {
         assert_eq!(rows[0].task_id, live_task);
         assert_eq!(rows[1].session_id, None);
         assert_eq!(rows[1].task_id, orphan_task);
+    }
+
+    /// A refine round is work under way, so it rides the strip beside dispatched
+    /// tasks — with the round's session and the elapsed time since it opened —
+    /// and leaves it the moment the round concludes (DESIGN.md §6/§9).
+    #[test]
+    fn running_rows_include_a_refining_task() {
+        let mut s = Store::open_in_memory().unwrap();
+        let t = proposal(&mut s, "refine me");
+        let (_, session) = s
+            .record_refine_launch(t.id, "thin body", "claude", Some(1), None)
+            .unwrap();
+
+        let rows = s.running_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_id, t.id);
+        assert_eq!(rows[0].task_state, TaskState::Refining);
+        assert_eq!(rows[0].session_id, Some(session.id));
+        assert_eq!(rows[0].agent.as_deref(), Some("claude"));
+
+        s.conclude_refine(t.id, RefineOutcome::Applied).unwrap();
+        assert!(s.running_rows().unwrap().is_empty());
     }
 
     /// The strip filters on task state: a task that has left `running` —
