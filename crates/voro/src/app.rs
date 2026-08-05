@@ -82,14 +82,17 @@ pub struct TaskRow {
     pub blockers: Vec<DepRef>,
 }
 
-/// What a text prompt is collecting, and the transition it feeds — or, for
-/// `RefineNote`, the agent launch it feeds instead.
+/// What a text prompt is collecting, and the transition it feeds — or, for the
+/// two launch kinds, the agent launch it feeds instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     Ask,
     RejectWork,
     /// The one-line brief a note-driven refine hands its agent (DESIGN.md §6).
     RefineNote,
+    /// The one line the quick-message key says into a task's existing agent
+    /// session (DESIGN.md §8).
+    SessionMessage,
 }
 
 impl PromptKind {
@@ -98,17 +101,20 @@ impl PromptKind {
             PromptKind::Ask => "Question",
             PromptKind::RejectWork => "Rejection feedback",
             PromptKind::RefineNote => "Refine note — what needs fixing",
+            PromptKind::SessionMessage => "Message to the agent's session",
         }
     }
 
-    /// The transition this prompt feeds, where it feeds one. A refine note
-    /// feeds no transition: the task stays `proposed` and an agent rewrites
-    /// its body (DESIGN.md §6).
+    /// The transition this prompt feeds, where it feeds one. The two launch
+    /// kinds feed none from *here*: a refine note's round opens with its own
+    /// write (DESIGN.md §6), and a session message applies its own transition
+    /// — a reject-with-feedback, on a review or waiting task — before it
+    /// sends, so the send never outruns the state.
     fn action(self, text: String) -> Option<Action> {
         match self {
             PromptKind::Ask => Some(Action::Ask(text)),
             PromptKind::RejectWork => Some(Action::RejectWork(text)),
-            PromptKind::RefineNote => None,
+            PromptKind::RefineNote | PromptKind::SessionMessage => None,
         }
     }
 }
@@ -281,6 +287,15 @@ pub struct AttachRequest {
     pub cwd: String,
 }
 
+/// What the quick-message key needs resolved before it can send: the session
+/// the line lands in, the template that puts it there, and the listing the
+/// liveness probe reads to be sure the session is between turns.
+struct MessageTarget {
+    session_ref: String,
+    template: String,
+    sessions_cmd: Option<String>,
+}
+
 /// The two ways into an agent's own session (DESIGN.md §8): join one still
 /// running, or reopen one that has finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +313,20 @@ fn state_jump_verb(state: TaskState) -> Option<JumpVerb> {
         TaskState::Review | TaskState::Stalled => Some(JumpVerb::Resume),
         _ => None,
     }
+}
+
+/// Which states accept a quick message into the task's session (DESIGN.md §8) —
+/// the states whose session is open and between turns, so a headless resume
+/// lands as the next thing the agent reads. `running` and `refining` are refused
+/// because the session is mid-turn with no injection channel, and `stalled`
+/// because its session is dead: a headless resume there would restart the work
+/// with no tracked pid and no session row, invisible to the reconciler.
+/// Redispatch is the honest path for that, and `A` the one for the rest.
+fn state_accepts_message(state: TaskState) -> bool {
+    matches!(
+        state,
+        TaskState::NeedsInput | TaskState::Review | TaskState::Waiting
+    )
 }
 
 /// The template to jump in with: liveness decides the verb wherever the agent
@@ -1247,7 +1276,10 @@ impl App {
             KeyCode::Char('C') => self.cancel_refine_selected(),
             KeyCode::Char('o') => self.open_selected_in_viewer(),
             KeyCode::Char('g') => self.open_selected_pr(),
-            KeyCode::Char('a') => self.jump_into_session(),
+            // `a`/`A` are the quick and interactive halves of one action, the
+            // same pairing as `r`/`R` (DESIGN.md §9).
+            KeyCode::Char('a') => self.message_session(),
+            KeyCode::Char('A') => self.jump_into_session(),
             KeyCode::Char('l') => self.view_session_log(),
             KeyCode::Char('w') => self.hand_off_selected(),
             _ => {}
@@ -1365,6 +1397,24 @@ impl App {
     pub fn selected_can_hand_off(&self) -> bool {
         self.selected_task()
             .is_some_and(|t| t.state == TaskState::Review)
+    }
+
+    /// Whether the selection is somewhere dispatch can act from (DESIGN.md §8)
+    /// — what gates the `d/D` hint, so the line stops advertising a dispatch
+    /// that would only answer with the state it refuses.
+    pub fn selected_can_dispatch(&self) -> bool {
+        self.selected_task()
+            .is_some_and(|t| matches!(t.state, TaskState::Ready | TaskState::Stalled))
+    }
+
+    /// Whether the selection has a session that could take a quick message —
+    /// what gates the `a/A` hint. The state gate plus a session on record; the
+    /// captured ref and the agent's `message` verb are left to the key itself,
+    /// since a jump-in (`A`) is worth advertising either way.
+    pub fn selected_can_message(&self) -> bool {
+        self.selected_task().is_some_and(|t| {
+            state_accepts_message(t.state) && self.last_sessions.contains_key(&t.id)
+        })
     }
 
     /// Whether the selection is a refine in flight, so `C` can cancel it — what
@@ -1666,6 +1716,154 @@ impl App {
             ),
             cwd,
         });
+    }
+
+    /// Quick-message the selected task's agent session (DESIGN.md §8): `a`
+    /// collects one line and fires it into the session headlessly, so steering
+    /// an agent costs a sentence rather than the attach round-trip `A` still
+    /// performs. The state gate and the session's own pieces are checked here,
+    /// before the input opens, so a refusal costs no typing.
+    fn message_session(&mut self) {
+        let (task_id, state) = match self.selected_task() {
+            Some(task) => (task.id, task.state),
+            None => return,
+        };
+        if !state_accepts_message(state) {
+            self.status = Some(format!(
+                "task is {state} — a message lands on a needs-input, review, or \
+                 waiting task; A jumps into the session instead"
+            ));
+            return;
+        }
+        if self.message_target(task_id).is_none() {
+            return;
+        }
+        self.mode = Mode::Prompt {
+            task_id,
+            kind: PromptKind::SessionMessage,
+            buffer: String::new(),
+        };
+    }
+
+    /// Resolve what a quick message needs, reporting whichever piece is missing
+    /// on the status line exactly as `jump_into_session` does. Config is loaded
+    /// fresh, so an agent that gained a `message` verb since the TUI started
+    /// gains the key too.
+    fn message_target(&mut self, task_id: i64) -> Option<MessageTarget> {
+        let sessions = match self.store.sessions_for(task_id) {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return None;
+            }
+        };
+        let Some(session) = sessions.first() else {
+            self.status = Some(format!("task {task_id} has no recorded session to message"));
+            return None;
+        };
+        let Some(session_ref) = session.session_ref.clone() else {
+            self.status = Some(format!(
+                "no session reference was captured for session {} — nothing to message",
+                session.id
+            ));
+            return None;
+        };
+        let config = match AgentsConfig::load(&self.dispatch_ctx.agents_path) {
+            Ok(config) => config,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return None;
+            }
+        };
+        let agent = config.agent(&session.agent);
+        let Some(template) = agent.and_then(|a| a.message()) else {
+            self.status = Some(format!(
+                "agent '{}' defines no message template in {} — A jumps into the session instead",
+                session.agent,
+                self.dispatch_ctx.agents_path.display()
+            ));
+            return None;
+        };
+        Some(MessageTarget {
+            session_ref,
+            template: template.to_string(),
+            sessions_cmd: agent.and_then(|a| a.sessions()).map(str::to_string),
+        })
+    }
+
+    /// Send the collected line into the task's session (DESIGN.md §8). A
+    /// review or waiting task's message *is* its rejection: the transition runs
+    /// first, so the feedback is in the body and the event log before anything
+    /// is said, and a refused transition sends nothing. A `needs-input` task
+    /// transitions not at all — the answer lives in the transcript and the
+    /// agent's own `voro resume` moves it back to `running` (DESIGN.md §6).
+    fn send_session_message(&mut self, task_id: i64, message: &str) {
+        if message.trim().is_empty() {
+            self.status = Some("a message is required".into());
+            return;
+        }
+        let state = match self.store.task(task_id) {
+            Ok(task) => task.state,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        if !state_accepts_message(state) {
+            self.status = Some(format!("task is now {state} — nothing was sent"));
+            return;
+        }
+        let Some(target) = self.message_target(task_id) else {
+            return;
+        };
+        // A live session is mid-turn, so a headless resume would either be
+        // refused or land out of order; the operator wants the real terminal.
+        if crate::session_probe::session_is_live(
+            target.sessions_cmd.as_deref(),
+            Some(&target.session_ref),
+        ) == Some(true)
+        {
+            self.status = Some(format!(
+                "task {task_id}'s session is still running — A attaches to it"
+            ));
+            return;
+        }
+        let cwd = match self.task_checkout(task_id) {
+            Ok(path) => path,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
+        let rejected = matches!(state, TaskState::Review | TaskState::Waiting);
+        if rejected
+            && let Err(e) = self
+                .store
+                .apply(task_id, Action::RejectWork(message.to_string()))
+        {
+            self.status = Some(format!("{e} — nothing was sent"));
+            return;
+        }
+        let sent = crate::dispatch::send_message(
+            &self.dispatch_ctx,
+            crate::dispatch::SessionMessage {
+                task_id,
+                template: &target.template,
+                session_ref: &target.session_ref,
+                message,
+                cwd,
+            },
+        );
+        self.status = Some(match (sent, rejected) {
+            (Ok(summary), true) => format!("{summary} — task returned to running"),
+            (Ok(summary), false) => summary,
+            (Err(e), true) => format!(
+                "{e} — the feedback is recorded and the task is running, but nothing was sent"
+            ),
+            (Err(e), false) => e,
+        });
+        let refreshed = self.refresh();
+        self.report(refreshed);
     }
 
     /// The score decomposition (DESIGN.md §7) for a task, for the detail
@@ -2644,7 +2842,11 @@ impl App {
             KeyCode::Enter => {
                 match kind.action(buffer.clone()) {
                     Some(action) => self.apply_and_refresh(task_id, action),
-                    None => self.refine_with_note(task_id, &buffer),
+                    None => match kind {
+                        PromptKind::SessionMessage => self.send_session_message(task_id, &buffer),
+                        // RefineNote, the only other launch-feeding kind.
+                        _ => self.refine_with_note(task_id, &buffer),
+                    },
                 }
                 return;
             }
@@ -3326,7 +3528,12 @@ mod tests {
             .position(|r| matches!(r, CockpitRow::Running(_)))
             .unwrap();
 
-        for (k, expected) in [('d', "dispatched"), ('a', "jump-in"), ('o', "viewer")] {
+        for (k, expected) in [
+            ('d', "dispatched"),
+            ('a', "a message lands on"),
+            ('A', "jump-in"),
+            ('o', "viewer"),
+        ] {
             app.status = None;
             key(&mut app, KeyCode::Char(k));
             let status = app.status.as_deref().unwrap_or_default().to_string();
@@ -4082,6 +4289,7 @@ mod tests {
             ("sessions", format!("cat '{}'", listing.display())),
             ("attach", "agent attach {session}".into()),
             ("resume", "agent resume {session}".into()),
+            ("message", "agent message {session} {prompt_file}".into()),
         ]
         .into_iter()
         .filter(|(verb, _)| verbs.contains(verb))
@@ -4123,12 +4331,12 @@ mod tests {
         }
     }
 
-    /// All three session verbs, the ordinary configuration.
+    /// Every session verb, the ordinary configuration.
     fn all_verbs() -> &'static [&'static str] {
-        &["sessions", "attach", "resume"]
+        &["sessions", "attach", "resume", "message"]
     }
 
-    /// `a` on a running task whose session is still listed queues the agent's
+    /// `A` on a running task whose session is still listed queues the agent's
     /// `attach` command — ref substituted, project path as cwd — for main() to
     /// run with the TUI suspended.
     #[test]
@@ -4137,7 +4345,7 @@ mod tests {
         let project_path = env.project_path.clone();
         let mut app = App::new(env.store, env.ctx).unwrap();
         app.toggle_screen();
-        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('A'));
 
         let request = app.pending_attach.clone().expect("an attach request");
         assert_eq!(request.command, "agent attach 'ref-1'");
@@ -4146,7 +4354,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }
 
-    /// `a` on a review task whose session has finished uses `resume` — the
+    /// `A` on a review task whose session has finished uses `resume` — the
     /// point is reopening it, not attaching to a live one.
     #[test]
     fn attach_key_uses_resume_for_a_finished_review_session() {
@@ -4158,7 +4366,7 @@ mod tests {
 
         let mut app = App::new(env.store, env.ctx).unwrap();
         app.toggle_screen();
-        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('A'));
 
         let request = app.pending_attach.clone().expect("a resume request");
         assert_eq!(request.command, "agent resume 'ref-1'");
@@ -4179,7 +4387,7 @@ mod tests {
 
         let mut app = App::new(env.store, env.ctx).unwrap();
         app.toggle_screen();
-        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('A'));
 
         let request = app.pending_attach.clone().expect("an attach request");
         assert_eq!(request.command, "agent attach 'ref-1'");
@@ -4199,7 +4407,7 @@ mod tests {
         // the session ends after the refresh that left the task running
         write_listing(&listing, FINISHED_LISTING);
         app.toggle_screen();
-        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('A'));
 
         assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
         let request = app.pending_attach.clone().expect("a resume request");
@@ -4218,7 +4426,7 @@ mod tests {
         let mut app = App::new(env.store, env.ctx).unwrap();
         assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
         app.toggle_screen();
-        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('A'));
 
         let request = app.pending_attach.clone().expect("an attach request");
         assert_eq!(request.command, "agent attach 'ref-1'");
@@ -4235,7 +4443,7 @@ mod tests {
         let project_path = env.project_path.clone();
         let mut app = App::new(env.store, env.ctx).unwrap();
         app.toggle_screen();
-        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('A'));
 
         let request = app.pending_attach.clone().expect("a resume request");
         assert_eq!(request.command, "agent resume 'ref-1'");
@@ -4251,7 +4459,7 @@ mod tests {
         let project_path = env.project_path.clone();
         let mut app = App::new(env.store, env.ctx).unwrap();
         app.toggle_screen();
-        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('A'));
 
         assert!(app.pending_attach.is_none());
         assert!(
@@ -4335,7 +4543,7 @@ mod tests {
         assert_eq!(app.store.task(task.id).unwrap().state, TaskState::Stalled);
         assert!(app.running.is_empty(), "{:?}", app.running);
         app.toggle_screen();
-        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('A'));
 
         assert!(app.pending_attach.is_none());
         assert!(
@@ -4354,11 +4562,261 @@ mod tests {
     #[test]
     fn attach_key_on_a_ready_task_reports_the_states_that_work() {
         let mut app = app_with(&[TaskState::Ready]);
-        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('A'));
 
         assert!(app.pending_attach.is_none());
         assert!(
             app.status.as_deref().unwrap_or("").contains("jump-in"),
+            "{:?}",
+            app.status
+        );
+    }
+
+    // --- quick message into a task's session ---
+
+    /// The gate on which states take a quick message: the ones whose session
+    /// is open and between turns. `running`/`refining` are mid-turn and
+    /// `stalled` is dead, so all three belong to `A` or to redispatch.
+    #[test]
+    fn state_accepts_message_covers_the_three_messageable_states() {
+        for state in [TaskState::NeedsInput, TaskState::Review, TaskState::Waiting] {
+            assert!(state_accepts_message(state), "{state}");
+        }
+        for state in [
+            TaskState::Running,
+            TaskState::Refining,
+            TaskState::Stalled,
+            TaskState::Ready,
+            TaskState::Done,
+        ] {
+            assert!(!state_accepts_message(state), "{state}");
+        }
+    }
+
+    /// Type a message into the quick-message input and submit it.
+    fn send_message(app: &mut App, text: &str) {
+        key(app, KeyCode::Char('a'));
+        assert!(
+            matches!(
+                app.mode,
+                Mode::Prompt {
+                    kind: PromptKind::SessionMessage,
+                    ..
+                }
+            ),
+            "a should open the message input: {:?}",
+            app.status
+        );
+        type_str(app, text);
+        key(app, KeyCode::Enter);
+    }
+
+    /// The launch log, which records every command Voro spawns before it runs.
+    /// Absent until something is spawned, which is itself an assertion a test
+    /// wants to make.
+    fn launches(root: &std::path::Path) -> String {
+        std::fs::read_to_string(root.join("sessions").join("launches.log")).unwrap_or_default()
+    }
+
+    /// Every message to a review task is a reject-with-feedback: the
+    /// transition runs first, so the feedback is in the body and the event log
+    /// before the send, and the task is back on its agent in `running`. The
+    /// agent here reports no `sessions` listing, so liveness is unknowable and
+    /// the send proceeds — a missing signal is never a refusal.
+    #[test]
+    fn message_on_a_review_task_rejects_with_feedback_and_sends() {
+        let mut env = jump_in_env(&["attach", "resume", "message"], FINISHED_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        let (project_path, task_id) = (env.project_path.clone(), env.task_id);
+        let root = project_path.parent().unwrap().to_path_buf();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        send_message(&mut app, "the tests are missing");
+
+        let task = app.store.task(task_id).unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert!(task.body.contains("the tests are missing"), "{}", task.body);
+        assert!(
+            app.store
+                .events_for(task_id)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "feedback"),
+            "the rejection is logged"
+        );
+        let log = launches(&root);
+        assert!(log.contains("agent message 'ref-1'"), "{log}");
+        // fire-and-forget: the TUI never suspends for it
+        assert!(app.pending_attach.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `needs-input` task transitions not at all — per DESIGN.md §6 the
+    /// answer lives in the transcript, and the agent's own `voro resume` moves
+    /// the task back to `running`.
+    #[test]
+    fn message_on_a_needs_input_task_sends_without_transitioning() {
+        let mut env = jump_in_env(&["attach", "resume", "message"], FINISHED_LISTING);
+        env.store
+            .apply(env.task_id, Action::Ask("which crate?".into()))
+            .unwrap();
+        let (project_path, task_id) = (env.project_path.clone(), env.task_id);
+        let root = project_path.parent().unwrap().to_path_buf();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        send_message(&mut app, "voro-core");
+
+        let task = app.store.task(task_id).unwrap();
+        assert_eq!(task.state, TaskState::NeedsInput);
+        assert!(!task.body.contains("voro-core"), "{}", task.body);
+        assert!(launches(&root).contains("agent message 'ref-1'"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A session still running is mid-turn, so the headless send is refused
+    /// and the operator is pointed at the terminal instead. Nothing is sent
+    /// and — the part that matters — nothing is transitioned.
+    #[test]
+    fn message_refuses_a_session_that_is_still_running() {
+        let mut env = jump_in_env(all_verbs(), LIVE_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        let (project_path, task_id) = (env.project_path.clone(), env.task_id);
+        let root = project_path.parent().unwrap().to_path_buf();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        send_message(&mut app, "one more thing");
+
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Review);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("still running"),
+            "{:?}",
+            app.status
+        );
+        assert!(!launches(&root).contains("agent message"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The reject edge's documented tail (DESIGN.md §8), inherited unchanged:
+    /// when the agent's listing still reports the session finished, the
+    /// reconcile that follows the transition stalls the task. The feedback is
+    /// in the body either way, so the redispatch that stalling offers carries
+    /// it — and the headless send that did land reports back on the stalled
+    /// session's behalf if it gets there first.
+    #[test]
+    fn message_to_a_finished_session_leaves_the_reject_edge_to_reconcile() {
+        let mut env = jump_in_env(all_verbs(), FINISHED_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        let (project_path, task_id) = (env.project_path.clone(), env.task_id);
+        let root = project_path.parent().unwrap().to_path_buf();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        send_message(&mut app, "the tests are missing");
+
+        let task = app.store.task(task_id).unwrap();
+        assert_eq!(task.state, TaskState::Stalled);
+        assert!(task.body.contains("the tests are missing"), "{}", task.body);
+        assert!(launches(&root).contains("agent message 'ref-1'"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An agent with no `message` verb degrades per-verb: the key explains and
+    /// names the one that still works, and no input opens.
+    #[test]
+    fn message_without_the_verb_reports_and_points_at_the_jump_in() {
+        let mut env = jump_in_env(&["sessions", "attach", "resume"], FINISHED_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        let project_path = env.project_path.clone();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('a'));
+
+        assert!(matches!(app.mode, Mode::Normal));
+        let status = app.status.as_deref().unwrap_or("").to_string();
+        assert!(status.contains("no message template"), "{status}");
+        assert!(status.contains('A'), "{status}");
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// Without a captured reference there is nothing to resume into, so the
+    /// key explains rather than opening an input that could not be sent.
+    #[test]
+    fn message_without_a_captured_ref_reports_and_opens_nothing() {
+        // No `sessions` verb, so dispatch captures no reference at all.
+        let (mut store, ctx, project_path) = scratch_env(
+            "message-noref",
+            Some(
+                "default_agent = \"stub\"\n\n[agents.stub]\n\
+                 dispatch = \"cat {prompt_file}\"\n\
+                 message = \"agent message {session} {prompt_file}\"\n",
+            ),
+        );
+        let project = store
+            .create_project("demo", project_path.to_str().unwrap())
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: project.id,
+                repo_id: None,
+                title: "Do the thing".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
+        store.apply(task.id, Action::Complete(None)).unwrap();
+
+        let mut app = App::new(store, ctx).unwrap();
+        key(&mut app, KeyCode::Char('a'));
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("no session reference"),
+            "{:?}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// A task nobody ever dispatched has no session to say anything into.
+    #[test]
+    fn message_on_a_task_with_no_session_reports() {
+        let mut app = app_with(&[TaskState::Review]);
+        key(&mut app, KeyCode::Char('a'));
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("no recorded session"),
             "{:?}",
             app.status
         );

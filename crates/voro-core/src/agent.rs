@@ -4,9 +4,9 @@
 //! resolves which agent a task dispatches with.
 //!
 //! An agent is a set of verb templates; only `dispatch` is required (`cmd` is
-//! an accepted alias). The optional `sessions`/`attach`/`resume` verbs unlock
-//! session-aware dispatch and `plan` unlocks the TUI's interactive planning
-//! sessions (DESIGN.md §8); each degrades gracefully when absent
+//! an accepted alias). The optional `sessions`/`attach`/`resume`/`message` verbs
+//! unlock session-aware dispatch and `plan` unlocks the TUI's interactive
+//! planning sessions (DESIGN.md §8); each degrades gracefully when absent
 //! (docs/agent-integration.md). Config is layered: built-ins under `voro.toml`,
 //! which may add agents, override a built-in wholesale, and set `default_agent`
 //! and viewers. A missing file is not an error.
@@ -21,8 +21,9 @@ use crate::error::{Error, Result};
 use crate::scheduler::{AttentionCosts, DEFAULT_MAX_RUNNING};
 use crate::template::{render, shell_quote};
 
-/// The prompt-file substitution in the `dispatch` template. The working
-/// directory is handled by the spawner, not the template.
+/// The prompt-file substitution in the `dispatch`, `plan` and `message`
+/// templates. The working directory is handled by the spawner, not the
+/// template.
 pub const PROMPT_FILE_PLACEHOLDER: &str = "{prompt_file}";
 
 /// The task-id substitution in the `dispatch` template, the numeric id of the
@@ -38,9 +39,9 @@ pub const TASK_ID_PLACEHOLDER: &str = "{task_id}";
 /// is — they act on a session that already exists and has its name.
 pub const SESSION_NAME_PLACEHOLDER: &str = "{session_name}";
 
-/// The session-reference substitution in the `attach` and `resume` templates:
-/// the agent-opaque reference captured at dispatch (a Claude session UUID, a
-/// Codex session id, a tmux session name).
+/// The session-reference substitution in the `attach`, `resume` and `message`
+/// templates: the agent-opaque reference captured at dispatch (a Claude session
+/// UUID, a Codex session id, a tmux session name).
 pub const SESSION_PLACEHOLDER: &str = "{session}";
 
 /// The model substitution in a verb template, resolved from the agent's own
@@ -88,12 +89,18 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// each release; an operator wanting other models overrides the agent
 /// wholesale in `voro.toml`. `codex` carries no `{model}`, which is the
 /// no-model-direction case: a deep task dispatches with it unchanged.
+///
+/// The claude `message` verb is `resume` plus `-p`, and the near-duplication is
+/// deliberate: a verb is an opaque per-agent contract, which is exactly what
+/// lets an agent define a subset of them and degrade per-verb. `codex` defines
+/// no `message` and the TUI's quick-message key says so on the status line.
 const BUILTIN_AGENTS: &str = "\
 [agents.claude]
 dispatch   = \"claude --bg --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
 sessions   = \"claude agents --json\"
 attach     = \"claude attach {session}\"
 resume     = \"claude --resume {session}\"
+message    = \"claude -p --resume {session} \\\"$(cat {prompt_file})\\\"\"
 plan       = \"claude --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
 model      = \"opus\"
 model_deep = \"fable\"
@@ -143,6 +150,8 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #       sessions  list the agent's sessions as JSON (liveness + ref capture)
 #       attach    open a running session interactively    ({session})
 #       resume    reopen a finished session interactively  ({session})
+#       message   say one thing into a session headlessly, no terminal
+#                 ({session} and {prompt_file})
 #       plan      run an interactive foreground planning session ({prompt_file})
 #     `plan` may carry `{session_name}` too, but not `{task_id}`: a planning
 #     session drafts a task rather than naming one.
@@ -233,6 +242,11 @@ pub struct AgentTemplate {
     sessions: Option<String>,
     attach: Option<String>,
     resume: Option<String>,
+    /// A *headless* send into an existing session, carrying both
+    /// [`SESSION_PLACEHOLDER`] and [`PROMPT_FILE_PLACEHOLDER`]: it appends one
+    /// message to that session's transcript and returns, owning no terminal
+    /// (DESIGN.md §8). What the TUI's quick-message key fires.
+    message: Option<String>,
     /// An interactive foreground command carrying [`PROMPT_FILE_PLACEHOLDER`],
     /// run by the TUI's planning flow (DESIGN.md §8) — no `{session}`, since a
     /// planning session belongs to no task or session row.
@@ -268,6 +282,10 @@ impl AgentTemplate {
 
     pub fn resume(&self) -> Option<&str> {
         self.resume.as_deref()
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
     }
 
     pub fn plan(&self) -> Option<&str> {
@@ -403,6 +421,22 @@ fn render_launch(template: &str, spec: &LaunchSpec, model: Option<&str>) -> Stri
     render(template, &bindings)
 }
 
+/// Bind a `message` template's two placeholders in one pass, so neither value's
+/// own braces are re-scanned: the session reference Voro captured at dispatch
+/// and the file holding the message. Both are shell-quoted — the reference is
+/// agent-opaque text, not a token Voro may assume is bare.
+pub fn render_message(template: &str, session_ref: &str, prompt_file: &Path) -> String {
+    let session = shell_quote(Path::new(session_ref));
+    let prompt_file = shell_quote(prompt_file);
+    render(
+        template,
+        &[
+            (SESSION_PLACEHOLDER, session.as_str()),
+            (PROMPT_FILE_PLACEHOLDER, prompt_file.as_str()),
+        ],
+    )
+}
+
 /// A viewer command template from `voro.toml` (DESIGN.md §11a): a shell command
 /// run in a task's checkout — or its worktree — to open its diff. Defined as a
 /// named `[viewers.<name>]` table or the anonymous `[viewer]` default. The
@@ -533,7 +567,11 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
             "agent '{name}' cmd is missing the {PROMPT_FILE_PLACEHOLDER} placeholder"
         )));
     }
-    for (verb, template) in [("attach", &agent.attach), ("resume", &agent.resume)] {
+    for (verb, template) in [
+        ("attach", &agent.attach),
+        ("resume", &agent.resume),
+        ("message", &agent.message),
+    ] {
         if let Some(template) = template
             && !template.contains(SESSION_PLACEHOLDER)
         {
@@ -542,12 +580,16 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
             )));
         }
     }
-    if let Some(template) = &agent.plan
-        && !template.contains(PROMPT_FILE_PLACEHOLDER)
-    {
-        return Err(invalid(format!(
-            "agent '{name}' plan is missing the {PROMPT_FILE_PLACEHOLDER} placeholder"
-        )));
+    // `message` carries a prompt as well as a session: it says something into
+    // an existing conversation, so it needs both halves.
+    for (verb, template) in [("plan", &agent.plan), ("message", &agent.message)] {
+        if let Some(template) = template
+            && !template.contains(PROMPT_FILE_PLACEHOLDER)
+        {
+            return Err(invalid(format!(
+                "agent '{name}' {verb} is missing the {PROMPT_FILE_PLACEHOLDER} placeholder"
+            )));
+        }
     }
     // `{model}`, `{session_name}` and `{task_id}` are all resolved only where a
     // command launches work, so they are meaningful on `dispatch` and `plan`
@@ -558,6 +600,7 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
         ("sessions", &agent.sessions),
         ("attach", &agent.attach),
         ("resume", &agent.resume),
+        ("message", &agent.message),
     ] {
         let Some(template) = template else { continue };
         if template.contains(MODEL_PLACEHOLDER) {
@@ -631,6 +674,7 @@ pub struct ResolvedAgent {
     pub sessions: Option<String>,
     pub attach: Option<String>,
     pub resume: Option<String>,
+    pub message: Option<String>,
     pub plan: Option<String>,
     pub model: Option<String>,
     pub model_deep: Option<String>,
@@ -859,6 +903,7 @@ impl AgentsConfig {
             sessions: agent.sessions.clone(),
             attach: agent.attach.clone(),
             resume: agent.resume.clone(),
+            message: agent.message.clone(),
             plan: agent.plan.clone(),
             model: agent.model.clone(),
             model_deep: agent.model_deep.clone(),
@@ -1001,6 +1046,7 @@ impl AgentsConfig {
             ),
             ("attach", builtin.attach.is_some(), user.attach.is_some()),
             ("resume", builtin.resume.is_some(), user.resume.is_some()),
+            ("message", builtin.message.is_some(), user.message.is_some()),
             ("plan", builtin.plan.is_some(), user.plan.is_some()),
         ]
         .into_iter()
@@ -1494,6 +1540,125 @@ mod tests {
             "{:?}",
             config.override_missing_verbs("claude")
         );
+    }
+
+    // --- message verb ---
+
+    #[test]
+    fn message_parses_resolves_and_is_optional() {
+        let text = r#"
+            default_agent = "a"
+
+            [agents.a]
+            dispatch = "run {prompt_file}"
+            message = "say --into {session} {prompt_file}"
+
+            [agents.b]
+            dispatch = "other {prompt_file}"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        let a = config.resolve(None).unwrap();
+        assert_eq!(
+            a.message.as_deref(),
+            Some("say --into {session} {prompt_file}")
+        );
+        assert_eq!(config.agent("a").unwrap().message(), a.message.as_deref());
+        let b = config.resolve(Some("b")).unwrap();
+        assert_eq!(b.message, None);
+        assert_eq!(config.agent("b").unwrap().message(), None);
+    }
+
+    /// A message says something *into a session*, so it needs both halves:
+    /// which session, and what to say.
+    #[test]
+    fn message_requires_both_the_session_and_prompt_file_placeholders() {
+        for (template, missing) in [
+            ("say {prompt_file}", SESSION_PLACEHOLDER),
+            ("say --into {session}", PROMPT_FILE_PLACEHOLDER),
+        ] {
+            let text = format!(
+                "default_agent = \"a\"\n\n[agents.a]\ndispatch = \"run {{prompt_file}}\"\n\
+                 message = \"{template}\"\n"
+            );
+            let e = AgentsConfig::parse(&text, Path::new("/tmp/voro.toml"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(missing), "{template}: {e}");
+            assert!(e.contains("message"), "{template}: {e}");
+        }
+    }
+
+    /// `message` acts on a session that already exists, so it takes the launch
+    /// placeholders no more than `attach` and `resume` do.
+    #[test]
+    fn message_refuses_the_launch_placeholders() {
+        for placeholder in [
+            MODEL_PLACEHOLDER,
+            SESSION_NAME_PLACEHOLDER,
+            TASK_ID_PLACEHOLDER,
+        ] {
+            let text = format!(
+                "default_agent = \"a\"\n\n[agents.a]\ndispatch = \"run {{prompt_file}}\"\n\
+                 model = \"m\"\n\
+                 message = \"say --into {{session}} --as {placeholder} {{prompt_file}}\"\n"
+            );
+            let e = AgentsConfig::parse(&text, Path::new("/tmp/voro.toml"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(placeholder), "{placeholder}: {e}");
+            assert!(e.contains("message"), "{placeholder}: {e}");
+        }
+    }
+
+    #[test]
+    fn builtin_claude_defines_message_and_an_override_dropping_it_is_reported() {
+        let agents = builtin_agents();
+        let message = agents["claude"].message().unwrap();
+        assert!(message.contains(SESSION_PLACEHOLDER), "{message}");
+        assert!(message.contains(PROMPT_FILE_PLACEHOLDER), "{message}");
+        assert!(
+            message.contains("-p"),
+            "message is headless, not a terminal round-trip: {message}"
+        );
+        // codex names no message verb — the graceful-degradation case the TUI
+        // reports on its status line.
+        assert!(agents["codex"].message().is_none());
+
+        let text = r#"
+            [agents.claude]
+            cmd = "claude -p {prompt_file}"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        assert!(
+            config.override_missing_verbs("claude").contains(&"message"),
+            "{:?}",
+            config.override_missing_verbs("claude")
+        );
+    }
+
+    #[test]
+    fn render_message_binds_both_placeholders_shell_quoted() {
+        let rendered = render_message(
+            "claude -p --resume {session} \"$(cat {prompt_file})\"",
+            "3f6c-1111",
+            Path::new("/run/msg-1.md"),
+        );
+        assert_eq!(
+            rendered,
+            "claude -p --resume '3f6c-1111' \"$(cat '/run/msg-1.md')\""
+        );
+    }
+
+    /// The one-pass rule (§8): a value carrying its own braces reaches the
+    /// command line as written rather than being re-scanned.
+    #[test]
+    fn render_message_does_not_rescan_a_bound_value() {
+        let rendered = render_message(
+            "say {session} {prompt_file}",
+            "{prompt_file}",
+            Path::new("/run/m.md"),
+        );
+        assert_eq!(rendered, "say '{prompt_file}' '/run/m.md'");
     }
 
     /// A stale `continue` line — from a pre-pivot config or the old codex

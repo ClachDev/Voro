@@ -77,6 +77,7 @@ dispatch   = "claude --bg --name \"{session_name}\" --permission-mode auto --mod
 sessions   = "claude agents --json"
 attach     = "claude attach {session}"
 resume     = "claude --resume {session}"
+message    = "claude -p --resume {session} \"$(cat {prompt_file})\""
 plan       = "claude --name \"{session_name}\" --permission-mode auto --model {model} \"$(cat {prompt_file})\""
 model      = "opus"
 model_deep = "fable"
@@ -110,6 +111,16 @@ resume   = "codex resume {session}"
 - `attach` opens the *running* session interactively; `{session}` is replaced
   with the reference Voro captured at dispatch.
 - `resume` reopens a *finished* session interactively.
+- `message` says one thing into a session *headlessly*: it takes both
+  `{session}` and `{prompt_file}`, appends the file's contents to that session's
+  transcript as the next turn, and returns without owning the terminal. It is
+  the only session verb Voro backgrounds, and it is fire-and-forget — Voro reads
+  no reply, so an agent-side refusal lands in the launch's log rather than in
+  the UI. The built-in above is `resume` plus `-p`, and that near-duplication is
+  deliberate: a verb is an opaque per-agent contract, which is what lets an
+  agent define a subset of the verbs and degrade one at a time. `codex` names no
+  `message`, so the quick-message key reports that on the status line and the
+  jump-in still works.
 - `plan` runs an interactive *foreground* session for the TUI's agent-assisted
   task creation (DESIGN.md §8): `{prompt_file}` holds the planning brief, and
   the command owns the terminal until the conversation ends, so it must not
@@ -173,7 +184,7 @@ done`/`ask` stalls its task, exactly as pid-death does for plain agents (DESIGN.
 §8). When liveness is unknowable (no ref, listing failed) the session is left
 alone.
 
-**Jump-in.** In the TUI, `a` on a running task runs the agent's `attach` command
+**Jump-in.** In the TUI, `A` on a running task runs the agent's `attach` command
 with the TUI suspended — the real session, full control, including answering
 permission prompts; on a review or stalled task it runs `resume` instead,
 reopening the finished session. This is also how a `needs-input` question is
@@ -181,6 +192,20 @@ answered: the operator jumps into the agent's own session, answers in the
 conversation, and then runs `voro resume` (or presses Enter on the inbox row) to
 move the task back to `running`. Voro never records the answer text — the
 exchange lives in the session transcript (DESIGN.md §6/§8).
+
+**Quick message.** `a` is the same steering without the round-trip: it collects
+one line and fires it into the session through `message`, leaving the TUI
+standing. It applies to the three states whose session is open and between turns
+— `needs-input`, `review`, `waiting` — and refuses the rest: `running` and
+`refining` are mid-turn with no injection channel, and `stalled` has a dead
+session that redispatch, not a headless resume, is the honest answer for. Voro
+probes liveness first and refuses a session still running, since that one wants
+the terminal. On a `review` or `waiting` task the message *is* a
+reject-with-feedback: the transition runs first, so the feedback is appended to
+the body and logged before anything is said, and a refused transition sends
+nothing. On a `needs-input` task nothing transitions — the answer lives in the
+transcript, and the agent's own `voro resume` moves the task back (DESIGN.md
+§6).
 
 The same jump-in resolves a **stale review branch**. A task can sit in `review`
 while other work merges, leaving its branch in conflict with the moved base
@@ -195,10 +220,12 @@ model intact: a dispatched agent still cannot push. The task never leaves
 `review`; the PR simply updates.
 
 Every verb degrades gracefully when absent: no `attach`/`resume` disables the
-jump-in key for that agent, no `sessions` keeps pid-liveness reconciliation, no
-`plan` turns the TUI's planning key into a status line saying what to configure,
-and no `{model}` anywhere makes the deep flag a no-op for that agent. An agent
-defining only `dispatch`/`cmd` behaves exactly as before the verbs existed.
+jump-in key for that agent, no `message` turns the quick-message key into a
+status line pointing at the jump-in, no `sessions` keeps pid-liveness
+reconciliation, no `plan` turns the TUI's planning key into a status line saying
+what to configure, and no `{model}` anywhere makes the deep flag a no-op for
+that agent. An agent defining only `dispatch`/`cmd` behaves exactly as before
+the verbs existed.
 
 ### tmux as a universal fallback
 

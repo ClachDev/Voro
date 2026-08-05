@@ -1661,12 +1661,13 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
     match app.screen {
         Screen::Cockpit => vec![
             enter,
-            ("d/D", "dispatch", selected),
+            ("d/D", "dispatch", app.selected_can_dispatch()),
             ("r/R", "refine", selection_is_refinable(app)),
             ("C", "cancel refine", app.selected_is_refining()),
             ("s", "state", true),
             ("!", "deep", selected),
             ("w", "wait", app.selected_can_hand_off()),
+            ("a/A", "message", app.selected_can_message()),
             ("n/N", "new", true),
             ("e", "edit", true),
             ("?", "keys", true),
@@ -1680,6 +1681,7 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
             ("C", "cancel refine", app.selected_is_refining()),
             ("s", "state", true),
             ("!", "deep", true),
+            ("a/A", "message", app.selected_can_message()),
             ("n/N", "new", true),
             ("e", "edit", true),
             ("?", "keys", true),
@@ -1749,6 +1751,10 @@ const NEW_KEYS: [(&str, &str); 2] = [
     ("n", "new task, written in $EDITOR"),
     ("N", "new task, planned with an agent"),
 ];
+const MESSAGE_KEYS: [(&str, &str); 2] = [
+    ("a", "message the task's session, without leaving"),
+    ("A", "message it in person — attach or resume"),
+];
 
 /// A titled group of key/label pairs in the key map.
 type KeySection = (&'static str, Vec<(&'static str, &'static str)>);
@@ -1785,7 +1791,9 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                 ("h", "fold the task's history into the card"),
                 ("o", "open the diff in a viewer"),
                 ("g", "open the tracked PR"),
-                ("a", "attach to the task's session"),
+            ]);
+            actions.extend(pairs(MESSAGE_KEYS));
+            actions.extend([
                 ("l", "page the session log"),
                 ("w", "hand a review task off, to wait"),
             ]);
@@ -1818,7 +1826,9 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                 ("C", "cancel a refine in flight"),
                 ("o", "open the diff in a viewer"),
                 ("g", "open the tracked PR"),
-                ("a", "attach to the task's session"),
+            ]);
+            actions.extend(pairs(MESSAGE_KEYS));
+            actions.extend([
                 ("l", "page the session log"),
                 ("w", "hand a review task off, to wait"),
             ]);
@@ -3329,10 +3339,14 @@ mod tests {
         store
             .create_task(task("ready to go", TaskState::Ready))
             .unwrap();
+        // The review task carries a session, which is the worst case for the
+        // line: it earns the hand-off slot and the message slot at once.
         let reviewed = store
             .create_task(task("in review", TaskState::Ready))
             .unwrap();
-        store.apply(reviewed.id, Action::Start).unwrap();
+        store
+            .record_dispatch(reviewed.id, "claude", None, None)
+            .unwrap();
         store.apply(reviewed.id, Action::Complete(None)).unwrap();
         // ...and a refine in flight for the cancel slot, which rides the strip
         // rather than the queue.
@@ -3353,6 +3367,7 @@ mod tests {
         let mut seen_refine = false;
         let mut seen_wait = false;
         let mut seen_cancel = false;
+        let mut seen_message = false;
         for screen in [
             Screen::Cockpit,
             Screen::Tasks,
@@ -3402,6 +3417,14 @@ mod tests {
                 seen_refine |= keys.contains(&"r/R");
                 seen_wait |= keys.contains(&"w");
                 seen_cancel |= keys.contains(&"C");
+                seen_message |= keys.contains(&"a/A");
+                // Dispatch is advertised only where it can act, so the line
+                // never offers a verb whose only answer is the state it
+                // refuses — which is also what buys the message slot its room.
+                assert!(
+                    !(keys.contains(&"d/D") && keys.contains(&"a/A")),
+                    "{screen:?} row {i}: {keys:?}"
+                );
                 // The refine keys and the cancel are mutually exclusive by
                 // state, which is what keeps the line within its ten slots.
                 assert!(
@@ -3412,7 +3435,7 @@ mod tests {
             }
         }
         assert!(
-            seen_refine && seen_wait && seen_cancel,
+            seen_refine && seen_wait && seen_cancel && seen_message,
             "the conditional slots never showed"
         );
     }
@@ -3522,7 +3545,7 @@ mod tests {
         // The keys the trimmed line no longer carries, and the uppercase
         // glosses it never carried.
         for expected in [
-            "attach to the task's session",
+            "message it in person — attach or resume",
             "page the session log",
             "fold the score decomposition",
             "dispatch, choosing the agent first",
