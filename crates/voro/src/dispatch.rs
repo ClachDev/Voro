@@ -589,6 +589,34 @@ struct Spawned {
 fn spawn_expansion(ctx: &DispatchCtx, exp: Expansion) -> Result<Spawned, String> {
     let label = exp.launch.slug();
     let prompt_path = write_prompt(ctx, &label, &exp.prompt)?;
+    let command = exp.agent.launch_command(&LaunchSpec {
+        launch: exp.launch.clone(),
+        prompt_file: &prompt_path,
+        deep: exp.deep,
+    });
+    spawn_logged(
+        ctx,
+        label,
+        &prompt_path,
+        &command,
+        &exp.cwd,
+        exp.launch.session_name(),
+    )
+}
+
+/// Spawn a rendered command detached in `cwd`, with its output captured to a log
+/// stamped like the prompt beside it and a breadcrumb in the launch log. The
+/// shared tail of every background launch that is not a dispatch: the caller
+/// decides which verb template rendered the command and what the session it
+/// belongs to is called.
+fn spawn_logged(
+    ctx: &DispatchCtx,
+    label: String,
+    prompt_path: &Path,
+    command: &str,
+    cwd: &str,
+    session_name: String,
+) -> Result<Spawned, String> {
     let stamp = prompt_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -601,32 +629,24 @@ fn spawn_expansion(ctx: &DispatchCtx, exp: Expansion) -> Result<Spawned, String>
         .try_clone()
         .map_err(|e| format!("cannot open log {}: {e}", log_path.display()))?;
 
-    let command = exp.agent.launch_command(&LaunchSpec {
-        launch: exp.launch.clone(),
-        prompt_file: &prompt_path,
-        deep: exp.deep,
-    });
     let launch_log = ctx.launch_log_path();
-    append_launch_log(
-        &launch_log,
-        &format!("{label}: {command} (cwd {})", exp.cwd),
-    );
+    append_launch_log(&launch_log, &format!("{label}: {command} (cwd {cwd})"));
     let child = Command::new("sh")
         .arg("-c")
-        .arg(&command)
-        .current_dir(&exp.cwd)
+        .arg(command)
+        .current_dir(cwd)
         .env("VORO_DB", &ctx.db_path)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
         .process_group(0)
         .spawn()
-        .map_err(|e| format!("cannot spawn agent in {}: {e}", exp.cwd))?;
+        .map_err(|e| format!("cannot spawn agent in {cwd}: {e}"))?;
 
     Ok(Spawned {
         pid: i64::from(child.id()),
         log_path,
-        session_name: exp.launch.session_name(),
+        session_name,
         label,
         child,
     })
@@ -738,6 +758,54 @@ pub fn refine(
             "recording the refine failed ({e}); the spawned agent (pid {pid}) was killed"
         ));
     }
+    reap_expansion(spawned, ctx.launch_log_path());
+    Ok(summary)
+}
+
+/// One line said into a session that already exists (DESIGN.md §8), assembled by
+/// the TUI's quick-message key. Unlike an [`Expansion`] this opens no session
+/// row and tracks no pid: it joins a conversation Voro already knows about
+/// rather than starting one, so there is no new identity to compose and nothing
+/// for the reconciler to observe.
+pub struct SessionMessage<'a> {
+    /// The task whose session is being messaged — names the prompt and log
+    /// files, and the launch-log line.
+    pub task_id: i64,
+    /// The agent's `message` template, already known to define the verb.
+    pub template: &'a str,
+    /// The reference captured at dispatch, which the template's `{session}`
+    /// binds to.
+    pub session_ref: &'a str,
+    pub message: &'a str,
+    /// The task's own checkout: a headless resume has to run where its session
+    /// does, since that is what the agent resolves the conversation against.
+    pub cwd: String,
+}
+
+/// Fire a message into a task's agent session and return, leaving it to run
+/// (DESIGN.md §8). Fire-and-forget by design: the send is one turn appended to a
+/// transcript the operator watches elsewhere, so an agent-side refusal lands in
+/// the log rather than back in the UI, and nothing here waits for a reply.
+pub fn send_message(ctx: &DispatchCtx, msg: SessionMessage) -> Result<String, String> {
+    if msg.message.trim().is_empty() {
+        return Err("a message is required".into());
+    }
+    let label = format!("message-{}", msg.task_id);
+    let prompt_path = write_prompt(ctx, &label, msg.message)?;
+    let command = voro_core::render_message(msg.template, msg.session_ref, &prompt_path);
+    let spawned = spawn_logged(
+        ctx,
+        label,
+        &prompt_path,
+        &command,
+        &msg.cwd,
+        msg.session_ref.to_string(),
+    )?;
+    let summary = format!(
+        "message sent to task {}'s session — log {}",
+        msg.task_id,
+        spawned.log_path.display()
+    );
     reap_expansion(spawned, ctx.launch_log_path());
     Ok(summary)
 }

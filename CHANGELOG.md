@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Quick-message a task's session**: `a` in the TUI collects one line and sends
+  it straight into the task's recorded agent session, headlessly, without
+  suspending the cockpit — for a `needs-input`, `review`, or `waiting` task
+  whose session is between turns. On a review or waiting task the message *is*
+  the rejection: the feedback is appended to the body and logged before
+  anything is sent. The interactive jump-in moves from `a` to `A`. Agents
+  declare the capability with a new optional `message` verb (`{session}` plus
+  `{prompt_file}`), built in for `claude`; an agent without one, such as
+  `codex`, reports so on the status line and keeps its jump-in.
 - `voro set <id> --unlink <kind>:<other-id>` drops a single dependency edge —
   `related:7`, `discovered-from:4`, `blocks:9` — named as `voro show` lists it.
   A pair of tasks carrying two edges keeps the one not named, so an edge
@@ -49,11 +58,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no models, such as the built-in `codex`, ignores the flag entirely.
 - `?` in the TUI opens the current screen's complete key map — actions,
   navigation, and screen switching — including the keys no hint ever advertised
-  (`o` open in a viewer, `g` open the PR, `a` attach, `l` page the log, `J`/`K`
+  (`o` open in a viewer, `g` open the PR, `A` jump into the session, `l` page
+  the log, `J`/`K`
   and the page keys, `ctrl-r`). Any key closes it again.
 
 ### Changed
 
+- The cockpit key line advertises `d/D dispatch` only on a `ready` or `stalled`
+  row, where dispatch can actually act, rather than on any selection — which
+  also makes room for the new `a/A message` slot within the line's ten.
 - **Agent contract**: verb templates gain a `{session_name}` placeholder, and
   the built-in `claude` agent now names its session with it instead of spelling
   `voro-{task_id}` itself. Every session Voro launches carries a name it
