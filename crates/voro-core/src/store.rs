@@ -3207,8 +3207,8 @@ mod tests {
         }
     }
 
-    /// The round's guard rails: a task that is not `proposed` cannot start one,
-    /// and one that is not `refining` cannot conclude one.
+    /// The round's guard rails: a task past `proposed`/`ready` cannot start
+    /// one, and one that is not `refining` cannot conclude one.
     #[test]
     fn refine_transitions_are_refused_from_the_wrong_state() {
         use crate::transition::{Action, Triage};
@@ -3220,13 +3220,13 @@ mod tests {
             Err(Error::InvalidTransition { .. })
         ));
 
-        s.apply(t.id, Action::Triage(Triage::Ready)).unwrap();
+        s.apply(t.id, Action::Triage(Triage::Parked)).unwrap();
         assert!(matches!(
             s.record_refine_launch(t.id, "too late", "claude", None, None),
             Err(Error::InvalidTransition { .. })
         ));
         // The refused launch wrote nothing — no session, no state change.
-        assert_eq!(s.task(t.id).unwrap().state, TaskState::Ready);
+        assert_eq!(s.task(t.id).unwrap().state, TaskState::Parked);
         assert!(s.sessions_for(t.id).unwrap().is_empty());
     }
 

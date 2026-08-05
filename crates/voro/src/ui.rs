@@ -1641,9 +1641,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Line::from(spans), area);
 }
 
-/// Whether the selection is a proposal, which is the only thing refine acts on.
-fn selection_is_proposed(app: &App) -> bool {
-    app.selected_task_id().is_some_and(|id| app.is_proposed(id))
+/// Whether the selection is a brief refine can still rewrite — a proposal or a
+/// ready task (DESIGN.md §6).
+fn selection_is_refinable(app: &App) -> bool {
+    app.selected_task_id()
+        .is_some_and(|id| app.is_refinable(id))
 }
 
 /// Every slot the current screen's key line can hold, each flagged with whether
@@ -1660,7 +1662,7 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
         Screen::Cockpit => vec![
             enter,
             ("d/D", "dispatch", selected),
-            ("r/R", "refine", selection_is_proposed(app)),
+            ("r/R", "refine", selection_is_refinable(app)),
             ("C", "cancel refine", app.selected_is_refining()),
             ("s", "state", true),
             ("!", "deep", selected),
@@ -1674,7 +1676,7 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
         Screen::Tasks => vec![
             enter,
             ("w", "wait", app.selected_can_hand_off()),
-            ("r/R", "refine", selection_is_proposed(app)),
+            ("r/R", "refine", selection_is_refinable(app)),
             ("C", "cancel refine", app.selected_is_refining()),
             ("s", "state", true),
             ("!", "deep", true),
@@ -1721,7 +1723,8 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
 /// left to `?`. The line carries what changes a task's state or destiny;
 /// navigation, display toggles and browsing conveniences live in the key map
 /// only, so `?` is always present. Selection-only actions drop out when there
-/// is nothing to act on, and the refine keys appear only on a proposal.
+/// is nothing to act on, and the refine keys appear only on a task whose body is
+/// still a brief — a proposal or a ready task.
 fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     hint_candidates(app)
         .into_iter()
@@ -1739,8 +1742,8 @@ const DISPATCH_KEYS: [(&str, &str); 2] = [
     ("D", "dispatch, choosing the agent first"),
 ];
 const REFINE_KEYS: [(&str, &str); 2] = [
-    ("r", "refine a proposal, leaving a note"),
-    ("R", "refine a proposal, talking to an agent"),
+    ("r", "refine a brief, leaving a note"),
+    ("R", "refine a brief, talking to an agent"),
 ];
 const NEW_KEYS: [(&str, &str); 2] = [
     ("n", "new task, written in $EDITOR"),
@@ -3524,7 +3527,7 @@ mod tests {
             "fold the score decomposition",
             "dispatch, choosing the agent first",
             "new task, planned with an agent",
-            "refine a proposal, talking to an agent",
+            "refine a brief, talking to an agent",
             // The right-hand column, whole — nothing clipped at 80 columns.
             "page the card",
             "next screen",
