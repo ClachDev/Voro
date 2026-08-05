@@ -93,9 +93,12 @@ resume   = "codex resume {session}"
   `claude agents` and the `/resume` picker; agents with no session-naming flag
   simply leave it out. The scheme is `voro-<id>` for a dispatch of task `<id>`,
   `voro-<id>-refine` for a refine of it (DESIGN.md §6), and
-  `voro-plan-<project-id>` for a planning session. A dispatch's name is a
-  stable contract — anything else pointed at the same task suffixes a kind
-  rather than colliding with it.
+  `voro-plan-<project>` for a planning session, which belongs to no task and so
+  is named for its project — by name, so the bare number in a Voro-composed
+  session name is always a task id. Project names are unique, and any character
+  outside `[A-Za-z0-9._-]` is replaced with `-` before the name is used. A
+  dispatch's name is a stable contract — anything else pointed at the same task
+  suffixes a kind rather than colliding with it.
 - `dispatch` may also carry `{task_id}`, replaced with the task's numeric id,
   for a template that wants the id somewhere other than the session name. It is
   optional — a template that omits it dispatches unchanged — and it is refused
