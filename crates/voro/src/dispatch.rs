@@ -466,7 +466,9 @@ pub fn plan_session(
             let repo = store.default_repo(project_id).map_err(|e| e.to_string())?;
             (
                 "plan",
-                Launch::Plan { project_id },
+                Launch::Plan {
+                    project: project.name.clone(),
+                },
                 repo.path,
                 render_planning_prompt(&project.name, &ctx.db_path),
                 None,
@@ -599,7 +601,7 @@ fn spawn_expansion(ctx: &DispatchCtx, exp: Expansion) -> Result<Spawned, String>
         .map_err(|e| format!("cannot open log {}: {e}", log_path.display()))?;
 
     let command = exp.agent.launch_command(&LaunchSpec {
-        launch: exp.launch,
+        launch: exp.launch.clone(),
         prompt_file: &prompt_path,
         deep: exp.deep,
     });
@@ -2540,6 +2542,10 @@ mod tests {
             launch.command,
             format!("stub --interactive {}", shell_quote(&prompt_path))
         );
+        // the file is stemmed for the project by name, so the number in a
+        // Voro-named session or file is always a task id
+        let stem = prompt_path.file_name().unwrap().to_str().unwrap();
+        assert!(stem.starts_with("plan-proj-"), "{stem}");
 
         let prompt = std::fs::read_to_string(&prompt_path).unwrap();
         assert!(prompt.contains("plan a new task"), "{prompt}");

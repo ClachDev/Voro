@@ -297,8 +297,10 @@ impl AgentTemplate {
 /// The invariant it carries: every session Voro launches has a Voro-composed
 /// name, `voro-<id>` for a dispatch and `voro-<id>-<kind>` for anything else
 /// pointed at that task, so nothing Voro starts shows up anonymous or
-/// duplicately named in the agent's own session listing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// duplicately named in the agent's own session listing. A planning session
+/// belongs to no task, so it is named for its project — by name, not id, since
+/// a bare number there would read as a task id.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launch {
     /// A task dispatched to a headless session (DESIGN.md §8).
     Dispatch { task_id: i64 },
@@ -306,8 +308,10 @@ pub enum Launch {
     /// intensity — the headless note-driven one and the interactive one are the
     /// same operation, and only one of them is ever backgrounded.
     Refine { task_id: i64 },
-    /// An interactive planning session drafting a new task for a project.
-    Plan { project_id: i64 },
+    /// An interactive planning session drafting a new task for a project,
+    /// carrying the project's name. Project names are unique (schema §5), so
+    /// two projects cannot claim one session name.
+    Plan { project: String },
 }
 
 impl Launch {
@@ -320,7 +324,7 @@ impl Launch {
         match self {
             Launch::Dispatch { task_id } => format!("voro-{task_id}"),
             Launch::Refine { task_id } => format!("voro-{task_id}-refine"),
-            Launch::Plan { project_id } => format!("voro-plan-{project_id}"),
+            Launch::Plan { project } => format!("voro-plan-{}", sanitize_for_name(project)),
         }
     }
 
@@ -330,7 +334,7 @@ impl Launch {
         match self {
             Launch::Dispatch { task_id } => format!("task-{task_id}"),
             Launch::Refine { task_id } => format!("refine-{task_id}"),
-            Launch::Plan { project_id } => format!("plan-{project_id}"),
+            Launch::Plan { project } => format!("plan-{}", sanitize_for_name(project)),
         }
     }
 
@@ -345,12 +349,31 @@ impl Launch {
     }
 }
 
+/// Reduce a free-text name to what a session name and a filename can both
+/// safely carry: every character outside `[A-Za-z0-9._-]` becomes `-`. A
+/// session name is substituted into a shell command line and its slug becomes a
+/// filename, so a project called `my stuff` or `it's "fine"` must not reach
+/// either as written. Case is preserved, so `voro-plan-ODM` stays readable.
+/// Two names that reduce to the same string is a collision Voro accepts:
+/// project names are unique, and `a b` alongside `a-b` is not a real case.
+fn sanitize_for_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 /// Everything a verb template needs bound to become a command line: which
 /// launch this is, the prompt file written for it, and whether the task earns
 /// the deeper model. Assembled by the caller that wrote the prompt, rendered by
 /// [`ResolvedAgent::launch_command`] or
 /// [`ResolvedAgent::plan_launch_command`](ResolvedAgent::plan_launch_command).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LaunchSpec<'a> {
     pub launch: Launch,
     pub prompt_file: &'a Path,
@@ -1716,21 +1739,46 @@ mod tests {
     fn a_launch_names_its_session_and_its_files() {
         let dispatch = Launch::Dispatch { task_id: 42 };
         let refine = Launch::Refine { task_id: 42 };
-        let plan = Launch::Plan { project_id: 3 };
+        let plan = Launch::Plan {
+            project: "mote".into(),
+        };
         // The dispatch name is the published contract; anything else pointed at
-        // the same task suffixes a kind rather than colliding with it.
+        // the same task suffixes a kind rather than colliding with it. A
+        // planning session names its project, so the bare number in a session
+        // name is always a task id.
         assert_eq!(dispatch.session_name(), "voro-42");
         assert_eq!(refine.session_name(), "voro-42-refine");
-        assert_eq!(plan.session_name(), "voro-plan-3");
+        assert_eq!(plan.session_name(), "voro-plan-mote");
         assert_ne!(dispatch.session_name(), refine.session_name());
         // The file slugs are exactly what the three paths computed before the
         // identity was factored out, so no prompt or log filename moved.
         assert_eq!(dispatch.slug(), "task-42");
         assert_eq!(refine.slug(), "refine-42");
-        assert_eq!(plan.slug(), "plan-3");
+        assert_eq!(plan.slug(), "plan-mote");
         assert_eq!(dispatch.task_id(), Some(42));
         assert_eq!(refine.task_id(), Some(42));
         assert_eq!(plan.task_id(), None);
+    }
+
+    #[test]
+    fn a_planning_session_sanitizes_its_project_name() {
+        // The session name is substituted into a shell command line and the
+        // slug becomes a filename, so nothing outside `[A-Za-z0-9._-]` may
+        // survive either. Case does, so a project named in capitals reads as
+        // itself.
+        let plan = |name: &str| Launch::Plan {
+            project: name.to_string(),
+        };
+        assert_eq!(plan("odm 2").session_name(), "voro-plan-odm-2");
+        assert_eq!(plan("odm 2").slug(), "plan-odm-2");
+        assert_eq!(plan("ODM").session_name(), "voro-plan-ODM");
+        assert_eq!(
+            plan("it's \"fine\"; rm -rf /").session_name(),
+            "voro-plan-it-s--fine---rm--rf--"
+        );
+        assert_eq!(plan("a/b").slug(), "plan-a-b");
+        // The characters a name may keep pass through untouched.
+        assert_eq!(plan("voro-core_v1.2").slug(), "plan-voro-core_v1.2");
     }
 
     #[test]
@@ -1751,11 +1799,13 @@ mod tests {
         // flag, so the foreground plan verb carries it.
         let planned = claude
             .plan_launch_command(&LaunchSpec {
-                launch: Launch::Plan { project_id: 3 },
+                launch: Launch::Plan {
+                    project: "mote".into(),
+                },
                 ..spec(false)
             })
             .unwrap();
-        assert!(planned.contains("--name \"voro-plan-3\""), "{planned}");
+        assert!(planned.contains("--name \"voro-plan-mote\""), "{planned}");
         assert!(!planned.contains("--bg"), "{planned}");
 
         // Nothing reaches the shell as literal braces on any of them.
@@ -1947,11 +1997,13 @@ mod tests {
         );
         assert_eq!(
             a.plan_launch_command(&LaunchSpec {
-                launch: Launch::Plan { project_id: 2 },
+                launch: Launch::Plan {
+                    project: "mote".into(),
+                },
                 ..spec(false)
             })
             .unwrap(),
-            "run -i --name voro-plan-2 '/tmp/p.md'"
+            "run -i --name voro-plan-mote '/tmp/p.md'"
         );
     }
 
