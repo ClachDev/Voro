@@ -52,11 +52,43 @@ task; drop it for a proposal that stands on its own. Finish
 with your work committed on a branch and a PR-ready `--summary` on `done` — what
 changed, why, and how you verified it — since `voro pr` opens the pull request
 straight from that summary. Never modify the database with raw SQL, which would
-bypass the state machine and event log.{branch}{docs}
+bypass the state machine and event log.{branch}{review}{docs}
 
 ---
 
 ";
+
+/// The `{review}` block, rendered into every dispatched prompt (DESIGN.md §8).
+/// A writing agent's self-review shares the session's context and so ratifies
+/// its blind spots rather than catching them, while the operator's review
+/// attention is the queue's scarce resource; an independent reader placed ahead
+/// of `done` spends the agent's tokens instead. The mechanism is named
+/// agent-agnostically for the same reason [`BRANCH_ISOLATE_SENTENCE`] is — the
+/// harness's own subagent where it has one, a deliberate separate pass where it
+/// does not. Voro cannot verify the review happened (it is told, not observing),
+/// so this is a prompt-level mandate with the standing of the branch block.
+const REVIEW_GATE_TEMPLATE: &str = "\n\n\
+Before you call `voro done {task_id}`, have the work reviewed by a reviewer that
+carries no authorship context — one that did not watch you write it. Use your
+harness's own subagent mechanism for that where it has one: in Claude Code, a
+subagent, which starts on a clean context. Lacking such a mechanism, do the
+review as a deliberate separate pass over the review inputs alone, setting the
+assumptions you worked under aside.
+
+The reviewer gets two inputs and nothing else: this task body, and the diff of
+your work branch against the project's base branch. Not your notes, and not this
+session's transcript — a reader who sees only what the operator will see is the
+whole point. Its brief is adversarial: look for grounds to reject this work
+against the acceptance criteria in the task body, rather than for confirmation
+that it is done.
+
+Address every finding before you call `done` — fix it, or rebut it with
+evidence. One pass: do not send the fixes back for a second review. A finding
+you fixed needs no record, since the fix is in the diff; a finding you rebutted
+rather than fixed goes in the `--summary`, the finding and your rebuttal in a
+sentence each, because rejecting a reviewer's finding is a judgement the
+operator should see rather than one you settle alone. The summary is otherwise
+the PR-ready account it always was.";
 
 /// The `{docs}` block for a task linked to plan or design documents (DESIGN.md
 /// §3/§8). Each is named at its resolved location — absolute for a path, since
@@ -276,6 +308,10 @@ fn render_preamble(
             ("{db}", db_flag.as_str()),
         ],
     );
+    // Rendered here rather than bound raw into the outer template for the same
+    // reason the branch block is: a single pass emits a value verbatim, so a
+    // `{task_id}` inside an already-bound value would reach the agent unfilled.
+    let review_block = render(REVIEW_GATE_TEMPLATE, &[("{task_id}", task_id.as_str())]);
     // A task with no linked document renders no block at all, so an unlinked
     // dispatch's prompt is byte-for-byte what it was before docs existed.
     let docs_block = if docs.is_empty() {
@@ -298,6 +334,7 @@ fn render_preamble(
         RETURN_PATH_PREAMBLE_TEMPLATE,
         &[
             ("{branch}", branch_block.as_str()),
+            ("{review}", review_block.as_str()),
             ("{docs}", docs_block.as_str()),
             ("{task_id}", task_id.as_str()),
             ("{db}", db_flag.as_str()),
@@ -1574,6 +1611,80 @@ mod tests {
                 rendered.contains(&format!("git worktree add <path> -b {name}")),
                 "{rendered}"
             );
+        }
+    }
+
+    #[test]
+    fn preamble_mandates_an_independent_review_before_done() {
+        // Every dispatched prompt carries the gate, whatever else the preamble
+        // renders: the self-review it replaces shares the session's blind spots,
+        // and the operator is otherwise the diff's first independent reader.
+        let db = Store::default_db_path();
+        let docs = [("Plan".to_string(), "/tmp/plan.md".to_string())];
+        for branch in [None, Some("feat/parser")] {
+            for docs in [&[][..], &docs[..]] {
+                let rendered = render_preamble(62, &db, branch, docs);
+                // the gate is tied to `done`, and names the literal task id
+                assert!(
+                    rendered.contains("Before you call `voro done 62`"),
+                    "{rendered}"
+                );
+                // the branch block says "Lacking such a mechanism" too, so the
+                // ordering is read off the gate's own text rather than the
+                // whole preamble's
+                let gate = &rendered[rendered.find("Before you call `voro done").unwrap()..];
+                // harness subagent first, manual separate pass as the fallback
+                let subagent = gate.find("subagent mechanism").unwrap();
+                let manual = gate.find("Lacking such a mechanism").unwrap();
+                assert!(subagent < manual, "{gate}");
+                assert!(
+                    rendered.contains("in Claude Code, a\nsubagent"),
+                    "{rendered}"
+                );
+                // reviewer inputs: task body and branch diff, nothing else
+                assert!(
+                    rendered.contains("this task body, and the diff of\nyour work branch"),
+                    "{rendered}"
+                );
+                assert!(
+                    rendered.contains("not this\nsession's transcript"),
+                    "{rendered}"
+                );
+                // adversarial brief, not a confirmation pass
+                assert!(rendered.contains("brief is adversarial"), "{rendered}");
+                assert!(rendered.contains("grounds to reject"), "{rendered}");
+                assert!(rendered.contains("acceptance criteria"), "{rendered}");
+                // fix or rebut every finding, one pass only
+                assert!(
+                    rendered.contains("fix it, or rebut it with\nevidence"),
+                    "{rendered}"
+                );
+                assert!(rendered.contains("One pass"), "{rendered}");
+                // rebutted findings ride in the summary; fixed ones need no record
+                assert!(
+                    rendered.contains("rather than fixed goes in the `--summary`"),
+                    "{rendered}"
+                );
+                assert!(rendered.contains("needs no record"), "{rendered}");
+                // ahead of the body separator, like every other preamble block
+                let gate_at = rendered.find("Before you call `voro done").unwrap();
+                assert!(gate_at < rendered.rfind("---").unwrap(), "{rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn planning_and_refine_prompts_carry_no_review_gate() {
+        // Their deliverable is a task body, not a diff, so there is nothing for
+        // an adversarial reviewer to read a branch against.
+        let db = Store::default_db_path();
+        let planning = render_planning_prompt("augere", &db);
+        assert!(!planning.contains("voro done"), "{planning}");
+        assert!(!planning.contains("adversarial"), "{planning}");
+        for template in [REFINE_PROMPT_TEMPLATE, REFINE_PLAN_PROMPT_TEMPLATE] {
+            let refine = render_refine_prompt(template, 62, &db, "## seed\n", "tighten it");
+            assert!(!refine.contains("adversarial"), "{refine}");
+            assert!(!refine.contains("no authorship context"), "{refine}");
         }
     }
 
