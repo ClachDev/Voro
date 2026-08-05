@@ -1737,22 +1737,40 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 
 /// The lowercase/uppercase pairs the key line renders as one slot (DESIGN.md
 /// §9). This map is the only place the uppercase variants are glossed, so the
-/// three lines are worded to one shape: each says what the shifted key does
-/// *differently* from its lowercase sibling.
+/// three lines are worded to one shape, the one the case convention asks for:
+/// the lowercase acts headlessly and stays in the TUI, the uppercase names the
+/// surface it opens.
 const DISPATCH_KEYS: [(&str, &str); 2] = [
-    ("d", "dispatch to the resolved agent"),
-    ("D", "dispatch, choosing the agent first"),
+    ("d", "dispatch to the resolved agent, headless"),
+    ("D", "dispatch, choosing the agent in a picker"),
 ];
 const REFINE_KEYS: [(&str, &str); 2] = [
-    ("r", "refine a brief, leaving a note"),
-    ("R", "refine a brief, talking to an agent"),
+    ("r", "refine a brief from a note, headless"),
+    ("R", "refine a brief in an agent session"),
 ];
 const NEW_KEYS: [(&str, &str); 2] = [
     ("n", "new task, written in $EDITOR"),
-    ("N", "new task, planned with an agent"),
+    ("N", "new task, planned in an agent session"),
+];
+
+/// The uppercase keys DESIGN.md §9 names as standing outside the case
+/// convention, because none is the shifted half of a pair: `C` and the projects
+/// screen's `A` share a letter with an unrelated action, `J`/`K` scroll the
+/// card, and the Config screen's `V`/`A` pick defaults. Every other uppercase
+/// binding has to be the interactive half of a pair, which the test below
+/// enforces screen by screen.
+#[cfg(test)]
+const CASE_EXCEPTIONS: [(Screen, &str); 7] = [
+    (Screen::Cockpit, "C"),
+    (Screen::Cockpit, "J"),
+    (Screen::Cockpit, "K"),
+    (Screen::Tasks, "C"),
+    (Screen::Projects, "A"),
+    (Screen::Config, "V"),
+    (Screen::Config, "A"),
 ];
 const MESSAGE_KEYS: [(&str, &str); 2] = [
-    ("a", "message the task's session, without leaving"),
+    ("a", "message the task's session, headless"),
     ("A", "message it in person — attach or resume"),
 ];
 
@@ -3480,6 +3498,38 @@ mod tests {
         }
     }
 
+    /// The case convention (DESIGN.md §9): an uppercase key is the interactive
+    /// half of a lowercase/uppercase pair, or one of the exceptions the doc
+    /// names. A new uppercase binding that is neither fails here, which is the
+    /// point — it is the prompt to decide which of the two it is.
+    #[test]
+    fn every_uppercase_key_is_paired_or_a_named_exception() {
+        let paired: Vec<&str> = [DISPATCH_KEYS, REFINE_KEYS, NEW_KEYS, MESSAGE_KEYS]
+            .iter()
+            .flat_map(|set| set.iter())
+            .map(|(key, _)| *key)
+            .collect();
+        for screen in [
+            Screen::Cockpit,
+            Screen::Tasks,
+            Screen::Projects,
+            Screen::Config,
+        ] {
+            let uppercase = key_map(screen)
+                .into_iter()
+                .flat_map(|(_, entries)| entries)
+                .flat_map(|(key, _)| key.split('/').collect::<Vec<_>>())
+                .filter(|key| key.chars().count() == 1 && key.chars().all(char::is_uppercase));
+            for key in uppercase {
+                assert!(
+                    paired.contains(&key) || CASE_EXCEPTIONS.contains(&(screen, key)),
+                    "{screen:?} binds {key:?} uppercase, but it is neither half of a pair \
+                     nor a documented exception — see DESIGN.md §9"
+                );
+            }
+        }
+    }
+
     /// `?` opens the current screen's map from any screen, listing the keys the
     /// line has no room for and the gloss for each uppercase variant; any key
     /// closes it again (DESIGN.md §9).
@@ -3548,9 +3598,9 @@ mod tests {
             "message it in person — attach or resume",
             "page the session log",
             "fold the score decomposition",
-            "dispatch, choosing the agent first",
-            "new task, planned with an agent",
-            "refine a brief, talking to an agent",
+            "dispatch, choosing the agent in a picker",
+            "new task, planned in an agent session",
+            "refine a brief in an agent session",
             // The right-hand column, whole — nothing clipped at 80 columns.
             "page the card",
             "next screen",
