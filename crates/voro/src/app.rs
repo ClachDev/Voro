@@ -1409,20 +1409,22 @@ impl App {
         }
     }
 
-    /// Whether a task is still awaiting triage — what gates the refine keys,
-    /// on the queue and in the triage menu alike.
-    pub fn is_proposed(&self, task_id: i64) -> bool {
-        self.all
-            .iter()
-            .any(|r| r.task.id == task_id && r.task.state == TaskState::Proposed)
+    /// Whether a task's body is still a brief rather than work under way — what
+    /// gates the refine keys. A `ready` task qualifies as much as a `proposed`
+    /// one: its verdict was issued against the body, so rewriting the body sends
+    /// it back through triage (DESIGN.md §6).
+    pub fn is_refinable(&self, task_id: i64) -> bool {
+        self.all.iter().any(|r| {
+            r.task.id == task_id && matches!(r.task.state, TaskState::Proposed | TaskState::Ready)
+        })
     }
 
-    /// Refine the selected proposal (DESIGN.md §6). Refine is an event on a
-    /// proposal rather than a verdict on one, so it answers from the queue —
-    /// where the operator reads the body and notices it is sub-standard — and
-    /// not only from behind the triage menu, which collects verdicts. A
-    /// selection that is not a proposal reports why via the status line, the
-    /// same no-op-with-explanation style as the other action keys.
+    /// Refine the selected task (DESIGN.md §6). Refine is an event on a brief
+    /// rather than a verdict on one, so it answers from the queue — where the
+    /// operator reads the body and notices it is sub-standard — and not only
+    /// from behind the triage menu, which collects verdicts. A selection whose
+    /// body is no longer a brief awaiting work reports why via the status line,
+    /// the same no-op-with-explanation style as the other action keys.
     fn refine_selected(&mut self, flow: RefineFlow) {
         let Some(task) = self.selected_task() else {
             return;
@@ -1434,9 +1436,9 @@ impl App {
             ));
             return;
         }
-        if state != TaskState::Proposed {
+        if !matches!(state, TaskState::Proposed | TaskState::Ready) {
             self.status = Some(format!(
-                "task is {state} — refine works on a proposal awaiting triage"
+                "task is {state} — refine works on a proposal or a ready task"
             ));
             return;
         }
@@ -1454,8 +1456,8 @@ impl App {
 
     /// Note-driven refine (DESIGN.md §6): hand the body, the note, and the
     /// discovered-from context to a headless agent that rewrites the body in
-    /// place. No transition — the task stays `proposed` and comes back round
-    /// for a verdict on the improved version.
+    /// place. The task leaves the queue for `refining` while the round runs and
+    /// comes back `proposed` for a verdict on the improved version.
     fn refine_with_note(&mut self, task_id: i64, note: &str) {
         match crate::dispatch::refine(&mut self.store, &self.dispatch_ctx, task_id, note) {
             Ok(summary) => {
@@ -3151,11 +3153,30 @@ mod tests {
         assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Proposed);
     }
 
-    /// On anything but a proposal the queue's refine keys are a no-op that says
-    /// why, the same style as the other action keys — not a silent swallow.
+    /// A task triaged `ready` against a body the operator has since soured on
+    /// refines from the queue exactly as a proposal does (DESIGN.md §6).
     #[test]
-    fn the_queue_refine_keys_explain_themselves_on_a_non_proposal() {
+    fn refine_key_answers_on_a_ready_task_too() {
         let mut app = app_with(&[TaskState::Ready]);
+        let task_id = app.selected_task_id().expect("the ready row is selected");
+
+        key(&mut app, KeyCode::Char('r'));
+        match &app.mode {
+            Mode::Prompt {
+                task_id: id,
+                kind: PromptKind::RefineNote,
+                ..
+            } => assert_eq!(*id, task_id),
+            _ => panic!("r on a queued ready task should open the refine-note prompt"),
+        }
+    }
+
+    /// Past `ready` the body is a brief already being worked, so the queue's
+    /// refine keys are a no-op that says why, the same style as the other action
+    /// keys — not a silent swallow.
+    #[test]
+    fn the_queue_refine_keys_explain_themselves_on_work_under_way() {
+        let mut app = app_with(&[TaskState::Review]);
 
         key(&mut app, KeyCode::Char('r'));
         assert!(matches!(app.mode, Mode::Normal));

@@ -27,9 +27,9 @@ pub enum Triage {
 pub enum Action {
     /// proposed → parked | ready | rejected
     Triage(Triage),
-    /// proposed → refining; the string is the operator's refine note, which
-    /// rides the transition as a `refined` event (empty for the interactive
-    /// flavour, which is a conversation rather than a brief).
+    /// proposed | ready → refining; the string is the operator's refine note,
+    /// which rides the transition as a `refined` event (empty for the
+    /// interactive flavour, which is a conversation rather than a brief).
     Refine(String),
     /// refining → proposed; the round is over, however it ended.
     ConcludeRefine(RefineOutcome),
@@ -167,9 +167,11 @@ impl Store {
     }
 
     /// Refine's atomic write (DESIGN.md §6), the shape [`record_dispatch`]
-    /// established: move the task `proposed → refining` and open the round's
-    /// session in one transaction, so a refining task always has a session to
-    /// probe and a refine session always names a task that is refining. The
+    /// established: move the task `proposed | ready → refining` and open the
+    /// round's session in one transaction, so a refining task always has a
+    /// session to probe and a refine session always names a task that is
+    /// refining. A round launched from `ready` still concludes to `proposed`,
+    /// which is what sends the rewritten body back through triage. The
     /// note rides the transition; the empty string is the interactive flavour,
     /// which is a conversation rather than a brief. Spawning the process is the
     /// caller's job, before this commits.
@@ -195,8 +197,11 @@ impl Store {
     /// trigger comes through here — the agent's own `set --body-file`
     /// (`Applied`), a reconciled dead agent (`Failed`), a quit or cancelled
     /// session (`Cancelled`) — so the returned proposal's markers read from one
-    /// place. Refused on a task that is not refining, like any other
-    /// transition.
+    /// place. The landing is `proposed` whatever the round started from: the
+    /// round keeps no memory of its origin, so a task refined out of `ready`
+    /// comes back for a fresh verdict on the body that replaced the one the old
+    /// verdict was issued against. Refused on a task that is not refining, like
+    /// any other transition.
     pub fn conclude_refine(&mut self, task_id: i64, outcome: RefineOutcome) -> Result<Task> {
         self.apply(task_id, Action::ConcludeRefine(outcome))
     }
@@ -385,10 +390,11 @@ fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskSta
         (Proposed, Action::Triage(Triage::Parked)) => Parked,
         (Proposed, Action::Triage(Triage::Ready)) => Ready,
         (Proposed, Action::Triage(Triage::Reject)) => Rejected,
-        // A refine round: out of the triage queue while an agent rewrites the
-        // body, back to `proposed` for a real verdict when it concludes
-        // (DESIGN.md §6).
-        (Proposed, Action::Refine(_)) => Refining,
+        // A refine round: out of the queue while an agent rewrites the body,
+        // back to `proposed` for a real verdict when it concludes — from
+        // `ready` as much as from `proposed`, since a verdict issued against a
+        // body that no longer exists has to be reissued (DESIGN.md §6).
+        (Proposed | Ready, Action::Refine(_)) => Refining,
         (Refining, Action::ConcludeRefine(_)) => Proposed,
         (Ready | Stalled, Action::Start) => Running,
         // A human task cannot be blocked on a decision — the executor *is* the
@@ -796,7 +802,7 @@ mod tests {
             (Proposed, Action::Triage(Triage::Parked)) => Some(Parked),
             (Proposed, Action::Triage(Triage::Ready)) => Some(Ready),
             (Proposed, Action::Triage(Triage::Reject)) => Some(Rejected),
-            (Proposed, Action::Refine(_)) => Some(Refining),
+            (Proposed | Ready, Action::Refine(_)) => Some(Refining),
             (Refining, Action::ConcludeRefine(_)) => Some(Proposed),
             (Ready | Stalled, Action::Start) => Some(Running),
             (Ready | Stalled, Action::Park) => Some(Parked),
@@ -844,7 +850,7 @@ mod tests {
     /// `legal_actions` is the transition *menu*, so it matches `apply` on every
     /// action but one: launching a refine is a legal transition the menu
     /// deliberately withholds, because that menu collects verdicts and refine is
-    /// not one (DESIGN.md §6) — it answers from its own key over the proposal.
+    /// not one (DESIGN.md §6) — it answers from its own key over the row.
     #[test]
     fn legal_actions_agrees_with_apply() {
         for state in TaskState::ALL {
@@ -876,6 +882,99 @@ mod tests {
                     "legal_actions disagrees for {state} + {action:?}"
                 );
             }
+        }
+    }
+
+    // --- refine rounds (DESIGN.md §6): where they start and where they land ---
+
+    mod refine {
+        use super::*;
+
+        /// The note-driven and interactive flavours are one action carrying
+        /// different notes, so both must open a round from `ready` and both
+        /// must open its session in the same write.
+        #[test]
+        fn a_ready_task_can_be_refined_in_either_flavour() {
+            for note in ["the body names no files", ""] {
+                let (mut s, p) = store_with_project();
+                let id = create(&mut s, p, TaskState::Ready);
+
+                let (task, session) = s
+                    .record_refine_launch(id, note, "claude", Some(4242), None)
+                    .unwrap();
+                assert_eq!(task.state, TaskState::Refining);
+                assert_eq!(session.task_id, id);
+                assert!(session.ended_at.is_none());
+                assert!(
+                    s.events_for(id)
+                        .unwrap()
+                        .iter()
+                        .any(|e| e.detail.as_deref() == Some("ready -> refining")),
+                    "the transition is logged"
+                );
+            }
+        }
+
+        /// However the round ends, and whichever state it started from, it
+        /// lands on `proposed`: the verdict a `ready` task already carried was
+        /// issued against a body that no longer exists (DESIGN.md §6).
+        #[test]
+        fn every_round_concludes_to_proposed_whatever_it_started_from() {
+            for from in [TaskState::Proposed, TaskState::Ready] {
+                for outcome in [
+                    RefineOutcome::Applied,
+                    RefineOutcome::Failed,
+                    RefineOutcome::Cancelled,
+                ] {
+                    let (mut s, p) = store_with_project();
+                    let id = create(&mut s, p, from);
+                    s.record_refine_launch(id, "thin body", "claude", Some(1), None)
+                        .unwrap();
+
+                    let task = s.conclude_refine(id, outcome).unwrap();
+                    assert_eq!(task.state, TaskState::Proposed, "{from} + {outcome:?}");
+                }
+            }
+        }
+
+        /// `parked` is deliberately outside the widening, and so is every state
+        /// past triage — a refine rewrites a brief, and by `running` the brief
+        /// is already being worked.
+        #[test]
+        fn refine_is_refused_everywhere_but_proposed_and_ready() {
+            for state in TaskState::ALL {
+                if matches!(state, TaskState::Proposed | TaskState::Ready) {
+                    continue;
+                }
+                let (mut s, p) = store_with_project();
+                let id = task_in_state(&mut s, p, state);
+                let result = s.apply(id, Action::Refine("thin body".into()));
+                assert!(
+                    matches!(result, Err(Error::InvalidTransition { .. })),
+                    "refine from {state} should be refused"
+                );
+            }
+        }
+
+        /// The dispatch race is closed by the state rather than by a guard
+        /// (DESIGN.md §6): a `ready` task under refinement is not in the
+        /// scheduler's input at all, so no window can hand it out while its
+        /// body is being rewritten.
+        #[test]
+        fn a_refining_task_leaves_the_ready_work_queue() {
+            let (mut s, p) = store_with_project();
+            s.set_weight(p, 3).unwrap();
+            let id = create(&mut s, p, TaskState::Ready);
+            assert!(crate::scheduler::focus(&s.candidates().unwrap()).is_some());
+
+            s.record_refine_launch(id, "thin body", "claude", Some(1), None)
+                .unwrap();
+            let candidates = s.candidates().unwrap();
+            assert!(
+                !candidates.iter().any(|c| c.task.id == id),
+                "a refining task is not a scheduler candidate"
+            );
+            assert!(crate::scheduler::focus(&candidates).is_none());
         }
     }
 

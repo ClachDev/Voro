@@ -511,10 +511,11 @@ pub fn plan_session(
 }
 
 /// The precondition both refine flavours share: a refine round starts from
-/// `proposed` (DESIGN.md §6), so anything else is refused before a prompt is
-/// written or a process spawned. The transition API refuses it again when the
-/// round is recorded; this is the early, spelled-out refusal — including of a
-/// task already `refining`, whose round the operator can only cancel.
+/// `proposed` or `ready` (DESIGN.md §6), so anything else is refused before a
+/// prompt is written or a process spawned. The transition API refuses it again
+/// when the round is recorded; this is the early, spelled-out refusal —
+/// including of a task already `refining`, whose round the operator can only
+/// cancel.
 fn guard_refinable(store: &Store, task_id: i64) -> Result<voro_core::Task, String> {
     let task = store.task(task_id).map_err(|e| e.to_string())?;
     if task.state == TaskState::Refining {
@@ -522,9 +523,9 @@ fn guard_refinable(store: &Store, task_id: i64) -> Result<voro_core::Task, Strin
             "task {task_id} is already being refined — cancel that round first"
         ));
     }
-    if task.state != TaskState::Proposed {
+    if !matches!(task.state, TaskState::Proposed | TaskState::Ready) {
         return Err(format!(
-            "only a proposed task can be refined; task {task_id} is {}",
+            "only a proposed or ready task can be refined; task {task_id} is {}",
             task.state
         ));
     }
@@ -658,12 +659,15 @@ fn kill_expansion(spawned: Spawned) {
     let _ = child.wait();
 }
 
-/// Note-driven refine (DESIGN.md §6): hand a proposed task's body, the
+/// Note-driven refine (DESIGN.md §6): hand a proposed or ready task's body, the
 /// operator's note, and the context of the task it was discovered from to a
 /// headless agent, which rewrites the body and applies it with `voro set
-/// --body-file`. The task moves `proposed → refining` and opens a session row in
-/// one write, so the rewrite is visible in every window and out of the triage
-/// queue until it concludes. The *default* agent runs it whatever override the
+/// --body-file`. The task moves `proposed | ready → refining` and opens a
+/// session row in one write, so the rewrite is visible in every window and out
+/// of the queue until it concludes — which is what stops a second window
+/// dispatching a `ready` task against the body being replaced. However the round
+/// began it concludes to `proposed`, so the rewritten body earns a fresh
+/// verdict. The *default* agent runs it whatever override the
 /// task carries, since a task's agent override picks who executes the task, not
 /// who writes its brief; the task's `deep` flag still applies, because a task
 /// worth the strongest model is worth a brief written with it. A human task
@@ -2413,7 +2417,7 @@ mod tests {
     }
 
     #[test]
-    fn refine_is_refused_off_proposed_and_without_a_note() {
+    fn refine_is_refused_off_the_brief_states_and_without_a_note() {
         let (mut store, ctx, project) = fixture("cat {prompt_file}");
         let id = proposal(&mut store, &project, false);
 
@@ -2421,13 +2425,38 @@ mod tests {
         assert!(err.contains("note"), "{err}");
 
         store
-            .apply(id, voro_core::Action::Triage(voro_core::Triage::Ready))
+            .apply(id, voro_core::Action::Triage(voro_core::Triage::Parked))
             .unwrap();
         let err = refine(&mut store, &ctx, id, "too late").unwrap_err();
-        assert!(err.contains("proposed"), "{err}");
+        assert!(err.contains("proposed or ready"), "{err}");
         // refused before anything spawned, so no prompt was even written
         assert!(!ctx.runtime_dir.exists());
         assert!(!store.refined_flag(id).unwrap());
+    }
+
+    /// The widening of task #352: a triaged task whose body the operator now
+    /// wants rewritten refines like a proposal, and the round takes it out of
+    /// the dispatchable queue while it runs (DESIGN.md §6).
+    #[test]
+    fn a_ready_task_refines_like_a_proposal() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file} > refine-prompt.txt");
+        let id = proposal(&mut store, &project, false);
+        store
+            .apply(id, voro_core::Action::Triage(voro_core::Triage::Ready))
+            .unwrap();
+
+        refine(&mut store, &ctx, id, "name the files it touches").unwrap();
+        assert_eq!(store.task(id).unwrap().state, TaskState::Refining);
+        assert!(
+            !store.candidates().unwrap().iter().any(|c| c.task.id == id),
+            "a refining task is out of the scheduler's input"
+        );
+
+        store
+            .conclude_refine(id, voro_core::RefineOutcome::Applied)
+            .unwrap();
+        assert_eq!(store.task(id).unwrap().state, TaskState::Proposed);
+        assert!(store.refined_flag(id).unwrap());
     }
 
     #[test]
@@ -2481,18 +2510,18 @@ mod tests {
     }
 
     #[test]
-    fn interactive_refine_is_refused_off_proposed() {
+    fn interactive_refine_is_refused_off_the_brief_states() {
         let (mut store, ctx, project) = fixture_toml(
             "default_agent = \"stub\"\n\n[agents.stub]\n\
              dispatch = \"cat {prompt_file}\"\nplan = \"stub --interactive {prompt_file}\"\n",
         );
         let id = proposal(&mut store, &project, false);
         store
-            .apply(id, voro_core::Action::Triage(voro_core::Triage::Ready))
+            .apply(id, voro_core::Action::Triage(voro_core::Triage::Parked))
             .unwrap();
 
         let err = plan_session(&store, &ctx, PlanTarget::Refine { task_id: id }).unwrap_err();
-        assert!(err.contains("proposed"), "{err}");
+        assert!(err.contains("proposed or ready"), "{err}");
     }
 
     /// A round already in flight is not refinable either — the second launch is

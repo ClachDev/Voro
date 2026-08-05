@@ -203,16 +203,19 @@ transitions
                                   the three verdicts move the proposal; refine
                                   is not a verdict — it dispatches an agent to
                                   rewrite the body against --note TEXT (or
-                                  --note-file PATH), moving the task proposed →
-                                  refining until the round concludes. It returns
-                                  to proposed marked ↻ refined for a re-triage
-                                  of the improved version, or ⚠ refine failed if
-                                  the agent died having written nothing. A
-                                  verdict on a refining task is refused: it is
-                                  out of the queue while the rewrite is in
-                                  flight. The note-less interactive variant is a
-                                  conversation with the agent, so it lives in
-                                  the TUI, on `R` over a proposal
+                                  --note-file PATH), moving the task proposed or
+                                  ready → refining until the round concludes. It
+                                  returns to proposed marked ↻ refined for a
+                                  re-triage of the improved version, or ⚠ refine
+                                  failed if the agent died having written
+                                  nothing. A task refined out of ready comes back
+                                  through triage because the verdict it carried
+                                  was issued against the replaced body. A verdict
+                                  on a refining task is refused: it is out of the
+                                  queue while the rewrite is in flight. The
+                                  note-less interactive variant is a conversation
+                                  with the agent, so it lives in the TUI, on `R`
+                                  over the row
   start <task-id>                 ready → running
   ask <task-id> --question TEXT   running → needs-input
   resume <task-id>                needs-input → running, once you have answered
@@ -2202,11 +2205,12 @@ fn ask_verb(store: &mut Store, args: AskArgs) -> Result<String, String> {
 
 /// Triage a proposal (DESIGN.md §6). Three of the four outcomes are verdicts
 /// that transition the task; `refine` is the fourth — it dispatches an agent to
-/// rewrite the body against the operator's note and leaves the task `proposed`,
-/// so the improved version comes back round for a real verdict. A note is
-/// required here: the note-less interactive variant is an agent conversation,
-/// which is TUI-only for the same reason planning sessions are (§8) — the CLI is
-/// how an LLM drives Voro.
+/// rewrite the body against the operator's note, so the improved version comes
+/// back round for a real verdict. The verdicts act on a proposal alone; refine
+/// also accepts a `ready` id, whose rewritten body then returns through triage.
+/// A note is required here: the note-less interactive variant is an agent
+/// conversation, which is TUI-only for the same reason planning sessions are
+/// (§8) — the CLI is how an LLM drives Voro.
 fn triage_verb(store: &mut Store, args: TriageArgs, ctx: &DispatchCtx) -> Result<String, String> {
     let note = text_or_file(args.note, args.note_file)?;
     match Triage::try_from(args.target) {
