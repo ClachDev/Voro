@@ -147,7 +147,11 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #     for planning), and the optional `{task_id}` by the task's numeric id.
 #     The optional session verbs unlock attachable dispatch, and each degrades
 #     gracefully when absent:
-#       sessions  list the agent's sessions as JSON (liveness + ref capture)
+#       sessions  list the agent's sessions as JSON (liveness + ref capture).
+#                 Each entry needs an id (`sessionId`, or `id`); `state`
+#                 (`done` once finished, `working` while going) and `pid` say
+#                 whether it is still live, `pid` deciding it where present.
+#                 An entry carrying neither reads as dead.
 #       attach    open a running session interactively    ({session})
 #       resume    reopen a finished session interactively  ({session})
 #       message   say one thing into a session headlessly, no terminal
@@ -1094,7 +1098,8 @@ impl AgentsConfig {
 /// objects, of which the fields below are read and everything else ignored.
 /// `sessionId` (falling back to `id`) is the durable reference substituted
 /// into `{session}`; `cwd` and `startedAt` (ms epoch) identify a fresh
-/// dispatch's session among its siblings; `state` is `"done"` once finished.
+/// dispatch's session among its siblings; `state` and `pid` together say
+/// whether the session is still going ([`AgentSessionEntry::liveness`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSessionEntry {
     pub session_ref: String,
@@ -1102,6 +1107,24 @@ pub struct AgentSessionEntry {
     pub cwd: Option<String>,
     pub started_at_ms: Option<i64>,
     pub state: Option<String>,
+    /// The supervisor process behind this session, where the listing names one.
+    /// Authoritative for liveness when present (DESIGN.md §8), since a listing
+    /// keeps entries for sessions whose state it never retires.
+    pub pid: Option<i64>,
+}
+
+/// What a listing entry says about its session, as far as pure logic can tell
+/// (DESIGN.md §8). [`AgentSessionEntry::liveness`] classifies; the `voro` crate
+/// resolves [`SessionLiveness::WhileProcessLives`] with the process check, so
+/// `voro-core` still never touches a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLiveness {
+    /// Still going, with nothing left to check.
+    Live,
+    /// Live exactly while this process exists.
+    WhileProcessLives(i64),
+    /// No longer running.
+    Dead,
 }
 
 impl AgentSessionEntry {
@@ -1111,9 +1134,21 @@ impl AgentSessionEntry {
         self.session_ref == session_ref || self.short_id.as_deref() == Some(session_ref)
     }
 
-    /// A finished session: still listed, but no longer running.
-    pub fn is_finished(&self) -> bool {
-        self.state.as_deref() == Some("done")
+    /// Classify this entry's liveness (DESIGN.md §8). A listing that keeps an
+    /// entry forever is the case this exists for: an agent's own listing may
+    /// leave a long-dead session sitting at `blocked` and never say `done`, so
+    /// not-done cannot mean live. A named `pid` decides it — which keeps a
+    /// genuinely stalled session, blocked on a permission prompt with its
+    /// supervisor alive, reading as live and attachable. Failing a pid, only
+    /// `working` claims the session is going; anything else, including a state
+    /// this doesn't recognise or no state at all, reads as dead.
+    pub fn liveness(&self) -> SessionLiveness {
+        match (self.state.as_deref(), self.pid) {
+            (Some("done"), _) => SessionLiveness::Dead,
+            (_, Some(pid)) => SessionLiveness::WhileProcessLives(pid),
+            (Some("working"), None) => SessionLiveness::Live,
+            _ => SessionLiveness::Dead,
+        }
     }
 }
 
@@ -1139,6 +1174,7 @@ pub fn parse_sessions_json(json: &str) -> Result<Vec<AgentSessionEntry>> {
             cwd: get_str("cwd"),
             started_at_ms: item.get("startedAt").and_then(|v| v.as_i64()),
             state: get_str("state"),
+            pid: item.get("pid").and_then(|v| v.as_i64()),
         });
     }
     Ok(entries)
@@ -1703,12 +1739,50 @@ mod tests {
         assert_eq!(entries[0].short_id.as_deref(), Some("deadbeef"));
         assert_eq!(entries[0].cwd.as_deref(), Some("/tmp/proj"));
         assert_eq!(entries[0].started_at_ms, Some(1767950000000));
-        assert!(entries[0].is_finished());
+        assert_eq!(entries[0].pid, Some(4321));
+        assert_eq!(entries[0].liveness(), SessionLiveness::Dead);
         assert!(entries[0].matches_ref("deadbeef"), "short id matches too");
         assert!(entries[0].matches_ref("3f6c0e6e-1111-2222-3333-444455556666"));
 
         assert_eq!(entries[1].session_ref, "cafebabe", "id is the fallback");
-        assert!(!entries[1].is_finished(), "no state means not finished");
+        assert_eq!(entries[1].pid, None, "the field is optional");
+        assert_eq!(
+            entries[1].liveness(),
+            SessionLiveness::Dead,
+            "an entry saying neither state nor pid claims nothing, so it is not live"
+        );
+    }
+
+    /// The listing's own account of liveness (DESIGN.md §8). The case that
+    /// forced it: an agent listing that never retires a finished session leaves
+    /// it sitting at `blocked` indefinitely, so not-`done` cannot mean live —
+    /// but a `blocked` entry whose supervisor pid is still there is a session
+    /// genuinely stuck mid-turn, which must stay live and attachable.
+    #[test]
+    fn liveness_takes_done_first_then_pid_then_state() {
+        let entry = |json: &str| {
+            let listing = format!("[{{\"sessionId\": \"u\", {json}}}]");
+            parse_sessions_json(&listing).unwrap().remove(0).liveness()
+        };
+        // `done` wins over a pid that is still around: the session is over
+        // whatever process outlives it.
+        assert_eq!(
+            entry(r#""state": "done", "pid": 4321"#),
+            SessionLiveness::Dead
+        );
+        assert_eq!(entry(r#""state": "done""#), SessionLiveness::Dead);
+        // a pid decides every other state, including one Voro does not know
+        for state in ["\"state\": \"blocked\", ", "\"state\": \"working\", ", ""] {
+            assert_eq!(
+                entry(&format!("{state}\"pid\": 4321")),
+                SessionLiveness::WhileProcessLives(4321),
+                "{state}"
+            );
+        }
+        // without a pid, only `working` claims the session is going
+        assert_eq!(entry(r#""state": "working""#), SessionLiveness::Live);
+        assert_eq!(entry(r#""state": "blocked""#), SessionLiveness::Dead);
+        assert_eq!(entry(r#""state": "idle""#), SessionLiveness::Dead);
     }
 
     #[test]

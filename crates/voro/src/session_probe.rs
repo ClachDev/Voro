@@ -1,10 +1,16 @@
 //! Liveness of an agent's own session — the one thing about a session Voro
 //! reads by asking rather than by being told (DESIGN.md §8). An agent defining
 //! a `sessions` verb lists its sessions as JSON, and a session is live while
-//! its captured ref appears there not-yet-finished. Every caller that runs that
-//! verb comes through here: reconciliation (has a `running` task's session
-//! died?), the jump-in key (attach a live session, resume a finished one), and
-//! ref capture at dispatch.
+//! its captured ref appears there on an entry that still reads as running.
+//! Every caller that runs that verb comes through here: reconciliation (has a
+//! `running` task's session died?), the jump-in key (attach a live session,
+//! resume a finished one), and ref capture at dispatch.
+//!
+//! Reading an entry takes two halves. `voro-core` classifies it from `state`
+//! and `pid` alone ([`AgentSessionEntry::liveness`]), and this module supplies
+//! the process check that a pid-bearing entry resolves through — the same
+//! `kill -0` the pid-only agents are reconciled by, so the boundary that keeps
+//! `voro-core` free of process I/O holds for both liveness sources.
 //!
 //! Liveness is three-valued on purpose. `None` — no `sessions` verb, no
 //! captured ref, or a listing that would not run — means unknowable, and each
@@ -14,7 +20,7 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use voro_core::{AgentSessionEntry, parse_sessions_json};
+use voro_core::{AgentSessionEntry, SessionLiveness, parse_sessions_json};
 
 /// Run an agent's `sessions` command and parse its listing, in a given
 /// directory where the caller has one to scope it to (dispatch matches a fresh
@@ -34,13 +40,38 @@ pub fn run_sessions_command(cmd: &str, cwd: Option<&Path>) -> Option<Vec<AgentSe
     parse_sessions_json(&String::from_utf8_lossy(&output.stdout)).ok()
 }
 
+/// Whether one listing entry describes a session still going: `voro-core`'s
+/// classification with its process check resolved.
+pub fn entry_is_live(entry: &AgentSessionEntry) -> bool {
+    match entry.liveness() {
+        SessionLiveness::Live => true,
+        SessionLiveness::WhileProcessLives(pid) => pid_is_alive(pid),
+        SessionLiveness::Dead => false,
+    }
+}
+
 /// Whether a listing shows this ref as a session still going. A ref that has
-/// dropped out of the listing reads the same as one marked finished.
+/// dropped out of the listing reads the same as one whose entry is dead.
 pub fn listing_says_live(entries: &[AgentSessionEntry], session_ref: &str) -> bool {
     entries
         .iter()
         .find(|e| e.matches_ref(session_ref))
-        .is_some_and(|e| !e.is_finished())
+        .is_some_and(entry_is_live)
+}
+
+/// Whether a process with this pid still exists, via `kill -0` (existence
+/// check, no signal sent). A non-positive pid is refused: 0 and negative pids
+/// address process groups, not the single process meant here. Shared by both
+/// liveness sources — the pid a session row recorded at spawn, and the pid a
+/// listing entry names for its supervisor.
+pub fn pid_is_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
 /// Whether a session is still running, for a caller holding no listing of its
@@ -73,6 +104,54 @@ mod tests {
         assert_eq!(session_is_live(Some(&done), Some("uuid-1")), Some(false));
         let empty = listing_cmd("[]");
         assert_eq!(session_is_live(Some(&empty), Some("uuid-1")), Some(false));
+    }
+
+    /// A pid-less zombie: the listing keeps the entry at `blocked` long after
+    /// the session died, and with no pid to check there is nothing claiming it
+    /// is going. Reading it as live is what sent quick-message and jump-in at a
+    /// session that no longer exists (DESIGN.md §8).
+    #[test]
+    fn a_pidless_blocked_entry_is_not_live() {
+        let cmd = listing_cmd(r#"[{"sessionId": "uuid-1", "state": "blocked"}]"#);
+        assert_eq!(session_is_live(Some(&cmd), Some("uuid-1")), Some(false));
+    }
+
+    /// The other half: the same `blocked` entry with a supervisor pid that is
+    /// still around is a session genuinely stuck mid-turn — live, attachable,
+    /// and not something a headless message may join.
+    #[test]
+    fn a_blocked_entry_with_a_live_pid_is_live() {
+        let cmd = listing_cmd(&format!(
+            r#"[{{"sessionId": "uuid-1", "state": "blocked", "pid": {}}}]"#,
+            std::process::id()
+        ));
+        assert_eq!(session_is_live(Some(&cmd), Some("uuid-1")), Some(true));
+    }
+
+    /// A named pid that has gone decides the entry too, whatever its state —
+    /// and `done` beside a live pid still reads dead.
+    #[test]
+    fn the_named_pid_decides_unless_the_entry_says_done() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        let cmd = listing_cmd(&format!(
+            r#"[{{"sessionId": "uuid-1", "state": "working", "pid": {dead_pid}}}]"#
+        ));
+        assert_eq!(session_is_live(Some(&cmd), Some("uuid-1")), Some(false));
+
+        let cmd = listing_cmd(&format!(
+            r#"[{{"sessionId": "uuid-1", "state": "done", "pid": {}}}]"#,
+            std::process::id()
+        ));
+        assert_eq!(session_is_live(Some(&cmd), Some("uuid-1")), Some(false));
+    }
+
+    #[test]
+    fn a_non_positive_pid_is_never_alive() {
+        assert!(!pid_is_alive(0));
+        assert!(!pid_is_alive(-1));
+        assert!(pid_is_alive(std::process::id() as i64));
     }
 
     /// The three ways liveness is unknowable, each answering `None` rather

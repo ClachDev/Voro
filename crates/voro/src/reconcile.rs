@@ -16,11 +16,14 @@
 //! `sessions` verb is queried through [`crate::session_probe`], its listing
 //! taken once per pass and cached here across the sessions sharing an agent.
 //! This is the only correct source for supervisor-owned launches (`claude
-//! --bg`), whose spawned pid is a launcher that exits at birth: pid-checking
-//! would declare every such dispatch dead, so those sessions are *never*
-//! pid-checked, and undeterminable liveness (no ref, listing failed) is left
-//! alone rather than guessed. Agents without a `sessions` verb keep the pid
-//! check.
+//! --bg`), whose spawned pid is a launcher that exits at birth: the pid the
+//! session row holds would declare every such dispatch dead, so it is never
+//! consulted for them, and undeterminable liveness (no ref, listing failed) is
+//! left alone rather than guessed. The pid a listing *entry* carries is a
+//! different pid — the supervisor's — and it is authoritative where present,
+//! which is what stops a listing that keeps dead sessions at `blocked` forever
+//! from reading them all as live. Agents without a `sessions` verb keep the
+//! spawned-pid check.
 //!
 //! A refine round is the exception that check exists to avoid guessing about,
 //! and it is not a guess: refine spawns its agent as a direct `sh -c` child
@@ -36,11 +39,10 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::process::Command;
 
 use voro_core::{AgentSessionEntry, AgentsConfig, Result, Store, TaskState};
 
-use crate::session_probe::{listing_says_live, run_sessions_command};
+use crate::session_probe::{listing_says_live, pid_is_alive, run_sessions_command};
 
 /// How much of a session's log tail to scan for a usage-cap signature.
 const LOG_TAIL_BYTES: u64 = 4096;
@@ -125,19 +127,6 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
     Ok(finalised)
 }
 
-/// Whether a process with this pid still exists, via `kill -0` (existence
-/// check, no signal sent). A non-positive pid is refused: 0 and negative pids
-/// address process groups, not the single process meant here.
-fn pid_is_alive(pid: i64) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .is_ok_and(|out| out.status.success())
-}
-
 /// Best-effort usage-cap detector (DESIGN.md §8): scan the log tail for the
 /// phrases in [`CAP_SIGNATURES`].
 fn log_tail_looks_capped(path: &str) -> bool {
@@ -161,7 +150,7 @@ fn log_tail_looks_capped(path: &str) -> bool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::process::Stdio;
+    use std::process::{Command, Stdio};
     use voro_core::{Action, NewTask, Priority, SessionOutcome, TaskState};
 
     /// An agents path that never exists — loads the built-ins, so a verb-less
@@ -442,6 +431,57 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// The zombie case (DESIGN.md §8): an agent's listing keeps entries for
+    /// long-dead sessions at `blocked` and never says `done`, so a `running`
+    /// task whose session is one of them must still be finalised — otherwise
+    /// the task rides the strip as live forever.
+    #[test]
+    fn a_pidless_blocked_zombie_stalls_the_task() {
+        let (agents_path, dir) = sessions_fixture(
+            "zombie",
+            r#"[{"sessionId": "full-uuid-1", "cwd": "/tmp/proj",
+                "startedAt": 1, "state": "blocked"}]"#,
+        );
+        let (mut s, task_id) = running_task();
+        let session = s
+            .create_session(task_id, "claude", Some(std::process::id() as i64), None)
+            .unwrap();
+        s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 1);
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
+        assert_eq!(
+            s.session(session.id).unwrap().outcome,
+            Some(SessionOutcome::Failed)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same entry with its supervisor pid still alive is a session stuck
+    /// mid-turn, not a zombie: left alone, so a permission prompt waiting on
+    /// the operator does not stall the task under them.
+    #[test]
+    fn a_blocked_entry_with_a_live_pid_is_left_alone() {
+        let (agents_path, dir) = sessions_fixture(
+            "blocked-live",
+            &format!(
+                r#"[{{"sessionId": "full-uuid-1", "cwd": "/tmp/proj",
+                    "startedAt": 1, "state": "blocked", "pid": {}}}]"#,
+                std::process::id()
+            ),
+        );
+        let (mut s, task_id) = running_task();
+        let session = s.create_session(task_id, "claude", None, None).unwrap();
+        s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert!(s.session(session.id).unwrap().ended_at.is_none());
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// With a `sessions` verb configured but no captured ref, liveness is

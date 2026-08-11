@@ -16,9 +16,9 @@ mod transition;
 
 pub use agent::{
     AgentSessionEntry, AgentTemplate, AgentsConfig, Launch, LaunchSpec, PROMPT_FILE_PLACEHOLDER,
-    Provenance, ResolvedAgent, SESSION_NAME_PLACEHOLDER, SESSION_PLACEHOLDER, TASK_ID_PLACEHOLDER,
-    VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, ViewerTemplate,
-    parse_sessions_json, render_message,
+    Provenance, ResolvedAgent, SESSION_NAME_PLACEHOLDER, SESSION_PLACEHOLDER, SessionLiveness,
+    TASK_ID_PLACEHOLDER, VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER,
+    VIEWER_PATH_PLACEHOLDER, ViewerTemplate, parse_sessions_json, render_message,
 };
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};
