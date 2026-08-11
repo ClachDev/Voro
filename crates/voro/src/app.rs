@@ -4262,6 +4262,23 @@ mod tests {
     const LIVE_LISTING: &str = r#"[{"sessionId": "ref-1", "state": "working"}]"#;
     const FINISHED_LISTING: &str = r#"[{"sessionId": "ref-1", "state": "done"}]"#;
 
+    /// The zombie shape the pid rule exists for (task #376): an entry the
+    /// agent's listing leaves at `blocked` long after the session died, with
+    /// no pid to check. It read as live while not-`done` meant live, which
+    /// sent `A` at `claude attach <uuid>` — "No job matching" — and made `a`
+    /// refuse a session there was nothing to attach to.
+    const ZOMBIE_LISTING: &str = r#"[{"sessionId": "ref-1", "state": "blocked"}]"#;
+
+    /// The same entry with a supervisor pid that is still around: a session
+    /// genuinely stuck mid-turn — on a permission prompt, say — which stays
+    /// live, attachable, and closed to a headless send.
+    fn blocked_live_listing() -> String {
+        format!(
+            r#"[{{"sessionId": "ref-1", "state": "blocked", "pid": {}}}]"#,
+            std::process::id()
+        )
+    }
+
     struct JumpIn {
         store: Store,
         ctx: crate::dispatch::DispatchCtx,
@@ -4380,6 +4397,47 @@ mod tests {
     #[test]
     fn attach_key_attaches_to_a_review_tasks_live_session() {
         let mut env = jump_in_env(all_verbs(), LIVE_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        let project_path = env.project_path.clone();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('A'));
+
+        let request = app.pending_attach.clone().expect("an attach request");
+        assert_eq!(request.command, "agent attach 'ref-1'");
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// A review task whose entry is a pid-less zombie resumes: `blocked` with
+    /// nothing behind it is not a claim that anything is still running, and
+    /// attaching to it fails at the agent (task #376).
+    #[test]
+    fn attach_key_resumes_a_review_tasks_zombie_session() {
+        let mut env = jump_in_env(all_verbs(), ZOMBIE_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        let project_path = env.project_path.clone();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        key(&mut app, KeyCode::Char('A'));
+
+        let request = app.pending_attach.clone().expect("a resume request");
+        assert_eq!(request.command, "agent resume 'ref-1'");
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// The same entry with a live pid is the case the pid rule protects: a
+    /// stalled-but-alive session is attached to, not resumed out from under.
+    #[test]
+    fn attach_key_attaches_to_a_blocked_session_with_a_live_pid() {
+        let mut env = jump_in_env(all_verbs(), &blocked_live_listing());
         env.store
             .apply(env.task_id, Action::Complete(None))
             .unwrap();
@@ -4684,6 +4742,61 @@ mod tests {
     #[test]
     fn message_refuses_a_session_that_is_still_running() {
         let mut env = jump_in_env(all_verbs(), LIVE_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        let (project_path, task_id) = (env.project_path.clone(), env.task_id);
+        let root = project_path.parent().unwrap().to_path_buf();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        send_message(&mut app, "one more thing");
+
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Review);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("still running"),
+            "{:?}",
+            app.status
+        );
+        assert!(!launches(&root).contains("agent message"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The refusal's other half (task #376): a pid-less `blocked` zombie is
+    /// not a session still running, so the message goes headlessly — the
+    /// rejection lands first, then the send. The reconcile that follows finds
+    /// the same zombie and stalls the task, exactly as a `done` entry does
+    /// below, with the feedback already in the body for the redispatch.
+    #[test]
+    fn message_sends_into_a_zombie_session() {
+        let mut env = jump_in_env(all_verbs(), ZOMBIE_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        let (project_path, task_id) = (env.project_path.clone(), env.task_id);
+        let root = project_path.parent().unwrap().to_path_buf();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        send_message(&mut app, "the tests are missing");
+
+        let task = app.store.task(task_id).unwrap();
+        assert!(task.body.contains("the tests are missing"), "{}", task.body);
+        assert_eq!(task.state, TaskState::Stalled);
+        assert!(launches(&root).contains("agent message 'ref-1'"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same entry with a live pid keeps the refusal: the session is stuck
+    /// mid-turn with its supervisor still there, so the operator wants `A`.
+    #[test]
+    fn message_refuses_a_blocked_session_with_a_live_pid() {
+        let mut env = jump_in_env(all_verbs(), &blocked_live_listing());
         env.store
             .apply(env.task_id, Action::Complete(None))
             .unwrap();

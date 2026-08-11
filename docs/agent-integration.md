@@ -106,8 +106,12 @@ resume   = "codex resume {session}"
   on `plan`, which serves a target that has no task id to bind, and on the
   session verbs, which name their session with `{session}`.
 - `sessions` prints the agent's sessions as a JSON array; Voro reads
-  `sessionId` (or `id`), `cwd`, `startedAt` (ms epoch), and `state` (`"done"`
-  once finished) from each object and ignores the rest.
+  `sessionId` (or `id`), `cwd`, `startedAt` (ms epoch), `state` (`"done"` once
+  finished, `"working"` while going) and `pid` from each object and ignores the
+  rest. `state` and `pid` are what say whether an entry is still live, and both
+  are optional individually — but an entry carrying neither claims nothing and
+  reads as dead, so a listing should emit one or the other for every entry it
+  wants Voro to see as running (see *Liveness without pids* below).
 - `attach` opens the *running* session interactively; `{session}` is replaced
   with the reference Voro captured at dispatch.
 - `resume` reopens a *finished* session interactively.
@@ -178,11 +182,17 @@ dispatch summary says so.
 
 **Liveness without pids.** A `--bg`-style launch is owned by a supervisor and its
 spawned pid exits at once, so for agents with a `sessions` verb the reconciler
-never pid-checks: a session is live while its ref appears in the listing
-not-yet-`done`, and one that drops out or finishes there without calling `voro
-done`/`ask` stalls its task, exactly as pid-death does for plain agents (DESIGN.md
-§8). When liveness is unknowable (no ref, listing failed) the session is left
-alone.
+never checks the pid the session row recorded: liveness comes from the listing
+entry the ref appears on. That entry is read as dead once its `state` is `done`;
+failing that, a `pid` the *entry* names — the supervisor's, not the launcher's —
+decides it, the session being live exactly while that process exists; and failing
+both, only `state: "working"` reads live. Not-`done` deliberately does not mean
+live: a listing under no obligation to retire its entries (`claude agents --json`
+leaves dead sessions at `blocked` forever) would otherwise read as a fleet of
+running agents. A session that drops out, finishes, or zombies there without
+calling `voro done`/`ask` stalls its task, exactly as pid-death does for plain
+agents (DESIGN.md §8). When liveness is unknowable (no ref, listing failed) the
+session is left alone.
 
 **Jump-in.** In the TUI, `A` on a running task runs the agent's `attach` command
 with the TUI suspended — the real session, full control, including answering
