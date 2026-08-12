@@ -306,11 +306,13 @@ enum JumpVerb {
 
 /// Which verb a task's state implies — the fallback for when the agent cannot
 /// say whether its session is still live. `None` for a state with no session
-/// worth jumping into, which is what gates the key.
+/// worth jumping into, which is what gates the key. `waiting` keeps its session
+/// open exactly as `review` does (DESIGN.md §8), so it jumps in on the same
+/// terms — the strip is where the operator now meets it.
 fn state_jump_verb(state: TaskState) -> Option<JumpVerb> {
     match state {
         TaskState::Running => Some(JumpVerb::Attach),
-        TaskState::Review | TaskState::Stalled => Some(JumpVerb::Resume),
+        TaskState::Review | TaskState::Waiting | TaskState::Stalled => Some(JumpVerb::Resume),
         _ => None,
     }
 }
@@ -397,9 +399,10 @@ pub struct App {
     /// rows are selectable for triage. Keyed by project name and held across
     /// refreshes, so triaging one proposal does not collapse the rest.
     pub expanded_digests: std::collections::HashSet<String>,
-    /// The cockpit's running strip (DESIGN.md §9): one row per `running` task
-    /// with its open session if any, so a task started by hand is still visible.
-    /// Filtered on task state, so `review`/`needs-input` tasks stay in the queue.
+    /// The cockpit's running strip (DESIGN.md §9): one row per `running`,
+    /// `refining`, or `waiting` task with its open session if any, so a task
+    /// started by hand is still visible. Filtered on task state, so
+    /// `review`/`needs-input` tasks stay in the queue.
     pub running: Vec<RunningRow>,
     /// Task counts by state (DESIGN.md §12), rendered as the persistent header
     /// indicator so the backlogs stay felt even when a low-scoring row falls
@@ -1645,7 +1648,7 @@ impl App {
         };
         let Some(by_state) = state_jump_verb(state) else {
             self.status = Some(format!(
-                "task is {state} — jump-in works on running, review, or \
+                "task is {state} — jump-in works on running, review, waiting, or \
                  stalled tasks"
             ));
             return;
@@ -3030,6 +3033,16 @@ mod tests {
                     store.apply(task.id, Action::Complete(None)).unwrap();
                     store.apply(task.id, Action::Accept).unwrap();
                 }
+                // A hand-off, dispatched first so it carries the open session
+                // `waiting` keeps (DESIGN.md §8) — what the quick-message and
+                // jump-in keys read off the strip row.
+                TaskState::Waiting => {
+                    store
+                        .record_dispatch(task.id, "claude", None, None)
+                        .unwrap();
+                    store.apply(task.id, Action::Complete(None)).unwrap();
+                    store.apply(task.id, Action::HandOff).unwrap();
+                }
                 // A dispatch that died: reconcile records the outcome and
                 // stalls the task (DESIGN.md §8).
                 TaskState::Stalled => {
@@ -3423,6 +3436,120 @@ mod tests {
             .expect("the refine rides the strip");
         app.cockpit_sel = strip;
         assert!(app.selected_is_refining());
+    }
+
+    /// A hand-off is work in flight someone else owns, which is the same fact
+    /// the strip carries about a dispatch (DESIGN.md §9). It rides the strip
+    /// while staying out of the queue and out of `next` — `waiting` earns no
+    /// score (§7), and putting it on the strip does not change that.
+    #[test]
+    fn a_waiting_task_rides_the_strip_and_not_the_queue() {
+        let mut app = app_with(&[TaskState::Waiting, TaskState::Ready]);
+        let waiting = app
+            .all
+            .iter()
+            .find(|r| r.task.state == TaskState::Waiting)
+            .unwrap()
+            .task
+            .id;
+
+        assert!(
+            !app.queue_task_ids().contains(&waiting),
+            "{:?}",
+            app.queue_task_ids()
+        );
+        assert_eq!(app.running.len(), 1);
+        assert_eq!(app.running[0].task_id, waiting);
+        assert_eq!(app.running[0].task_state, TaskState::Waiting);
+        assert_eq!(app.counts.waiting, 1);
+
+        let strip = app
+            .cockpit_rows
+            .iter()
+            .position(|r| matches!(r, CockpitRow::Running(_)))
+            .expect("the hand-off rides the strip");
+        app.cockpit_sel = strip;
+        assert_eq!(app.selected_task_id(), Some(waiting));
+    }
+
+    /// The strip's newest row kind reaches the verdicts `waiting` offers
+    /// (DESIGN.md §6) through the same transition menu every other row uses —
+    /// a merged PR is accepted without leaving the cockpit.
+    #[test]
+    fn a_verdict_applies_from_a_waiting_strip_row() {
+        let mut app = app_with(&[TaskState::Waiting]);
+        let task_id = app.running[0].task_id;
+        app.cockpit_sel = app
+            .cockpit_rows
+            .iter()
+            .position(|r| matches!(r, CockpitRow::Running(_)))
+            .unwrap();
+
+        key(&mut app, KeyCode::Char('s'));
+        match &app.mode {
+            Mode::Transition { actions, .. } => assert_eq!(
+                actions.iter().map(action_label).collect::<Vec<_>>(),
+                vec![
+                    "accept → done",
+                    "reject with feedback → running",
+                    "reclaim → review",
+                    "abandon → rejected",
+                ]
+            ),
+            _ => panic!("s on a waiting strip row should open the transition menu"),
+        }
+        key(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Done);
+        assert!(app.running.is_empty(), "{:?}", app.running);
+    }
+
+    /// The reclaim verdict returns a hand-off to the operator's own queue, so
+    /// the row leaves the strip for a queue row rather than closing.
+    #[test]
+    fn reclaiming_from_the_strip_returns_the_task_to_the_queue() {
+        let mut app = app_with(&[TaskState::Waiting]);
+        let task_id = app.running[0].task_id;
+
+        app.apply_and_refresh(task_id, Action::Reclaim);
+
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Review);
+        assert!(app.running.is_empty(), "{:?}", app.running);
+        assert!(app.queue_task_ids().contains(&task_id));
+    }
+
+    /// Dispatch-oriented keys no-op with an explanation on a hand-off, as they
+    /// do on a refine (DESIGN.md §9) — while the two session keys, which
+    /// `waiting` has always accepted, keep working from the strip row.
+    #[test]
+    fn dispatch_keys_explain_themselves_on_a_waiting_row() {
+        let mut app = app_with(&[TaskState::Waiting]);
+        app.cockpit_sel = app
+            .cockpit_rows
+            .iter()
+            .position(|r| matches!(r, CockpitRow::Running(_)))
+            .unwrap();
+
+        for (k, expected) in [('d', "dispatched"), ('o', "viewer"), ('C', "refine")] {
+            app.status = None;
+            key(&mut app, KeyCode::Char(k));
+            let status = app.status.as_deref().unwrap_or_default().to_string();
+            assert!(status.contains("waiting"), "{k}: {status}");
+            assert!(status.contains(expected), "{k}: {status}");
+        }
+        assert_eq!(app.store.task(1).unwrap().state, TaskState::Waiting);
+
+        // `a` and `A` are gated on the state, which accepts `waiting`: what
+        // stops them here is the fixture's missing session ref, not the row.
+        for k in ['a', 'A'] {
+            app.status = None;
+            key(&mut app, KeyCode::Char(k));
+            let status = app.status.as_deref().unwrap_or_default().to_string();
+            assert!(
+                !status.contains("task is waiting"),
+                "{k} must not refuse a hand-off on its state: {status}"
+            );
+        }
     }
 
     /// The cancel key (DESIGN.md §6): the escape hatch for a hung agent

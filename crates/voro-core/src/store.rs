@@ -1288,26 +1288,40 @@ impl Store {
         Ok(has_branch != has_summary)
     }
 
-    /// Rows for the cockpit's running strip (DESIGN.md §9): every `running` or
-    /// `refining` task, joined with its open session if it has one. The strip
-    /// filters on task *state*, so `review`/`needs-input` tasks (session still
-    /// open) do not appear, while a refine in flight does — an open session no
-    /// longer implies executing the task (§8), and what the strip shows is work
-    /// under way. A hand-started task with no session shows with `session_id`/
+    /// Rows for the cockpit's running strip (DESIGN.md §9): every `running`,
+    /// `refining`, or `waiting` task, joined with its open session if it has
+    /// one. The strip filters on task *state*, so `review`/`needs-input` tasks
+    /// (session still open) do not appear, while a refine in flight and a
+    /// handed-off task both do — an open session no longer implies executing
+    /// the task (§8), and what the strip shows is work in flight that someone
+    /// else owns. A hand-started task with no session shows with `session_id`/
     /// `agent` `NULL`. The one-open-session invariant (§8) bounds the join to one
     /// row per task; elapsed is computed in SQL so the TUI only formats it.
+    ///
+    /// A `waiting` task measures its elapsed from `state_since` rather than its
+    /// session: the session opened when the agent started the work, long before
+    /// the hand-off, and what the operator wants from a handed-off row is how
+    /// long it has been waiting. Waiting rows sort after the rest, since they
+    /// are the ones nobody is actively typing into.
+    ///
     /// Archived projects leave the cockpit entirely (§5), the strip included.
     pub fn running_rows(&self) -> Result<Vec<RunningRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.id AS session_id, t.id, t.title, t.state, s.agent,
-                    COALESCE(s.started_at, t.state_since) AS since,
-                    CAST(strftime('%s', 'now')
-                         - strftime('%s', COALESCE(s.started_at, t.state_since)) AS INTEGER)
-             FROM tasks t
-             JOIN projects p ON p.id = t.project_id
-             LEFT JOIN sessions s ON s.task_id = t.id AND s.ended_at IS NULL
-             WHERE t.state IN ('running','refining') AND p.archived = 0
-             ORDER BY (s.id IS NULL), s.id DESC, t.id DESC",
+            "WITH strip AS (
+                 SELECT s.id AS session_id, t.id AS task_id, t.title, t.state,
+                        s.agent, t.pr_url,
+                        CASE WHEN t.state = 'waiting' THEN t.state_since
+                             ELSE COALESCE(s.started_at, t.state_since) END AS since
+                 FROM tasks t
+                 JOIN projects p ON p.id = t.project_id
+                 LEFT JOIN sessions s ON s.task_id = t.id AND s.ended_at IS NULL
+                 WHERE t.state IN ('running','refining','waiting') AND p.archived = 0
+             )
+             SELECT session_id, task_id, title, state, agent, pr_url, since,
+                    CAST(strftime('%s', 'now') - strftime('%s', since) AS INTEGER)
+             FROM strip
+             ORDER BY (state = 'waiting'), (session_id IS NULL),
+                      session_id DESC, task_id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(RunningRow {
@@ -1316,8 +1330,9 @@ impl Store {
                 task_title: row.get(2)?,
                 task_state: row.get(3)?,
                 agent: row.get(4)?,
-                started_at: row.get(5)?,
-                elapsed_secs: row.get(6)?,
+                pr_url: row.get(5)?,
+                started_at: row.get(6)?,
+                elapsed_secs: row.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -3506,6 +3521,96 @@ mod tests {
 
         s.conclude_refine(t.id, RefineOutcome::Applied).unwrap();
         assert!(s.running_rows().unwrap().is_empty());
+    }
+
+    /// A hand-off is work in flight someone else owns, so it rides the strip
+    /// too (DESIGN.md §9) — but its elapsed counts from the hand-off rather
+    /// than from the session, which opened when the agent started the work and
+    /// says nothing about how long the PR has been sitting there.
+    #[test]
+    fn running_rows_measure_a_waiting_task_from_the_hand_off() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let id = s
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "handed off".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap()
+            .id;
+        let (_, opened) = s.record_dispatch(id, "claude", Some(1), None).unwrap();
+        s.apply(id, Action::Complete(None)).unwrap();
+        s.apply(id, Action::HandOff).unwrap();
+        s.set_pr(id, Some("https://github.com/o/r/pull/7")).unwrap();
+        let session = opened.id;
+        s.conn
+            .execute(
+                "UPDATE sessions SET started_at = datetime('now', '-2 hours') WHERE id = ?1",
+                params![session],
+            )
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE tasks SET state_since = datetime('now', '-90 seconds') WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let rows = s.running_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_id, id);
+        assert_eq!(rows[0].task_state, TaskState::Waiting);
+        assert_eq!(rows[0].session_id, Some(session));
+        assert_eq!(
+            rows[0].pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/7")
+        );
+        assert!(
+            (85..=95).contains(&rows[0].elapsed_secs),
+            "expected ~90s waiting, got {} (the session's own age is 2h)",
+            rows[0].elapsed_secs
+        );
+    }
+
+    /// Work an agent is driving sorts ahead of the hand-offs, which are the
+    /// rows nobody is typing into.
+    #[test]
+    fn running_rows_sort_waiting_after_work_under_way() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let waiting = task_in_state(&mut s, p.id, TaskState::Waiting);
+        let running = task_in_state(&mut s, p.id, TaskState::Running);
+        let refining = task_in_state(&mut s, p.id, TaskState::Refining);
+
+        let rows = s.running_rows().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.last().unwrap().task_id, waiting);
+        let ahead: Vec<i64> = rows[..2].iter().map(|r| r.task_id).collect();
+        assert!(
+            ahead.contains(&running) && ahead.contains(&refining),
+            "{ahead:?}"
+        );
+    }
+
+    /// Archiving retires the whole project from the cockpit (DESIGN.md §5), and
+    /// the strip's newest row kind is no exception.
+    #[test]
+    fn running_rows_exclude_a_waiting_task_in_an_archived_project() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("retiring", "/tmp/retiring").unwrap();
+        let id = task_in_state(&mut s, p.id, TaskState::Waiting);
+        assert_eq!(s.running_rows().unwrap().len(), 1);
+
+        s.set_archived(p.id, true).unwrap();
+        assert!(s.running_rows().unwrap().is_empty());
+        assert_eq!(s.task(id).unwrap().state, TaskState::Waiting);
     }
 
     /// The strip filters on task state: a task that has left `running` —

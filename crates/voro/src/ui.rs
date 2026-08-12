@@ -685,6 +685,38 @@ fn refining_span() -> Span<'static> {
     )
 }
 
+/// A hand-off on the running strip (DESIGN.md §9): work in flight that someone
+/// else owns, sitting beside the work an agent owns. Blue rather than the
+/// refine's cyan, because nothing here is being typed into — the elapsed time
+/// beside it counts from the hand-off, not from any session.
+///
+/// Padded one narrower than the other state labels: the hourglass is a
+/// double-width glyph, so nine characters here occupy the same eleven columns
+/// the state column holds everywhere else.
+fn waiting_span() -> Span<'static> {
+    Span::styled(
+        format!("{:10} ", "⏳ waiting"),
+        Style::new().fg(Color::Blue),
+    )
+}
+
+/// What a waiting strip row is holding up (DESIGN.md §7): its direct open
+/// `blocks` dependents, counted by the rule the `unblock_bonus` uses. A waiting
+/// task earns no score, so the count cannot reach the operator through the
+/// queue — this badge is the only place the gating shows.
+fn blocks_span(open_dependents: usize) -> Span<'static> {
+    Span::styled(
+        format!("  blocks {open_dependents}"),
+        Style::new().fg(Color::Yellow),
+    )
+}
+
+/// A tracked PR on a waiting strip row — presence only, never its state, which
+/// Voro does not poll (DESIGN.md §8).
+fn strip_pr_span() -> Span<'static> {
+    Span::styled("  PR", Style::new().fg(Color::Magenta))
+}
+
 /// The stale-branch marker (DESIGN.md §8): a review task whose tracked PR
 /// reports a merge conflict, probed on demand for the selected task. Purely
 /// informational — it flags that the branch needs resolving before it can
@@ -1237,10 +1269,11 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para.scroll((scroll, 0)).block(block), area);
 }
 
-/// Work under way (DESIGN.md §9): agent, task state, and elapsed time since the
-/// session opened — dispatched `running` tasks and the refine rounds rewriting a
-/// proposal's body alike. `draw_cockpit` collapses this to a zero-height area
-/// when nothing is under way.
+/// Work in flight that someone else owns (DESIGN.md §9): agent, task state, and
+/// elapsed time — dispatched `running` tasks, the refine rounds rewriting a
+/// proposal's body, and the `waiting` hand-offs whose owner is a person rather
+/// than an agent. `draw_cockpit` collapses this to a zero-height area when
+/// nothing is in flight.
 fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     if area.height == 0 {
         return;
@@ -1259,10 +1292,11 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                 Some(agent) => Span::styled(format!("{agent:8} "), Style::new().fg(Color::Magenta)),
                 None => Span::styled(format!("{:8} ", "—"), Style::new().dim()),
             };
-            let state = if r.task_state == TaskState::Refining {
-                refining_span()
-            } else {
-                Span::raw(format!("{:11} ", r.task_state.to_string()))
+            let waiting = r.task_state == TaskState::Waiting;
+            let state = match r.task_state {
+                TaskState::Refining => refining_span(),
+                TaskState::Waiting => waiting_span(),
+                other => Span::raw(format!("{other:11} ")),
             };
             let mut spans = vec![
                 Span::raw(format!("{} ", task_ref(r.task_id))),
@@ -1274,7 +1308,22 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                 ),
                 Span::raw(r.task_title.clone()),
             ];
-            if r.session_id.is_none() {
+            if waiting {
+                let open = app.dependents.get(&r.task_id).map_or(0, |d| {
+                    d.iter()
+                        .filter(|d| d.kind == DepKind::Blocks && d.is_open())
+                        .count()
+                });
+                if open > 0 {
+                    spans.push(blocks_span(open));
+                }
+                if r.pr_url.is_some() {
+                    spans.push(strip_pr_span());
+                }
+            }
+            // A hand-off has nothing left to be live: the work is with someone
+            // else, so a closed session is the expected shape, not an orphan.
+            if r.session_id.is_none() && !waiting {
                 spans.push(Span::styled(
                     "  ⚠ no live session",
                     Style::new().fg(Color::Yellow),
@@ -2187,6 +2236,119 @@ mod tests {
         assert!(
             rendered.contains(&format!("blocked by #{}, #{}", open.id, closed.id)),
             "browser did not annotate the parked row with its blockers: {rendered}"
+        );
+    }
+
+    /// End-to-end through the real cockpit draw (DESIGN.md §9): a hand-off
+    /// rides the strip as its own kind of row, badged with what it is holding
+    /// up and whether a PR tracks it, while staying out of the queue.
+    #[test]
+    fn a_hand_off_renders_on_the_strip_with_its_badges() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let mut task = |title: &str| {
+            store
+                .create_task(NewTask {
+                    project_id: p.id,
+                    repo_id: None,
+                    title: title.into(),
+                    body: String::new(),
+                    priority: Priority::P2,
+                    state: TaskState::Ready,
+                    agent: None,
+                    human: false,
+                    deep: false,
+                })
+                .unwrap()
+                .id
+        };
+        let handed_off = task("dependency bump");
+        let gated = task("the work behind it");
+        let closed_dependent = task("already landed");
+        let under_way = task("still being written");
+
+        store.add_dep(gated, handed_off, DepKind::Blocks).unwrap();
+        store
+            .add_dep(closed_dependent, handed_off, DepKind::Blocks)
+            .unwrap();
+        store.apply(closed_dependent, Action::Abandon).unwrap();
+
+        store
+            .record_dispatch(handed_off, "claude", None, None)
+            .unwrap();
+        store.apply(handed_off, Action::Complete(None)).unwrap();
+        store.apply(handed_off, Action::HandOff).unwrap();
+        store
+            .set_pr(handed_off, Some("https://github.com/o/r/pull/9"))
+            .unwrap();
+        store
+            .record_dispatch(under_way, "claude", None, None)
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let app = App::new(store, ctx).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal
+            .draw(|f| draw_cockpit(f, &app, &mut HitMap::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let lines: Vec<String> = buffer
+            .content()
+            .chunks(buffer.area().width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect();
+        let out = lines.join("\n");
+
+        // The detail pane names the selected task too, so read the strip's own
+        // rows: everything below its block header.
+        let strip = lines
+            .iter()
+            .position(|l| l.contains("Running"))
+            .map(|i| &lines[i + 1..])
+            .unwrap_or_else(|| panic!("no running strip was drawn:\n{out}"));
+        let waiting_row = strip
+            .iter()
+            .find(|l| l.contains("dependency bump"))
+            .unwrap_or_else(|| panic!("the hand-off is not on the strip:\n{out}"));
+        assert!(waiting_row.contains('⏳'), "{waiting_row}");
+        // one open dependent, not two: the abandoned one no longer waits on it
+        assert!(waiting_row.contains("blocks 1"), "{waiting_row}");
+        assert!(waiting_row.contains("  PR"), "{waiting_row}");
+        assert!(
+            !waiting_row.contains("no live session"),
+            "a hand-off has nothing left to be live: {waiting_row}"
+        );
+        assert!(out.contains("waiting 1"), "the header counts it: {out}");
+
+        // Work under way sorts above the hand-off, and the double-width
+        // hourglass leaves the columns aligned across both row kinds.
+        let running_at = strip
+            .iter()
+            .position(|l| l.contains("still being written"))
+            .unwrap();
+        let waiting_at = strip
+            .iter()
+            .position(|l| l.contains("dependency bump"))
+            .unwrap();
+        assert!(running_at < waiting_at, "{out}");
+        // by cell, not by byte: the buffer spells a double-width glyph as its
+        // symbol plus a blank, so one char is one column
+        let column = |line: &str, needle: &str| {
+            line.find(needle)
+                .map(|byte| line[..byte].chars().count())
+                .unwrap()
+        };
+        assert_eq!(
+            column(&strip[running_at], "still being written"),
+            column(&strip[waiting_at], "dependency bump"),
+            "the strip's title column moved between row kinds:\n{out}"
         );
     }
 
