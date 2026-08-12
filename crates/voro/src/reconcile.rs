@@ -25,11 +25,13 @@
 //! from reading them all as live. Agents without a `sessions` verb keep the
 //! spawned-pid check.
 //!
-//! A refine round is the exception that check exists to avoid guessing about,
-//! and it is not a guess: refine spawns its agent as a direct `sh -c` child
-//! whose pid Voro holds, captures no session ref, and hands the process to no
-//! supervisor — so the pid *is* the round, and a refining session is pid-checked
-//! whatever verbs its agent defines.
+//! A refine round reads the same way, because it is launched the same way: the
+//! headless flavour renders the agent's own `dispatch` template, so under a
+//! `--bg` launcher its recorded pid lies exactly as a dispatch's does, and its
+//! ref is captured at launch so the listing can be consulted. The interactive
+//! flavour is the one genuinely-own-pid case — a foreground `plan` child, no ref
+//! by construction — so a refining session with no ref falls back to its pid
+//! rather than becoming unprobeable.
 //!
 //! There is no daemon watching for process exit. Reconciliation runs on read:
 //! `App::refresh` and every CLI verb call [`reconcile_live_sessions`] before
@@ -82,31 +84,28 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
         }
 
         // Work under way: probe liveness. `None` (no ref, listing failed, no
-        // pid) leaves the session alone rather than wrongly finalising it. A
-        // refine round is always its own pid — no supervisor holds it — so the
-        // listing path, which exists for launches whose pid lies, is skipped.
-        let sessions_cmd = match task_state {
-            TaskState::Refining => None,
-            _ => config
-                .as_ref()
-                .and_then(|c| c.agent(&session.agent))
-                .and_then(|a| a.sessions()),
-        };
-        let alive: Option<bool> = match sessions_cmd {
-            Some(cmd) => match session.session_ref.as_deref() {
-                // No ref: not findable in the listing, and pid-checking a
-                // supervisor-owned launch would wrongly kill it.
-                None => None,
-                Some(session_ref) => {
-                    let listing = listings
-                        .entry(session.agent.clone())
-                        .or_insert_with(|| run_sessions_command(cmd, None));
-                    listing
-                        .as_ref()
-                        .map(|entries| listing_says_live(entries, session_ref))
-                }
-            },
-            // No pid recorded means liveness can't be checked.
+        // pid) leaves the session alone rather than wrongly finalising it.
+        let sessions_cmd = config
+            .as_ref()
+            .and_then(|c| c.agent(&session.agent))
+            .and_then(|a| a.sessions());
+        let alive: Option<bool> = match sessions_cmd.zip(session.session_ref.as_deref()) {
+            Some((cmd, session_ref)) => {
+                let listing = listings
+                    .entry(session.agent.clone())
+                    .or_insert_with(|| run_sessions_command(cmd, None));
+                listing
+                    .as_ref()
+                    .map(|entries| listing_says_live(entries, session_ref))
+            }
+            // A refining session with no ref is the interactive round: a real
+            // foreground child, so its pid is the round and is authoritative.
+            None if task_state == TaskState::Refining => session.pid.map(pid_is_alive),
+            // A dispatch with no ref is not findable in the listing, and
+            // pid-checking a supervisor-owned launch would wrongly kill it.
+            None if sessions_cmd.is_some() => None,
+            // No sessions verb: the spawned pid is all there is. No pid
+            // recorded means liveness can't be checked.
             None => session.pid.map(pid_is_alive),
         };
         let Some(alive) = alive else { continue };
@@ -179,6 +178,14 @@ mod tests {
             .unwrap();
         s.apply(t.id, Action::Start).unwrap();
         (s, t.id)
+    }
+
+    /// A pid guaranteed to name no process: spawned and reaped.
+    fn dead_pid() -> i64 {
+        let mut child = Command::new("true").stdout(Stdio::null()).spawn().unwrap();
+        let pid = child.id() as i64;
+        child.wait().unwrap();
+        pid
     }
 
     #[test]
@@ -294,12 +301,11 @@ mod tests {
                 deep: false,
             })
             .unwrap();
-        let mut child = Command::new("true").stdout(Stdio::null()).spawn().unwrap();
-        let dead_pid = child.id() as i64;
-        child.wait().unwrap();
-        // `claude` defines a `sessions` verb, so a *dispatch* of its with no
-        // captured ref would be left alone. A refine round is a plain child
-        // whose pid Voro holds, so it is pid-checked regardless.
+        let dead_pid = dead_pid();
+        // `claude` defines a `sessions` verb, so a *dispatch* of it with no
+        // captured ref would be left alone. A ref-less refine round is the
+        // interactive flavour — a foreground child whose pid Voro holds — so it
+        // is pid-checked.
         let (_, session) = s
             .record_refine_launch(t.id, "thin body", "claude", Some(dead_pid), None)
             .unwrap();
@@ -343,6 +349,29 @@ mod tests {
 
         assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 0);
         assert_eq!(s.task(t.id).unwrap().state, TaskState::Refining);
+    }
+
+    /// A proposal under refinement, ready to hang a round's session off of.
+    fn refining_task(agent: &str, pid: Option<i64>) -> (Store, i64, i64) {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("proj", "/tmp/proj").unwrap();
+        let t = s
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "sloppy".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Proposed,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        let (_, session) = s
+            .record_refine_launch(t.id, "thin body", agent, pid, None)
+            .unwrap();
+        (s, t.id, session.id)
     }
 
     // --- sessions-verb liveness (task #75) ---
@@ -531,5 +560,68 @@ mod tests {
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- refine rounds read the same listing (task #379) ---
+
+    /// The refine-side twin of
+    /// [`a_listed_live_session_is_left_alone_despite_a_dead_pid`]: a headless
+    /// round runs the agent's `dispatch` template, so under a `--bg` launcher
+    /// its recorded pid dies at birth. Trusting that pid finalised rounds
+    /// seconds after they started and marked the rewrites they went on to apply
+    /// as failures; with a ref captured, the listing is what answers.
+    #[test]
+    fn a_listed_live_refine_round_is_left_alone_despite_a_dead_pid() {
+        let (agents_path, dir) = sessions_fixture(
+            "refine-alive",
+            r#"[{"sessionId": "refine-uuid", "cwd": "/tmp/proj",
+                "startedAt": 1, "state": "working"}]"#,
+        );
+        let (mut s, task_id, session_id) = refining_task("claude", Some(dead_pid()));
+        s.set_session_ref(session_id, "refine-uuid").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert!(s.session(session_id).unwrap().ended_at.is_none());
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Refining);
+        assert!(!s.refine_failed_flag(task_id).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half: a round genuinely gone from the listing is still caught
+    /// and still marked, however alive the pid on the row looks.
+    #[test]
+    fn a_refine_round_gone_from_the_listing_is_marked_failed() {
+        let (agents_path, dir) = sessions_fixture("refine-gone", "[]");
+        let (mut s, task_id, session_id) = refining_task("claude", Some(std::process::id() as i64));
+        s.set_session_ref(session_id, "refine-uuid").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 1);
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Proposed);
+        assert!(s.refine_failed_flag(task_id).unwrap());
+        assert_eq!(
+            s.session(session_id).unwrap().outcome,
+            Some(SessionOutcome::Failed)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An agent that defines no `sessions` verb has only the spawned pid, and
+    /// for it that pid is right: rounds still reconcile by pid, dead and alive.
+    #[test]
+    fn a_refine_round_of_a_verbless_agent_is_pid_checked() {
+        let (mut s, task_id, session_id) = refining_task("manual", Some(dead_pid()));
+        assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 1);
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Proposed);
+        assert!(s.refine_failed_flag(task_id).unwrap());
+        assert_eq!(
+            s.session(session_id).unwrap().outcome,
+            Some(SessionOutcome::Failed)
+        );
+
+        let (mut s, task_id, _) = refining_task("manual", Some(std::process::id() as i64));
+        assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 0);
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Refining);
     }
 }
