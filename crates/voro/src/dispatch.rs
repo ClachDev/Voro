@@ -173,6 +173,14 @@ Write the task body as a self-contained dispatchable prompt: the agent that
 picks it up later gets no other context, so name the relevant files, spell out
 the decisions already made, and give concrete acceptance criteria.
 
+Say in the body where the task's evidence and outputs land — the pull request
+description, a decision record, a gitignored results directory, whatever the
+project's own conventions call for — so the agent does not default to
+committing verification write-ups and work logs as new files. Ask the operator
+where they belong if the project states no convention. Say too what the task
+makes obsolete — existing files, docs, or tooling it replaces — and put
+retiring them in the same task's scope.
+
 When the operator confirms the draft, write the body to a file outside the
 checkout and create the task with:
 
@@ -3505,6 +3513,28 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("--db"), "{rendered}");
+    }
+
+    #[test]
+    fn planning_prompt_asks_for_evidence_routing_and_supersession() {
+        let rendered = render_planning_prompt("proj", &Store::default_db_path());
+        assert!(
+            rendered.contains("where the task's evidence and outputs land"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("gitignored results directory"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("if the project states no convention"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("makes obsolete"), "{rendered}");
+        assert!(
+            rendered.contains("retiring them in the same task's scope"),
+            "{rendered}"
+        );
     }
 
     #[test]
