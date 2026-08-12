@@ -452,6 +452,9 @@ pub struct App {
     pub conflict_selected: Option<(i64, bool)>,
     /// The background thread and debounce clock behind `conflict_selected`.
     probe: crate::probe::ConflictProbe,
+    /// The background threads capturing the revisions rejections were made
+    /// against (DESIGN.md §8), drained by `poll_reviewed_capture`.
+    capture: crate::probe::ReviewedCapture,
 
     pub cockpit_rows: Vec<CockpitRow>,
     pub cockpit_sel: usize,
@@ -543,6 +546,7 @@ impl App {
             last_sessions: std::collections::HashMap::new(),
             conflict_selected: None,
             probe: crate::probe::ConflictProbe::default(),
+            capture: crate::probe::ReviewedCapture::default(),
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
             tasks_sel: 0,
@@ -902,6 +906,36 @@ impl App {
         }
     }
 
+    /// Capture the revision a rejection was made against, off the event loop
+    /// (DESIGN.md §8). The keypress gains nothing by waiting for `gh`: the
+    /// value is read only when the rework comes back for re-review, minutes or
+    /// hours later, and rejecting has just moved the task to `running`, where
+    /// neither read path consults it. A task with neither a PR nor a branch has
+    /// nothing to read, so it starts nothing.
+    fn capture_reviewed(&mut self, task_id: i64) {
+        // The head is read a moment after the keypress rather than at it, so a
+        // rework commit pushed inside that window would be captured as reviewed
+        // and left out of the delta. `voro reject` on the CLI stays synchronous
+        // for anyone who wants the tight capture.
+        if let Some(source) = crate::pr::reviewed_source(&self.store, task_id) {
+            self.capture.start(task_id, source);
+        }
+    }
+
+    /// Record every revision a background capture has finished (DESIGN.md §8).
+    /// Each belongs to the task it was captured for, not to the selection, so
+    /// nothing is discarded here. Errors are swallowed as the synchronous path
+    /// swallows them: an unrecorded revision costs a full diff on the
+    /// re-review, never a failed reject. Quitting before a capture lands loses
+    /// it the same way, which is why no refresh follows either — nothing
+    /// rendered reads the reviewed revision, which `pr` and `open` read on
+    /// demand.
+    pub fn poll_reviewed_capture(&mut self) {
+        for (task_id, sha) in self.capture.take_results() {
+            let _ = self.store.record_reviewed(task_id, &sha);
+        }
+    }
+
     pub fn move_selection(&mut self, delta: i64) {
         let (sel, len) = match self.screen {
             Screen::Cockpit => (&mut self.cockpit_sel, self.cockpit_rows.len()),
@@ -1040,8 +1074,9 @@ impl App {
         if self.report(result).is_some() {
             if rejected {
                 // The head the operator just judged, so the re-review can be
-                // narrowed to the rework (DESIGN.md §8).
-                crate::pr::record_reviewed(&mut self.store, task_id);
+                // narrowed to the rework (DESIGN.md §8) — captured off the loop,
+                // so the redraw does not wait on `gh`.
+                self.capture_reviewed(task_id);
             }
             let result = self.refresh();
             self.report(result);
@@ -1855,8 +1890,9 @@ impl App {
         }
         if rejected {
             // What the operator just judged, so the re-review can be narrowed to
-            // the rework (DESIGN.md §8).
-            crate::pr::record_reviewed(&mut self.store, task_id);
+            // the rework (DESIGN.md §8) — off the loop, so the message is sent
+            // without waiting on `gh`.
+            self.capture_reviewed(task_id);
         }
         // A rejection reaches the session framed as one: the feedback, plus the
         // instruction to answer it point by point at `done` (DESIGN.md §8). An
@@ -5559,6 +5595,21 @@ mod tests {
         app.poll_conflict_probe();
         assert_eq!(app.conflict_selected, None);
         assert_eq!(app.probe.in_flight(), None);
+    }
+
+    /// A captured revision reaches the store whatever is selected by the time
+    /// it lands (DESIGN.md §8) — the rejection that started it has already
+    /// moved its task on to `running`.
+    #[test]
+    fn a_captured_revision_is_recorded_against_its_task() {
+        let mut app = app_with(&[TaskState::Review, TaskState::Ready]);
+        let id = app.selected_task_id().unwrap();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        app.capture.inject_result(id, Some(sha));
+        app.move_selection(1);
+
+        app.poll_reviewed_capture();
+        assert_eq!(app.store.last_reviewed(id).unwrap(), Some(sha.to_string()));
     }
 
     /// Moving off the row drops its verdict, so nothing stale is rendered and

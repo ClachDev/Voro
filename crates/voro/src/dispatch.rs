@@ -2382,6 +2382,16 @@ mod tests {
         assert_eq!(store.last_reviewed(id).unwrap().as_deref(), Some(&head[..]));
     }
 
+    /// A task reviewed with neither a PR nor a branch has no revision to read,
+    /// so the TUI starts no capture for it at all (DESIGN.md §8).
+    #[test]
+    fn a_task_with_no_pr_and_no_branch_has_nothing_to_capture() {
+        let (mut store, _ctx, project) = fixture("cat {prompt_file}");
+        let id = review_task(&mut store, &project);
+
+        assert_eq!(crate::pr::reviewed_source(&store, id), None);
+    }
+
     #[test]
     fn open_ignores_new_placeholders_a_template_does_not_use() {
         // A template that mentions neither {branch} nor {base} is substituted
