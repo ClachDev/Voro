@@ -199,6 +199,58 @@ impl ToSql for DepKind {
     }
 }
 
+/// Which source of liveness is authoritative for a session (DESIGN.md §8),
+/// recorded by the code that spawned the process because only it knows what it
+/// spawned. The two differ in one respect: whether the pid the session row
+/// holds is the work itself or a launcher that spawned it and exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LivenessSource {
+    /// The recorded pid *is* the work — a foreground child Voro owns, or an
+    /// agent with no `sessions` verb, where the spawned pid is the only source
+    /// there is. `kill -0` answers.
+    Pid,
+    /// The work belongs to a supervisor the launch handed it to, so the
+    /// recorded pid dies at birth and only the agent's own `sessions` listing
+    /// can say whether the session is still working.
+    Listing,
+}
+
+impl LivenessSource {
+    pub const ALL: [LivenessSource; 2] = [LivenessSource::Pid, LivenessSource::Listing];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LivenessSource::Pid => "pid",
+            LivenessSource::Listing => "listing",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<LivenessSource> {
+        Self::ALL
+            .into_iter()
+            .find(|source| source.as_str() == s)
+            .ok_or_else(|| Error::Invalid(format!("unknown liveness source '{s}'")))
+    }
+}
+
+impl fmt::Display for LivenessSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromSql for LivenessSource {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        LivenessSource::parse(value.as_str()?).map_err(|e| FromSqlError::Other(Box::new(e)))
+    }
+}
+
+impl ToSql for LivenessSource {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionOutcome {
     Completed,
@@ -628,6 +680,9 @@ pub struct Session {
     /// substituted into the agent's attach/resume/continue verb templates.
     /// `None` when the agent has no capture story or capture failed.
     pub session_ref: Option<String>,
+    /// Which source reconciliation must read this session's liveness by,
+    /// recorded at launch by whichever code spawned the process (DESIGN.md §8).
+    pub liveness_source: LivenessSource,
     pub log_path: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,
