@@ -90,6 +90,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // probe once the selection has rested. Both halves are non-blocking, so
         // the `gh` call never stalls the loop and scrolling spawns nothing.
         app.poll_conflict_probe();
+        // Record the revisions rejections were made against, once the `gh` call
+        // a rejection started has answered (DESIGN.md §8). A tick or two behind
+        // the keypress, which is soon enough: nothing reads the revision until
+        // the rework comes back.
+        app.poll_reviewed_capture();
         if let Some(request) = app.pending_editor.take() {
             // $EDITOR owns the terminal for the duration; tear the TUI down
             // around it rather than fighting over raw mode.

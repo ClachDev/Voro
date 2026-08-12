@@ -1,14 +1,23 @@
-//! The stale-review-branch probe's off-loop machinery (DESIGN.md §8). The
-//! verdict costs a `gh` round-trip, so it is never taken on the render path:
-//! [`ConflictProbe`] runs [`crate::pr::conflict_status_url`] on a background
-//! thread and hands the answer back over a channel the event loop drains each
-//! tick. [`probe_due`] is the whole decision — pure, so the debounce and the
+//! The TUI's off-loop `gh` machinery (DESIGN.md §8): a network round-trip is
+//! never taken on the render path, and never on a keypress whose answer only
+//! feeds a later read. Each runner here spawns a background thread and hands
+//! its answer back over a channel the event loop drains each tick.
+//!
+//! [`ConflictProbe`] is the stale-review-branch probe, behind the *selection*:
+//! [`probe_due`] is the whole decision — pure, so the debounce and the
 //! at-most-one-in-flight rule are testable without a terminal or a network.
+//! [`ReviewedCapture`] is the reviewed-revision capture, behind a *keypress*:
+//! there is nothing to debounce, so every start runs, and every answer is
+//! recorded against the task it was captured for rather than against whatever
+//! is selected when it lands.
 
+use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use voro_core::Mergeability;
+
+use crate::pr::ReviewedSource;
 
 /// How long the selection must rest on a row before its probe starts. Scrolling
 /// through the queue moves faster than this, so rows passed over never spawn a
@@ -115,6 +124,77 @@ impl ConflictProbe {
             let verdict = crate::pr::conflict_status_url(&url);
             let _ = tx.send((task_id, verdict));
         });
+    }
+}
+
+/// The reviewed-revision capture's off-loop runner (DESIGN.md §8):
+/// [`crate::pr::resolve_reviewed`] on a background thread, with the answer sent
+/// back for the event loop to record. Started by a rejection rather than by the
+/// selection, which is what it does differently from [`ConflictProbe`] — there
+/// is no settle interval, because a keypress is already the operator's
+/// deliberate act and there is nothing to debounce; captures for several tasks
+/// may be in flight at once; and nothing that lands is ever discarded, because
+/// a captured revision belongs to its task whatever is on screen.
+pub struct ReviewedCapture {
+    tx: Sender<(i64, Option<String>)>,
+    rx: Receiver<(i64, Option<String>)>,
+    /// The tasks a capture is running for, so a repeated reject key cannot
+    /// spawn threads without bound.
+    in_flight: HashSet<i64>,
+}
+
+impl Default for ReviewedCapture {
+    fn default() -> Self {
+        let (tx, rx) = channel();
+        ReviewedCapture {
+            tx,
+            rx,
+            in_flight: HashSet::new(),
+        }
+    }
+}
+
+impl ReviewedCapture {
+    /// Resolve `source` on a background thread. Returns whether a thread was
+    /// started — `false` when this task already has a capture in flight, which
+    /// a held reject key would otherwise multiply.
+    pub fn start(&mut self, task_id: i64, source: ReviewedSource) -> bool {
+        if !self.in_flight.insert(task_id) {
+            return false;
+        }
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((task_id, crate::pr::resolve_reviewed(&source)));
+        });
+        true
+    }
+
+    /// Every revision that has landed since the last drain. Never blocks, and
+    /// drops nothing: unlike a conflict verdict, a captured revision is recorded
+    /// against the task it was captured for whatever the selection has moved on
+    /// to. A capture that resolved nothing still clears its task's guard, so a
+    /// later rejection of that task tries again.
+    pub fn take_results(&mut self) -> Vec<(i64, String)> {
+        let mut landed = Vec::new();
+        loop {
+            match self.rx.try_recv() {
+                Ok((task_id, sha)) => {
+                    self.in_flight.remove(&task_id);
+                    if let Some(sha) = sha {
+                        landed.push((task_id, sha));
+                    }
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return landed,
+            }
+        }
+    }
+
+    /// Hand back a revision as though a background capture had produced it, so
+    /// the event loop's drain-and-record half can be tested without `gh`.
+    #[cfg(test)]
+    pub fn inject_result(&mut self, task_id: i64, sha: Option<&str>) {
+        self.in_flight.insert(task_id);
+        let _ = self.tx.send((task_id, sha.map(str::to_string)));
     }
 }
 
@@ -244,5 +324,59 @@ mod tests {
         let mut probe = ConflictProbe::default();
         assert_eq!(probe.take_result(), None);
         assert_eq!(probe.in_flight(), None);
+    }
+
+    #[test]
+    fn no_revision_before_a_capture_runs() {
+        let mut capture = ReviewedCapture::default();
+        assert!(capture.take_results().is_empty());
+    }
+
+    /// A capture with nothing to read starts anyway — the runner does not know
+    /// what a source will resolve to — and lands as no revision.
+    #[test]
+    fn a_capture_that_resolves_nothing_yields_no_revision() {
+        let mut capture = ReviewedCapture::default();
+        assert!(capture.start(7, ReviewedSource::empty()));
+        // The thread may not have finished, so drain until it has: what is
+        // asserted is that a resolved-to-nothing capture never yields a row.
+        for _ in 0..100 {
+            assert!(capture.take_results().is_empty());
+            if !capture.in_flight.contains(&7) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the capture never landed");
+    }
+
+    /// Every revision that has landed is handed back, for as many tasks as have
+    /// captures in flight — a rejection's revision belongs to its own task, so
+    /// none of them may be dropped.
+    #[test]
+    fn draining_hands_back_every_landed_revision() {
+        let mut capture = ReviewedCapture::default();
+        capture.inject_result(7, Some("aaaa1111"));
+        capture.inject_result(8, None);
+        capture.inject_result(9, Some("bbbb2222"));
+        assert_eq!(
+            capture.take_results(),
+            vec![(7, "aaaa1111".to_string()), (9, "bbbb2222".to_string())]
+        );
+        assert!(capture.take_results().is_empty());
+    }
+
+    /// Holding the reject key on one task spawns one capture, not one per
+    /// press; the next press after its answer is drained captures afresh.
+    #[test]
+    fn at_most_one_capture_in_flight_per_task() {
+        let mut capture = ReviewedCapture::default();
+        capture.inject_result(7, Some("aaaa1111"));
+        assert!(!capture.start(7, ReviewedSource::empty()));
+        // Another task is unaffected: captures are per task, not global.
+        assert!(capture.start(8, ReviewedSource::empty()));
+
+        assert_eq!(capture.take_results(), vec![(7, "aaaa1111".to_string())]);
+        assert!(capture.start(7, ReviewedSource::empty()));
     }
 }

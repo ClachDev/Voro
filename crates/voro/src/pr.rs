@@ -95,26 +95,89 @@ pub fn local_review_diff(store: &Store, task_id: i64, repo_path: &str, branch: &
     )
 }
 
-/// Record the revision the operator has just reviewed and sent back (DESIGN.md
-/// §8), so the next look at this task is narrowed to the rework. Best-effort by
-/// design: a tracked PR's head is what was actually reviewed, a task without one
-/// falls back to the local tip of its branch, and neither being readable simply
-/// leaves the re-review showing the full diff.
-pub fn record_reviewed(store: &mut Store, task_id: i64) {
-    let Ok(task) = store.task(task_id) else {
-        return;
+/// Where the revision an operator has just reviewed can be read from: the
+/// task's tracked PR, and the local tip of its branch as the fallback. Holds
+/// owned strings and no `Store` handle, so it can move into the background
+/// thread that resolves it (`crate::probe`, DESIGN.md §8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewedSource {
+    pr_url: Option<String>,
+    /// The checkout the branch lives in, and the branch — a task dispatched
+    /// into a second repo has its branch there, not in the project's own.
+    branch: Option<(String, String)>,
+}
+
+#[cfg(test)]
+impl ReviewedSource {
+    /// A source with nothing to read, which resolves to `None` without running
+    /// a subprocess — enough to exercise the runner around it without `gh`.
+    pub fn empty() -> Self {
+        ReviewedSource {
+            pr_url: None,
+            branch: None,
+        }
+    }
+}
+
+/// The store half of a reviewed-revision capture (DESIGN.md §8): a few cheap
+/// SQLite reads, so it runs on the TUI event loop. `None` when the task has
+/// neither a tracked PR nor a branch in a resolvable checkout, which is the
+/// case that starts no capture at all.
+pub fn reviewed_source(store: &Store, task_id: i64) -> Option<ReviewedSource> {
+    let task = store.task(task_id).ok()?;
+    let branch = task.branch.as_deref().and_then(|branch| {
+        let repo = store.repo_for_task(&task).ok()?;
+        Some((repo.path, branch.to_string()))
+    });
+    let source = ReviewedSource {
+        pr_url: task.pr_url,
+        branch,
     };
-    let from_pr = task
+    (source.pr_url.is_some() || source.branch.is_some()).then_some(source)
+}
+
+/// The subprocess half of the capture (DESIGN.md §8), which is why it takes a
+/// [`ReviewedSource`] rather than a task: the TUI runs it off the event loop,
+/// where no `Store` is in reach. A tracked PR's head is what was actually
+/// reviewed, a task without one falls back to the local tip of its branch, and
+/// neither being readable yields `None` — an unreadable revision costs a full
+/// diff next time, never a failed reject.
+pub fn resolve_reviewed(source: &ReviewedSource) -> Option<String> {
+    let from_pr = source
         .pr_url
         .as_deref()
         .and_then(|url| PrRef::parse(url).ok())
-        .and_then(|pr| pr_revisions(&pr).head);
-    let sha = from_pr.or_else(|| {
-        let branch = task.branch.as_deref()?;
-        let repo = store.repo_for_task(&task).ok()?;
-        rev_parse(&repo.path, branch)
-    });
-    if let Some(sha) = sha {
+        .and_then(|pr| pr_head(&pr));
+    from_pr.or_else(|| {
+        let (repo_path, branch) = source.branch.as_ref()?;
+        rev_parse(repo_path, branch)
+    })
+}
+
+/// A PR's head revision (`gh pr view --json headRefOid`). The capture wants the
+/// head alone; the commit list [`pr_revisions`] also fetches answers a
+/// reachability question only the read path puts.
+fn pr_head(pr: &PrRef) -> Option<String> {
+    let output = Command::new("gh")
+        .args(["pr", "view", &pr.url, "--json", "headRefOid"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_pr_revisions(&String::from_utf8_lossy(&output.stdout)).head
+}
+
+/// Record the revision the operator has just reviewed and sent back (DESIGN.md
+/// §8), so the next look at this task is narrowed to the rework. Blocking, which
+/// is what a one-shot CLI verb should be; the TUI runs the same two halves
+/// either side of its event loop instead (`crate::probe::ReviewedCapture`).
+pub fn record_reviewed(store: &mut Store, task_id: i64) {
+    let Some(source) = reviewed_source(store, task_id) else {
+        return;
+    };
+    if let Some(sha) = resolve_reviewed(&source) {
         let _ = store.record_reviewed(task_id, &sha);
     }
 }
