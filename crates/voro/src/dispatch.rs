@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voro_core::{
-    AgentsConfig, Launch, LaunchSpec, ResolvedAgent, ReviewAction, ReviewDiff, Store, TaskState,
+    AgentsConfig, Launch, LaunchSpec, ResolvedAgent, ReviewDiff, Store, TaskState,
     VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, render,
 };
 
@@ -1029,12 +1029,9 @@ pub fn open(
     // second repo has its branch and worktree there (DESIGN.md §8).
     let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
 
-    // The project's review action may pin a named viewer even when open was
-    // invoked directly rather than through the resolved `pr` action.
-    let project_viewer = match &project.review_action {
-        ReviewAction::Viewer(Some(name)) => Some(name.clone()),
-        _ => None,
-    };
+    // The project's review action names the viewer its local diffs open in
+    // (DESIGN.md §8), which is all that setting still decides.
+    let project_viewer = project.review_action.viewer().map(str::to_string);
     let viewer_name = viewer_override.map(str::to_string).or(project_viewer);
 
     let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;

@@ -10,8 +10,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use voro_core::{
     Action, AgentsConfig, DepKind, Doc, Event, NewTask, PrRef, Priority, Project, QueueRow,
-    RefineOutcome, Repo, ReviewAction, ReviewMedium, Store, Task, TaskEdit, TaskState, Triage,
-    WipGate, scheduler,
+    RefineOutcome, Repo, ReviewAction, Store, Task, TaskEdit, TaskState, Triage, WipGate,
+    scheduler,
 };
 
 use crate::dispatch::{self, DispatchCtx};
@@ -38,11 +38,12 @@ projects
                                   (weight 0) or archive it instead to retire
                                   one that has any
   project action <project> <auto|pr|viewer[:NAME]>
-                                  set how `pr` shows the project's review
-                                  diffs: auto (GitHub when the checkout is a
-                                  GitHub repo, else the viewer), pr always,
-                                  or a viewer from voro.toml (viewer:NAME
-                                  picks a [viewers.NAME] entry)
+                                  set which viewer `open` shows the project's
+                                  local diffs in: viewer:NAME picks a
+                                  [viewers.NAME] entry from voro.toml, while
+                                  auto, pr, and bare viewer all leave the
+                                  default one (`pr` is always GitHub now, so
+                                  the medium is no longer a project setting)
   weight <project> <0-5>          set a project's weight (0 parks it)
 
 repos                             a project allocates attention; its repos
@@ -186,17 +187,17 @@ dispatch
   viewer remove <name>            delete a viewer; refused while a project's
                                   review action still names it
   open <task-id>                  open a review/running task's checkout in a
-                                  voro.toml viewer to see its diff — the
-                                  explicit spelling of pr's viewer medium;
-                                  reports what to configure if none is set
-  pr <task-id> [--yes]            show the task's diff via the project's
-                                  review action (`project action`). GitHub:
-                                  jump to the tracked PR in a browser, or push
-                                  the review task's branch and open a ready PR
+                                  voro.toml viewer to see its diff — the only
+                                  local-diff spelling, and the one `project
+                                  action` names a viewer for; reports what to
+                                  configure if none is set
+  pr <task-id> [--yes]            show the task's diff on GitHub, always: jump
+                                  to the tracked PR in a browser, or push the
+                                  review task's branch and open a ready PR
                                   from its summary, recording the URL (--yes
                                   skips the confirm; track an existing PR with
-                                  `set --pr`). Viewer: open the checkout in
-                                  the configured viewer, like `open`
+                                  `set --pr`). A checkout GitHub cannot take
+                                  errors pointing at `open`
 
 transitions
   triage <task-id> <parked|ready|reject|refine>
@@ -670,7 +671,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         }
         Verb::Open { task_id } => dispatch::open(store, ctx, task_id, None),
         Verb::Viewer { cmd } => viewer_verb(store, cmd, ctx),
-        Verb::Pr { task_id, yes } => pr_verb(store, task_id, yes, ctx),
+        Verb::Pr { task_id, yes } => pr_verb(store, task_id, yes),
         Verb::Reject(args) => reject_verb(store, args),
         Verb::Done(args) => done_verb(store, args),
         Verb::Import(args) => import_verb(store, args),
@@ -1556,28 +1557,29 @@ fn doc_link_echo(docs: &[Doc]) -> String {
     format!("docs: {}", listed.join(", "))
 }
 
-/// `pr <task-id> [--yes]` (DESIGN.md §8/§11c): the per-project "show me this
-/// task's diff" action. With a tracked PR, open it in a browser. Without one,
-/// resolve the project's review medium: GitHub creates the PR from the review
-/// task's done-time state (asserting PR-readiness, confirming unless `--yes`),
-/// a viewer project opens the checkout, as `open` does.
-fn pr_verb(store: &mut Store, id: i64, yes: bool, ctx: &DispatchCtx) -> Result<String, String> {
+/// `pr <task-id> [--yes]` (DESIGN.md §8/§11c): the GitHub half of "show me this
+/// task's diff", whatever the project's review action says. With a tracked PR,
+/// open it in a browser. Without one, create the PR from the review task's
+/// done-time state — asserting PR-readiness, confirming unless `--yes`. A
+/// checkout that cannot take a PR errors pointing at `voro open`, which is the
+/// only local-diff spelling.
+fn pr_verb(store: &mut Store, id: i64, yes: bool) -> Result<String, String> {
     let task = store.task(id).map_err(|e| e.to_string())?;
     if task.pr_url.is_some() {
         return crate::pr::open(store, id);
     }
-    let project = store.project(task.project_id).map_err(|e| e.to_string())?;
-    let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
-    if let ReviewMedium::Viewer(viewer) = crate::pr::resolve_medium(&project, &repo.path) {
-        return dispatch::open(store, ctx, id, viewer.as_deref());
-    }
     // Assert PR-ready and learn the branch before prompting, so a task missing
     // state, branch, or summary fails naming the gap rather than at the prompt.
     let plan = crate::pr::plan(store, id)?;
+    let local_diff = format!("`voro open {id}`");
+    // Then the medium, before the prompt rather than after it: nothing is worth
+    // confirming on a checkout GitHub cannot take.
+    let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
+    crate::pr::ensure_github_repo(&repo.path, &local_diff)?;
     if !yes && !confirm(&format!("push `{}` and open a PR for #{id}?", plan.branch))? {
         return Ok(format!("cancelled — no PR opened for #{id}"));
     }
-    crate::pr::create(store, id).map(|url| format!("opened {url} for task {id}"))
+    crate::pr::create(store, id, &local_diff).map(|url| format!("opened {url} for task {id}"))
 }
 
 /// Ask a yes/no question on the terminal, defaulting to no (DESIGN.md §8). A
@@ -1650,7 +1652,7 @@ fn done_verb(store: &mut Store, args: DoneArgs) -> Result<String, String> {
         write!(out, " (branch {})", name.trim()).unwrap();
     }
     // A code-producing task's complete report carries both a branch and a
-    // summary whatever the review medium, so warn (never fail) about whichever
+    // summary whichever key reviews it, so warn (never fail) about whichever
     // is absent — this note is ephemeral and costs the operator nothing, so it
     // stays symmetric where the durable flag only marks a branch without a
     // summary (DESIGN.md §8). A human task lands straight in `done` with no
@@ -2029,8 +2031,8 @@ fn next_verb(store: &mut Store) -> Result<String, String> {
 }
 
 /// `  [incomplete report]` when a `review` task carries a branch and no summary
-/// (DESIGN.md §8), else empty. Deliberately does not resolve the review medium,
-/// since `auto` resolution probes `gh` and this renders per line.
+/// (DESIGN.md §8), else empty. Read from task and event state alone — nothing
+/// here touches `gh`, since this renders per line.
 fn incomplete_report_suffix(store: &Store, task_id: i64) -> &'static str {
     if store.incomplete_report_flag(task_id).unwrap_or(false) {
         "  [incomplete report]"
@@ -3954,20 +3956,12 @@ mod tests {
         id
     }
 
-    /// Pin the demo project's review action to `pr`, so these tests exercise
-    /// the GitHub create path deterministically — under `auto` a non-GitHub
-    /// temp path would resolve to the viewer medium instead (DESIGN.md §8).
-    fn pin_pr_action(s: &mut Store) {
-        ok(s, &["project", "action", "demo", "pr"]);
-    }
-
     /// `pr` on a task that is not in `review` fails naming the state gap, before
     /// touching git or `gh` — the validation runs first.
     #[test]
     fn pr_create_requires_the_review_state() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        pin_pr_action(&mut s);
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
         let e = err(&mut s, &["pr", "1", "--yes"]);
         assert!(e.contains("review"), "{e}");
@@ -3978,7 +3972,6 @@ mod tests {
     fn pr_create_requires_a_branch() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        pin_pr_action(&mut s);
         let id = review_task(&mut s, None, Some("did it"));
         let e = err(&mut s, &["pr", &id.to_string(), "--yes"]);
         assert!(e.contains("branch"), "{e}");
@@ -3990,7 +3983,6 @@ mod tests {
     fn pr_create_requires_a_summary() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        pin_pr_action(&mut s);
         let id = review_task(&mut s, Some("feat/thing"), None);
         let e = err(&mut s, &["pr", &id.to_string(), "--yes"]);
         assert!(e.contains("summary"), "{e}");
@@ -4004,7 +3996,7 @@ mod tests {
         assert!(out.contains("--summary-file"), "{out}");
     }
 
-    // --- the folded review action (DESIGN.md §8/§11a) ---
+    // --- the review action's viewer, and the static `pr` (DESIGN.md §8/§11a) ---
 
     /// A DispatchCtx whose voro.toml is the given text, isolated under a temp
     /// root — the CLI-test face of the dispatch fixtures, for verbs that read
@@ -4079,11 +4071,12 @@ mod tests {
         assert!(ok(&mut s, &["help"]).contains("viewer list"), "help");
     }
 
-    /// The fold itself: `pr` on a project whose review action names a viewer
-    /// runs that viewer on the checkout — no branch, summary, or GitHub repo
-    /// required — instead of erroring at the forge seam (DESIGN.md §8).
+    /// `pr` is statically the GitHub medium (DESIGN.md §8): on a checkout that
+    /// cannot take a pull request it errors pointing at `voro open`, and the
+    /// project's review action — a viewer, here — does not redirect it. The
+    /// viewer would leave a marker behind, so its absence is the assertion.
     #[test]
-    fn pr_on_a_viewer_project_opens_the_viewer() {
+    fn pr_on_a_non_github_checkout_errors_pointing_at_open() {
         let mut s = store();
         let ctx = ctx_with_toml("[viewers.marker]\ncmd = \"touch {path}/opened.marker\"\n");
         let project_dir = ctx.db_path.parent().unwrap().join("project");
@@ -4094,20 +4087,17 @@ mod tests {
             &["project", "add", "demo", project_dir.to_str().unwrap()],
         );
         ok(&mut s, &["project", "action", "demo", "viewer:marker"]);
-        // a review task with neither branch nor summary — the viewer medium
-        // must not demand PR-readiness
-        let id = review_task(&mut s, None, None);
+        // PR-ready in every way but the checkout, so the refusal can only be
+        // about the medium.
+        let id = review_task(&mut s, Some("feat/thing"), Some("did it"));
 
-        let out = run_with(&mut s, &["pr", &id.to_string()], &ctx).unwrap();
-        assert!(out.contains("opened task"), "{out}");
-        let marker = project_dir.join("opened.marker");
-        for _ in 0..50 {
-            if marker.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(marker.exists(), "pr must have run the project's viewer");
+        let e = run_with(&mut s, &["pr", &id.to_string(), "--yes"], &ctx).unwrap_err();
+        assert!(e.contains("voro open"), "{e}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !project_dir.join("opened.marker").exists(),
+            "pr must not fall back to the project's viewer"
+        );
     }
 
     // --- done summary-file and PR-readiness warnings (DESIGN.md §8) ---

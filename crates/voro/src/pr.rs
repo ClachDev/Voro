@@ -8,8 +8,8 @@
 use std::process::{Command, Stdio};
 
 use voro_core::{
-    Mergeability, PrPlan, PrRef, PrRevisions, Project, ReviewDiff, ReviewMedium, Store,
-    format_review_feedback, parse_mergeable, parse_pr_revisions, plan_pr, plan_review_diff,
+    Mergeability, PrPlan, PrRef, PrRevisions, ReviewDiff, Store, format_review_feedback,
+    parse_mergeable, parse_pr_revisions, plan_pr, plan_review_diff,
 };
 
 /// Resolve a task's tracked PR, erroring with a fix-it hint when none is set.
@@ -200,13 +200,15 @@ pub fn plan(store: &Store, task_id: i64) -> Result<PrPlan, String> {
 /// the dispatched agent still cannot publish. Only called when no PR is
 /// tracked; a tracked one jumps to [`open`] instead. Returns the canonical URL
 /// so a caller can chain into [`open_url`] without re-reading the task.
-pub fn create(store: &mut Store, task_id: i64) -> Result<String, String> {
+/// `local_diff` is the caller's spelling of the local-diff key, for the
+/// non-GitHub error in [`ensure_github_repo`].
+pub fn create(store: &mut Store, task_id: i64, local_diff: &str) -> Result<String, String> {
     let plan = plan(store, task_id)?;
     let task = store.task(task_id).map_err(|e| e.to_string())?;
     // The task's own checkout: a task dispatched into a second repo has its
     // branch there, so that is where the push and `gh pr create` must run.
     let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
-    let url = open_pr_on_github(&repo.path, &plan)?;
+    let url = open_pr_on_github(&repo.path, &plan, local_diff)?;
     // Canonicalise before storing, so the tracked URL matches what `set --pr`
     // would record and a later jump-to-PR is addressable.
     let pr = PrRef::parse(&url)
@@ -254,59 +256,38 @@ pub fn conflict_status_url(url: &str) -> Mergeability {
     }
 }
 
-/// Resolve a project's review medium (DESIGN.md §8). The decision is
-/// `ReviewAction::resolve` in `voro-core`; this seam supplies the one input it
-/// cannot compute — whether the checkout is a GitHub repo `gh` can address —
-/// and only when the action is `auto`, so pinned media never pay for the probe.
-/// The action stays per-project; the probe runs against `checkout`, the task's
-/// resolved repo, so a multi-repo project answers per task (DESIGN.md §8).
-pub fn resolve_medium(project: &Project, checkout: &str) -> ReviewMedium {
-    let on_github = project.review_action.needs_probe() && is_github_repo(checkout);
-    project.review_action.resolve(on_github)
-}
-
-/// The probe behind the `auto` review action: whether `gh` can address the
-/// checkout as a GitHub repository. A missing or unauthenticated `gh` reads
-/// as "not GitHub" — the viewer is then the only workable medium — while the
-/// explicit `pr` action still reports the failure via [`ensure_github_repo`].
-fn is_github_repo(repo_path: &str) -> bool {
-    Command::new("gh")
-        .args(["repo", "view", "--json", "nameWithOwner"])
-        .current_dir(repo_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 /// The forge-specific half of [`create`] (DESIGN.md §8): push the branch and
 /// open a ready PR against the repo's default branch, returning the PR URL. A
-/// non-GitHub checkout gets a clear error pointing at the viewer medium.
-fn open_pr_on_github(repo_path: &str, plan: &PrPlan) -> Result<String, String> {
-    ensure_github_repo(repo_path)?;
+/// non-GitHub checkout gets a clear error pointing at the local-diff key.
+fn open_pr_on_github(repo_path: &str, plan: &PrPlan, local_diff: &str) -> Result<String, String> {
+    ensure_github_repo(repo_path, local_diff)?;
     push_branch(repo_path, &plan.branch)?;
     gh_pr_create(repo_path, plan)
 }
 
-/// Refuse a non-GitHub checkout before pushing anything, pointing at the
-/// viewer medium instead — reached when a project's review action is pinned
-/// to `pr` (or resolves there) but the checkout cannot take one (DESIGN.md §8).
-fn ensure_github_repo(repo_path: &str) -> Result<(), String> {
+/// Refuse a checkout `gh` cannot address as a GitHub repository, before
+/// anything is confirmed or pushed (DESIGN.md §8). The GitHub flow is what
+/// `g`/`pr` statically mean, so the fix is the other key rather than a project
+/// setting: `local_diff` names it in the caller's own idiom — `o` in the TUI,
+/// `voro open <id>` at the shell. A missing or unauthenticated `gh` reads as
+/// "not GitHub", which is the same dead end from the operator's side.
+pub fn ensure_github_repo(repo_path: &str, local_diff: &str) -> Result<(), String> {
     let output = Command::new("gh")
         .args(["repo", "view", "--json", "nameWithOwner"])
         .current_dir(repo_path)
         .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot run `gh` in {repo_path}: {e}"))?;
-    if output.status.success() {
-        return Ok(());
+        .output();
+    match output {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(_) => Err(format!(
+            "{repo_path} is not a GitHub repository, so there is no pull request to open — \
+             use {local_diff} to see this task's diff in a viewer"
+        )),
+        Err(e) => Err(format!(
+            "cannot run `gh` in {repo_path} ({e}), so no pull request can be reached — \
+             use {local_diff} to see this task's diff in a viewer"
+        )),
     }
-    Err(format!(
-        "{repo_path} is not a GitHub repository, so `pr` cannot open a pull request there; \
-         use `voro open <task-id>` to see its diff in a viewer, or point the project at one \
-         with `voro project action <project> viewer`"
-    ))
 }
 
 /// Push the task's branch to `origin` so `gh pr create --head` can find it. The
