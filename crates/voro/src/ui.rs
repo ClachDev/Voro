@@ -9,7 +9,7 @@ use voro_core::{
     ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
 };
 
-use crate::app::{App, CockpitRow, Mode, ReviewActionOption, Screen, TaskRow};
+use crate::app::{App, CockpitRow, Mode, Screen, TaskRow, ViewerOption, viewer_label};
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
@@ -369,7 +369,7 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             frame.render_stateful_widget(list, area, &mut state);
             hits.push_list(area, state.offset(), count, Hit::PickerOption);
         }
-        Mode::ReviewActionPicker {
+        Mode::ViewerPicker {
             options,
             current,
             sel,
@@ -378,11 +378,13 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             let items: Vec<ListItem> = options
                 .iter()
                 .map(|o| match o {
-                    ReviewActionOption::Action(a) if a == current => {
-                        ListItem::new(format!("{a}  (current)"))
+                    ViewerOption::Viewer(v) if v == current => {
+                        ListItem::new(format!("{}  (current)", viewer_label(v.as_deref())))
                     }
-                    ReviewActionOption::Action(a) => ListItem::new(a.to_string()),
-                    ReviewActionOption::NewViewer => ListItem::new(Line::from(Span::styled(
+                    ViewerOption::Viewer(v) => {
+                        ListItem::new(viewer_label(v.as_deref()).to_string())
+                    }
+                    ViewerOption::NewViewer => ListItem::new(Line::from(Span::styled(
                         "new viewer…",
                         Style::new().fg(Color::Blue),
                     ))),
@@ -396,7 +398,7 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title("Review action — ⏎ set, esc cancel"),
+                        .title("Viewer — ⏎ set, esc cancel"),
                 )
                 .highlight_style(SELECTED);
             frame.render_stateful_widget(list, area, &mut state);
@@ -1547,7 +1549,7 @@ fn blocker_spans(row: &TaskRow) -> Vec<Span<'static>> {
 }
 
 /// The projects screen (DESIGN.md §9): one row per project — weight, name,
-/// path, open task count, and the review action when one is pinned (§8). The
+/// path, open task count, and the viewer when the project names one (§8). The
 /// open count is the project's non-terminal tasks, from the loaded task list.
 /// An archived project stays on this screen, dim and tagged, so it can be
 /// found and unarchived (§5).
@@ -1572,9 +1574,9 @@ fn draw_projects(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             } else {
                 Style::new()
             };
-            let action = match &p.review_action {
-                voro_core::ReviewAction::Auto => String::new(),
-                other => format!("  [{other}]"),
+            let viewer = match &p.viewer {
+                Some(name) => format!("  [viewer:{name}]"),
+                None => String::new(),
             };
             let archived = if p.archived { "  [archived]" } else { "" };
             // The path column shows the default repo, so a single-repo project
@@ -1585,7 +1587,7 @@ fn draw_projects(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             };
             ListItem::new(Line::from(Span::styled(
                 format!(
-                    "{:>2}  {:14} {:28} {} open{extra}{action}{archived}",
+                    "{:>2}  {:14} {:28} {} open{extra}{viewer}{archived}",
                     p.weight,
                     p.name,
                     app.project_path(p.id),
@@ -1876,7 +1878,7 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
             ("a", "add", true),
             ("A", "archive", true),
             ("d", "delete", true),
-            ("v", "review action", true),
+            ("v", "viewer", true),
             ("?", "keys", true),
             ("tab", "config", true),
             ("q", "quit", true),
@@ -2054,7 +2056,7 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                     ("a", "add a project"),
                     ("A", "archive or unarchive the project"),
                     ("d", "delete the project — only when it is empty"),
-                    ("v", "pick the project's review action"),
+                    ("v", "pick the project's viewer"),
                 ],
             ),
             (

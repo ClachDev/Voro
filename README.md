@@ -142,7 +142,7 @@ lands in `review` where `voro open` or `voro pr` puts the diff in front of you.
 
 To extend or override the built-in agents and viewers, layer a
 `~/.config/voro/voro.toml` on top (`voro agent init` writes a skeleton). The
-dispatch semantics, the review action, and the `voro.toml` format are covered in
+dispatch semantics, the per-project viewer, and the `voro.toml` format are covered in
 [`docs/DESIGN.md`](docs/DESIGN.md) §8; the `CLAUDE.md`/`AGENTS.md` return-path
 snippet and the Claude Code hooks configuration are in
 [`docs/agent-integration.md`](docs/agent-integration.md).

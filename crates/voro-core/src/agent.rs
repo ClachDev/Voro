@@ -188,14 +188,13 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #   * set `default_agent` — used for tasks with no --agent override. When unset,
 #     Voro picks the first built-in found on PATH (claude, then codex).
 #   * set up viewers — [viewers.<name>] tables define how a task's diff is
-#     shown locally when `voro pr`/`voro open` resolve to the viewer medium
-#     (DESIGN.md §8). A viewer cmd may carry `{path}` (the task's worktree, or
-#     the project checkout when it has none), `{branch}` (the task's branch, or
-#     empty), and `{base}` (the checkout's default branch); `{base}...{branch}`
-#     spells a diff range. `default_viewer` names the one used when a project
-#     does not pick a viewer itself (`voro project action <p> viewer:<name>`); a
-#     single anonymous [viewer] table is the older, still-valid spelling of
-#     the default.
+#     shown locally by `voro open` (DESIGN.md §8). A viewer cmd may carry
+#     `{path}` (the task's worktree, or the project checkout when it has none),
+#     `{branch}` (the task's branch, or empty), and `{base}` (the checkout's
+#     default branch); `{base}...{branch}` spells a diff range.
+#     `default_viewer` names the one used when a project does not pick a viewer
+#     itself (`voro project viewer <p> <name>`); a single anonymous [viewer]
+#     table is the older, still-valid spelling of the default.
 #   * price the queue — `max_running` caps how many dispatches ride at once
 #     (default 5; at the cap the queue offers no more), and a [costs] table
 #     divides each row's score by what its action asks of you, so a cheap
@@ -783,8 +782,8 @@ pub struct AgentsConfig {
     /// The anonymous `[viewer]` table — the pre-names single viewer, still
     /// honoured as a default when no `default_viewer` is set.
     viewer: Option<ViewerTemplate>,
-    /// The named `[viewers.<name>]` tables a project's review action can
-    /// pick from (DESIGN.md §8/§11a).
+    /// The named `[viewers.<name>]` tables a project can pick from
+    /// (DESIGN.md §8/§11a).
     viewers: BTreeMap<String, ViewerTemplate>,
     /// The user-set `default_viewer`, naming a `[viewers.*]` entry.
     default_viewer: Option<String>,
@@ -991,8 +990,8 @@ impl AgentsConfig {
         })
     }
 
-    /// The names of the `[viewers.*]` tables, sorted, for the TUI's
-    /// review-action picker and `viewer list`.
+    /// The names of the `[viewers.*]` tables, sorted, for the TUI's viewer
+    /// picker and `viewer list`.
     pub fn viewer_names(&self) -> Vec<String> {
         self.viewers.keys().cloned().collect()
     }
