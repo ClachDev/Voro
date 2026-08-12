@@ -728,6 +728,26 @@ fn conflict_span() -> Span<'static> {
     )
 }
 
+/// A queue row's state cell, coloured by what the state asks of the operator.
+/// Only the states that are stuck on them take a colour: `needs-input` cyan,
+/// the hue the agent already speaks in throughout the TUI (the question suffix,
+/// `↻ refined`, `⟳ refining`); `review` green, matching the branch and repo
+/// lines in the detail pane, since a git artifact is what there is to look at;
+/// `stalled` red, matching the failed-session line. `ready` stays plain so an
+/// uncoloured queue reads as nothing waiting on the operator, and `proposed`
+/// stays dim with the rest of its row. No bold — that is reserved for the row
+/// markers, which sit above the state cell in the hierarchy.
+fn state_span(state: TaskState) -> Span<'static> {
+    let style = match state {
+        TaskState::NeedsInput => Style::new().fg(Color::Cyan),
+        TaskState::Review => Style::new().fg(Color::Green),
+        TaskState::Stalled => Style::new().fg(Color::Red),
+        TaskState::Proposed => Style::new().dim(),
+        _ => Style::new(),
+    };
+    Span::styled(format!("{:11}", state.as_str()), style)
+}
+
 /// The human-only flag (task #100) rendered as a row marker. A property of the
 /// task rather than an anomaly, so it stays dim where the warning flags shout.
 fn human_span() -> Span<'static> {
@@ -967,15 +987,9 @@ fn action_row_line(app: &App, row: &ActionRow, indent: &str) -> Line<'static> {
     };
     let mut spans = vec![
         score,
-        Span::styled(
-            format!(
-                "{indent}{} {:11} {}",
-                task_ref(c.task.id),
-                c.task.state.as_str(),
-                c.task.priority,
-            ),
-            style,
-        ),
+        Span::styled(format!("{indent}{} ", task_ref(c.task.id)), style),
+        state_span(c.task.state),
+        Span::styled(format!(" {}", c.task.priority), style),
         deep_marker(c.task.deep),
         Span::styled(format!(" {}: {}", c.project_name, c.task.title), style),
     ];
@@ -2500,6 +2514,40 @@ mod tests {
             .collect();
         assert!(out.contains("⚠ refine failed"), "{out}");
         assert!(!out.contains("↻ refined"), "{out}");
+    }
+
+    /// The queue's state cell is coloured only where the state is stuck on the
+    /// operator, and never bold — the row markers own that weight.
+    #[test]
+    fn state_cell_colours_only_the_states_stuck_on_the_operator() {
+        let cases = [
+            (TaskState::NeedsInput, Some(Color::Cyan)),
+            (TaskState::Review, Some(Color::Green)),
+            (TaskState::Stalled, Some(Color::Red)),
+            (TaskState::Ready, None),
+            (TaskState::Proposed, None),
+        ];
+        for (state, fg) in cases {
+            let span = state_span(state);
+            assert_eq!(span.style.fg, fg, "{}", state.as_str());
+            assert!(
+                !span.style.add_modifier.contains(Modifier::BOLD),
+                "{}",
+                state.as_str()
+            );
+        }
+        assert!(
+            state_span(TaskState::Proposed)
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            !state_span(TaskState::Ready)
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
     }
 
     /// End-to-end: a human-only task carries the `[human]` marker on its queue
