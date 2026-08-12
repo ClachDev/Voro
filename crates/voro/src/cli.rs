@@ -161,6 +161,11 @@ tasks
                                   parked projects
   explain <task-id>               score decomposition, and the divisor the
                                   inbox ranks it by
+  seed [--force]                  fill the dev store with fixture data — a
+                                  board covering every task state. A build run
+                                  from a target/ directory seeds it by itself
+                                  on first run; --force rebuilds it. Refused
+                                  against your real store
   import <project> [--repo NAME] [--gh-repo owner/name]
                                   import open GitHub issues as proposed
                                   tasks via `gh issue list`; idempotent.
@@ -292,6 +297,12 @@ enum Verb {
     Inbox,
     Next,
     Stats,
+    /// Fill the dev store with fixture data.
+    Seed {
+        /// Discard what is there and rebuild it.
+        #[arg(long)]
+        force: bool,
+    },
     Explain {
         task_id: i64,
     },
@@ -664,6 +675,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Inbox => inbox_verb(store, ctx),
         Verb::Next => next_verb(store),
         Verb::Stats => stats_verb(store),
+        Verb::Seed { force } => seed_verb(store, ctx, force),
         Verb::Explain { task_id } => explain_verb(store, task_id, ctx),
         Verb::Agent { cmd } => agent_verb(cmd, ctx),
         Verb::Dispatch { task_id, agent } => {
@@ -1989,6 +2001,37 @@ fn plural(n: usize, noun: &str) -> String {
 
 /// Task counts by state (DESIGN.md §12) as a scriptable readout, excluding
 /// parked projects so the numbers match the queue and header.
+/// Fixture data, for the dev store only (DESIGN.md §5). The refusal is on the
+/// database in play rather than on how the binary was built, so no combination
+/// of flags and environment seeds over the operator's board.
+fn seed_verb(store: &mut Store, ctx: &DispatchCtx, force: bool) -> Result<String, String> {
+    if ctx.db_path == Store::production_db_path() {
+        return Err(format!(
+            "refusing to seed {} — that is your real store, not the dev one. A build run from \
+             a target/ directory seeds {} by itself on first run.",
+            Store::production_db_path().display(),
+            Store::dev_db_path().display()
+        ));
+    }
+    let empty = voro_core::seed::is_empty(store).map_err(|e| e.to_string())?;
+    if !empty {
+        if !force {
+            return Err(format!(
+                "{} already has projects — pass --force to discard them and rebuild the fixture",
+                ctx.db_path.display()
+            ));
+        }
+        store.truncate_all().map_err(|e| e.to_string())?;
+    }
+    let summary = voro_core::seed::seed(store).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "seeded {} with {} projects and {} tasks",
+        ctx.db_path.display(),
+        summary.projects,
+        summary.tasks
+    ))
+}
+
 fn stats_verb(store: &mut Store) -> Result<String, String> {
     let c = store.state_counts().map_err(|e| e.to_string())?;
     let mut out = String::new();

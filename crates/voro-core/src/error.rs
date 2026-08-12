@@ -9,6 +9,16 @@ pub enum Error {
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    #[error(
+        "this database is at schema version {version}, but this build of voro knows only {known} \
+         migration(s) — a newer build migrated it, and this one cannot read it safely. {remedy}"
+    )]
+    SchemaAhead {
+        version: usize,
+        known: usize,
+        remedy: String,
+    },
+
     #[error("task {0} not found")]
     TaskNotFound(i64),
 

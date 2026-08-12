@@ -11,6 +11,7 @@ mod model;
 mod pr;
 mod review;
 pub mod scheduler;
+pub mod seed;
 mod store;
 mod template;
 mod transition;

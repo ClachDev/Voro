@@ -28,10 +28,70 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0016_add_refining_state.sql"),
 ];
 
+/// Whether a path lies inside a Cargo build directory — a `target` component
+/// followed immediately by a profile. Covers `target/debug/voro`,
+/// `target/release/voro`, and the `target/debug/deps/` binaries the test
+/// harness runs, in a worktree or the primary checkout alike.
+fn path_is_cargo_target(path: &Path) -> bool {
+    let parts: Vec<_> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts
+        .windows(2)
+        .any(|pair| pair[0] == "target" && (pair[1] == "debug" || pair[1] == "release"))
+}
+
+/// How to get out of a database whose schema is ahead of this build. The dev
+/// store is disposable, so its way out is to throw it away; the operator's
+/// store is not, so its way out is a binary that understands it, or a snapshot
+/// from before the migration.
+fn remedy_for_schema_ahead(path: Option<&Path>) -> String {
+    if path.is_some_and(|p| p == Store::dev_db_path()) {
+        format!(
+            "It is the dev store, which is disposable — rebuild it at this build's schema with \
+             `voro seed --force`, or delete {} and it will be reseeded on the next run.",
+            Store::dev_db_path().display()
+        )
+    } else {
+        format!(
+            "Run the build that migrated it — `cargo install --path crates/voro` from a checkout \
+             carrying that migration — or restore a pre-migration snapshot from {}.",
+            Store::backup_dir_for(path.unwrap_or(&Store::production_db_path())).display()
+        )
+    }
+}
+
 /// Owns the SQLite database. All writes go through this type; task state in
 /// particular is only ever changed by the transition API in `transition.rs`.
 pub struct Store {
     pub(crate) conn: Connection,
+}
+
+/// Drop every row, leaving the schema in place — the reset behind
+/// `voro seed --force`. Only ever aimed at the dev store; the CLI is what
+/// refuses any other target.
+impl Store {
+    pub fn truncate_all(&mut self) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.pragma_update(None, "foreign_keys", false)?;
+        for table in [
+            "task_docs",
+            "docs",
+            "deps",
+            "events",
+            "sessions",
+            "tasks",
+            "repos",
+            "projects",
+        ] {
+            tx.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+        tx.execute("DELETE FROM sqlite_sequence", []).ok();
+        tx.commit()?;
+        self.conn.pragma_update(None, "foreign_keys", true)?;
+        Ok(())
+    }
 }
 
 /// Initial state for a task created by a human. `proposed` is quick capture;
@@ -67,15 +127,15 @@ impl Store {
             std::fs::create_dir_all(dir)
                 .map_err(|e| Error::Invalid(format!("cannot create {}: {e}", dir.display())))?;
         }
-        Store::from_connection(Connection::open(path)?)
+        Store::from_connection_at(Connection::open(path)?, Some(path))
     }
 
     pub fn open_in_memory() -> Result<Store> {
-        Store::from_connection(Connection::open_in_memory()?)
+        Store::from_connection_at(Connection::open_in_memory()?, None)
     }
 
-    /// `$XDG_DATA_HOME/voro/voro.db`, defaulting to `~/.local/share`.
-    pub fn default_db_path() -> PathBuf {
+    /// `$XDG_DATA_HOME/voro`, defaulting to `~/.local/share/voro`.
+    pub fn data_dir() -> PathBuf {
         let data_home = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
@@ -85,14 +145,117 @@ impl Store {
                     .unwrap_or_default();
                 home.join(".local/share")
             });
-        data_home.join("voro/voro.db")
+        data_home.join("voro")
     }
 
+    /// The operator's store (DESIGN.md §5). Fixed regardless of how the running
+    /// binary was built, so a dev build can recognise it as the one database it
+    /// must not open by default.
+    pub fn production_db_path() -> PathBuf {
+        Store::data_dir().join("voro.db")
+    }
+
+    /// The store a dev build uses instead (DESIGN.md §5). Seeded on first open
+    /// and disposable: deleting it costs nothing, which is what makes it the
+    /// safe default for a binary carrying unreleased migrations.
+    pub fn dev_db_path() -> PathBuf {
+        Store::data_dir().join("dev.db")
+    }
+
+    /// Where snapshots taken before a migration land: beside the database they
+    /// protect, so a store opened with `--db` keeps its own history rather than
+    /// scattering copies through the operator's data directory.
+    pub fn backup_dir_for(path: &Path) -> PathBuf {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .join("backups")
+    }
+
+    /// True when this binary was run out of a Cargo `target/` directory rather
+    /// than installed. Such a build may carry migrations that no released
+    /// binary knows, and applying those to the operator's store strands it at a
+    /// schema every other build refuses — so a dev build defaults to the dev
+    /// store instead. The check is on the running executable, not on a
+    /// compile-time path, so it holds for `cargo run` from the primary checkout
+    /// exactly as it does for a build inside a worktree.
+    pub fn is_dev_build() -> bool {
+        std::env::current_exe().is_ok_and(|exe| path_is_cargo_target(&exe))
+    }
+
+    /// The store a bare `voro` opens: the dev one for a dev build, the
+    /// operator's otherwise.
+    pub fn default_db_path() -> PathBuf {
+        if Store::is_dev_build() {
+            Store::dev_db_path()
+        } else {
+            Store::production_db_path()
+        }
+    }
+
+    #[cfg(test)]
     fn from_connection(conn: Connection) -> Result<Store> {
+        Store::from_connection_at(conn, None)
+    }
+
+    fn from_connection_at(conn: Connection, path: Option<&Path>) -> Result<Store> {
         conn.pragma_update(None, "foreign_keys", true)?;
         let mut store = Store { conn };
+        let version = store.schema_version()?;
+        if version > MIGRATIONS.len() {
+            return Err(Error::SchemaAhead {
+                version,
+                known: MIGRATIONS.len(),
+                remedy: remedy_for_schema_ahead(path),
+            });
+        }
+        if version < MIGRATIONS.len()
+            && let Some(path) = path
+        {
+            store.snapshot(path, version)?;
+        }
         store.migrate()?;
         Ok(store)
+    }
+
+    fn schema_version(&self) -> Result<usize> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as usize)
+    }
+
+    /// Copy the database beside itself before a migration touches it. A
+    /// migration that renames or drops a column is not reversible from the
+    /// migrated file alone, so the pre-migration copy is the only thing that
+    /// makes the advice in [`Error::SchemaAhead`] — restore a snapshot —
+    /// something the operator can actually act on. A database with no schema
+    /// yet has nothing to lose, and a failure to write the copy is reported
+    /// rather than fatal: refusing to open over a full disk would be a worse
+    /// outcome than migrating without a snapshot.
+    fn snapshot(&self, path: &Path, version: usize) -> Result<()> {
+        if version == 0 || !path.exists() {
+            return Ok(());
+        }
+        let stamp: String =
+            self.conn
+                .query_row("SELECT strftime('%Y%m%d-%H%M%S', 'now')", [], |row| {
+                    row.get(0)
+                })?;
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "voro".to_string());
+        let dir = Store::backup_dir_for(path);
+        let target = dir.join(format!("{stem}-v{version}-{stamp}.db"));
+        let copied = std::fs::create_dir_all(&dir).and_then(|()| std::fs::copy(path, &target));
+        if let Err(e) = copied {
+            eprintln!(
+                "voro: could not snapshot {} before migrating to schema {}: {e}",
+                path.display(),
+                MIGRATIONS.len()
+            );
+        }
+        Ok(())
     }
 
     /// SQLite's `PRAGMA data_version`, which increments whenever another
@@ -1629,6 +1792,116 @@ pub(crate) fn log_global_event(conn: &Connection, kind: &str, detail: Option<&st
         params![kind, detail],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod schema_guard_tests {
+    use super::*;
+
+    /// A unique scratch directory per test, cleaned up by the caller.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "voro-store-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_cargo_build_directory_is_recognised_in_every_profile() {
+        for exe in [
+            "/home/u/proj/target/debug/voro",
+            "/home/u/proj/target/release/voro",
+            "/home/u/proj/target/debug/deps/voro-1a2b3c",
+            "/home/u/proj/.claude/worktrees/feature/target/debug/voro",
+        ] {
+            assert!(
+                path_is_cargo_target(Path::new(exe)),
+                "{exe} should be a dev build"
+            );
+        }
+        for exe in [
+            "/home/u/.cargo/bin/voro",
+            "/usr/local/bin/voro",
+            "/opt/target-practice/voro",
+        ] {
+            assert!(
+                !path_is_cargo_target(Path::new(exe)),
+                "{exe} should not be a dev build"
+            );
+        }
+    }
+
+    #[test]
+    fn a_database_from_the_future_is_refused_with_a_way_out() {
+        let dir = scratch("future");
+        let path = dir.join("voro.db");
+        Store::open(&path).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", (MIGRATIONS.len() + 1) as i64)
+            .unwrap();
+
+        let message = match Store::open(&path) {
+            Ok(_) => panic!("a store from the future should not open"),
+            Err(e) => e.to_string(),
+        };
+        assert!(message.contains("schema version"), "{message}");
+        // The remedy is the point of the error: a version mismatch the operator
+        // cannot act on is the cryptic failure this guard exists to replace.
+        assert!(message.contains("cargo install"), "{message}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_dev_store_is_told_to_reseed_rather_than_reinstall() {
+        let remedy = remedy_for_schema_ahead(Some(&Store::dev_db_path()));
+        assert!(remedy.contains("voro seed --force"), "{remedy}");
+        assert!(!remedy.contains("cargo install"), "{remedy}");
+    }
+
+    #[test]
+    fn a_migration_snapshots_the_database_beside_it_first() {
+        let dir = scratch("snapshot");
+        let path = dir.join("voro.db");
+        // A store one migration short of current, so opening it migrates.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+        drop(conn);
+
+        Store::open(&path).unwrap();
+
+        let backups: Vec<_> = std::fs::read_dir(Store::backup_dir_for(&path))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert!(backups[0].starts_with("voro-v1-"), "{backups:?}");
+
+        // The snapshot is the state *before* the migration, which is the only
+        // thing that makes it worth keeping.
+        let saved = Connection::open(Store::backup_dir_for(&path).join(&backups[0])).unwrap();
+        let version: i64 = saved
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_fresh_database_is_not_snapshotted() {
+        let dir = scratch("fresh");
+        let path = dir.join("voro.db");
+        Store::open(&path).unwrap();
+        assert!(!Store::backup_dir_for(&path).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]

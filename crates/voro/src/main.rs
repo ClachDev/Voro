@@ -36,15 +36,62 @@ fn split_db(args: Vec<String>) -> (PathBuf, Vec<String>) {
             rest.push(arg);
         }
     }
-    let db = db
-        .or_else(|| std::env::var_os("VORO_DB").map(PathBuf::from))
-        .unwrap_or_else(Store::default_db_path);
+    let db = db.unwrap_or_else(resolved_db);
     (db, rest)
+}
+
+/// The database a run with no `--db` uses. `VORO_DB` is how a dispatched
+/// session inherits the store its dispatcher was on (DESIGN.md §8), and it is
+/// therefore also how the operator's store reaches a process that never asked
+/// for it — a dev build launched from inside a session's worktree. A dev build
+/// declines that inheritance and stays on the dev store (DESIGN.md §5). An
+/// explicit `--db` is a deliberate act and is honoured either way.
+fn resolved_db() -> PathBuf {
+    let inherited = std::env::var_os("VORO_DB").map(PathBuf::from);
+    if Store::is_dev_build() && inherited.as_deref() == Some(Store::production_db_path().as_path())
+    {
+        eprintln!(
+            "voro: this build runs from a target/ directory, so it is ignoring the inherited \
+             VORO_DB pointing at {} and using {} instead. Pass --db explicitly to override.",
+            Store::production_db_path().display(),
+            Store::dev_db_path().display()
+        );
+        return Store::dev_db_path();
+    }
+    inherited.unwrap_or_else(Store::default_db_path)
+}
+
+/// Report a startup failure the way the CLI verbs report theirs — the error's
+/// own message, on stderr. Returning it from `main` instead prints the derived
+/// `Debug` form, which buries the sentence the operator needs to read (an
+/// unopenable store is the one error most likely to be the *first* thing a new
+/// or upgrading install sees).
+fn or_exit<T>(result: voro_core::Result<T>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("voro: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (path, verb_args) = split_db(std::env::args().skip(1).collect());
-    let mut store = Store::open(&path)?;
+    let mut store = or_exit(Store::open(&path));
+    // A dev store is worth nothing empty: the interface it exists to exercise
+    // renders as a blank board, and an agent handed one cannot tell an empty
+    // fixture from a broken query (DESIGN.md §5).
+    if path == Store::dev_db_path() && or_exit(voro_core::seed::is_empty(&store)) {
+        let summary = or_exit(voro_core::seed::seed(&mut store));
+        eprintln!(
+            "voro: seeded the dev store at {} with {} projects and {} tasks — \
+             `voro seed --force` rebuilds it.",
+            path.display(),
+            summary.projects,
+            summary.tasks
+        );
+    }
     let ctx = dispatch::DispatchCtx::from_db_path(&path);
 
     if !verb_args.is_empty() {
