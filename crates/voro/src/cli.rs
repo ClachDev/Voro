@@ -1432,8 +1432,12 @@ fn set_verb(store: &mut Store, mut args: SetArgs) -> Result<String, String> {
     // the verb the refine prompts already end with — so a `set` that *replaces*
     // the body concludes the round. An append, or a `set` touching anything else,
     // leaves the round running.
-    let concludes_refine =
-        (args.body.is_some() || args.body_file.is_some()) && current.state == TaskState::Refining;
+    let replaces_body = args.body.is_some() || args.body_file.is_some();
+    let concludes_refine = replaces_body && current.state == TaskState::Refining;
+    // The backstop for a rewrite that arrives after its round was already
+    // concluded failed (DESIGN.md §6): the body lands on a `proposed` task, too
+    // late to conclude anything, so the recorded outcome is corrected instead.
+    let corrects_late_refine = replaces_body && current.state == TaskState::Proposed;
     let body = set_body(&current.body, &mut args, id)?;
     let agent = if args.no_agent {
         None
@@ -1466,6 +1470,12 @@ fn set_verb(store: &mut Store, mut args: SetArgs) -> Result<String, String> {
     } else {
         task
     };
+    let refine_echo =
+        if corrects_late_refine && store.correct_late_refine(id).map_err(|e| e.to_string())? {
+            "\nthe failed refine round is marked applied — its rewrite landed late".to_string()
+        } else {
+            String::new()
+        };
     let task = match &args.blocked_by {
         Some(raw) => store
             .set_blocks_deps(id, &parse_ids("blocked-by", raw)?)
@@ -1531,7 +1541,7 @@ fn set_verb(store: &mut Store, mut args: SetArgs) -> Result<String, String> {
         String::new()
     };
     Ok(format!(
-        "task {} updated ({}){blocks_echo}{unlink_echo}{docs_echo}",
+        "task {} updated ({}){blocks_echo}{unlink_echo}{docs_echo}{refine_echo}",
         task.id, task.state
     ))
 }
@@ -2801,6 +2811,39 @@ mod tests {
 
         ok(&mut s, &["set", "1", "--append-body", "a finding"]);
         assert_eq!(s.task(1).unwrap().state, TaskState::Refining);
+    }
+
+    /// The late-rewrite backstop (DESIGN.md §6): a round finalised `failed`
+    /// while its agent was in fact still working leaves the rewrite landing on a
+    /// `proposed` task, too late to conclude anything. The body must not sit
+    /// under a marker saying no rewrite happened, so the `set` corrects the
+    /// round's recorded outcome instead.
+    #[test]
+    fn a_body_landing_after_a_failed_round_flips_the_marker() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "An idea", "--body", "thin"]);
+        s.record_refine_launch(1, "make it dispatchable", "claude", None, None)
+            .unwrap();
+        s.conclude_refine(1, RefineOutcome::Failed).unwrap();
+        assert!(s.refine_failed_flag(1).unwrap());
+
+        let path = std::env::temp_dir().join(format!("voro-late-refine-{}.md", std::process::id()));
+        std::fs::write(&path, "# Rewritten\n\nNames real files and criteria.\n").unwrap();
+        let out = ok(&mut s, &["set", "1", "--body-file", path.to_str().unwrap()]);
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(out.contains("its rewrite landed late"), "{out}");
+        assert!(s.refined_flag(1).unwrap());
+        assert!(!s.refine_failed_flag(1).unwrap());
+        assert!(ok(&mut s, &["list"]).contains("↻ refined"));
+        // The correction transitions nothing: the proposal still awaits triage.
+        assert_eq!(s.task(1).unwrap().state, TaskState::Proposed);
+
+        // An ordinary edit of a proposal nobody refined says nothing about
+        // refining, and a second body change corrects nothing further.
+        let out = ok(&mut s, &["set", "1", "--body", "another pass"]);
+        assert!(!out.contains("rewrite landed late"), "{out}");
     }
 
     /// A verdict on a refining task is refused by the transition API itself

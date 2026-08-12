@@ -97,6 +97,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   everywhere else in the CLI. The GitHub-side override it used to be is now
   `--gh-repo owner/name`.
 
+### Fixed
+
+- A headless `voro refine` is no longer marked `⚠ refine failed` seconds after
+  it starts. The round runs the agent's own `dispatch` template, so under a
+  `claude --bg`-style launcher the pid Voro recorded belonged to a launcher that
+  exits at birth — reconciliation read it as a dead round and sent the proposal
+  back to `proposed` under a failure marker while the agent worked on, so the
+  rewrite that landed later was read under a warning saying no rewrite had
+  happened. A round now captures a session ref at launch and is read from the
+  agent's own listing, exactly as a dispatch is; a genuinely dead round is still
+  caught, and an agent defining no `sessions` verb still reconciles by pid, as
+  does the interactive refine, whose foreground child really is the round.
+- A `voro set --body`/`--body-file` landing on a `proposed` task whose last
+  refine round concluded `failed` corrects that round's outcome to applied, so a
+  rewrite that arrives after its round was concluded reads `↻ refined` rather
+  than sitting under the failure marker. The task neither reopens nor
+  transitions.
+
 ## [0.1.0](https://github.com/ClachDev/Voro/compare/27b1105...v0.1.0) - 2026-07-16
 
 Initial release of Voro, a local, single-operator command centre that

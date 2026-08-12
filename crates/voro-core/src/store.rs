@@ -1032,6 +1032,34 @@ impl Store {
         self.refine_marker(task_id, RefineOutcome::Failed)
     }
 
+    /// Correct the outcome of a round that concluded `failed` but whose rewrite
+    /// then arrived anyway (DESIGN.md §6): a body replacement landing on a
+    /// `proposed` task whose last round failed says that round did apply
+    /// something, however late, so the recorded outcome is superseded by
+    /// `applied` and the row's marker flips from `⚠ refine failed` to `↻
+    /// refined`. A rewritten body sitting under a failure marker is worse than
+    /// no marker at all: it teaches the operator to disbelieve the one signal
+    /// that exists to say a rewrite they asked for silently never happened.
+    ///
+    /// This corrects a *concluded* round and nothing else — the task neither
+    /// re-enters `refining` nor transitions, and the round's session keeps the
+    /// outcome the reconciler observed of its process. Returns whether anything
+    /// was corrected, so a caller can say so; a no-op on any other state or any
+    /// other last outcome, and idempotent, since the correction it appends is
+    /// itself the newest outcome.
+    pub fn correct_late_refine(&mut self, task_id: i64) -> Result<bool> {
+        if !self.refine_failed_flag(task_id)? {
+            return Ok(false);
+        }
+        log_event(
+            &self.conn,
+            task_id,
+            "refine",
+            Some(RefineOutcome::Applied.as_str()),
+        )?;
+        Ok(true)
+    }
+
     fn refine_marker(&self, task_id: i64, wanted: RefineOutcome) -> Result<bool> {
         let state: Option<TaskState> = self
             .conn
@@ -3192,6 +3220,70 @@ mod tests {
         s.apply(t.id, Action::Triage(Triage::Parked)).unwrap();
         assert!(!s.refined_flag(t.id).unwrap());
         assert!(!s.refine_failed_flag(t.id).unwrap());
+    }
+
+    /// The late-rewrite backstop (DESIGN.md §6): a round concluded `failed`
+    /// whose rewrite lands afterwards has its outcome corrected to applied, so
+    /// the improved body is not read under a marker saying no rewrite happened.
+    #[test]
+    fn a_late_rewrite_corrects_a_failed_round_to_applied() {
+        let mut s = Store::open_in_memory().unwrap();
+        let t = proposal(&mut s, "refine me");
+        s.record_refine_launch(t.id, "note", "claude", Some(1), None)
+            .unwrap();
+        s.conclude_refine(t.id, RefineOutcome::Failed).unwrap();
+        assert!(s.refine_failed_flag(t.id).unwrap());
+
+        assert!(s.correct_late_refine(t.id).unwrap());
+        assert!(s.refined_flag(t.id).unwrap());
+        assert!(!s.refine_failed_flag(t.id).unwrap());
+        assert_eq!(
+            s.latest_refine_outcome(t.id).unwrap(),
+            Some(RefineOutcome::Applied)
+        );
+        // A correction transitions nothing and reopens nothing.
+        assert_eq!(s.task(t.id).unwrap().state, TaskState::Proposed);
+        assert_eq!(
+            s.sessions_for(t.id).unwrap()[0].outcome,
+            Some(SessionOutcome::Failed),
+            "the session keeps the outcome the reconciler observed"
+        );
+        // Idempotent: the correction is itself the newest outcome.
+        assert!(!s.correct_late_refine(t.id).unwrap());
+    }
+
+    /// The correction is confined to the one case it exists for: any other last
+    /// outcome, and any state but `proposed`, is left alone.
+    #[test]
+    fn correcting_a_round_is_a_no_op_off_the_failed_case() {
+        use crate::transition::{Action, Triage};
+
+        for outcome in [RefineOutcome::Applied, RefineOutcome::Cancelled] {
+            let mut s = Store::open_in_memory().unwrap();
+            let t = proposal(&mut s, "refine me");
+            s.record_refine_launch(t.id, "note", "claude", Some(1), None)
+                .unwrap();
+            s.conclude_refine(t.id, outcome).unwrap();
+
+            assert!(!s.correct_late_refine(t.id).unwrap(), "{outcome}");
+            assert_eq!(s.latest_refine_outcome(t.id).unwrap(), Some(outcome));
+        }
+
+        // A task nobody ever refined, and a failed round already triaged away.
+        let mut s = Store::open_in_memory().unwrap();
+        let t = proposal(&mut s, "never refined");
+        assert!(!s.correct_late_refine(t.id).unwrap());
+        assert_eq!(s.latest_refine_outcome(t.id).unwrap(), None);
+
+        s.record_refine_launch(t.id, "note", "claude", Some(1), None)
+            .unwrap();
+        s.conclude_refine(t.id, RefineOutcome::Failed).unwrap();
+        s.apply(t.id, Action::Triage(Triage::Ready)).unwrap();
+        assert!(!s.correct_late_refine(t.id).unwrap());
+        assert_eq!(
+            s.latest_refine_outcome(t.id).unwrap(),
+            Some(RefineOutcome::Failed)
+        );
     }
 
     /// A concluded round closes its session with the matching outcome, whichever

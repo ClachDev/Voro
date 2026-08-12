@@ -722,6 +722,8 @@ pub fn refine(
     let seed = refine_seed(store, &task)?;
     let prompt = render_refine_prompt(REFINE_PROMPT_TEMPLATE, task_id, &ctx.db_path, &seed, note);
 
+    let cwd = repo.path.clone();
+    let spawn_ms = now_ms();
     let spawned = spawn_expansion(
         ctx,
         Expansion {
@@ -732,6 +734,9 @@ pub fn refine(
             cwd: repo.path,
         },
     )?;
+    let pid = spawned.pid;
+    let log_path = spawned.log_path.clone();
+    let session_name = spawned.session_name.clone();
 
     // Recorded after the spawn, exactly as dispatch records its session, so the
     // pid the reconciler probes is the real one; a round that could not be
@@ -741,25 +746,49 @@ pub fn refine(
         task_id,
         note,
         &agent.name,
-        Some(spawned.pid),
-        Some(spawned.log_path.to_string_lossy().as_ref()),
+        Some(pid),
+        Some(log_path.to_string_lossy().as_ref()),
     );
-    let summary = format!(
-        "task {task_id} sent for refinement by '{}' as {} (pid {}) — log {}",
-        agent.name,
-        spawned.session_name,
-        spawned.pid,
-        spawned.log_path.display()
-    );
-    if let Err(e) = recorded {
-        let pid = spawned.pid;
-        kill_expansion(spawned);
-        return Err(format!(
-            "recording the refine failed ({e}); the spawned agent (pid {pid}) was killed"
-        ));
-    }
+    let session = match recorded {
+        Ok((_, session)) => session,
+        Err(e) => {
+            kill_expansion(spawned);
+            return Err(format!(
+                "recording the refine failed ({e}); the spawned agent (pid {pid}) was killed"
+            ));
+        }
+    };
     reap_expansion(spawned, ctx.launch_log_path());
-    Ok(summary)
+
+    // A round's ref is captured exactly as a dispatch's is, and for the same
+    // reason (DESIGN.md §8): the round runs the agent's `dispatch` template, so
+    // where that template detaches — `claude --bg` does — the pid above belongs
+    // to a launcher that exits at birth, and only the agent's own listing can
+    // say whether the round is still working.
+    let ref_note = match &agent.sessions {
+        Some(sessions_cmd) => match capture_session_ref(
+            sessions_cmd,
+            &cwd,
+            spawn_ms,
+            ctx.ref_capture_timeout,
+            &log_path,
+        ) {
+            Some(session_ref) => {
+                store
+                    .set_session_ref(session.id, &session_ref)
+                    .map_err(|e| e.to_string())?;
+                format!(", ref {session_ref}")
+            }
+            None => ", session ref not captured".to_string(),
+        },
+        None => String::new(),
+    };
+
+    Ok(format!(
+        "task {task_id} sent for refinement by '{}' as {session_name} (pid {pid}{ref_note}) — log {}",
+        agent.name,
+        log_path.display()
+    ))
 }
 
 /// One line said into a session that already exists (DESIGN.md §8), assembled by
@@ -1114,10 +1143,7 @@ fn spawn_session(
         prompt_file: &prompt_path,
         deep: task.deep,
     });
-    let spawn_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+    let spawn_ms = now_ms();
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&command)
@@ -1199,6 +1225,15 @@ fn spawn_session(
         ref_note,
         log_path.display()
     ))
+}
+
+/// Wall-clock milliseconds, the unit an agent's `sessions` listing stamps its
+/// entries in, so a spawn can be told from the sessions that preceded it.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Capture the agent's reference for the session just spawned: poll the
@@ -2330,6 +2365,9 @@ mod tests {
         assert_eq!(sessions[0].agent, "stub");
         assert!(sessions[0].pid.is_some());
         assert!(sessions[0].ended_at.is_none());
+        // This stub defines no `sessions` verb, so there is no listing to find
+        // the round in and the pid is the only thing to probe it by.
+        assert!(sessions[0].session_ref.is_none());
         assert!(
             sessions[0]
                 .log_path
@@ -2338,6 +2376,56 @@ mod tests {
             "{:?}",
             sessions[0].log_path
         );
+    }
+
+    /// A round captures its session ref exactly as a dispatch does (task #379).
+    /// It has to: the round renders the agent's *dispatch* template, so under a
+    /// `--bg` launcher the pid on the row belongs to a launcher that exits at
+    /// birth, and only the agent's own listing can say the round is still
+    /// working. Without this reconcile read the dead launcher as a dead round
+    /// and mismarked the rewrite that then landed (DESIGN.md §8).
+    #[test]
+    fn refine_captures_the_session_ref_from_the_sessions_listing() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"true\"\nsessions = \"true\"\n",
+        );
+        let root = project.parent().unwrap().to_path_buf();
+        let listing = write_sessions_json(&root, &project, "refine-uuid");
+        std::fs::write(
+            &ctx.agents_path,
+            format!(
+                "default_agent = \"stub\"\n\n[agents.stub]\n\
+                 dispatch = \"cat {{prompt_file}} >/dev/null\"\nsessions = \"cat '{}'\"\n",
+                listing.display()
+            ),
+        )
+        .unwrap();
+        let id = proposal(&mut store, &project, false);
+
+        let summary = refine(&mut store, &ctx, id, "name the files").unwrap();
+        assert!(summary.contains("ref refine-uuid"), "{summary}");
+        assert_eq!(
+            store.sessions_for(id).unwrap()[0].session_ref.as_deref(),
+            Some("refine-uuid")
+        );
+        assert_eq!(store.task(id).unwrap().state, TaskState::Refining);
+    }
+
+    /// Capture is best-effort here as it is for a dispatch: a listing that
+    /// matches nothing leaves the ref NULL, says so, and the round runs on.
+    #[test]
+    fn refine_survives_a_ref_it_cannot_capture() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file} >/dev/null\"\nsessions = \"echo []\"\n",
+        );
+        let id = proposal(&mut store, &project, false);
+
+        let summary = refine(&mut store, &ctx, id, "name the files").unwrap();
+        assert!(summary.contains("session ref not captured"), "{summary}");
+        assert!(store.sessions_for(id).unwrap()[0].session_ref.is_none());
+        assert_eq!(store.task(id).unwrap().state, TaskState::Refining);
     }
 
     /// A proposal linked to a plan document is refined against that plan — the
