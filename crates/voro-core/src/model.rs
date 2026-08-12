@@ -308,19 +308,23 @@ impl fmt::Display for RefineOutcome {
     }
 }
 
-/// A project's review medium (DESIGN.md §8/§11a): which of the two media the
-/// unified `pr` action uses to get a review task's diff in front of the
-/// operator. Stored on the project (`projects.review_action`).
+/// Which viewer a project's local diffs open in (DESIGN.md §8/§11a). The two
+/// review keys are static — `g`/`pr` are always the GitHub PR flow, `o`/`open`
+/// always a local viewer — so this no longer chooses between media; it names
+/// the `voro.toml` viewer `o`/`open` resolve for this project. `Auto` and `Pr`
+/// survive as stored values that name no viewer, leaving the default one.
+/// Stored on the project (`projects.review_action`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ReviewAction {
-    /// Resolve at use: GitHub when the checkout is a GitHub repo, otherwise
-    /// the configured viewer. Stored as NULL — the unconfigured default.
+    /// No viewer named — the default viewer. Stored as NULL, the unconfigured
+    /// default.
     #[default]
     Auto,
-    /// Always the GitHub PR flow (jump to the tracked PR, or push and create).
+    /// No viewer named either, kept so a project pinned to the GitHub flow
+    /// before the keys split still reads and writes.
     Pr,
-    /// Always a local viewer from `voro.toml`: the named `[viewers.<name>]`
-    /// when one is given, otherwise the default viewer.
+    /// A local viewer from `voro.toml`: the named `[viewers.<name>]` when one
+    /// is given, otherwise the default viewer.
     Viewer(Option<String>),
 }
 
@@ -342,21 +346,13 @@ impl ReviewAction {
         }
     }
 
-    /// Resolve the medium once the checkout's GitHub-ness is known. Only `Auto`
-    /// consults the probe's answer.
-    pub fn resolve(&self, on_github: bool) -> ReviewMedium {
+    /// The `voro.toml` viewer this project's local diffs open in, or `None` for
+    /// the default viewer.
+    pub fn viewer(&self) -> Option<&str> {
         match self {
-            ReviewAction::Auto if on_github => ReviewMedium::GithubPr,
-            ReviewAction::Auto => ReviewMedium::Viewer(None),
-            ReviewAction::Pr => ReviewMedium::GithubPr,
-            ReviewAction::Viewer(name) => ReviewMedium::Viewer(name.clone()),
+            ReviewAction::Viewer(Some(name)) => Some(name),
+            _ => None,
         }
-    }
-
-    /// Whether resolving this action needs the GitHub probe at all, so
-    /// callers can skip the `gh` shell-out when the medium is pinned.
-    pub fn needs_probe(&self) -> bool {
-        matches!(self, ReviewAction::Auto)
     }
 }
 
@@ -389,17 +385,6 @@ impl ToSql for ReviewAction {
             other => Ok(other.to_string().into()),
         }
     }
-}
-
-/// The concrete medium a [`ReviewAction`] resolves to: the single "show me
-/// this task's diff" action, per project (DESIGN.md §8).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReviewMedium {
-    /// Jump to / create the GitHub PR.
-    GithubPr,
-    /// Run a `voro.toml` viewer on the checkout; `Some` names a
-    /// `[viewers.<name>]` entry, `None` is the default viewer.
-    Viewer(Option<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -764,21 +749,17 @@ mod tests {
         assert!(ReviewAction::parse("viewer:  ").is_err());
     }
 
+    /// The narrowed role (DESIGN.md §8): the action names the viewer `o`/`open`
+    /// resolve, and only the `viewer:<name>` form names one — the two legacy
+    /// forms leave the default viewer rather than choosing a medium.
     #[test]
-    fn review_action_resolves_the_medium() {
-        assert_eq!(ReviewAction::Auto.resolve(true), ReviewMedium::GithubPr);
+    fn review_action_names_the_projects_viewer() {
         assert_eq!(
-            ReviewAction::Auto.resolve(false),
-            ReviewMedium::Viewer(None)
+            ReviewAction::Viewer(Some("zed".into())).viewer(),
+            Some("zed")
         );
-        assert!(ReviewAction::Auto.needs_probe());
-
-        assert_eq!(ReviewAction::Pr.resolve(false), ReviewMedium::GithubPr);
-        assert!(!ReviewAction::Pr.needs_probe());
-        assert_eq!(
-            ReviewAction::Viewer(Some("zed".into())).resolve(true),
-            ReviewMedium::Viewer(Some("zed".into()))
-        );
-        assert!(!ReviewAction::Viewer(None).needs_probe());
+        assert_eq!(ReviewAction::Viewer(None).viewer(), None);
+        assert_eq!(ReviewAction::Auto.viewer(), None);
+        assert_eq!(ReviewAction::Pr.viewer(), None);
     }
 }

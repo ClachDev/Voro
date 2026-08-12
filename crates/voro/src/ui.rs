@@ -1738,7 +1738,6 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
     // glyph renders as the bold key and the verb as the dim label.
     let enter = app.enter_hint().and_then(|h| h.split_once(' '));
     let enter = ("⏎", enter.map_or("act", |(_, verb)| verb), enter.is_some());
-    let selected = app.selected_task_id().is_some();
     match app.screen {
         Screen::Cockpit => vec![
             enter,
@@ -1746,8 +1745,10 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
             ("r/R", "refine", selection_is_refinable(app)),
             ("C", "cancel refine", app.selected_is_refining()),
             ("s", "state", true),
-            ("!", "deep", selected),
+            ("!", "deep", app.selected_can_go_deep()),
             ("w", "wait", app.selected_can_hand_off()),
+            ("o", "open", app.selected_has_a_diff()),
+            ("g", "PR", app.selected_is_in_review()),
             ("a/A", "message", app.selected_can_message()),
             ("n/N", "new", true),
             ("e", "edit", true),
@@ -1758,10 +1759,12 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
         Screen::Tasks => vec![
             enter,
             ("w", "wait", app.selected_can_hand_off()),
+            ("o", "open", app.selected_has_a_diff()),
+            ("g", "PR", app.selected_is_in_review()),
             ("r/R", "refine", selection_is_refinable(app)),
             ("C", "cancel refine", app.selected_is_refining()),
             ("s", "state", true),
-            ("!", "deep", true),
+            ("!", "deep", app.selected_can_go_deep()),
             ("a/A", "message", app.selected_can_message()),
             ("n/N", "new", true),
             ("e", "edit", true),
@@ -1888,8 +1891,8 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                 ("C", "cancel a refine in flight"),
                 ("x", "fold the score decomposition into the card"),
                 ("h", "fold the task's history into the card"),
-                ("o", "open the diff in a viewer"),
-                ("g", "open the tracked PR"),
+                ("o", "open the local diff in a viewer"),
+                ("g", "open the PR on GitHub"),
             ]);
             actions.extend(pairs(MESSAGE_KEYS));
             actions.extend([
@@ -1923,8 +1926,8 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                 ("!", "toggle deep — the agent's strongest model"),
                 ("c", "link and unlink documents"),
                 ("C", "cancel a refine in flight"),
-                ("o", "open the diff in a viewer"),
-                ("g", "open the tracked PR"),
+                ("o", "open the local diff in a viewer"),
+                ("g", "open the PR on GitHub"),
             ]);
             actions.extend(pairs(MESSAGE_KEYS));
             actions.extend([
@@ -3550,11 +3553,80 @@ mod tests {
         }
     }
 
-    /// A lowercase/uppercase pair of one action takes a single slot keyed on
-    /// the pair, and the line stays short enough to scan: ten slots or fewer on
-    /// every row of a queue holding one of each kind (DESIGN.md §9).
+    /// The review cluster's gating (DESIGN.md §9): `o` is advertised wherever
+    /// there is a diff to look at — `review` and `running` — `g` only on
+    /// `review`, where the PR is the review, and `!` nowhere past dispatch. A
+    /// `ready` row, which has none of the three states, shows the mirror image.
     #[test]
-    fn the_key_line_pairs_its_slots_and_stays_at_ten() {
+    fn the_key_line_advertises_the_review_keys_only_where_they_act() {
+        use crate::app::App;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let task = |title: &str| NewTask {
+            project_id: p.id,
+            repo_id: None,
+            title: title.into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state: TaskState::Ready,
+            agent: None,
+            human: false,
+            deep: false,
+        };
+        store.create_task(task("ready to go")).unwrap();
+        let running = store.create_task(task("under way")).unwrap();
+        store.apply(running.id, Action::Start).unwrap();
+        let reviewed = store.create_task(task("in review")).unwrap();
+        store.apply(reviewed.id, Action::Start).unwrap();
+        store.apply(reviewed.id, Action::Complete(None)).unwrap();
+
+        let mut app = App::new(
+            store,
+            crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                "/nonexistent/voro.db",
+            )),
+        )
+        .unwrap();
+        app.screen = Screen::Tasks;
+
+        let keys_for = |app: &mut App, title: &str| {
+            app.tasks_sel = app
+                .all
+                .iter()
+                .position(|row| row.task.title == title)
+                .unwrap_or_else(|| panic!("no {title:?} row"));
+            key_hints(app)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>()
+        };
+
+        let ready = keys_for(&mut app, "ready to go");
+        assert!(!ready.contains(&"o"), "{ready:?}");
+        assert!(!ready.contains(&"g"), "{ready:?}");
+        assert!(ready.contains(&"!"), "{ready:?}");
+
+        let running = keys_for(&mut app, "under way");
+        assert!(running.contains(&"o"), "{running:?}");
+        assert!(!running.contains(&"g"), "{running:?}");
+        assert!(running.contains(&"!"), "{running:?}");
+
+        let review = keys_for(&mut app, "in review");
+        assert!(review.contains(&"o"), "{review:?}");
+        assert!(review.contains(&"g"), "{review:?}");
+        assert!(!review.contains(&"!"), "{review:?}");
+    }
+
+    /// A lowercase/uppercase pair of one action takes a single slot keyed on
+    /// the pair, and the line stays short enough to scan: eleven slots or fewer
+    /// on every row of a queue holding one of each kind (DESIGN.md §9). Eleven
+    /// rather than ten because a `review` row carries the whole review cluster
+    /// — `⏎`, `w`, `o`, `g` — the one moment all four are live options; `!`
+    /// dropping off that row is what keeps even eleven reachable.
+    #[test]
+    fn the_key_line_pairs_its_slots_and_stays_at_eleven() {
         use crate::app::App;
         use ratatui::crossterm::event::{KeyCode, KeyEvent};
         use voro_core::{Action, NewTask, Store};
@@ -3640,7 +3712,7 @@ mod tests {
                 }
                 let keys: Vec<&str> = key_hints(&app).iter().map(|(k, _)| *k).collect();
                 assert!(
-                    keys.len() <= 10,
+                    keys.len() <= 11,
                     "{screen:?} row {i} shows {} slots: {keys:?}",
                     keys.len()
                 );
@@ -3668,7 +3740,7 @@ mod tests {
                     "{screen:?} row {i}: {keys:?}"
                 );
                 // The refine keys and the cancel are mutually exclusive by
-                // state, which is what keeps the line within its ten slots.
+                // state, which is what keeps the line within its eleven slots.
                 assert!(
                     !(keys.contains(&"r/R") && keys.contains(&"C")),
                     "{screen:?} row {i}: {keys:?}"

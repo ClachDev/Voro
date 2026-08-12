@@ -3,8 +3,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::ui::Hit;
 use voro_core::{
     Action, ActionRow, AgentsConfig, DepKind, DepRef, DigestRow, Event, PrRef, Priority, Project,
-    Queue, QueueRow, RefineOutcome, ReviewAction, ReviewMedium, ReworkReport, RunningRow,
-    ScoreBreakdown, StateCounts, Store, Task, TaskState, Triage, WipGate, scheduler,
+    Queue, QueueRow, RefineOutcome, ReviewAction, ReworkReport, RunningRow, ScoreBreakdown,
+    StateCounts, Store, Task, TaskState, Triage, WipGate, scheduler,
 };
 
 /// Lines `PgDn`/`PgUp` move the focus card in one press. A fixed step, since
@@ -1370,8 +1370,8 @@ impl App {
 
     /// The checkout a task's work lives in (DESIGN.md §8): its resolved repo's
     /// path. Every TUI action that needs a working directory for a task —
-    /// paging its log, attaching to its session, resolving its review medium
-    /// — comes here rather than reading a project path.
+    /// paging its log, attaching to its session, asking whether it can take a
+    /// pull request — comes here rather than reading a project path.
     fn task_checkout(&self, task_id: i64) -> voro_core::Result<String> {
         let task = self.store.task(task_id)?;
         Ok(self.store.repo_for_task(&task)?.path)
@@ -1406,6 +1406,38 @@ impl App {
     pub fn selected_can_hand_off(&self) -> bool {
         self.selected_task()
             .is_some_and(|t| t.state == TaskState::Review)
+    }
+
+    /// Whether the selection has work to look at locally — what gates the `o`
+    /// hint (DESIGN.md §9), and the same pair of states the key itself allows.
+    pub fn selected_has_a_diff(&self) -> bool {
+        self.selected_task()
+            .is_some_and(|t| matches!(t.state, TaskState::Review | TaskState::Running))
+    }
+
+    /// Whether the selection is the task `g` has a PR to show or create — what
+    /// gates that hint (DESIGN.md §9). The key stays bound in every state, for
+    /// jumping to a tracked PR and linking one; only the advertisement is
+    /// narrowed to the moment the PR is the review.
+    pub fn selected_is_in_review(&self) -> bool {
+        self.selected_task()
+            .is_some_and(|t| t.state == TaskState::Review)
+    }
+
+    /// Whether the selection still has a dispatch ahead of it, so the model
+    /// `!` picks would be used — what gates that hint (DESIGN.md §9). Deep is a
+    /// property of the *next* launch, so on a task whose work is done — under
+    /// review, handed off, or closed — the line stops offering a toggle that
+    /// changes nothing the operator is about to see. The key itself stays bound
+    /// in every state, as `g` does; only the advertisement is narrowed, which is
+    /// what makes room for the review keys beside it.
+    pub fn selected_can_go_deep(&self) -> bool {
+        self.selected_task().is_some_and(|t| {
+            !matches!(
+                t.state,
+                TaskState::Review | TaskState::Waiting | TaskState::Done | TaskState::Rejected
+            )
+        })
     }
 
     /// Whether the selection is somewhere dispatch can act from (DESIGN.md §8)
@@ -1962,16 +1994,17 @@ impl App {
         }
     }
 
-    /// The review key — the per-project "show me this task's diff" action
-    /// (DESIGN.md §8). With a tracked PR, jump to it in a browser (§11c). With
-    /// none: a `review` task resolves the project's review medium — GitHub opens
-    /// the create-PR confirmation modal, a viewer project opens the checkout —
-    /// and any other state falls back to the link-an-existing-PR prompt.
+    /// The GitHub key (DESIGN.md §8) — statically the PR medium, whatever the
+    /// project's review action says. With a tracked PR, jump to it in a browser
+    /// (§11c). With none, a `review` task opens the create-PR confirmation
+    /// modal, and any other state falls back to the link-an-existing-PR prompt.
+    /// A checkout GitHub cannot take refuses before the modal, naming `o` — the
+    /// local diff is the only thing left to look at.
     fn open_selected_pr(&mut self) {
         let Some(task) = self.selected_task() else {
             return;
         };
-        let (id, state, project_id) = (task.id, task.state, task.project_id);
+        let (id, state) = (task.id, task.state);
         let has_pr = task.pr_url.is_some();
         if has_pr {
             match crate::pr::open(&self.store, id) {
@@ -1987,30 +2020,12 @@ impl App {
             };
             return;
         }
-        let project = match self.store.project(project_id) {
-            Ok(project) => project,
-            Err(e) => {
-                self.status = Some(e.to_string());
-                return;
-            }
-        };
-        let checkout = match self.task_checkout(id) {
-            Ok(path) => path,
-            Err(e) => {
-                self.status = Some(e.to_string());
-                return;
-            }
-        };
-        if let ReviewMedium::Viewer(viewer) = crate::pr::resolve_medium(&project, &checkout) {
-            let result =
-                crate::dispatch::open(&mut self.store, &self.dispatch_ctx, id, viewer.as_deref());
-            match result {
-                Ok(summary) => self.status = Some(summary),
-                Err(e) => self.status = Some(e),
-            }
-            return;
-        }
-        match crate::pr::plan(&self.store, id) {
+        // The network-free preconditions first, so a task missing a branch or
+        // summary names that gap without a `gh` round-trip; then the medium,
+        // which has to answer before the modal rather than after it.
+        let planned = crate::pr::plan(&self.store, id)
+            .and_then(|plan| self.pr_checkout_is_github(id).map(|()| plan));
+        match planned {
             Ok(plan) => {
                 self.mode = Mode::ConfirmPr {
                     task_id: id,
@@ -2022,13 +2037,20 @@ impl App {
         }
     }
 
+    /// Whether the task's checkout can take a pull request at all, named in the
+    /// TUI's idiom so the refusal points at `o` (DESIGN.md §8).
+    fn pr_checkout_is_github(&self, task_id: i64) -> Result<(), String> {
+        let checkout = self.task_checkout(task_id).map_err(|e| e.to_string())?;
+        crate::pr::ensure_github_repo(&checkout, "`o`")
+    }
+
     /// Drive the create-PR confirmation modal (DESIGN.md §8). Enter (or `y`)
     /// runs the same `crate::pr::create` the CLI's `pr` calls and shows the new
     /// PR, then refreshes; esc (or `n`) cancels without touching anything.
     fn key_confirm_pr(&mut self, key: KeyEvent, task_id: i64, branch: String, title: String) {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let created = crate::pr::create(&mut self.store, task_id);
+                let created = crate::pr::create(&mut self.store, task_id, "`o`");
                 self.report_created_pr(task_id, created, crate::pr::open_url);
                 let result = self.refresh();
                 self.report(result);
@@ -5283,6 +5305,58 @@ mod tests {
             }
             _ => panic!("expected the link-PR prompt, got {:?}", app.status),
         }
+    }
+
+    /// `g` is statically the GitHub medium (DESIGN.md §8): on a review task
+    /// whose checkout cannot take a pull request it refuses on the status line
+    /// naming `o`, opens no confirmation, and does not fall back to the
+    /// project's viewer — which is what the viewer action here would have done
+    /// before the split.
+    #[test]
+    fn review_key_on_a_non_github_checkout_refuses_naming_the_viewer_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "voro-review-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut store = Store::open_in_memory().unwrap();
+        let project = store.create_project("demo", dir.to_str().unwrap()).unwrap();
+        store
+            .set_review_action(project.id, &ReviewAction::Viewer(Some("zed".into())))
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: project.id,
+                repo_id: None,
+                title: "reviewable".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        store.set_branch(task.id, Some("feat/thing")).unwrap();
+        store.apply(task.id, Action::Start).unwrap();
+        // PR-ready in every way but the checkout, so the refusal can only be
+        // about the medium — the plan's own gaps are checked first.
+        store
+            .apply(task.id, Action::Complete(Some("did it".into())))
+            .unwrap();
+
+        let mut app = App::new(store, dummy_ctx()).unwrap();
+        key(&mut app, KeyCode::Char('g'));
+
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(matches!(app.mode, Mode::Normal), "{status:?}");
+        assert!(status.contains("`o`"), "{status:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Typing a reference and submitting tracks it (canonicalised) on the task
