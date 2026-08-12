@@ -888,7 +888,7 @@ fn session_lines(session: &Session, state: TaskState) -> Vec<Line<'static>> {
     lines
 }
 
-/// One task's queue row: the effective score it was ranked by, its verb, and
+/// One task's queue row: the effective score it was ranked by, its state, and
 /// the markers the row carries. Shared by the top-level rows and the proposals
 /// listed under an expanded digest, which differ only in indent and dimming.
 fn action_row_line(app: &App, row: &ActionRow, indent: &str) -> Line<'static> {
@@ -908,9 +908,9 @@ fn action_row_line(app: &App, row: &ActionRow, indent: &str) -> Line<'static> {
         score,
         Span::styled(
             format!(
-                "{indent}{} {:10} {}",
+                "{indent}{} {:11} {}",
                 task_ref(c.task.id),
-                row.action.as_str(),
+                c.task.state.as_str(),
                 c.task.priority,
             ),
             style,
@@ -934,8 +934,8 @@ fn action_row_line(app: &App, row: &ActionRow, indent: &str) -> Line<'static> {
         spans.push(refine_failed_span());
     }
     if app.incomplete_report.contains(&c.task.id) {
-        // The verb column says "pr", but a PR cannot be opened
-        // from a half-finished report, so name the gap too.
+        // A PR cannot be opened from a half-finished report, and
+        // nothing else on the row says so, so name the gap.
         spans.push(incomplete_report_span());
     }
     Line::from(spans)
@@ -2712,14 +2712,16 @@ mod tests {
         }
     }
 
-    /// End-to-end: every queue row carries its next-action verb (DESIGN.md §3),
-    /// one task per arm of the derivation, rendered through the real cockpit
-    /// draw path. `do` versus `dispatch` is also the human-task marker.
+    /// End-to-end: every queue row names the task's state (DESIGN.md §3), in
+    /// the cockpit's own rows and under an expanded digest alike, rendered
+    /// through the real draw path. The two `ready` arms — by hand and
+    /// dispatchable — are told apart by the `[human]` marker, not the column.
     #[test]
-    fn cockpit_queue_shows_the_next_action_verb_on_each_row() {
+    fn cockpit_queue_shows_the_task_state_on_each_row() {
         use crate::app::App;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
         use voro_core::{Action, NewTask, Store};
 
         let mut store = Store::open_in_memory().unwrap();
@@ -2777,43 +2779,71 @@ mod tests {
         let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
-        let app = App::new(store, ctx).unwrap();
+        let mut app = App::new(store, ctx).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal
-            .draw(|f| {
-                draw(f, &app);
-            })
-            .unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let mut render = |app: &App| {
+            terminal
+                .draw(|f| {
+                    draw(f, app);
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+        let rendered = render(&app);
 
-        // The proposal's verb rides its digest row rather than a row of its
-        // own (DESIGN.md §7); every other verb still renders in place.
+        // A proposal is collapsed into its digest row rather than one of its
+        // own (DESIGN.md §7); every other state renders in place.
         assert!(
             rendered.contains("▲ 1 proposal awaiting triage"),
             "the digest should stand in for #{}: {rendered}",
             triage.id
         );
-        for (task, verb) in [
-            (&answer, "answer"),
-            (&pr, "pr"),
-            (&review_pr, "review PR"),
-            (&redispatch, "redispatch"),
-            (&do_, "do"),
-            (&dispatch, "dispatch"),
+        let state_cell =
+            |id: i64, state: TaskState| format!("{} {:11}", task_ref(id), state.as_str());
+        for (task, state) in [
+            (&answer, TaskState::NeedsInput),
+            (&pr, TaskState::Review),
+            (&review_pr, TaskState::Review),
+            (&redispatch, TaskState::Stalled),
+            (&do_, TaskState::Ready),
+            (&dispatch, TaskState::Ready),
         ] {
-            let cell = format!("{} {:10}", task_ref(task.id), verb);
             assert!(
-                rendered.contains(&cell),
-                "queue row for #{} should carry '{verb}': {rendered}",
+                rendered.contains(&state_cell(task.id, state)),
+                "queue row for #{} should carry '{state}': {rendered}",
                 task.id
             );
         }
+        assert!(
+            rendered.contains(&format!("voro: {}  [human]", do_.title)),
+            "the by-hand row should carry the human marker: {rendered}"
+        );
+
+        // Folding the digest open lists the proposal itself, which names its
+        // state in the same column as every other row.
+        let digest_index = app
+            .queue
+            .rows
+            .iter()
+            .position(|r| matches!(r, voro_core::QueueRow::Digest(_)))
+            .expect("the proposal should have been collapsed into a digest");
+        app.cockpit_sel = app
+            .cockpit_rows
+            .iter()
+            .position(|r| matches!(r, crate::app::CockpitRow::Queue(i) if *i == digest_index))
+            .expect("the digest should be a selectable cockpit row");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let expanded = render(&app);
+        assert!(
+            expanded.contains(&state_cell(triage.id, TaskState::Proposed)),
+            "the expanded proposal should carry 'proposed': {expanded}"
+        );
     }
 
     /// End-to-end: with the fleet full the cockpit offers no dispatch rows and
