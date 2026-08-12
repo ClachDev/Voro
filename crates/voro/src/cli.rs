@@ -1634,9 +1634,12 @@ fn done_verb(store: &mut Store, args: DoneArgs) -> Result<String, String> {
             .map_err(|e| e.to_string())?;
         write!(out, " (branch {})", name.trim()).unwrap();
     }
-    // A complete report carries both a branch and a summary whatever the review
-    // medium, so warn (never fail) about whichever is absent. A human task lands
-    // straight in `done` with no report to read, so it earns no warning.
+    // A code-producing task's complete report carries both a branch and a
+    // summary whatever the review medium, so warn (never fail) about whichever
+    // is absent — this note is ephemeral and costs the operator nothing, so it
+    // stays symmetric where the durable flag only marks a branch without a
+    // summary (DESIGN.md §8). A human task lands straight in `done` with no
+    // report to read, so it earns no warning.
     if task.state == TaskState::Review {
         let has_branch = store.task(id).map_err(|e| e.to_string())?.branch.is_some();
         let has_summary = store
@@ -1711,7 +1714,7 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
     {
         writeln!(
             out,
-            "incomplete report: only one of branch and summary recorded — complete it with `voro set {id}`"
+            "incomplete report: a branch is recorded but no summary — complete it with `voro set {id} --summary ...`"
         )
         .unwrap();
     }
@@ -2001,9 +2004,9 @@ fn next_verb(store: &mut Store) -> Result<String, String> {
     }
 }
 
-/// `  [incomplete report]` when a `review` task carries only one of a branch
-/// and a summary (DESIGN.md §8), else empty. Deliberately does not resolve the
-/// review medium, since `auto` resolution probes `gh` and this renders per line.
+/// `  [incomplete report]` when a `review` task carries a branch and no summary
+/// (DESIGN.md §8), else empty. Deliberately does not resolve the review medium,
+/// since `auto` resolution probes `gh` and this renders per line.
 fn incomplete_report_suffix(store: &Store, task_id: i64) -> &'static str {
     if store.incomplete_report_flag(task_id).unwrap_or(false) {
         "  [incomplete report]"
@@ -4156,14 +4159,15 @@ mod tests {
         assert!(ok(&mut s, &["list"]).contains("[incomplete report]"));
         assert!(
             ok(&mut s, &["show", "1"])
-                .contains("incomplete report: only one of branch and summary recorded")
+                .contains("incomplete report: a branch is recorded but no summary")
         );
     }
 
     #[test]
     fn a_complete_report_is_not_flagged_incomplete() {
-        // Both halves present: a complete report, no anomaly. And a planning
-        // task with neither is likewise not flagged.
+        // Both halves present: a complete report, no anomaly. A planning task
+        // with neither is likewise not flagged, and so is the no-code report —
+        // an investigation whose summary is the whole deliverable.
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "Coding", "--state", "ready"]);
@@ -4173,10 +4177,14 @@ mod tests {
         ok(&mut s, &["add", "demo", "Planning", "--state", "ready"]);
         ok(&mut s, &["start", "2"]);
         ok(&mut s, &["done", "2"]);
+        ok(&mut s, &["add", "demo", "Audit", "--state", "ready"]);
+        ok(&mut s, &["start", "3"]);
+        ok(&mut s, &["done", "3", "--summary", "already fixed"]);
 
         assert!(!ok(&mut s, &["list"]).contains("[incomplete report]"));
         assert!(!ok(&mut s, &["show", "1"]).contains("incomplete report"));
         assert!(!ok(&mut s, &["show", "2"]).contains("incomplete report"));
+        assert!(!ok(&mut s, &["show", "3"]).contains("incomplete report"));
     }
 
     // --- set --summary (task #99, DESIGN.md §8) ---
