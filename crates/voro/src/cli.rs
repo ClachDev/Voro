@@ -1619,6 +1619,11 @@ fn reject_verb(store: &mut Store, args: RejectArgs) -> Result<String, String> {
     let task = store
         .apply(id, Action::RejectWork(feedback))
         .map_err(|e| e.to_string())?;
+    // The head at the moment of rejection is exactly what the operator judged,
+    // so it is recorded to narrow the re-review to the rework (DESIGN.md §8).
+    // Best-effort, and after the transition: an unreadable revision costs a full
+    // diff rather than a reject, and a refused reject records nothing.
+    crate::pr::record_reviewed(store, id);
     Ok(format!("task {} -> {}", task.id, task.state))
 }
 
@@ -1761,6 +1766,15 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
             "conflicts: branch no longer merges with the base — resolve before merging"
         )
         .unwrap();
+    }
+    // The response to a rejection (DESIGN.md §8), the CLI's mirror of the
+    // detail pane's block: the summary the rework came back with, read beside
+    // the feedback it answers rather than dug out of the event log.
+    if let Some(report) =
+        voro_core::rework_report(&store.events_for(id).map_err(|e| e.to_string())?)
+        && let Some(summary) = report.summary
+    {
+        writeln!(out, "response to the review feedback:\n{summary}").unwrap();
     }
     // The plans this task implements (DESIGN.md §3), resolved to where they
     // actually are — the same absolute location dispatch hands the agent.
