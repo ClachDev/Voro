@@ -406,9 +406,9 @@ pub struct App {
     /// past the queue's uniform cap (§7).
     pub counts: StateCounts,
     pub all: Vec<TaskRow>,
-    /// Review tasks carrying only one of a branch and a summary (DESIGN.md §8):
-    /// the half-finished done report a dispatched session left behind, which a
-    /// PR cannot be opened from. Re-derived per refresh, never stored.
+    /// Review tasks carrying a branch and no summary (DESIGN.md §8): the
+    /// half-written done report a dispatched session left behind, which a PR
+    /// cannot be opened from. Re-derived per refresh, never stored.
     pub incomplete_report: std::collections::HashSet<i64>,
     /// Proposals whose last refine round rewrote the body (DESIGN.md §6): what
     /// renders the `↻ refined` marker, so the operator triages the improved

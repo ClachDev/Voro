@@ -1264,10 +1264,11 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Whether `task_id` is a `review` task carrying a *partial* completion
-    /// report — exactly one of its branch and summary present (DESIGN.md §8).
-    /// Neither is deliberately not flagged (a planning task produces neither),
-    /// both is complete. Gated on `review`, derived fresh rather than stored.
+    /// Whether `task_id` is a `review` task carrying a *half-written* completion
+    /// report — a branch with no summary (DESIGN.md §8). A summary with no
+    /// branch is not flagged: an investigation, triage or audit produces no code
+    /// and its summary is the whole deliverable. Gated on `review`, derived
+    /// fresh rather than stored.
     pub fn incomplete_report_flag(&self, task_id: i64) -> Result<bool> {
         let row: Option<(TaskState, Option<String>)> = self
             .conn
@@ -1285,7 +1286,7 @@ impl Store {
         }
         let has_branch = branch.is_some();
         let has_summary = self.latest_summary(task_id)?.is_some();
-        Ok(has_branch != has_summary)
+        Ok(has_branch && !has_summary)
     }
 
     /// Rows for the cockpit's running strip (DESIGN.md §9): every `running` or
@@ -3000,7 +3001,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_report_flag_marks_a_review_task_missing_one_half() {
+    fn incomplete_report_flag_marks_a_review_task_with_a_branch_and_no_summary() {
         use crate::transition::Action;
 
         // Helper: a fresh task carried to `review` with the given branch/summary.
@@ -3029,14 +3030,22 @@ mod tests {
             (s, t.id)
         }
 
-        // Branch but no summary — the classic forgotten-summary flake and the
-        // shape the SessionEnd fallback leaves behind.
+        // The still-anomalous half report: a branch but no summary — the classic
+        // forgotten-summary flake and the shape the SessionEnd fallback leaves.
         let (s, id) = reviewed(Some("feat/x"), None);
-        assert!(s.incomplete_report_flag(id).unwrap());
+        assert!(
+            s.incomplete_report_flag(id).unwrap(),
+            "half report: branch, no summary"
+        );
 
-        // Summary but no branch — the reverse flake.
-        let (s, id) = reviewed(None, Some("did the thing"));
-        assert!(s.incomplete_report_flag(id).unwrap());
+        // The legitimate no-code report: a summary and no branch, as an
+        // investigation, triage or audit ends. The summary is the deliverable,
+        // so this is a complete report and must not be flagged.
+        let (s, id) = reviewed(None, Some("already fixed by PR #96; nothing to do"));
+        assert!(
+            !s.incomplete_report_flag(id).unwrap(),
+            "no-code report: summary, no branch"
+        );
 
         // Both present — a complete report, not an anomaly.
         let (s, id) = reviewed(Some("feat/x"), Some("did the thing"));

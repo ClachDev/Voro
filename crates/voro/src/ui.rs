@@ -646,8 +646,8 @@ fn score_span(total: f64) -> Span<'static> {
     Span::styled(format!("{total:5.1} "), Style::new().fg(Color::Yellow))
 }
 
-/// The incomplete-report flag (DESIGN.md §8): a `review` task carrying only one
-/// of a branch and a summary. Yellow to match the running strip's "no live
+/// The incomplete-report flag (DESIGN.md §8): a `review` task carrying a branch
+/// and no summary. Yellow to match the running strip's "no live
 /// session" warning, since both are anomalies needing the operator.
 fn incomplete_report_span() -> Span<'static> {
     Span::styled(
@@ -1172,7 +1172,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::from(conflict_span()));
         }
     } else if app.incomplete_report.contains(&task.id) {
-        // A review task missing a branch or summary: `pr` would fail, so say
+        // A review task with a branch and no summary: `pr` would fail, so say
         // what is needed rather than the optimistic "next: pr".
         lines.push(Line::from(incomplete_report_span()));
     } else if let Some(verb) = task.next_action() {
