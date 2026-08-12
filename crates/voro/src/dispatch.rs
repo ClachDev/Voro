@@ -208,13 +208,19 @@ The operator's note is what they want fixed. It is the brief; honour it:
 When the rewrite is ready, write it to a file outside the checkout and apply it
 with exactly this command:
 
-    voro set {task_id}{db} --body-file <path>
+    voro set {task_id}{db} --body-file <path> [--title \"...\"]
 
-That is the only change you may make. The task stays `proposed` so the operator
-re-triages the improved version, so do not change its state, priority, or
-dependencies — no `voro triage`, no `--priority`, no `--blocked-by`, no `voro
-add` or `voro propose` — and never modify Voro's database with raw SQL, which
-would bypass the state machine and event log. Rewrite the body and stop.
+Add `--title` when the note asks for a retitle or the rewrite leaves the
+current title inaccurate, and put it on that same command, because
+a title-only `voro set` replaces no body, so it concludes no round and would
+leave this one hanging.
+
+That one command is the only change you may make. The task stays `proposed` so
+the operator re-triages the improved version, and everything else stays as it
+is: do not change its state, priority, or dependencies — no `voro triage`, no
+`--priority`, no `--blocked-by`, no `voro add` or `voro propose` — and never
+modify Voro's database with raw SQL, which would bypass the state machine and
+event log. Rewrite the body and stop.
 ";
 
 /// The interactive refine (DESIGN.md §6): the planning harness pointed at a task
@@ -238,14 +244,20 @@ decisions already made, and give concrete acceptance criteria.
 When the operator confirms the rewrite, write the body to a file outside the
 checkout and apply it with:
 
-    voro set {task_id}{db} --body-file <path>
+    voro set {task_id}{db} --body-file <path> [--title \"...\"]
 
-That is the only change to make. The task stays `proposed` so the operator
-re-triages the improved version, so do not change its state, priority, or
-dependencies, and do not create a new task — this edits the one that exists. If
-the operator decides against changing anything, end the session without applying
-a body — that is a no-op, not a failure. Never modify Voro's database with raw
-SQL, which would bypass the state machine and event log.
+Add `--title` when the operator wants the task retitled or the rewrite leaves
+the current title inaccurate, and put it on that same command, because
+a title-only `voro set` replaces no body, so it concludes no round and would
+leave this one hanging.
+
+That one command is the only change to make. The task stays `proposed` so the
+operator re-triages the improved version, and everything else stays as it is:
+do not change its state, priority, or dependencies, and do not create a new
+task — this edits the one that exists. If the operator decides against changing
+anything, end the session without applying a body — that is a no-op, not a
+failure. Never modify Voro's database with raw SQL, which would bypass the state
+machine and event log.
 ";
 
 /// How often the session-ref capture re-polls the agent's `sessions` command
@@ -2627,14 +2639,16 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("what the parent actually did"), "{prompt}");
-        // the one write it is told to make, with the id and database literal
+        // the one write it is told to make, with the id and database literal,
+        // and the retitle that may ride along on it (task #391)
         assert!(
             prompt.contains(&format!(
-                "voro set {id} --db {} --body-file",
+                "voro set {id} --db {} --body-file <path> [--title",
                 shell_quote(&ctx.db_path)
             )),
             "{prompt}"
         );
+        assert!(prompt.contains("a title-only `voro set`"), "{prompt}");
         // and the writes it is told not to make
         assert!(
             prompt.contains("do not change its state, priority, or"),
@@ -2933,7 +2947,14 @@ mod tests {
         let prompt = std::fs::read_to_string(&prompt_path).unwrap();
         // the existing body is seeded, and the session ends in `set`, not `add`
         assert!(prompt.contains("make it better"), "{prompt}");
-        assert!(prompt.contains(&format!("voro set {id}")), "{prompt}");
+        assert!(
+            prompt.contains(&format!(
+                "voro set {id} --db {} --body-file <path> [--title",
+                shell_quote(&ctx.db_path)
+            )),
+            "{prompt}"
+        );
+        assert!(prompt.contains("a title-only `voro set`"), "{prompt}");
         assert!(!prompt.contains("voro add"), "{prompt}");
         assert!(prompt.contains("interactive"), "{prompt}");
 
