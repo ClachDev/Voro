@@ -5,8 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use voro_core::{
-    ActionRow, DepKind, DepRef, DigestRow, EffectiveScore, Event, QueueRow, ScoreBreakdown,
-    Session, SessionOutcome, StateCounts, TaskState,
+    ActionRow, DepKind, DepRef, DigestRow, EffectiveScore, Event, QueueRow, ReworkReport,
+    ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
 };
 
 use crate::app::{App, CockpitRow, Mode, ReviewActionOption, Screen, TaskRow};
@@ -834,6 +834,35 @@ fn review_next_span(task: &voro_core::Task) -> Option<Span<'static>> {
 /// end time. An open one shows agent and start time. Both end on the log path
 /// the `l` key pages. States where the session is history rather than context
 /// (`done`, `rejected`, a redispatch-ready task) render nothing.
+/// The response to a rejection (DESIGN.md §8): the summary the rework came back
+/// with, rendered against the feedback it answers. This is the other half of
+/// making a re-review proportional to the fix — the operator reads *what the
+/// agent says it changed* here, and the diff since the rejected revision beside
+/// it, instead of rediscovering both from the whole PR. Only a task that has
+/// been sent back renders it; a first review's summary is the PR body and is
+/// read there.
+fn rework_lines(report: &ReworkReport) -> Vec<Line<'static>> {
+    let Some(summary) = &report.summary else {
+        return Vec::new();
+    };
+    let mut lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            "response to the review feedback:",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    // One `Line` per source line, as the question block does: ratatui does not
+    // break lines inside a `Span`, so a point-by-point summary rendered as one
+    // span would collapse into a single paragraph and lose its structure.
+    lines.extend(
+        summary
+            .lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), Style::new().fg(Color::Cyan)))),
+    );
+    lines
+}
+
 fn session_lines(session: &Session, state: TaskState) -> Vec<Line<'static>> {
     if !matches!(
         state,
@@ -1209,6 +1238,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         && let Some(b) = app.score_breakdown(task.id)
     {
         lines.extend(score_lines(&b, app.effective_score(task, b.total)));
+    }
+    if let Some(report) = app.rework_report(task.id) {
+        lines.extend(rework_lines(&report));
     }
     lines.push(Line::default());
     lines.extend(crate::markdown::body_lines(&task.body));

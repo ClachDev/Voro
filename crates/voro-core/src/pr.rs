@@ -101,6 +101,15 @@ impl PrRef {
     pub fn api_path(&self, resource: &str) -> String {
         format!("repos/{}/pulls/{}/{resource}", self.nwo(), self.number)
     }
+
+    /// The PR's diff narrowed to a commit range — GitHub's compare-within-a-PR
+    /// view (DESIGN.md §8), which is what makes a re-review proportional to the
+    /// rework rather than to the whole branch. It stays *inside* the PR, so the
+    /// review comments and the merge button are where they always were, and the
+    /// full diff remains one click away.
+    pub fn range_url(&self, since: &str, head: &str) -> String {
+        format!("{}/files/{since}..{head}", self.url)
+    }
 }
 
 fn parse_number(raw: &str) -> Result<u64> {
@@ -313,6 +322,16 @@ mod tests {
         assert_eq!(
             pr.api_path("comments"),
             "repos/acme/widget/pulls/42/comments"
+        );
+    }
+
+    #[test]
+    fn narrows_a_pr_to_a_commit_range() {
+        assert_eq!(
+            PrRef::parse("https://github.com/acme/widget/pull/42")
+                .unwrap()
+                .range_url("abc1234", "def5678"),
+            "https://github.com/acme/widget/pull/42/files/abc1234..def5678"
         );
     }
 

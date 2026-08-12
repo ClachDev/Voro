@@ -8,8 +8,8 @@
 use std::process::{Command, Stdio};
 
 use voro_core::{
-    Mergeability, PrPlan, PrRef, Project, ReviewMedium, Store, format_review_feedback,
-    parse_mergeable, plan_pr,
+    Mergeability, PrPlan, PrRef, PrRevisions, Project, ReviewDiff, ReviewMedium, Store,
+    format_review_feedback, parse_mergeable, parse_pr_revisions, plan_pr, plan_review_diff,
 };
 
 /// Resolve a task's tracked PR, erroring with a fix-it hint when none is set.
@@ -22,10 +22,132 @@ fn tracked_pr(store: &Store, task_id: i64) -> Result<PrRef, String> {
 }
 
 /// Open a task's tracked PR in a browser via `gh pr view --web` (DESIGN.md
-/// §11c).
+/// §11c), narrowed to what the rework added when the operator has already
+/// reviewed and sent this task back (§8). A first review, and every state but
+/// `review`, opens the PR whole exactly as before.
 pub fn open(store: &Store, task_id: i64) -> Result<String, String> {
     let pr = tracked_pr(store, task_id)?;
-    open_url(&pr.url)
+    match review_diff(store, task_id, &pr) {
+        ReviewDiff::Since { since, head } => open_url(&pr.range_url(&since, &head))
+            .map(|opened| format!("{opened} — the changes since your last review")),
+        ReviewDiff::Full { notice } => {
+            let opened = open_url(&pr.url)?;
+            Ok(match notice {
+                Some(notice) => format!("{opened} — {notice}"),
+                None => opened,
+            })
+        }
+    }
+}
+
+/// What a look at this task's PR should show (DESIGN.md §8). Only a `review`
+/// task that carries a recorded reviewed revision pays for the `gh` round-trip
+/// — everything else short-circuits to the full diff, so a first review is
+/// network-identical to what it was.
+fn review_diff(store: &Store, task_id: i64, pr: &PrRef) -> ReviewDiff {
+    let in_review = store
+        .task(task_id)
+        .is_ok_and(|t| t.state == voro_core::TaskState::Review);
+    let reviewed = match in_review {
+        true => store.last_reviewed(task_id).ok().flatten(),
+        false => None,
+    };
+    let Some(reviewed) = reviewed else {
+        return ReviewDiff::Full { notice: None };
+    };
+    let revisions = pr_revisions(pr);
+    plan_review_diff(
+        Some(&reviewed),
+        revisions.head.as_deref(),
+        revisions.contains(&reviewed),
+    )
+}
+
+/// A PR's head and commit list (`gh pr view --json headRefOid,commits`), which
+/// together say whether the revision the operator reviewed is still on the
+/// branch. Any failure — missing `gh`, no network, an unreadable answer — reads
+/// as no revisions, which degrades the review to the full diff rather than
+/// erroring.
+fn pr_revisions(pr: &PrRef) -> PrRevisions {
+    let output = Command::new("gh")
+        .args(["pr", "view", &pr.url, "--json", "headRefOid,commits"])
+        .stdin(Stdio::null())
+        .output();
+    match output {
+        Ok(o) if o.status.success() => parse_pr_revisions(&String::from_utf8_lossy(&o.stdout)),
+        _ => PrRevisions::default(),
+    }
+}
+
+/// The viewer medium's half of the same decision (DESIGN.md §8), answered from
+/// the checkout rather than from GitHub: the branch's local tip, and whether the
+/// reviewed revision is still an ancestor of it. Feeds `{base}` in the viewer
+/// template, so `git diff {base}` shows the rework alone.
+pub fn local_review_diff(store: &Store, task_id: i64, repo_path: &str, branch: &str) -> ReviewDiff {
+    let Some(reviewed) = store.last_reviewed(task_id).ok().flatten() else {
+        return ReviewDiff::Full { notice: None };
+    };
+    let head = rev_parse(repo_path, branch);
+    plan_review_diff(
+        Some(&reviewed),
+        head.as_deref(),
+        is_ancestor(repo_path, &reviewed, branch),
+    )
+}
+
+/// Record the revision the operator has just reviewed and sent back (DESIGN.md
+/// §8), so the next look at this task is narrowed to the rework. Best-effort by
+/// design: a tracked PR's head is what was actually reviewed, a task without one
+/// falls back to the local tip of its branch, and neither being readable simply
+/// leaves the re-review showing the full diff.
+pub fn record_reviewed(store: &mut Store, task_id: i64) {
+    let Ok(task) = store.task(task_id) else {
+        return;
+    };
+    let from_pr = task
+        .pr_url
+        .as_deref()
+        .and_then(|url| PrRef::parse(url).ok())
+        .and_then(|pr| pr_revisions(&pr).head);
+    let sha = from_pr.or_else(|| {
+        let branch = task.branch.as_deref()?;
+        let repo = store.repo_for_task(&task).ok()?;
+        rev_parse(&repo.path, branch)
+    });
+    if let Some(sha) = sha {
+        let _ = store.record_reviewed(task_id, &sha);
+    }
+}
+
+/// Resolve a revision to a full SHA in a checkout, or `None` when git cannot.
+fn rev_parse(repo_path: &str, rev: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Whether `ancestor` is still reachable from `descendant` — false once a
+/// force-push or rebase has rewritten it away, which is what sends a re-review
+/// back to the full diff.
+fn is_ancestor(repo_path: &str, ancestor: &str, descendant: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Open a PR URL in a browser, taking the URL rather than a task so a

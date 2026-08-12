@@ -1344,6 +1344,41 @@ impl Store {
             .flatten())
     }
 
+    /// Record the branch revision the operator has just reviewed (DESIGN.md
+    /// §8), so the next look at this task can be narrowed to what the rework
+    /// added. Written at rejection, when the head is exactly what was judged.
+    /// The `events` table carries it, so delta re-review costs no column and no
+    /// migration; a later recording supersedes an earlier one the way a summary
+    /// does.
+    pub fn record_reviewed(&mut self, id: i64, sha: &str) -> Result<()> {
+        let sha = sha.trim();
+        if sha.is_empty() {
+            return Err(Error::Invalid("a reviewed revision is required".into()));
+        }
+        // Prove the task exists before appending, so a typo'd id leaves no
+        // orphan row in an append-only log.
+        self.task(id)?;
+        log_event(&self.conn, id, crate::review::REVIEWED_EVENT, Some(sha))
+    }
+
+    /// The revision recorded by the newest [`record_reviewed`], or `None` for a
+    /// task nobody has reviewed and sent back — which is what keeps a first
+    /// review showing the whole diff.
+    ///
+    /// [`record_reviewed`]: Store::record_reviewed
+    pub fn last_reviewed(&self, task_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT detail FROM events WHERE task_id = ?1 AND kind = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![task_id, crate::review::REVIEWED_EVENT],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub fn events_for(&self, task_id: i64) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, task_id, at, kind, detail FROM events WHERE task_id = ?1 ORDER BY id",
@@ -2997,6 +3032,39 @@ mod tests {
             s.latest_summary(t.id).unwrap().as_deref(),
             Some("second pass")
         );
+    }
+
+    /// The reviewed revision is what delta re-review compares against
+    /// (DESIGN.md §8): absent until the operator sends work back, superseded by
+    /// each later rejection, and carried on the event log alone.
+    #[test]
+    fn last_reviewed_supersedes_and_starts_absent() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("voro", "/tmp/voro").unwrap();
+        let t = s
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "review me".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        assert_eq!(s.last_reviewed(t.id).unwrap(), None);
+
+        s.record_reviewed(t.id, "  aaaa1111  ").unwrap();
+        assert_eq!(s.last_reviewed(t.id).unwrap().as_deref(), Some("aaaa1111"));
+        s.record_reviewed(t.id, "bbbb2222").unwrap();
+        assert_eq!(s.last_reviewed(t.id).unwrap().as_deref(), Some("bbbb2222"));
+
+        assert!(s.record_reviewed(t.id, "   ").is_err());
+        assert!(s.record_reviewed(999, "aaaa1111").is_err());
+        // and it never touches task state
+        assert_eq!(s.task(t.id).unwrap().state, TaskState::Ready);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voro_core::{
-    AgentsConfig, Launch, LaunchSpec, ResolvedAgent, ReviewAction, Store, TaskState,
+    AgentsConfig, Launch, LaunchSpec, ResolvedAgent, ReviewAction, ReviewDiff, Store, TaskState,
     VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, render,
 };
 
@@ -52,11 +52,43 @@ task; drop it for a proposal that stands on its own. Finish
 with your work committed on a branch and a PR-ready `--summary` on `done` — what
 changed, why, and how you verified it — since `voro pr` opens the pull request
 straight from that summary. Never modify the database with raw SQL, which would
-bypass the state machine and event log.{branch}{docs}
+bypass the state machine and event log.{branch}{docs}{rework}
 
 ---
 
 ";
+
+/// Shared by the rework message and the redispatch preamble so the
+/// answer-the-feedback instruction cannot drift (DESIGN.md §8). A re-review is
+/// narrowed to the diff since the rejected revision, so the summary is what
+/// carries the operator from each of their points to the change that answers
+/// it; without it they are back to rediscovering the rework from the diff.
+const REWORK_SUMMARY_SENTENCE: &str = "Report with `voro done {task_id}{db} --summary \"...\"` whose summary answers that \
+     feedback point by point — one item per point, saying what you changed or \
+     why you did not. The operator re-reviews only the diff since the revision \
+     they rejected, so that summary is what connects your changes to their \
+     points.";
+
+/// The `{rework}` block for a task that has already been through review and was
+/// sent back (DESIGN.md §8). It rides the preamble because a redispatch is the
+/// path where the feedback reaches a *fresh* session — one that has none of the
+/// rejected round's context — and the body's `## Feedback` section is where the
+/// transition put the points themselves.
+const REWORK_TEMPLATE: &str = "\n\n\
+This task has been through review once already and was sent back: the `## Feedback`
+section of the body below carries the operator's points. {instruction}";
+
+/// One rejection said into a session that is still open (DESIGN.md §8). Unlike
+/// the preamble block this carries the feedback itself, since the session has
+/// the task body from its original dispatch and will not re-read it.
+const REWORK_MESSAGE_TEMPLATE: &str = "\
+<!-- Voro: task {task_id} was reviewed and sent back -->
+The work you reported on task {task_id} has been reviewed. It was not accepted;
+the operator's feedback follows.
+
+{feedback}
+
+{instruction}";
 
 /// The `{docs}` block for a task linked to plan or design documents (DESIGN.md
 /// §3/§8). Each is named at its resolved location — absolute for a path, since
@@ -246,6 +278,7 @@ fn render_preamble(
     db_path: &Path,
     branch: Option<&str>,
     docs: &[(String, String)],
+    rework: bool,
 ) -> String {
     let db_flag = db_flag(db_path);
     let task_id = task_id.to_string();
@@ -294,11 +327,54 @@ fn render_preamble(
             .join("\n");
         render(LINKED_DOCS_TEMPLATE, &[("{list}", list.as_str())])
     };
+    // A task nobody has rejected renders no block, so a first dispatch's prompt
+    // is byte-for-byte what it was before delta re-review existed.
+    let rework_block = if rework {
+        render(
+            REWORK_TEMPLATE,
+            &[(
+                "{instruction}",
+                rework_instruction(&task_id, &db_flag).as_str(),
+            )],
+        )
+    } else {
+        String::new()
+    };
     render(
         RETURN_PATH_PREAMBLE_TEMPLATE,
         &[
             ("{branch}", branch_block.as_str()),
             ("{docs}", docs_block.as_str()),
+            ("{rework}", rework_block.as_str()),
+            ("{task_id}", task_id.as_str()),
+            ("{db}", db_flag.as_str()),
+        ],
+    )
+}
+
+/// [`REWORK_SUMMARY_SENTENCE`] filled for a concrete task, so both the message
+/// and the preamble name the same copy-pasteable `done` line.
+fn rework_instruction(task_id: &str, db_flag: &str) -> String {
+    render(
+        REWORK_SUMMARY_SENTENCE,
+        &[("{task_id}", task_id), ("{db}", db_flag)],
+    )
+}
+
+/// The rejection as the agent's still-open session receives it (DESIGN.md §8):
+/// the operator's feedback, and the instruction to answer it point by point in
+/// the completion summary. The feedback is bound last-and-verbatim through
+/// [`render`], so a point that itself spells `{task_id}` reaches the agent as
+/// the operator wrote it.
+pub fn rework_message(task_id: i64, db_path: &Path, feedback: &str) -> String {
+    let db_flag = db_flag(db_path);
+    let task_id = task_id.to_string();
+    let instruction = rework_instruction(&task_id, &db_flag);
+    render(
+        REWORK_MESSAGE_TEMPLATE,
+        &[
+            ("{feedback}", feedback.trim()),
+            ("{instruction}", instruction.as_str()),
             ("{task_id}", task_id.as_str()),
             ("{db}", db_flag.as_str()),
         ],
@@ -945,7 +1021,27 @@ pub fn open(
             .unwrap_or_else(|| repo.path.clone()),
         None => repo.path.clone(),
     };
-    let base = default_base_branch(&repo.path);
+    // `{base}` is what the viewer template diffs against, so narrowing a
+    // re-review to the rework is a matter of binding it to the revision the
+    // operator last reviewed rather than to the checkout's default branch
+    // (DESIGN.md §8). Only a `review` task that has been sent back once has
+    // one; everything else diffs against the base as it always did.
+    let (base, scope) = match (task.state, task.branch.as_deref()) {
+        (TaskState::Review, Some(branch)) => {
+            match crate::pr::local_review_diff(store, task_id, &repo.path, branch) {
+                ReviewDiff::Since { since, .. } => {
+                    (since, " — the changes since your last review".to_string())
+                }
+                ReviewDiff::Full {
+                    notice: Some(notice),
+                } => (default_base_branch(&repo.path), format!(" — {notice}")),
+                ReviewDiff::Full { notice: None } => {
+                    (default_base_branch(&repo.path), String::new())
+                }
+            }
+        }
+        _ => (default_base_branch(&repo.path), String::new()),
+    };
     let branch = task.branch.clone().unwrap_or_default();
     let command = viewer
         .replace(
@@ -999,7 +1095,7 @@ pub fn open(
     });
 
     Ok(format!(
-        "opened task {task_id} in {} (pid {pid}) — launch log {}",
+        "opened task {task_id} in {} (pid {pid}){scope} — launch log {}",
         project.name,
         launch_log.display()
     ))
@@ -1088,9 +1184,17 @@ fn spawn_session(
             Ok((doc.label().to_string(), location))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    // A redispatch of work that was reviewed and sent back carries the
+    // answer-the-feedback instruction (DESIGN.md §8): the successor session has
+    // none of the rejected round's context, so the points in the body's
+    // `## Feedback` section are all it has to answer.
+    let rework = store
+        .events_for(task_id)
+        .map(|events| voro_core::rework_report(&events).is_some())
+        .unwrap_or(false);
     let prompt = format!(
         "{}{body}",
-        render_preamble(task_id, &ctx.db_path, task.branch.as_deref(), &docs)
+        render_preamble(task_id, &ctx.db_path, task.branch.as_deref(), &docs, rework)
     );
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("cannot write prompt {}: {e}", prompt_path.display()))?;
@@ -1472,7 +1576,7 @@ mod tests {
         assert!(prompt.contains("Detailed prompt."), "{prompt}");
         // the rendered preamble is dropped in ahead of the task body
         assert!(
-            prompt.starts_with(&render_preamble(id, &ctx.db_path, None, &[])),
+            prompt.starts_with(&render_preamble(id, &ctx.db_path, None, &[], false)),
             "{prompt}"
         );
         assert!(
@@ -1485,7 +1589,7 @@ mod tests {
     fn preamble_renders_a_db_flag_only_for_a_non_default_database() {
         // a scratch (non-default) db renders --db on every verb, shell-quoted
         let db = PathBuf::from("/tmp/scratch/voro.db");
-        let rendered = render_preamble(62, &db, None, &[]);
+        let rendered = render_preamble(62, &db, None, &[], false);
         assert!(
             rendered.contains("voro ask 62 --db '/tmp/scratch/voro.db'"),
             "{rendered}"
@@ -1500,7 +1604,7 @@ mod tests {
         );
 
         // the default db is what the verbs resolve to unaided, so no flag
-        let default = render_preamble(62, &Store::default_db_path(), None, &[]);
+        let default = render_preamble(62, &Store::default_db_path(), None, &[], false);
         assert!(default.contains("voro ask 62 --question"), "{default}");
         assert!(!default.contains("--db"), "{default}");
     }
@@ -1510,7 +1614,7 @@ mod tests {
         // no assigned branch: the agent is told to register the name it picks,
         // but branch-assignment wording and a completion `voro done --branch`
         // are absent, since no name is known.
-        let plain = render_preamble(62, &Store::default_db_path(), None, &[]);
+        let plain = render_preamble(62, &Store::default_db_path(), None, &[], false);
         assert!(!plain.contains("git branch `"), "{plain}");
         assert!(plain.contains("voro set 62 --branch <name>"), "{plain}");
         assert!(!plain.contains("voro done 62 --branch"), "{plain}");
@@ -1526,7 +1630,13 @@ mod tests {
 
         // with a branch: the agent is told to use it, register it, and confirm
         // it at completion.
-        let branched = render_preamble(62, &Store::default_db_path(), Some("feat/parser"), &[]);
+        let branched = render_preamble(
+            62,
+            &Store::default_db_path(),
+            Some("feat/parser"),
+            &[],
+            false,
+        );
         assert!(branched.contains("git branch `feat/parser`"), "{branched}");
         assert!(branched.contains("Voro runs no git"), "{branched}");
         // the assigned case carries the same stale-branch self-serve instruction.
@@ -1558,7 +1668,7 @@ mod tests {
         // because the harness names the branch itself, both cases spell out the
         // rename onto the branch Voro tracks.
         for (branch, name) in [(None, "<name>"), (Some("feat/parser"), "feat/parser")] {
-            let rendered = render_preamble(62, &Store::default_db_path(), branch, &[]);
+            let rendered = render_preamble(62, &Store::default_db_path(), branch, &[], false);
             assert!(rendered.contains("`EnterWorktree` tool"), "{rendered}");
             assert!(
                 rendered.contains(&format!("git switch -c {name}")),
@@ -1593,7 +1703,7 @@ mod tests {
                 "https://example.com/rfc".to_string(),
             ),
         ];
-        let linked = render_preamble(62, &db, None, &docs);
+        let linked = render_preamble(62, &db, None, &docs, false);
         assert!(
             linked.contains("derives from the document(s) below"),
             "{linked}"
@@ -1612,8 +1722,66 @@ mod tests {
         assert!(docs_at < linked.rfind("---").unwrap(), "{linked}");
 
         // A task citing no document renders exactly the prompt it always did.
-        let plain = render_preamble(62, &db, None, &[]);
+        let plain = render_preamble(62, &db, None, &[], false);
         assert!(!plain.contains("derives from the document"), "{plain}");
+    }
+
+    /// A redispatch of rejected work carries the answer-the-feedback
+    /// instruction, and a task nobody rejected carries none (DESIGN.md §8).
+    #[test]
+    fn preamble_tells_a_redispatched_rework_to_answer_the_feedback() {
+        let db = Store::default_db_path();
+        let reworking = render_preamble(62, &db, None, &[], true);
+        assert!(
+            reworking.contains("been through review once already"),
+            "{reworking}"
+        );
+        assert!(reworking.contains("point by point"), "{reworking}");
+        assert!(
+            reworking.contains("voro done 62 --summary"),
+            "the instruction must be copy-pasteable: {reworking}"
+        );
+
+        let first = render_preamble(62, &db, None, &[], false);
+        assert!(!first.contains("point by point"), "{first}");
+    }
+
+    /// The rejection as the live session hears it: the operator's points
+    /// verbatim, plus the same instruction the preamble carries.
+    #[test]
+    fn the_rework_message_carries_the_feedback_and_the_instruction() {
+        let message = rework_message(
+            62,
+            &Store::default_db_path(),
+            "  tests are missing, and the docs are stale  ",
+        );
+        assert!(
+            message.contains("task 62 was reviewed and sent back"),
+            "{message}"
+        );
+        assert!(
+            message.contains("tests are missing, and the docs are stale"),
+            "{message}"
+        );
+        assert!(message.contains("point by point"), "{message}");
+        assert!(message.contains("voro done 62 --summary"), "{message}");
+    }
+
+    /// Feedback is untrusted text: a point that spells a placeholder reaches
+    /// the agent as the operator wrote it, and the message's own placeholders
+    /// still resolve.
+    #[test]
+    fn rework_message_emits_feedback_verbatim() {
+        let db = PathBuf::from("/tmp/other.db");
+        let message = rework_message(62, &db, "the {task_id} handling is wrong, and {db} too");
+        assert!(
+            message.contains("the {task_id} handling is wrong, and {db} too"),
+            "{message}"
+        );
+        assert!(
+            message.contains("voro done 62 --db '/tmp/other.db' --summary"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -2056,6 +2224,127 @@ mod tests {
             std::fs::read_to_string(&range).unwrap().trim(),
             "main...feat"
         );
+    }
+
+    /// Wait for a detached viewer to have written its marker file, and return
+    /// what it wrote.
+    fn viewer_output(path: &Path) -> String {
+        for _ in 0..50 {
+            if path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::read_to_string(path).unwrap().trim().to_string()
+    }
+
+    /// A checkout with a viewer template spelling a diff range, a worktree on
+    /// `feat`, and a review task on that branch. Returns the pieces plus the
+    /// revision at the point the operator would have reviewed.
+    fn range_fixture() -> (Store, DispatchCtx, PathBuf, PathBuf, i64, String) {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        std::fs::write(
+            &ctx.agents_path,
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"cat {prompt_file}\"\n\n\
+             [viewer]\ncmd = \"echo {base}...{branch} > {path}/range.txt\"\n",
+        )
+        .unwrap();
+        let wt = commit_and_worktree(&project, "feat");
+        // The commit the first review looked at, then a rework commit on top.
+        std::fs::write(wt.join("first"), "one\n").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-q", "-m", "reviewed"]);
+        let reviewed = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&wt)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        std::fs::write(wt.join("second"), "two\n").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-q", "-m", "the rework"]);
+
+        let id = review_task(&mut store, &project);
+        store.set_branch(id, Some("feat")).unwrap();
+        (store, ctx, project, wt, id, reviewed)
+    }
+
+    /// The whole point of delta re-review on the viewer medium (DESIGN.md §8):
+    /// `{base}` binds to the revision the operator rejected, so the viewer opens
+    /// the rework alone rather than the branch.
+    #[test]
+    fn open_narrows_the_range_to_the_reviewed_revision() {
+        let (mut store, ctx, _project, wt, id, reviewed) = range_fixture();
+        store.record_reviewed(id, &reviewed).unwrap();
+
+        let summary = open(&mut store, &ctx, id, None).unwrap();
+        assert!(
+            summary.contains("since your last review"),
+            "the summary must say what it narrowed to: {summary}"
+        );
+        assert_eq!(
+            viewer_output(&wt.join("range.txt")),
+            format!("{reviewed}...feat")
+        );
+    }
+
+    /// A first review is untouched: no reviewed revision has been recorded, so
+    /// `{base}` is still the checkout's default branch and nothing is said.
+    #[test]
+    fn open_leaves_a_first_review_diffing_against_the_base() {
+        let (mut store, ctx, _project, wt, id, _reviewed) = range_fixture();
+
+        let summary = open(&mut store, &ctx, id, None).unwrap();
+        assert!(!summary.contains("review"), "{summary}");
+        assert_eq!(viewer_output(&wt.join("range.txt")), "main...feat");
+    }
+
+    /// The force-push case: the recorded revision is no longer on the branch,
+    /// so the range cannot be built. Degrade to the full diff with a notice —
+    /// never an error.
+    #[test]
+    fn open_falls_back_to_the_base_when_the_reviewed_revision_is_gone() {
+        let (mut store, ctx, _project, wt, id, _reviewed) = range_fixture();
+        store
+            .record_reviewed(id, "0123456789abcdef0123456789abcdef01234567")
+            .unwrap();
+
+        let summary = open(&mut store, &ctx, id, None).unwrap();
+        assert!(
+            summary.contains("no longer on the branch"),
+            "the fallback must explain itself: {summary}"
+        );
+        assert_eq!(viewer_output(&wt.join("range.txt")), "main...feat");
+    }
+
+    /// Recording is what a reject does, and a task with a branch but no PR
+    /// records the local tip of it (DESIGN.md §8).
+    #[test]
+    fn rejecting_records_the_branch_head_that_was_reviewed() {
+        let (mut store, _ctx, _project, wt, id, _reviewed) = range_fixture();
+        assert_eq!(store.last_reviewed(id).unwrap(), None);
+
+        crate::pr::record_reviewed(&mut store, id);
+
+        let head = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&wt)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert_eq!(store.last_reviewed(id).unwrap().as_deref(), Some(&head[..]));
     }
 
     #[test]

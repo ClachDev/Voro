@@ -3,8 +3,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::ui::Hit;
 use voro_core::{
     Action, ActionRow, AgentsConfig, DepKind, DepRef, DigestRow, Event, PrRef, Priority, Project,
-    Queue, QueueRow, RefineOutcome, ReviewAction, ReviewMedium, RunningRow, ScoreBreakdown,
-    StateCounts, Store, Task, TaskState, Triage, WipGate, scheduler,
+    Queue, QueueRow, RefineOutcome, ReviewAction, ReviewMedium, ReworkReport, RunningRow,
+    ScoreBreakdown, StateCounts, Store, Task, TaskState, Triage, WipGate, scheduler,
 };
 
 /// Lines `PgDn`/`PgUp` move the focus card in one press. A fixed step, since
@@ -1032,8 +1032,14 @@ impl App {
     /// open, so the operator answers the question or addresses the feedback in
     /// that same session — Voro only moves the state (DESIGN.md §6/§8).
     fn apply_and_refresh(&mut self, task_id: i64, action: Action) {
+        let rejected = matches!(action, Action::RejectWork(_));
         let result = self.store.apply(task_id, action);
         if self.report(result).is_some() {
+            if rejected {
+                // The head the operator just judged, so the re-review can be
+                // narrowed to the rework (DESIGN.md §8).
+                crate::pr::record_reviewed(&mut self.store, task_id);
+            }
             let result = self.refresh();
             self.report(result);
         }
@@ -1844,13 +1850,23 @@ impl App {
             self.status = Some(format!("{e} — nothing was sent"));
             return;
         }
+        if rejected {
+            // What the operator just judged, so the re-review can be narrowed to
+            // the rework (DESIGN.md §8).
+            crate::pr::record_reviewed(&mut self.store, task_id);
+        }
+        // A rejection reaches the session framed as one: the feedback, plus the
+        // instruction to answer it point by point at `done` (DESIGN.md §8). An
+        // ordinary message is said as written.
+        let framed = rejected
+            .then(|| crate::dispatch::rework_message(task_id, &self.dispatch_ctx.db_path, message));
         let sent = crate::dispatch::send_message(
             &self.dispatch_ctx,
             crate::dispatch::SessionMessage {
                 task_id,
                 template: &target.template,
                 session_ref: &target.session_ref,
-                message,
+                message: framed.as_deref().unwrap_or(message),
                 cwd,
             },
         );
@@ -1877,6 +1893,14 @@ impl App {
     /// A read error yields an empty history for the same reason.
     pub fn task_events(&self, task_id: i64) -> Vec<Event> {
         self.store.events_for(task_id).unwrap_or_default()
+    }
+
+    /// The rework cycle a task is in, if any (DESIGN.md §8): the newest
+    /// rejection feedback and the summary answering it. `None` for a task
+    /// nobody has sent back, which is what keeps a first review's detail pane
+    /// exactly as it was.
+    pub fn rework_report(&self, task_id: i64) -> Option<ReworkReport> {
+        voro_core::rework_report(&self.store.events_for(task_id).ok()?)
     }
 
     /// The selected task's id and agent override, if it is `ready` or `stalled`
