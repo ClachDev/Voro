@@ -634,11 +634,13 @@ pub struct Session {
     pub outcome: Option<SessionOutcome>,
 }
 
-/// A row of the cockpit's running strip (DESIGN.md §9): one per `running` or
-/// `refining` task, joined with its open session if it has one. A task with no
-/// open session (started by hand) still shows, with `session_id`/`agent` `None`.
+/// A row of the cockpit's running strip (DESIGN.md §9): one per `running`,
+/// `refining`, or `waiting` task, joined with its open session if it has one. A
+/// task with no open session (started by hand) still shows, with `session_id`/
+/// `agent` `None`. `started_at` is what `elapsed_secs` counts from — the
+/// session for work under way, the hand-off for a `waiting` task — and
 /// `elapsed_secs` is computed in SQL against the database's clock, so the TUI
-/// only has to format it.
+/// only has to format it. `pr_url` carries the strip's PR marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningRow {
     pub session_id: Option<i64>,
@@ -646,6 +648,7 @@ pub struct RunningRow {
     pub task_title: String,
     pub task_state: TaskState,
     pub agent: Option<String>,
+    pub pr_url: Option<String>,
     pub started_at: String,
     pub elapsed_secs: i64,
 }
