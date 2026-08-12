@@ -291,6 +291,9 @@ pub struct AttachRequest {
 /// the line lands in, the template that puts it there, and the listing the
 /// liveness probe reads to be sure the session is between turns.
 struct MessageTarget {
+    /// The session row the send updates once it is confirmed — its process, and
+    /// its reference where the agent's verb forks (DESIGN.md §8).
+    session_id: i64,
     session_ref: String,
     template: String,
     sessions_cmd: Option<String>,
@@ -1861,6 +1864,7 @@ impl App {
             return None;
         };
         Some(MessageTarget {
+            session_id: session.id,
             session_ref,
             template: template.to_string(),
             sessions_cmd: agent.and_then(|a| a.sessions()).map(str::to_string),
@@ -1868,11 +1872,15 @@ impl App {
     }
 
     /// Send the collected line into the task's session (DESIGN.md §8). A
-    /// review or waiting task's message *is* its rejection: the transition runs
-    /// first, so the feedback is in the body and the event log before anything
-    /// is said, and a refused transition sends nothing. A `needs-input` task
-    /// transitions not at all — the answer lives in the transcript and the
-    /// agent's own `voro resume` moves it back to `running` (DESIGN.md §6).
+    /// review or waiting task's message *is* its rejection, and the send goes
+    /// first: a message that never left would otherwise leave the feedback in
+    /// the body, the task back in `running`, and the agent none the wiser —
+    /// which is exactly the state a redispatch cannot tell from a stall. So the
+    /// spawn is confirmed, then the session row and the transition commit
+    /// together, and a refused send leaves the task precisely where it was. A
+    /// `needs-input` task transitions not at all — the answer lives in the
+    /// transcript and the agent's own `voro resume` moves it back to `running`
+    /// (DESIGN.md §6).
     fn send_session_message(&mut self, task_id: i64, message: &str) {
         if message.trim().is_empty() {
             self.status = Some("a message is required".into());
@@ -1912,20 +1920,6 @@ impl App {
             }
         };
         let rejected = matches!(state, TaskState::Review | TaskState::Waiting);
-        if rejected
-            && let Err(e) = self
-                .store
-                .apply(task_id, Action::RejectWork(message.to_string()))
-        {
-            self.status = Some(format!("{e} — nothing was sent"));
-            return;
-        }
-        if rejected {
-            // What the operator just judged, so the re-review can be narrowed to
-            // the rework (DESIGN.md §8) — off the loop, so the message is sent
-            // without waiting on `gh`.
-            self.capture_reviewed(task_id);
-        }
         // A rejection reaches the session framed as one: the feedback, plus the
         // instruction to answer it point by point at `done` (DESIGN.md §8). An
         // ordinary message is said as written.
@@ -1941,13 +1935,47 @@ impl App {
                 cwd,
             },
         );
-        self.status = Some(match (sent, rejected) {
-            (Ok(summary), true) => format!("{summary} — task returned to running"),
-            (Ok(summary), false) => summary,
-            (Err(e), true) => format!(
-                "{e} — the feedback is recorded and the task is running, but nothing was sent"
-            ),
-            (Err(e), false) => e,
+        let sent = match sent {
+            Ok(sent) => sent,
+            Err(e) => {
+                self.status = Some(format!("{e} — task {task_id} is unchanged"));
+                return;
+            }
+        };
+        // The send is under way, so the session row follows it — the process
+        // now carrying the turn, and the reference the agent forked into where
+        // its verb does that — and the rejection commits behind it. A store
+        // failure here takes the agent down with it rather than leaving it
+        // working on feedback no state records.
+        let pid = sent.pid();
+        if let Err(e) =
+            self.store
+                .record_session_send(target.session_id, sent.new_session_ref(), pid)
+        {
+            sent.abandon();
+            self.status = Some(format!(
+                "recording the send failed ({e}); the spawned agent (pid {pid}) was killed"
+            ));
+            return;
+        }
+        if rejected {
+            if let Err(e) = self
+                .store
+                .apply(task_id, Action::RejectWork(message.to_string()))
+            {
+                sent.abandon();
+                self.status = Some(format!("{e}; the spawned agent (pid {pid}) was killed"));
+                return;
+            }
+            // What the operator just judged, so the re-review can be narrowed to
+            // the rework (DESIGN.md §8) — off the loop, so nothing waits on `gh`.
+            self.capture_reviewed(task_id);
+        }
+        let summary = sent.confirm(&self.dispatch_ctx);
+        self.status = Some(if rejected {
+            format!("{summary} — task returned to running")
+        } else {
+            summary
         });
         let refreshed = self.refresh();
         self.report(refreshed);
@@ -3218,6 +3246,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         (store, ctx, project_path)
     }
@@ -3269,6 +3298,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         let project = store
             .create_project("demo", project_path.to_str().unwrap())
@@ -4507,6 +4537,12 @@ mod tests {
     /// session verbs the stub agent defines, so a test can take one away. The
     /// stub lingers after printing its prompt, so a verb-less agent — whose
     /// liveness is the pid — keeps its task `running` through reconcile.
+    ///
+    /// The `message` verb lingers too: a send that exits non-zero inside its
+    /// grace window is a send that did not happen (task #390), so the stub has
+    /// to be a command that survives. It says what it is in a trailing comment,
+    /// which the launch log records verbatim — that is what the assertions
+    /// below read the rendered `{session}` out of.
     fn jump_in_env(verbs: &[&str], listing_json: &str) -> JumpIn {
         let (mut store, ctx, project_path) = scratch_env("jumpin", None);
         let listing = project_path.parent().unwrap().join("listing.json");
@@ -4515,7 +4551,10 @@ mod tests {
             ("sessions", format!("cat '{}'", listing.display())),
             ("attach", "agent attach {session}".into()),
             ("resume", "agent resume {session}".into()),
-            ("message", "agent message {session} {prompt_file}".into()),
+            (
+                "message",
+                "sleep 30 # agent message {session} {prompt_file}".into(),
+            ),
         ]
         .into_iter()
         .filter(|(verb, _)| verbs.contains(verb))
@@ -4924,7 +4963,8 @@ mod tests {
 
     /// A `needs-input` task transitions not at all — per DESIGN.md §6 the
     /// answer lives in the transcript, and the agent's own `voro resume` moves
-    /// the task back to `running`.
+    /// the task back to `running`. Its session row still follows the send, so
+    /// the answer's process is what the reconciler reads.
     #[test]
     fn message_on_a_needs_input_task_sends_without_transitioning() {
         let mut env = jump_in_env(&["attach", "resume", "message"], FINISHED_LISTING);
@@ -4941,6 +4981,107 @@ mod tests {
         assert_eq!(task.state, TaskState::NeedsInput);
         assert!(!task.body.contains("voro-core"), "{}", task.body);
         assert!(launches(&root).contains("agent message 'ref-1'"));
+        let session = app.store.sessions_for(task_id).unwrap().remove(0);
+        assert!(crate::session_probe::pid_is_alive(session.pid.unwrap()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Rewrite the stub agent's `message` verb — loaded fresh on every send, so
+    /// a test can change what a send *does* after the environment is built.
+    fn set_message_verb(env: &JumpIn, template: &str) {
+        let config = std::fs::read_to_string(&env.ctx.agents_path).unwrap();
+        let rewritten = config
+            .lines()
+            .map(|line| match line.starts_with("message = ") {
+                true => format!("message = \"{template}\"\n"),
+                false => format!("{line}\n"),
+            })
+            .collect::<String>();
+        std::fs::write(&env.ctx.agents_path, rewritten).unwrap();
+    }
+
+    /// The defect this ordering exists for (task #390): the send is what the
+    /// rejection hangs off, so a message the agent refuses — a supervisor-held
+    /// session, a stale reference — leaves the task in `review` with its body
+    /// untouched and the refusal on the status line. Recording feedback the
+    /// agent never received, and returning the task to `running` on the
+    /// strength of it, is the one outcome worse than not sending.
+    #[test]
+    fn a_refused_send_leaves_the_review_task_exactly_where_it_was() {
+        let mut env = jump_in_env(all_verbs(), FINISHED_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        set_message_verb(
+            &env,
+            "printf 'Session is currently running as a background agent' >&2; \
+             exit 1 # {session} {prompt_file}",
+        );
+        let (project_path, task_id) = (env.project_path.clone(), env.task_id);
+        let root = project_path.parent().unwrap().to_path_buf();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        send_message(&mut app, "the tests are missing");
+
+        let task = app.store.task(task_id).unwrap();
+        assert_eq!(task.state, TaskState::Review);
+        assert!(!task.body.contains("Feedback"), "{}", task.body);
+        assert!(
+            !task.body.contains("the tests are missing"),
+            "{}",
+            task.body
+        );
+        assert!(
+            !app.store
+                .events_for(task_id)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "feedback"),
+            "no rejection is logged for a message that never landed"
+        );
+        // the agent's own account of the refusal, out of the log and onto the
+        // status line
+        let status = app.status.as_deref().unwrap_or("").to_string();
+        assert!(status.contains("background agent"), "{status}");
+        assert!(status.contains("unchanged"), "{status}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A verb that forks rather than resuming in place: the session row follows
+    /// the fork, so the next message and the next jump-in address the
+    /// conversation where it actually continued — and the rejection lands as
+    /// usual behind the confirmed send.
+    #[test]
+    fn a_forking_send_moves_the_session_to_the_reference_it_opened() {
+        let mut env = jump_in_env(all_verbs(), FINISHED_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        set_message_verb(
+            &env,
+            "sleep 30 # agent message {session} --session-id {new_session} {prompt_file}",
+        );
+        let (project_path, task_id) = (env.project_path.clone(), env.task_id);
+        let root = project_path.parent().unwrap().to_path_buf();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        send_message(&mut app, "the tests are missing");
+
+        let task = app.store.task(task_id).unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert!(task.body.contains("the tests are missing"), "{}", task.body);
+        let session = app.store.sessions_for(task_id).unwrap().remove(0);
+        let new_ref = session.session_ref.expect("a reference");
+        assert_ne!(new_ref, "ref-1", "the row followed the fork");
+        assert!(crate::session_probe::pid_is_alive(session.pid.unwrap()));
+        assert!(
+            launches(&root).contains(&format!("--session-id '{new_ref}'")),
+            "the recorded reference is the one the command was given"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4976,10 +5117,11 @@ mod tests {
     }
 
     /// The refusal's other half (task #376): a pid-less `blocked` zombie is
-    /// not a session still running, so the message goes headlessly — the
-    /// rejection lands first, then the send. The reconcile that follows finds
-    /// the same zombie and stalls the task, exactly as a `done` entry does
-    /// below, with the feedback already in the body for the redispatch.
+    /// not a session still running, so the message goes headlessly — and the
+    /// send that lands is what the task then rides on. The reconcile that
+    /// follows finds the same zombie in the listing but the send's own process
+    /// on the row, so the task stays `running` rather than being stalled out
+    /// from under the agent now answering (task #390).
     #[test]
     fn message_sends_into_a_zombie_session() {
         let mut env = jump_in_env(all_verbs(), ZOMBIE_LISTING);
@@ -4995,7 +5137,7 @@ mod tests {
 
         let task = app.store.task(task_id).unwrap();
         assert!(task.body.contains("the tests are missing"), "{}", task.body);
-        assert_eq!(task.state, TaskState::Stalled);
+        assert_eq!(task.state, TaskState::Running);
         assert!(launches(&root).contains("agent message 'ref-1'"));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -5030,14 +5172,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The reject edge's documented tail (DESIGN.md §8), inherited unchanged:
-    /// when the agent's listing still reports the session finished, the
-    /// reconcile that follows the transition stalls the task. The feedback is
-    /// in the body either way, so the redispatch that stalling offers carries
-    /// it — and the headless send that did land reports back on the stalled
-    /// session's behalf if it gets there first.
+    /// The reject edge's tail, corrected (task #390): a session the listing
+    /// reports finished used to be stalled by the very next reconcile, seconds
+    /// after the rejection was sent into it — the operator's feedback recorded,
+    /// the task queued for redispatch, and the agent that received it ignored.
+    /// The send's own process is now on the row, so the task rides `running`
+    /// for as long as the turn takes.
     #[test]
-    fn message_to_a_finished_session_leaves_the_reject_edge_to_reconcile() {
+    fn message_to_a_finished_session_keeps_the_task_running() {
         let mut env = jump_in_env(all_verbs(), FINISHED_LISTING);
         env.store
             .apply(env.task_id, Action::Complete(None))
@@ -5050,9 +5192,15 @@ mod tests {
         send_message(&mut app, "the tests are missing");
 
         let task = app.store.task(task_id).unwrap();
-        assert_eq!(task.state, TaskState::Stalled);
+        assert_eq!(task.state, TaskState::Running);
         assert!(task.body.contains("the tests are missing"), "{}", task.body);
         assert!(launches(&root).contains("agent message 'ref-1'"));
+        let session = app.store.sessions_for(task_id).unwrap().remove(0);
+        assert!(session.ended_at.is_none());
+        assert!(
+            crate::session_probe::pid_is_alive(session.pid.unwrap()),
+            "the row carries the send's own process, not the dispatch launcher"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5551,6 +5699,7 @@ mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         app
     }

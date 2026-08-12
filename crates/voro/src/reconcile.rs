@@ -25,6 +25,14 @@
 //! from reading them all as live. Agents without a `sessions` verb keep the
 //! spawned-pid check.
 //!
+//! The row's own pid is still read in one direction, for every agent: a pid
+//! that is *alive* proves the session is (task #390). A quick message replaces
+//! that pid with the process carrying its turn, and where the agent had to fork
+//! to be joined at all, that turn is a `-p` run the agent's listing never shows
+//! — so the listing would report the session gone while the message it was just
+//! sent is still being worked on. A dead pid still proves nothing and falls
+//! back to the listing.
+//!
 //! A refine round reads the same way, because it is launched the same way: the
 //! headless flavour renders the agent's own `dispatch` template, so under a
 //! `--bg` launcher its recorded pid lies exactly as a dispatch's does, and its
@@ -107,6 +115,16 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
             // No sessions verb: the spawned pid is all there is. No pid
             // recorded means liveness can't be checked.
             None => session.pid.map(pid_is_alive),
+        };
+        // A recorded process that is still there proves the session is live
+        // whatever the listing says: a quick message forks a `-p` turn that
+        // never appears in `claude agents`, so listing-absence alone must not
+        // finalise the session under it (DESIGN.md §8). The check is
+        // directional — a dead pid proves nothing, since a dispatch's pid is a
+        // launcher that exits at birth, and falls back to the listing verdict.
+        let alive = match alive {
+            Some(false) if session.pid.is_some_and(pid_is_alive) => Some(true),
+            verdict => verdict,
         };
         let Some(alive) = alive else { continue };
         if alive {
@@ -441,8 +459,11 @@ mod tests {
         ] {
             let (agents_path, dir) = sessions_fixture(name, listing);
             let (mut s, task_id) = running_task();
+            // The launcher pid of a `--bg` dispatch, dead as it always is by
+            // now, so the listing is what decides (a *live* pid would override
+            // it — see `a_live_pid_outlives_its_absence_from_the_listing`).
             let session = s
-                .create_session(task_id, "claude", Some(std::process::id() as i64), None)
+                .create_session(task_id, "claude", Some(dead_pid()), None)
                 .unwrap();
             s.set_session_ref(session.id, "full-uuid-1").unwrap();
 
@@ -475,7 +496,7 @@ mod tests {
         );
         let (mut s, task_id) = running_task();
         let session = s
-            .create_session(task_id, "claude", Some(std::process::id() as i64), None)
+            .create_session(task_id, "claude", Some(dead_pid()), None)
             .unwrap();
         s.set_session_ref(session.id, "full-uuid-1").unwrap();
 
@@ -505,6 +526,26 @@ mod tests {
         let (mut s, task_id) = running_task();
         let session = s.create_session(task_id, "claude", None, None).unwrap();
         s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert!(s.session(session.id).unwrap().ended_at.is_none());
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The quick-message case (task #390): a forked `-p` turn does not appear
+    /// in the agent's listing at all, so the ref the session now carries reads
+    /// as gone — while the process answering the message is right there on the
+    /// row. A live pid outranks the listing, or the send the operator just made
+    /// would stall the task under the agent working on it.
+    #[test]
+    fn a_live_pid_outlives_its_absence_from_the_listing() {
+        let (agents_path, dir) = sessions_fixture("message-fork", "[]");
+        let (mut s, task_id) = running_task();
+        let session = s.create_session(task_id, "claude", None, None).unwrap();
+        s.record_session_send(session.id, Some("forked-uuid"), std::process::id() as i64)
+            .unwrap();
 
         assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
         assert!(s.session(session.id).unwrap().ended_at.is_none());
@@ -593,7 +634,7 @@ mod tests {
     #[test]
     fn a_refine_round_gone_from_the_listing_is_marked_failed() {
         let (agents_path, dir) = sessions_fixture("refine-gone", "[]");
-        let (mut s, task_id, session_id) = refining_task("claude", Some(std::process::id() as i64));
+        let (mut s, task_id, session_id) = refining_task("claude", Some(dead_pid()));
         s.set_session_ref(session_id, "refine-uuid").unwrap();
 
         assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 1);

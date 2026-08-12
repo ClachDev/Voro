@@ -11,7 +11,7 @@
 //! log — and records it on the session row for later attach/resume.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -879,11 +879,20 @@ pub fn refine(
     ))
 }
 
+/// How long [`send_message`] watches a spawned send before calling it started.
+const MESSAGE_GRACE: Duration = Duration::from_secs(2);
+
+/// How often that window is polled.
+const MESSAGE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How much of a failed send's log to look at for the line to quote back.
+const LOG_TAIL_BYTES: u64 = 4096;
+
 /// One line said into a session that already exists (DESIGN.md §8), assembled by
 /// the TUI's quick-message key. Unlike an [`Expansion`] this opens no session
-/// row and tracks no pid: it joins a conversation Voro already knows about
-/// rather than starting one, so there is no new identity to compose and nothing
-/// for the reconciler to observe.
+/// row: it joins a conversation Voro already knows about rather than starting
+/// one, so there is no new identity to compose — it updates the row that
+/// conversation already has (DESIGN.md §8).
 pub struct SessionMessage<'a> {
     /// The task whose session is being messaged — names the prompt and log
     /// files, and the launch-log line.
@@ -899,32 +908,143 @@ pub struct SessionMessage<'a> {
     pub cwd: String,
 }
 
-/// Fire a message into a task's agent session and return, leaving it to run
-/// (DESIGN.md §8). Fire-and-forget by design: the send is one turn appended to a
-/// transcript the operator watches elsewhere, so an agent-side refusal lands in
-/// the log rather than back in the UI, and nothing here waits for a reply.
-pub fn send_message(ctx: &DispatchCtx, msg: SessionMessage) -> Result<String, String> {
+/// A quick message whose send is under way: the spawn survived its grace window
+/// ([`send_message`]), so the caller may now record what it changed about the
+/// session and — for a rejection — apply the transition the message carries.
+/// The child is still held, so a caller whose recording fails can take the
+/// agent down with it ([`abandon`](Self::abandon)) rather than leaving it acting
+/// on a message no state reflects.
+pub struct SentMessage {
+    spawned: Spawned,
+    task_id: i64,
+    new_session_ref: Option<String>,
+}
+
+impl SentMessage {
+    /// The process carrying the turn. Unlike a dispatch's launcher pid this is
+    /// the send itself, so it is alive for as long as the agent is answering —
+    /// which is what keeps the reconciler off a task whose forked turn does not
+    /// appear in the agent's own listing (DESIGN.md §8).
+    pub fn pid(&self) -> i64 {
+        self.spawned.pid
+    }
+
+    /// The reference the session answers to from now on, when the agent's verb
+    /// forked rather than resuming in place.
+    pub fn new_session_ref(&self) -> Option<&str> {
+        self.new_session_ref.as_deref()
+    }
+
+    /// Let the send run: hand the child to the reaper and report it. From here
+    /// the turn is fire-and-forget — it is appended to a transcript the operator
+    /// watches elsewhere, so an agent-side refusal after this point lands in the
+    /// log rather than back in the UI.
+    pub fn confirm(self, ctx: &DispatchCtx) -> String {
+        let summary = format!(
+            "message sent to task {}'s session — log {}",
+            self.task_id,
+            self.spawned.log_path.display()
+        );
+        reap_expansion(self.spawned, ctx.launch_log_path());
+        summary
+    }
+
+    /// Kill the send's process group, for a caller whose store write failed
+    /// after the spawn: an agent must not go on acting on a message the
+    /// database does not record.
+    pub fn abandon(self) {
+        kill_expansion(self.spawned);
+    }
+}
+
+/// Fire a message into a task's agent session and wait just long enough to know
+/// it started (DESIGN.md §8). A headless send can be refused outright — a
+/// supervisor-held session, a stale reference — and that refusal exits in well
+/// under a second, so the spawn is given a grace window to fail in and an early
+/// non-zero exit is reported as a send that did not happen. What comes back is
+/// a [`SentMessage`] the caller records against the session before letting it
+/// run; the transition a rejection carries hangs off that, so nothing is
+/// committed against a message that never left.
+pub fn send_message(ctx: &DispatchCtx, msg: SessionMessage) -> Result<SentMessage, String> {
     if msg.message.trim().is_empty() {
         return Err("a message is required".into());
     }
     let label = format!("message-{}", msg.task_id);
     let prompt_path = write_prompt(ctx, &label, msg.message)?;
-    let command = voro_core::render_message(msg.template, msg.session_ref, &prompt_path);
-    let spawned = spawn_logged(
+    let rendered = voro_core::render_message(msg.template, msg.session_ref, &prompt_path);
+    let mut spawned = spawn_logged(
         ctx,
         label,
         &prompt_path,
-        &command,
+        &rendered.command,
         &msg.cwd,
         msg.session_ref.to_string(),
     )?;
-    let summary = format!(
-        "message sent to task {}'s session — log {}",
-        msg.task_id,
-        spawned.log_path.display()
-    );
-    reap_expansion(spawned, ctx.launch_log_path());
-    Ok(summary)
+    // An exit inside the window is only a failure if it failed: a verb that
+    // says its piece and returns cleanly has delivered the message.
+    if let Some(status) = wait_for_early_exit(&mut spawned.child, ctx.message_grace)
+        && !status.success()
+    {
+        append_launch_log(
+            &ctx.launch_log_path(),
+            &format!("{}: exited with {status}", spawned.label),
+        );
+        return Err(format!(
+            "the message was refused by '{}' ({status}){}",
+            msg.template
+                .split_whitespace()
+                .next()
+                .unwrap_or("the agent"),
+            log_tail_note(&spawned.log_path)
+        ));
+    }
+    Ok(SentMessage {
+        spawned,
+        task_id: msg.task_id,
+        new_session_ref: rendered.new_session_ref,
+    })
+}
+
+/// Poll a freshly spawned child for up to `grace`, returning its status if it
+/// exits in that window and `None` if it is still going (or could not be
+/// waited on, which is not evidence either way). A zero grace is a single look.
+fn wait_for_early_exit(child: &mut Child, grace: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(MESSAGE_POLL_INTERVAL.min(grace));
+    }
+}
+
+/// The last line a failed send wrote, for the status line — the agent's own
+/// account of why it refused, which is otherwise only in the log file. Empty
+/// when there is nothing to quote.
+fn log_tail_note(path: &Path) -> String {
+    let Ok(mut file) = File::open(path) else {
+        return String::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if file
+        .seek(SeekFrom::Start(len.saturating_sub(LOG_TAIL_BYTES)))
+        .is_err()
+    {
+        return String::new();
+    }
+    let mut tail = String::new();
+    if file.read_to_string(&mut tail).is_err() {
+        return String::new();
+    }
+    match tail.lines().rev().find(|l| !l.trim().is_empty()) {
+        Some(line) => format!(": {}", line.trim().chars().take(160).collect::<String>()),
+        None => String::new(),
+    }
 }
 
 /// Where dispatch finds its inputs and puts its artefacts. Built from the
@@ -942,6 +1062,11 @@ pub struct DispatchCtx {
     /// agent that defines a `sessions` verb, before giving up (the ref stays
     /// NULL and the summary says so). Zero means a single attempt.
     pub ref_capture_timeout: Duration,
+    /// How long a quick message's process gets to prove it started before the
+    /// send is treated as having landed (DESIGN.md §8). Long enough for a
+    /// refusal — which is immediate — to be caught, short enough that the TUI
+    /// does not visibly stall. Zero means a single look.
+    pub message_grace: Duration,
 }
 
 impl DispatchCtx {
@@ -958,6 +1083,7 @@ impl DispatchCtx {
             agents_path: AgentsConfig::default_path(),
             runtime_dir,
             ref_capture_timeout: Duration::from_secs(5),
+            message_grace: MESSAGE_GRACE,
         }
     }
 
@@ -1516,6 +1642,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         (store, ctx, project)
     }
@@ -2098,6 +2225,7 @@ mod tests {
         // give the stub time to write the line before capture's single poll
         let ctx = DispatchCtx {
             ref_capture_timeout: Duration::from_secs(3),
+            message_grace: std::time::Duration::from_millis(300),
             ..ctx
         };
         let summary = dispatch(&mut store, &ctx, id, None).unwrap();

@@ -2451,6 +2451,7 @@ mod tests {
             agents_path: agents_path.clone(),
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         let mut s = store();
         let call = |s: &mut Store, args: &[&str]| {
@@ -2496,6 +2497,7 @@ mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         let mut s = store();
         let call = |s: &mut Store, args: &[&str]| {
@@ -4019,6 +4021,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         }
     }
 
@@ -4491,6 +4494,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         ok(
             &mut store,
@@ -4570,6 +4574,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         (store, ctx, project)
     }

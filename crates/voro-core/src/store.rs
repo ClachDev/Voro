@@ -1241,6 +1241,28 @@ impl Store {
         self.session(id)
     }
 
+    /// Record what a confirmed headless send did to a session (DESIGN.md §8):
+    /// the process now carrying the turn, and — where the agent forked rather
+    /// than resumed in place — the reference the conversation continues under.
+    /// One statement, so a reconcile in another window never reads the new
+    /// reference beside the old process or the reverse.
+    pub fn record_session_send(
+        &mut self,
+        id: i64,
+        session_ref: Option<&str>,
+        pid: i64,
+    ) -> Result<Session> {
+        let changed = self.conn.execute(
+            "UPDATE sessions SET pid = ?1, session_ref = COALESCE(?2, session_ref)
+             WHERE id = ?3",
+            params![pid, session_ref, id],
+        )?;
+        if changed == 0 {
+            return Err(Error::SessionNotFound(id));
+        }
+        self.session(id)
+    }
+
     /// Close a session with its outcome, stamping `ended_at`.
     pub fn end_session(&mut self, id: i64, outcome: SessionOutcome) -> Result<Session> {
         if set_session_outcome(&self.conn, id, outcome)? == 0 {
@@ -3517,6 +3539,35 @@ mod tests {
 
         assert!(matches!(
             s.set_session_ref(999, "x"),
+            Err(Error::SessionNotFound(999))
+        ));
+    }
+
+    /// A confirmed send moves the session's process to the one carrying the
+    /// turn, and follows the fork when the agent opened a new reference — but a
+    /// send that resumed in place must not blank the reference it already had.
+    #[test]
+    fn record_session_send_moves_the_pid_and_follows_a_fork() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+        let opened = s
+            .create_session(task_id, "claude", Some(1234), None)
+            .unwrap();
+        s.set_session_ref(opened.id, "first-ref").unwrap();
+
+        let resumed = s.record_session_send(opened.id, None, 4321).unwrap();
+        assert_eq!(resumed.pid, Some(4321));
+        assert_eq!(resumed.session_ref.as_deref(), Some("first-ref"));
+
+        let forked = s
+            .record_session_send(opened.id, Some("forked-ref"), 5678)
+            .unwrap();
+        assert_eq!(forked.pid, Some(5678));
+        assert_eq!(forked.session_ref.as_deref(), Some("forked-ref"));
+        assert_eq!(s.session(opened.id).unwrap(), forked);
+
+        assert!(matches!(
+            s.record_session_send(999, None, 1),
             Err(Error::SessionNotFound(999))
         ));
     }

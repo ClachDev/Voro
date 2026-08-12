@@ -15,11 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it straight into the task's recorded agent session, headlessly, without
   suspending the cockpit — for a `needs-input`, `review`, or `waiting` task
   whose session is between turns. On a review or waiting task the message *is*
-  the rejection: the feedback is appended to the body and logged before
-  anything is sent. The interactive jump-in moves from `a` to `A`. Agents
-  declare the capability with a new optional `message` verb (`{session}` plus
-  `{prompt_file}`), built in for `claude`; an agent without one, such as
-  `codex`, reports so on the status line and keeps its jump-in.
+  the rejection: the send goes first and the feedback is appended to the body
+  and logged behind it, so a message the agent refuses leaves the task
+  untouched rather than recording feedback nobody received. The interactive
+  jump-in moves from `a` to `A`. Agents declare the capability with a new
+  optional `message` verb (`{session}` plus `{prompt_file}`, and the optional
+  `{new_session}` for an agent that can only be joined by forking — which is
+  how the built-in `claude` verb reaches a session its supervisor still holds),
+  built in for `claude`; an agent without one, such as `codex`, reports so on
+  the status line and keeps its jump-in.
 - `voro set <id> --unlink <kind>:<other-id>` drops a single dependency edge —
   `related:7`, `discovered-from:4`, `blocks:9` — named as `voro show` lists it.
   A pair of tasks carrying two edges keeps the one not named, so an edge
