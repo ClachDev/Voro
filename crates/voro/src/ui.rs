@@ -568,7 +568,7 @@ fn draw_cockpit(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     let running_height = if app.running.is_empty() {
         0
     } else {
-        (app.running.len() as u16 + 2).clamp(3, 6)
+        (app.running.len() as u16 + 2).clamp(3, 10)
     };
     let [header, queue, detail, running, status] = Layout::vertical([
         Constraint::Length(1),
@@ -2399,6 +2399,89 @@ mod tests {
             column(&strip[waiting_at], "dependency bump"),
             "the strip's title column moved between row kinds:\n{out}"
         );
+    }
+
+    /// A full slate of in-flight work — the dispatch cap's worth of running
+    /// sessions plus the hand-offs that do not count against it — fits on the
+    /// strip at once rather than being cut off behind a scroll.
+    #[test]
+    fn a_full_slate_of_in_flight_work_all_shows_on_the_strip() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let mut task = |title: &str| {
+            store
+                .create_task(NewTask {
+                    project_id: p.id,
+                    repo_id: None,
+                    title: title.into(),
+                    body: String::new(),
+                    priority: Priority::P2,
+                    state: TaskState::Ready,
+                    agent: None,
+                    human: false,
+                    deep: false,
+                })
+                .unwrap()
+                .id
+        };
+        let running: Vec<(i64, String)> = (1..=6)
+            .map(|n| {
+                let title = format!("under way {n}");
+                (task(&title), title)
+            })
+            .collect();
+        let handed_off: Vec<(i64, String)> = (1..=2)
+            .map(|n| {
+                let title = format!("handed off {n}");
+                (task(&title), title)
+            })
+            .collect();
+
+        for (id, _) in &running {
+            store.record_dispatch(*id, "claude", None, None).unwrap();
+        }
+        for (id, _) in &handed_off {
+            store.record_dispatch(*id, "claude", None, None).unwrap();
+            store.apply(*id, Action::Complete(None)).unwrap();
+            store.apply(*id, Action::HandOff).unwrap();
+        }
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let app = App::new(store, ctx).unwrap();
+        assert_eq!(app.running.len(), 8, "the fixture must fill the strip");
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        terminal
+            .draw(|f| draw_cockpit(f, &app, &mut HitMap::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let lines: Vec<String> = buffer
+            .content()
+            .chunks(buffer.area().width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect();
+        let out = lines.join("\n");
+
+        // The detail pane names the selected task too, so read the strip's own
+        // rows: everything below its block header.
+        let strip = lines
+            .iter()
+            .position(|l| l.contains("Running"))
+            .map(|i| &lines[i + 1..])
+            .unwrap_or_else(|| panic!("no running strip was drawn:\n{out}"));
+        for (_, title) in running.iter().chain(handed_off.iter()) {
+            assert!(
+                strip.iter().any(|l| l.contains(title.as_str())),
+                "{title} did not fit on the strip:\n{out}"
+            );
+        }
     }
 
     /// End-to-end through the real cockpit draw (DESIGN.md §6/§9): a refine
