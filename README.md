@@ -57,9 +57,11 @@ The cockpit has four screens — **Cockpit** (the next-action queue), **Tasks**
 (every task), **Projects**, and **Config**, which lists the agents Voro will
 dispatch to with the command each one runs, the viewers it opens diffs in, and
 the path of the `voro.toml` they were resolved from. `tab` cycles between them
-and `1`–`4` jump straight to one; `j`/`k` move the selection, and the footer
-always shows the keys that apply to what you have selected. The walkthrough
-below drives one task from nothing to a reviewed diff.
+and `alt-1`–`alt-4` jump straight to one; `j`/`k` move the selection, and the
+footer always shows the keys that apply to what you have selected. A bare digit
+sets the number on the row you have selected — `0`–`3` a task's priority on the
+Cockpit and Tasks screens, `0`–`5` a project's weight on the Projects screen.
+The walkthrough below drives one task from nothing to a reviewed diff.
 
 **1. Register a project.** A first launch against an empty database already
 opens on the Projects screen — `tab` is the way there any other time. Press `a`
