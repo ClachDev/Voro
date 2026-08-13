@@ -575,7 +575,7 @@ fn draw_cockpit(frame: &mut Frame, app: &App, hits: &mut HitMap) {
         Constraint::Length(queue_height),
         Constraint::Min(5),
         Constraint::Length(running_height),
-        Constraint::Length(1),
+        Constraint::Length(status_height(app, frame.area())),
     ])
     .areas(frame.area());
 
@@ -1403,8 +1403,11 @@ fn format_elapsed(secs: i64) -> String {
 }
 
 fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
-    let [list_area, status] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+    let [list_area, status] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(status_height(app, frame.area())),
+    ])
+    .areas(frame.area());
 
     let items: Vec<ListItem> = app
         .all
@@ -1518,8 +1521,11 @@ fn blocker_spans(row: &TaskRow) -> Vec<Span<'static>> {
 /// An archived project stays on this screen, dim and tagged, so it can be
 /// found and unarchived (§5).
 fn draw_projects(frame: &mut Frame, app: &App, hits: &mut HitMap) {
-    let [list_area, status] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+    let [list_area, status] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(status_height(app, frame.area())),
+    ])
+    .areas(frame.area());
 
     let items: Vec<ListItem> = app
         .projects
@@ -1586,8 +1592,11 @@ fn draw_projects(frame: &mut Frame, app: &App, hits: &mut HitMap) {
 /// viewers, with the legacy anonymous `[viewer]` shown read-only beneath them. A
 /// file that failed to parse is surfaced here rather than rendering empty.
 fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
-    let [main, status] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+    let [main, status] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(status_height(app, frame.area())),
+    ])
+    .areas(frame.area());
 
     if let Some(err) = &app.config_error {
         let para = Paragraph::new(vec![
@@ -1718,11 +1727,52 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     draw_status(frame, app, status);
 }
 
+/// How many lines the status region needs at this frame size (DESIGN.md §9).
+/// The key line is always one; a message takes as many as it wraps to, up to
+/// half the screen — a message Voro cannot fit in half a terminal is past the
+/// point where growing the region further helps.
+fn status_height(app: &App, area: Rect) -> u16 {
+    let Some(msg) = &app.status else {
+        return 1;
+    };
+    let needed = wrap_status(msg, area.width).len() as u16;
+    needed.clamp(1, (area.height / 2).max(1))
+}
+
+/// Greedy word wrap for the status line. Voro's errors end with the actionable
+/// half — the key to press instead — so truncating them at the pane width hides
+/// exactly the part worth reading (DESIGN.md §9). Wrapping here rather than
+/// through `Wrap` keeps the drawn line count knowable before the layout is
+/// split, so the region can be sized to the message. A word wider than the pane
+/// gets its own line and truncates there, having nowhere else to go.
+fn wrap_status(msg: &str, width: u16) -> Vec<String> {
+    let width = width.max(1) as usize;
+    let mut lines = Vec::new();
+    for paragraph in msg.split('\n') {
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let fits = Span::raw(current.as_str()).width() + 1 + Span::raw(word).width() <= width;
+            if !current.is_empty() && !fits {
+                lines.push(std::mem::take(&mut current));
+            }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        lines.push(current);
+    }
+    lines
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     // A red status message overrides the key line, as before.
     if let Some(msg) = &app.status {
-        let line = Line::from(Span::styled(msg.clone(), Style::new().fg(Color::Red)));
-        frame.render_widget(line, area);
+        let lines: Vec<Line> = wrap_status(msg, area.width)
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, Style::new().fg(Color::Red))))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), area);
         return;
     }
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -2100,6 +2150,198 @@ pub fn popup_area(frame: &mut Frame, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use voro_core::{Priority, Task, TaskState};
+
+    /// The refusal `g` gives on a checkout `gh` cannot address (DESIGN.md §8) —
+    /// the shape every wrapping test here cares about: long, and closing on the
+    /// key to press instead.
+    const GH_REFUSAL: &str = "/home/michael/Projects/demoproj is not a GitHub repository, \
+         so there is no pull request to open — use `o` to see this task's diff in a viewer";
+
+    /// Every screen's status region, read back as one whitespace-normalised
+    /// string, so a message that wrapped across rows reads as itself again.
+    fn screen_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        rows.join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// An app showing `status`, over `queued` ready tasks and `running`
+    /// dispatched ones — the two counts are what decide how much of the cockpit
+    /// the queue and the running strip claim.
+    fn app_with_status(status: &str, queued: usize, running: usize) -> crate::app::App {
+        use voro_core::{NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let mut task = |title: String| {
+            store
+                .create_task(NewTask {
+                    project_id: p.id,
+                    repo_id: None,
+                    title,
+                    body: String::new(),
+                    priority: Priority::P2,
+                    state: TaskState::Ready,
+                    agent: None,
+                    human: false,
+                    deep: false,
+                })
+                .unwrap()
+                .id
+        };
+        for i in 0..queued {
+            task(format!("queued {i}"));
+        }
+        let live: Vec<i64> = (0..running).map(|i| task(format!("live {i}"))).collect();
+        for id in live {
+            store.record_dispatch(id, "claude", None, None).unwrap();
+        }
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = crate::app::App::new(store, ctx).unwrap();
+        app.status = Some(status.into());
+        app
+    }
+
+    #[test]
+    fn wrap_status_breaks_on_words_and_keeps_every_one() {
+        let lines = wrap_status(GH_REFUSAL, 40);
+        assert!(lines.len() > 1, "{lines:?}");
+        for line in &lines {
+            assert!(
+                line.chars().count() <= 40,
+                "{line:?} is wider than the pane"
+            );
+        }
+        assert_eq!(
+            lines.join(" ").split_whitespace().collect::<Vec<_>>(),
+            GH_REFUSAL.split_whitespace().collect::<Vec<_>>(),
+        );
+    }
+
+    /// A word with nowhere to break — a long path — takes its own line rather
+    /// than pushing the rest of the message off the pane.
+    #[test]
+    fn wrap_status_gives_an_overlong_word_its_own_line() {
+        let lines = wrap_status("at /a/very/long/path/that/exceeds/the/pane use `o`", 12);
+        assert_eq!(
+            lines,
+            vec!["at", "/a/very/long/path/that/exceeds/the/pane", "use `o`"]
+        );
+    }
+
+    /// The bug this fixes: at an ordinary terminal width the closing half of an
+    /// error — the part naming what to press instead — was cut off. The cockpit
+    /// now grows its status region to fit the whole message.
+    #[test]
+    fn cockpit_status_wraps_instead_of_truncating() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let app = app_with_status(GH_REFUSAL, 1, 0);
+        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+
+        let normalised = GH_REFUSAL.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            screen_text(&terminal).contains(&normalised),
+            "the whole message should be on screen, got:\n{}",
+            screen_text(&terminal)
+        );
+    }
+
+    /// A cockpit whose queue and running strip are both at their tallest still
+    /// shows the message whole — three times the length of the longest real
+    /// one, on a narrow screen — the panes above it giving up the rows.
+    #[test]
+    fn a_crowded_cockpit_still_shows_the_whole_message() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let long = format!("{GH_REFUSAL} {GH_REFUSAL} {GH_REFUSAL}");
+        let app = app_with_status(&long, 20, 12);
+        let mut terminal = Terminal::new(TestBackend::new(70, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+
+        let normalised = long.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            screen_text(&terminal).contains(&normalised),
+            "the whole message should survive a full cockpit, got:\n{}",
+            screen_text(&terminal)
+        );
+    }
+
+    /// The same holds on every other screen, since each splits its own layout.
+    #[test]
+    fn every_screen_wraps_a_long_status() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+        let normalised = GH_REFUSAL.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (key, screen) in [
+            ('2', Screen::Tasks),
+            ('3', Screen::Projects),
+            ('4', Screen::Config),
+        ] {
+            let mut app = app_with_status(GH_REFUSAL, 1, 0);
+            app.on_key(KeyEvent::from(KeyCode::Char(key)));
+            assert_eq!(app.screen, screen);
+            // Switching screens is free to clear the message; re-arm it.
+            app.status = Some(GH_REFUSAL.into());
+
+            let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw(f, &app);
+                })
+                .unwrap();
+            assert!(
+                screen_text(&terminal).contains(&normalised),
+                "{screen:?} truncated the message:\n{}",
+                screen_text(&terminal)
+            );
+        }
+    }
+
+    /// A short message and the key line still occupy one row, so the panes keep
+    /// the space they had whenever there is nothing long to say.
+    #[test]
+    fn status_region_stays_one_line_for_short_messages() {
+        let area = Rect::new(0, 0, 110, 24);
+        let mut app = app_with_status("task 9 has no session on record", 1, 0);
+        assert_eq!(status_height(&app, area), 1);
+        app.status = None;
+        assert_eq!(status_height(&app, area), 1);
+    }
+
+    /// The region grows only to half the screen: a terminal too small to hold
+    /// the message is better served by keeping its lists than by burying them.
+    #[test]
+    fn status_region_stops_at_half_the_screen() {
+        let app = app_with_status(&GH_REFUSAL.repeat(20), 1, 0);
+        assert_eq!(status_height(&app, Rect::new(0, 0, 40, 24)), 12);
+        assert_eq!(status_height(&app, Rect::new(0, 0, 40, 3)), 1);
+    }
 
     /// End-to-end: the Config screen renders the read-only agents (with the
     /// default marked) over the editable named viewers, drawn through the real
