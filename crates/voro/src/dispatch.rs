@@ -1142,12 +1142,12 @@ pub fn dispatch(
 }
 
 /// Open a `review` (or `running`) task's diff in a viewer (DESIGN.md §11a): the
-/// viewer medium of the per-project review action (§8). A dispatched agent works
+/// only local-diff spelling (§8). A dispatched agent works
 /// in a throwaway worktree on the task's branch, so the diff lives there, not in
 /// the primary checkout — the viewer is run in that worktree when the task has a
 /// live one, falling back to the task's resolved repo when it has no branch or no worktree
 /// (§8). `viewer_override` names a `[viewers.<name>]` entry; `None` falls back to
-/// the project's review action or the config default. The viewer template gets
+/// the viewer the project names, or the config default. The viewer template gets
 /// `{path}` (the resolved dir), `{branch}` (the task's branch, empty when none),
 /// and `{base}` (the checkout's default branch) so it can express a diff range.
 /// Opening never touches task state, so there is no clean-tree guard (the diff
@@ -1170,10 +1170,9 @@ pub fn open(
     // second repo has its branch and worktree there (DESIGN.md §8).
     let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
 
-    // The project's review action names the viewer its local diffs open in
-    // (DESIGN.md §8), which is all that setting still decides.
-    let project_viewer = project.review_action.viewer().map(str::to_string);
-    let viewer_name = viewer_override.map(str::to_string).or(project_viewer);
+    let viewer_name = viewer_override
+        .map(str::to_string)
+        .or_else(|| project.viewer.clone());
 
     let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     let viewer = config
@@ -2614,9 +2613,9 @@ mod tests {
 
     /// The two named-viewer selection paths (DESIGN.md §8/§11a): an explicit
     /// override picks its `[viewers.<name>]` entry over the default, and with
-    /// no override the project's `viewer:<name>` review action picks one.
+    /// no override the viewer the project names picks one.
     #[test]
-    fn open_picks_the_named_viewer_from_override_or_project_action() {
+    fn open_picks_the_named_viewer_from_override_or_project() {
         let (mut store, ctx, project) = fixture("cat {prompt_file}");
         std::fs::write(
             &ctx.agents_path,
@@ -2639,12 +2638,7 @@ mod tests {
         std::fs::remove_file(&marker).unwrap();
 
         let project_id = store.task(id).unwrap().project_id;
-        store
-            .set_review_action(
-                project_id,
-                &voro_core::ReviewAction::Viewer(Some("special".into())),
-            )
-            .unwrap();
+        store.set_viewer(project_id, Some("special")).unwrap();
         open(&mut store, &ctx, id, None).unwrap();
         for _ in 0..50 {
             if marker.exists() {

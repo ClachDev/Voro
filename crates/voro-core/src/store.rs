@@ -5,8 +5,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    Dep, DepKind, DepRef, Doc, Event, Priority, Project, RefineOutcome, Repo, ReviewAction,
-    RunningRow, Session, SessionOutcome, Task, TaskState, location_is_url,
+    Dep, DepKind, DepRef, Doc, Event, Priority, Project, RefineOutcome, Repo, RunningRow, Session,
+    SessionOutcome, Task, TaskState, location_is_url,
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -27,6 +27,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0015_dep_kind_in_key.sql"),
     include_str!("../migrations/0016_add_refining_state.sql"),
     include_str!("../migrations/0017_schema_migrations.sql"),
+    include_str!("../migrations/0018_project_viewer.sql"),
 ];
 
 /// Whether a path lies inside a Cargo build directory — a `target` component
@@ -453,12 +454,21 @@ impl Store {
         Ok(())
     }
 
-    /// Set how `pr` shows this project's review diffs (DESIGN.md §8/§11a).
-    /// `Auto` stores NULL — the medium goes back to being resolved at use.
-    pub fn set_review_action(&mut self, project_id: i64, action: &ReviewAction) -> Result<Project> {
+    /// Name the `voro.toml` viewer this project's local diffs open in
+    /// (DESIGN.md §8/§11a). `None` stores NULL — no viewer named, so `open`
+    /// falls back to the config's default viewer.
+    pub fn set_viewer(&mut self, project_id: i64, viewer: Option<&str>) -> Result<Project> {
+        let viewer = match viewer.map(str::trim) {
+            Some("") => {
+                return Err(Error::Invalid(
+                    "viewer name is required — name no viewer to use the default one".into(),
+                ));
+            }
+            named => named,
+        };
         let changed = self.conn.execute(
-            "UPDATE projects SET review_action = ?1 WHERE id = ?2",
-            params![action, project_id],
+            "UPDATE projects SET viewer = ?1 WHERE id = ?2",
+            params![viewer, project_id],
         )?;
         if changed == 0 {
             return Err(Error::ProjectNotFound(project_id));
@@ -1787,14 +1797,14 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     })
 }
 
-pub(crate) const PROJECT_COLUMNS: &str = "id, name, weight, review_action, archived";
+pub(crate) const PROJECT_COLUMNS: &str = "id, name, weight, viewer, archived";
 
 fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
         id: row.get(0)?,
         name: row.get(1)?,
         weight: row.get(2)?,
-        review_action: row.get(3)?,
+        viewer: row.get(3)?,
         archived: row.get(4)?,
     })
 }
@@ -2168,35 +2178,73 @@ mod tests {
     }
 
     #[test]
-    fn review_action_defaults_to_auto_and_round_trips() {
-        use crate::model::ReviewAction;
+    fn project_viewer_defaults_to_none_and_round_trips() {
         let mut s = Store::open_in_memory().unwrap();
         let p = s.create_project("proj", "/tmp/proj").unwrap();
-        assert_eq!(p.review_action, ReviewAction::Auto);
+        assert_eq!(p.viewer, None);
 
-        let action = ReviewAction::Viewer(Some("zed".into()));
-        let updated = s.set_review_action(p.id, &action).unwrap();
-        assert_eq!(updated.review_action, action);
-        assert_eq!(s.project(p.id).unwrap().review_action, action);
-        assert_eq!(s.projects().unwrap()[0].review_action, action);
+        let updated = s.set_viewer(p.id, Some("zed")).unwrap();
+        assert_eq!(updated.viewer.as_deref(), Some("zed"));
+        assert_eq!(s.project(p.id).unwrap().viewer.as_deref(), Some("zed"));
+        assert_eq!(s.projects().unwrap()[0].viewer.as_deref(), Some("zed"));
 
-        // Auto writes NULL, so the column reads back empty
-        s.set_review_action(p.id, &ReviewAction::Auto).unwrap();
-        assert_eq!(s.project(p.id).unwrap().review_action, ReviewAction::Auto);
+        // Naming no viewer writes NULL, so the column reads back empty
+        s.set_viewer(p.id, None).unwrap();
+        assert_eq!(s.project(p.id).unwrap().viewer, None);
         let raw: Option<String> = s
             .conn
-            .query_row(
-                "SELECT review_action FROM projects WHERE id = ?1",
-                [p.id],
-                |r| r.get(0),
-            )
+            .query_row("SELECT viewer FROM projects WHERE id = ?1", [p.id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(raw, None);
 
+        // A blank name is a typo, not a way to clear the viewer
         assert!(matches!(
-            s.set_review_action(999, &ReviewAction::Pr),
+            s.set_viewer(p.id, Some("  ")),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            s.set_viewer(999, Some("zed")),
             Err(Error::ProjectNotFound(999))
         ));
+    }
+
+    /// A database from before migration 0018 carries review actions in the
+    /// pre-split spellings (DESIGN.md §5/§8). Opening it must keep the viewer a
+    /// project named and read the three spellings that named none as none.
+    #[test]
+    fn migration_0018_reads_review_actions_as_viewer_names() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..17] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 17).unwrap();
+        conn.execute(
+            "INSERT INTO projects (name, review_action) VALUES
+                 ('named', 'viewer:zed'),
+                 ('bare-viewer', 'viewer'),
+                 ('auto', 'auto'),
+                 ('pinned-to-pr', 'pr'),
+                 ('unset', NULL)",
+            [],
+        )
+        .unwrap();
+
+        let mut store = Store::from_connection(conn).unwrap();
+        let viewer_of = |store: &mut Store, name: &str| {
+            store
+                .projects()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.name == name)
+                .unwrap()
+                .viewer
+        };
+        assert_eq!(viewer_of(&mut store, "named").as_deref(), Some("zed"));
+        for named_none in ["bare-viewer", "auto", "pinned-to-pr", "unset"] {
+            assert_eq!(viewer_of(&mut store, named_none), None, "{named_none}");
+        }
     }
 
     #[test]
