@@ -108,6 +108,18 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// `claude --bg` session keeps its supervisor process after finishing its turn,
 /// and that supervisor refuses a headless `--resume` for as long as it lives,
 /// so the plain resume was a send that could never land (DESIGN.md §8).
+///
+/// The claude `logs` verb replays a background session's screen, which is the
+/// only place a usage cap is legible (DESIGN.md §8): `claude agents --json`
+/// reports a capped session as plain `blocked`, the same word a permission
+/// prompt earns, and Voro's own launch log holds nothing but the backgrounding
+/// banner. Two details of the spelling are load-bearing. `claude logs` keys on
+/// the *job* id — the first eight characters of the session id — so `{session}`
+/// is truncated in the template rather than passed whole; and the output is a
+/// full screen replay of unbounded length, so it is tailed here rather than
+/// read whole by the caller. It exits zero when it finds no such job, printing
+/// a not-found line instead, which is why nothing reads its status: text with
+/// no cap signature in it means "not capped", however it came about.
 const BUILTIN_AGENTS: &str = "\
 [agents.claude]
 dispatch   = \"claude --bg --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
@@ -115,6 +127,7 @@ sessions   = \"claude agents --json\"
 attach     = \"claude attach {session}\"
 resume     = \"claude --resume {session}\"
 message    = \"claude -p --resume {session} --fork-session --session-id {new_session} \\\"$(cat {prompt_file})\\\"\"
+logs       = \"claude logs \\\"$(printf %.8s {session})\\\" 2>/dev/null | tail -c 20000\"
 plan       = \"claude --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
 model      = \"opus\"
 model_deep = \"fable\"
@@ -172,6 +185,11 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #                 ({session} and {prompt_file}, plus the optional
 #                 {new_session}: a fresh reference for an agent that can only
 #                 be joined by forking, which the session row then follows)
+#       logs      print a session's recent output               ({session})
+#                 Read for one thing: whether the session is sitting on a
+#                 usage cap, which is badged on the running strip and used to
+#                 tell a capped death from an ordinary one. Tail it in the
+#                 template — Voro reads whatever it prints.
 #       plan      run an interactive foreground planning session ({prompt_file})
 #     `plan` may carry `{session_name}` too, but not `{task_id}`: a planning
 #     session drafts a task rather than naming one.
@@ -267,6 +285,13 @@ pub struct AgentTemplate {
     /// message to that session's transcript and returns, owning no terminal
     /// (DESIGN.md §8). What the TUI's quick-message key fires.
     message: Option<String>,
+    /// A session's recent output, carrying [`SESSION_PLACEHOLDER`]: whatever
+    /// the agent can say about what one of its sessions is doing right now
+    /// (DESIGN.md §8). Voro reads it for one thing only — whether the session
+    /// is held at a usage cap ([`crate::read_cap`]) — so an agent that cannot
+    /// produce output for a session simply omits it, and Voro classifies a dead
+    /// session from the launch log as it always has and badges no live one.
+    logs: Option<String>,
     /// An interactive foreground command carrying [`PROMPT_FILE_PLACEHOLDER`],
     /// run by the TUI's planning flow (DESIGN.md §8) — no `{session}`, since a
     /// planning session belongs to no task or session row.
@@ -306,6 +331,10 @@ impl AgentTemplate {
 
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    pub fn logs(&self) -> Option<&str> {
+        self.logs.as_deref()
     }
 
     pub fn plan(&self) -> Option<&str> {
@@ -452,6 +481,15 @@ pub struct RenderedMessage {
     /// The fresh reference bound to `{new_session}`, or `None` for a template
     /// that resumes its session in place.
     pub new_session_ref: Option<String>,
+}
+
+/// Bind a session verb's one placeholder: the reference Voro captured at
+/// launch, shell-quoted so a reference carrying shell metacharacters reaches
+/// the agent as itself. Serves `logs`, whose whole contract is a session in and
+/// that session's recent output out.
+pub fn render_session(template: &str, session_ref: &str) -> String {
+    let session = shell_quote(Path::new(session_ref));
+    render(template, &[(SESSION_PLACEHOLDER, session.as_str())])
 }
 
 /// Bind a `message` template's placeholders in one pass, so no value's own
@@ -615,6 +653,7 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
         ("attach", &agent.attach),
         ("resume", &agent.resume),
         ("message", &agent.message),
+        ("logs", &agent.logs),
     ] {
         if let Some(template) = template
             && !template.contains(SESSION_PLACEHOLDER)
@@ -645,6 +684,7 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
         ("attach", &agent.attach),
         ("resume", &agent.resume),
         ("message", &agent.message),
+        ("logs", &agent.logs),
     ] {
         let Some(template) = template else { continue };
         if template.contains(MODEL_PLACEHOLDER) {
@@ -671,6 +711,7 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
         ("sessions", agent.sessions.as_deref()),
         ("attach", agent.attach.as_deref()),
         ("resume", agent.resume.as_deref()),
+        ("logs", agent.logs.as_deref()),
         ("plan", agent.plan.as_deref()),
     ] {
         if template.is_some_and(|t| t.contains(NEW_SESSION_PLACEHOLDER)) {
@@ -736,6 +777,7 @@ pub struct ResolvedAgent {
     pub attach: Option<String>,
     pub resume: Option<String>,
     pub message: Option<String>,
+    pub logs: Option<String>,
     pub plan: Option<String>,
     pub model: Option<String>,
     pub model_deep: Option<String>,
@@ -965,6 +1007,7 @@ impl AgentsConfig {
             attach: agent.attach.clone(),
             resume: agent.resume.clone(),
             message: agent.message.clone(),
+            logs: agent.logs.clone(),
             plan: agent.plan.clone(),
             model: agent.model.clone(),
             model_deep: agent.model_deep.clone(),
@@ -1108,6 +1151,7 @@ impl AgentsConfig {
             ("attach", builtin.attach.is_some(), user.attach.is_some()),
             ("resume", builtin.resume.is_some(), user.resume.is_some()),
             ("message", builtin.message.is_some(), user.message.is_some()),
+            ("logs", builtin.logs.is_some(), user.logs.is_some()),
             ("plan", builtin.plan.is_some(), user.plan.is_some()),
         ]
         .into_iter()
@@ -1781,6 +1825,7 @@ mod tests {
         for (verb, template) in [
             ("attach", "join {session} {new_session}"),
             ("resume", "reopen {session} {new_session}"),
+            ("logs", "tail {session} {new_session}"),
             ("plan", "plan --session-id {new_session} {prompt_file}"),
         ] {
             let text = format!(
@@ -1805,6 +1850,51 @@ mod tests {
         let message = builtin_agents()["claude"].message().unwrap();
         assert!(message.contains("--fork-session"), "{message}");
         assert!(message.contains(NEW_SESSION_PLACEHOLDER), "{message}");
+    }
+
+    #[test]
+    fn render_session_binds_the_reference_shell_quoted() {
+        assert_eq!(
+            render_session("claude logs \"$(printf %.8s {session})\"", "3f6c-1111"),
+            "claude logs \"$(printf %.8s '3f6c-1111')\""
+        );
+    }
+
+    /// The built-in `claude` defines `logs` and `codex` does not, which is the
+    /// per-verb degradation the whole verb set is built on: cap badging is a
+    /// claude capability, and codex dispatches exactly as before without one.
+    #[test]
+    fn only_the_claude_builtin_defines_logs() {
+        let config = AgentsConfig::load(Path::new("/nonexistent/voro.toml")).unwrap();
+        let claude = config.agent("claude").expect("the built-in claude");
+        assert!(claude.logs().expect("a logs verb").contains("claude logs"));
+        assert!(config.agent("codex").expect("codex").logs().is_none());
+    }
+
+    /// `logs` joins the session verbs on both rules: it must name the session
+    /// it reads, and it may not carry a launch placeholder that only `dispatch`
+    /// and `plan` can resolve.
+    #[test]
+    fn logs_is_validated_as_a_session_verb() {
+        for (logs, expected) in [
+            ("agent-logs --tail", SESSION_PLACEHOLDER),
+            ("agent-logs {session} --model {model}", MODEL_PLACEHOLDER),
+            ("agent-logs {session} --task {task_id}", TASK_ID_PLACEHOLDER),
+            (
+                "agent-logs {session} --name {session_name}",
+                SESSION_NAME_PLACEHOLDER,
+            ),
+        ] {
+            let toml = format!(
+                "[agents.a]\ndispatch = \"run {{prompt_file}}\"\nmodel = \"m\"\nlogs = \"{logs}\"\n"
+            );
+            let raw: RawConfig = toml::from_str(&toml).unwrap();
+            let err = validate_agent("a", &raw.agents["a"], Path::new("/c.toml"))
+                .expect_err("{logs} is refused");
+            let message = err.to_string();
+            assert!(message.contains("logs"), "{message}");
+            assert!(message.contains(expected), "{message}");
+        }
     }
 
     /// The one-pass rule (§8): a value carrying its own braces reaches the
