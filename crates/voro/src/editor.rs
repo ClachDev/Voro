@@ -173,22 +173,49 @@ pub fn run_editor(initial: &str) -> Result<String, String> {
         std::env::temp_dir().join(format!("voro-task-{}-{stamp}.md", std::process::id()));
     std::fs::write(&path, initial).map_err(|e| format!("cannot write {path:?}: {e}"))?;
 
-    let editor = std::env::var("EDITOR")
-        .or_else(|_| std::env::var("VISUAL"))
-        .unwrap_or_else(|_| "vi".to_string());
+    let (editor, source) = editor_command();
     let status = Command::new("sh")
         .arg("-c")
         .arg(format!("{editor} \"$VORO_EDIT_FILE\""))
         .env("VORO_EDIT_FILE", &path)
         .status()
-        .map_err(|e| format!("cannot launch editor '{editor}': {e}"))?;
+        .map_err(|e| format!("could not run {source} ({editor}): {e}"))?;
 
     let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read back: {e}"));
     let _ = std::fs::remove_file(&path);
     if !status.success() {
-        return Err(format!("editor exited with {status}"));
+        return Err(editor_failure(
+            source,
+            &editor,
+            status.code(),
+            &status.to_string(),
+        ));
     }
     text
+}
+
+/// The editor to run and the name to blame when it fails — the variable it came
+/// from, so the reader knows which one to fix.
+fn editor_command() -> (String, &'static str) {
+    if let Ok(editor) = std::env::var("EDITOR") {
+        return (editor, "$EDITOR");
+    }
+    if let Ok(editor) = std::env::var("VISUAL") {
+        return (editor, "$VISUAL");
+    }
+    ("vi".to_string(), "the default editor")
+}
+
+/// How an editor that exited non-zero should read. The shell's 127 and 126 are
+/// its own codes rather than the editor's, and mean the command line could not
+/// be run at all, so they are spelled out; anything else is the editor's own
+/// verdict and is reported as it stands.
+fn editor_failure(source: &str, editor: &str, code: Option<i32>, status: &str) -> String {
+    match code {
+        Some(127) => format!("could not run {source} ({editor}): not found"),
+        Some(126) => format!("could not run {source} ({editor}): not executable"),
+        _ => format!("{source} ({editor}) exited with {status}"),
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +224,35 @@ mod tests {
 
     const VALID: &str = "title: Fix parser\npriority: 1\nstate: parked\nagent: codex\n\
                          blocked-by: 3, 7\n---\nThe parser crashes on empty input.\n";
+
+    /// 127 is the shell's "no such command", which is what an `$EDITOR` typo
+    /// produces and what a non-developer cannot decode.
+    #[test]
+    fn a_missing_editor_names_the_command_and_the_variable() {
+        let message = editor_failure("$EDITOR", "definitely-not-an-editor", Some(127), "");
+        assert_eq!(
+            message,
+            "could not run $EDITOR (definitely-not-an-editor): not found"
+        );
+    }
+
+    /// A file that exists but cannot be executed is a different fix.
+    #[test]
+    fn an_unexecutable_editor_says_so() {
+        let message = editor_failure("$VISUAL", "./notes.md", Some(126), "");
+        assert_eq!(
+            message,
+            "could not run $VISUAL (./notes.md): not executable"
+        );
+    }
+
+    /// The editor's own non-zero exit is its verdict, not the shell's, so it
+    /// is passed through — still named, so the reader knows what exited.
+    #[test]
+    fn an_editors_own_failure_is_reported_as_it_stands() {
+        let message = editor_failure("$EDITOR", "nvim", Some(1), "exit status: 1");
+        assert_eq!(message, "$EDITOR (nvim) exited with exit status: 1");
+    }
 
     #[test]
     fn parses_all_fields() {

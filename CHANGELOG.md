@@ -99,6 +99,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Two errors a first-time user is likeliest to meet now say what to do about
+  them. An editor that will not run reports the variable and the command it
+  came from rather than a bare exit code — `could not run $EDITOR
+  (definitely-not-an-editor): not found` in place of `editor exited with exit
+  status: 127` — and a missing `gh` is named as the GitHub CLI, with where to
+  install it, instead of an `os error 2` that reads as if the checkout were
+  missing.
 - A headless `voro refine` is no longer marked `⚠ refine failed` seconds after
   it starts. The round runs the agent's own `dispatch` template, so under a
   `claude --bg`-style launcher the pid Voro recorded belonged to a launcher that
