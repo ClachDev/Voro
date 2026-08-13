@@ -58,7 +58,8 @@ The cockpit has three screens — **Cockpit** (the next-action queue), **Tasks**
 selection, and the footer always shows the keys that apply to what you have
 selected. The walkthrough below drives one task from nothing to a reviewed diff.
 
-**1. Register a project.** Go to the Projects screen (`tab` to it) and press `a`
+**1. Register a project.** A first launch against an empty database already
+opens on the Projects screen — `tab` is the way there any other time. Press `a`
 to add one — Voro asks for a name and a path. Press `0`–`5` on a project to set
 its weight: the higher the weight, the harder that project's tasks pull toward the
 top of the queue.
