@@ -370,6 +370,13 @@ fn state_jump_verb(state: TaskState) -> Option<JumpVerb> {
 /// because its session is dead: a headless resume there would restart the work
 /// with no tracked pid and no session row, invisible to the reconciler.
 /// Redispatch is the honest path for that, and `A` the one for the rest.
+/// What a nudged session is told (DESIGN.md §8). One word, because the session
+/// already holds the whole task: its transcript, its worktree and whatever it
+/// had half-written when the window closed. Anything longer would be Voro
+/// restating a brief the agent can already read, and would risk redirecting work
+/// that was only ever interrupted.
+const NUDGE: &str = "continue";
+
 fn state_accepts_message(state: TaskState) -> bool {
     matches!(
         state,
@@ -1542,6 +1549,7 @@ impl App {
             // same pairing as `r`/`R` (DESIGN.md §9).
             KeyCode::Char('a') => self.message_session(),
             KeyCode::Char('A') => self.jump_into_session(),
+            KeyCode::Char('u') => self.nudge_capped(),
             KeyCode::Char('l') => self.view_session_log(),
             KeyCode::Char('w') => self.hand_off_selected(),
             _ => {}
@@ -2064,6 +2072,114 @@ impl App {
             kind: PromptKind::SessionMessage,
             buffer: String::new(),
         };
+    }
+
+    /// Nudge every cap-stuck session whose window has reopened (DESIGN.md §8).
+    ///
+    /// A usage cap ends a session's turn and leaves it sitting there: nothing
+    /// retries, so the work waits for a human however long ago the window
+    /// reopened. Walking the strip by hand costs an attach, a typed word and a
+    /// detach per session, which is why the reset hours go missing overnight.
+    /// This is that walk as one key.
+    ///
+    /// It deliberately fires nothing on its own. The sweep is the operator
+    /// saying "the window is open, go" — there is no daemon, and an agent that
+    /// resumed unwatched on a mis-read badge would be worse than a lost hour.
+    ///
+    /// Both guards the quick-message key answers to are stood down here, and the
+    /// cap reading is what earns that: [`state_accepts_message`] refuses a
+    /// `running` task because its session is mid-turn, and `send_session_message`
+    /// refuses a session that is still up — but a capped session is precisely
+    /// one that is up, `running`, and *not* mid-turn. Nothing else in the cockpit
+    /// can tell those apart, so nothing else may skip the guards.
+    fn nudge_capped(&mut self) {
+        let now = self.now_minutes;
+        // A cap whose time never parsed is the operator's call, not the clock's:
+        // they pressed the key, and a nudge sent early is refused by the agent
+        // rather than doing harm.
+        let (mut ready, mut waiting): (Vec<i64>, Vec<i64>) = (Vec::new(), Vec::new());
+        for (id, reading) in &self.caps {
+            let due =
+                reading.reset_minutes.is_none() || now.is_some_and(|now| reading.reset_passed(now));
+            if due { &mut ready } else { &mut waiting }.push(*id);
+        }
+        // A sweep visits the strip in a stable order rather than the map's.
+        ready.sort_unstable();
+        if ready.is_empty() {
+            self.status = Some(if waiting.is_empty() {
+                "no session is capped".into()
+            } else {
+                format!(
+                    "{} capped session{} — none has reached its reset yet",
+                    waiting.len(),
+                    if waiting.len() == 1 { "" } else { "s" }
+                )
+            });
+            return;
+        }
+
+        let mut sent = 0usize;
+        let mut refused: Vec<String> = Vec::new();
+        for task_id in ready {
+            match self.nudge_one(task_id) {
+                Ok(()) => {
+                    sent += 1;
+                    // The badge goes at once rather than waiting out the probe
+                    // interval, so a second press cannot put a second agent on
+                    // the same worktree. A session that is still capped when the
+                    // next reading lands badges again.
+                    self.caps.remove(&task_id);
+                }
+                Err(e) => refused.push(format!("{task_id}: {e}")),
+            }
+        }
+
+        let mut note = format!(
+            "nudged {sent} capped session{}",
+            if sent == 1 { "" } else { "s" }
+        );
+        if !waiting.is_empty() {
+            note.push_str(&format!(" — {} still before its reset", waiting.len()));
+        }
+        if !refused.is_empty() {
+            note.push_str(&format!(" — refused {}", refused.join("; ")));
+        }
+        self.status = Some(note);
+        let refreshed = self.refresh();
+        self.report(refreshed);
+    }
+
+    /// Say [`NUDGE`] into one capped session and record the send, exactly as the
+    /// quick-message key does — the same verb, the same forked reference, the
+    /// same tracked pid — so a nudged session stays as visible to the reconciler
+    /// as a messaged one.
+    fn nudge_one(&mut self, task_id: i64) -> Result<(), String> {
+        let target = self
+            .message_target(task_id)
+            .ok_or_else(|| self.status.clone().unwrap_or_else(|| "no session".into()))?;
+        let cwd = self.task_checkout(task_id).map_err(|e| e.to_string())?;
+        let sent = crate::dispatch::send_message(
+            &self.dispatch_ctx,
+            crate::dispatch::SessionMessage {
+                task_id,
+                template: &target.template,
+                session_ref: &target.session_ref,
+                message: NUDGE,
+                cwd,
+            },
+        )?;
+        let pid = sent.pid();
+        if let Err(e) =
+            self.store
+                .record_session_send(target.session_id, sent.new_session_ref(), pid)
+        {
+            sent.abandon();
+            return Err(format!(
+                "recording the send failed ({e}); the spawned agent (pid {pid}) was killed"
+            ));
+        }
+        sent.confirm(&self.dispatch_ctx);
+        Ok(())
     }
 
     /// Resolve what a quick message needs, reporting whichever piece is missing
@@ -5434,13 +5550,19 @@ mod tests {
         } else {
             String::new()
         };
+        // The nudge sweep (task #416) goes out through the same `message` verb
+        // the quick-message key uses, so the stub defines one that records what
+        // it was told and exits — a delivered send, as far as the caller can see.
+        let delivered = project_path.parent().unwrap().join("delivered.txt");
         std::fs::write(
             &ctx.agents_path,
             format!(
                 "default_agent = \"stub\"\n\n[agents.stub]\n\
                  dispatch = \"cat {{prompt_file}} && sleep 30\"\n\
-                 sessions = \"cat '{}'\"\n{logs}",
-                listing.display()
+                 sessions = \"cat '{}'\"\n\
+                 message = \"cat {{prompt_file}} >> '{}' # {{session}}\"\n{logs}",
+                listing.display(),
+                delivered.display()
             ),
         )
         .unwrap();
@@ -5544,6 +5666,122 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(app.caps.is_empty(), "{:?}", app.caps);
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    // --- nudging capped sessions back to work (task #416) ---
+
+    /// What a nudge was told, if anything.
+    fn delivered(project_path: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(project_path.parent().unwrap().join("delivered.txt")).ok()
+    }
+
+    /// The headline case (DESIGN.md §8): one key puts every capped session whose
+    /// window has reopened back to work, without the operator visiting any of
+    /// them. Both the guards the quick-message key answers to are stood down —
+    /// the task is `running` and its session is listed live — because the cap
+    /// reading says the session is up and idle rather than mid-turn.
+    #[test]
+    fn u_nudges_a_capped_session_whose_window_has_reopened() {
+        let (mut app, task_id, project_path) =
+            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+        settle_cap(&mut app, task_id, true);
+        // An hour past the 21:50 the agent named.
+        app.now_minutes = Some(22 * 60 + 50);
+
+        key(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(
+            delivered(&project_path).as_deref().map(str::trim),
+            Some(NUDGE),
+            "the session was told to continue: {:?}",
+            app.status
+        );
+        assert!(
+            !app.caps.contains_key(&task_id),
+            "the badge goes with the nudge, so a second press cannot double it"
+        );
+        assert_eq!(
+            app.store.task(task_id).unwrap().state,
+            TaskState::Running,
+            "a nudge is a send, not a transition"
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("nudged 1")),
+            "{:?}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// A cap whose window has not reopened is left alone: nudging it would spend
+    /// a send on a session the agent will only refuse again, and the badge is
+    /// the operator's cue that there is nothing to do yet.
+    #[test]
+    fn u_leaves_a_capped_session_that_is_still_waiting() {
+        let (mut app, task_id, project_path) =
+            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+        settle_cap(&mut app, task_id, true);
+        // An hour short of the 21:50 the agent named.
+        app.now_minutes = Some(20 * 60 + 50);
+
+        key(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(delivered(&project_path), None, "nothing was sent");
+        assert!(
+            app.caps.contains_key(&task_id),
+            "the badge stands until the window opens"
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("none has reached its reset")),
+            "{:?}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// The key on a healthy fleet says so and sends nothing, so a stray press
+    /// costs no agent turns.
+    #[test]
+    fn u_on_an_uncapped_fleet_sends_nothing() {
+        let (mut app, _, project_path) = cap_env(true, "running the test suite");
+        for _ in 0..20 {
+            app.poll_cap_probes();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        key(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(delivered(&project_path), None);
+        assert_eq!(app.status.as_deref(), Some("no session is capped"));
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// A cap whose reset time never parsed is still nudgeable: the operator
+    /// pressing the key is the judgement the clock could not supply, and a send
+    /// that turns out to be early is refused by the agent rather than doing harm.
+    #[test]
+    fn u_nudges_a_cap_that_named_no_reset_time() {
+        let (mut app, task_id, project_path) = cap_env(true, "Weekly limit reached");
+        settle_cap(&mut app, task_id, true);
+        assert_eq!(app.caps[&task_id].reset_minutes, None);
+
+        key(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(
+            delivered(&project_path).as_deref().map(str::trim),
+            Some(NUDGE),
+            "{:?}",
+            app.status
+        );
 
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }

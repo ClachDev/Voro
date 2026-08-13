@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One key gets every capped session working again.** A usage cap ends a
+  session's turn and leaves it there — nothing retries — so recovering the fleet
+  used to mean attaching to each capped session in turn and typing "continue",
+  and the reset hours went missing overnight. `u` now sweeps every badged
+  session whose reset has passed, tells each to continue, and reports how many
+  it nudged, how many are still waiting on their window, and any the agent
+  refused. It fires only when you press it: there is no daemon, and an agent
+  resuming unwatched would cost more than a lost hour. Sessions already back at
+  work are untouched, and the badge drops as each nudge lands so a second press
+  cannot start a second agent on the same worktree.
+
 - **Capped sessions are visible instead of silently stuck.** A usage cap does
   not kill a backgrounded agent — the supervisor stays alive and waits for the
   window to reset — so capped work used to ride the running strip looking
@@ -202,6 +213,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--gh-repo owner/name`.
 
 ### Fixed
+
+- **A capped session's badge now shows the reset time it actually named.** Real
+  cap messages end with an upgrade prompt that mentions a usage limit of its
+  own, and that trailing mention was winning: it carries no time, so every
+  genuine cap badged as a bare `⚠ capped` and the strip could never say whether
+  the window had reopened. The prompt is now read as the boilerplate it is.
+  Verified against a real cap rather than the wordings this was first written
+  from.
+
+- **A quick message no longer wakes a session that cannot do anything.** The
+  `message` verb carried no `--permission-mode`, and the flag is per invocation
+  rather than a property of the session, so every resumed turn ran in ask mode
+  against a closed stdin: edits and commands stopped for approvals nobody could
+  give, and the refusals went to the launch log instead of the TUI. Sends looked
+  delivered and quietly did nothing.
 
 - Two errors a first-time user is likeliest to meet now say what to do about
   them. An editor that will not run reports the variable and the command it
