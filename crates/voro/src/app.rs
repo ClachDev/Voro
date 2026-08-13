@@ -4227,6 +4227,9 @@ mod tests {
         let path = ctx.agents_path.clone();
         let mut app = App::new(store, ctx).unwrap();
 
+        // No project is registered, so the app opened on Projects, where the
+        // digits are weights; the jump below is a cockpit key.
+        app.screen = Screen::Cockpit;
         key(&mut app, KeyCode::Char('4'));
         key(&mut app, KeyCode::Char('a'));
         type_str(&mut app, "emacsclient");
