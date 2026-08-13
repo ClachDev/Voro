@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use voro_core::{
-    ActionRow, DepKind, DepRef, DigestRow, EffectiveScore, Event, QueueRow, ReworkReport,
+    ActionRow, CompletionReport, DepKind, DepRef, DigestRow, EffectiveScore, Event, QueueRow,
     ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
 };
 
@@ -880,27 +880,24 @@ fn review_next_span(task: &voro_core::Task) -> Option<Span<'static>> {
     ))
 }
 
-/// A task's newest session, rendered for the attention states (tasks #73/#110).
-/// A finished session is a post-mortem: its outcome (`capped` yellow — it clears
-/// when the quota resets — `failed` red and wanting its log read), agent, and
-/// end time. An open one shows agent and start time. Both end on the log path
-/// the `l` key pages. States where the session is history rather than context
-/// (`done`, `rejected`, a redispatch-ready task) render nothing.
-/// The response to a rejection (DESIGN.md §8): the summary the rework came back
-/// with, rendered against the feedback it answers. This is the other half of
-/// making a re-review proportional to the fix — the operator reads *what the
-/// agent says it changed* here, and the diff since the rejected revision beside
-/// it, instead of rediscovering both from the whole PR. Only a task that has
-/// been sent back renders it; a first review's summary is the PR body and is
-/// read there.
-fn rework_lines(report: &ReworkReport) -> Vec<Line<'static>> {
-    let Some(summary) = &report.summary else {
-        return Vec::new();
+/// What the agent reported (DESIGN.md §8): the completion summary of the cycle
+/// in hand, rendered above the body — the body is the instruction that has
+/// already been carried out, the summary is the account of carrying it out, and
+/// the account is what a verdict is given against. It is the only such account
+/// a project with no PR and no configured viewer has, so the card cannot leave
+/// it to `voro show`. On a rework it is headed by the feedback it answers,
+/// which is the other half of making a re-review proportional to the fix — the
+/// operator reads *what the agent says it changed* here and the diff since the
+/// rejected revision beside it.
+fn completion_lines(report: &CompletionReport) -> Vec<Line<'static>> {
+    let heading = match report.feedback {
+        Some(_) => "response to the review feedback:",
+        None => "completion summary:",
     };
     let mut lines = vec![
         Line::default(),
         Line::from(Span::styled(
-            "response to the review feedback:",
+            heading,
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
     ];
@@ -908,13 +905,20 @@ fn rework_lines(report: &ReworkReport) -> Vec<Line<'static>> {
     // break lines inside a `Span`, so a point-by-point summary rendered as one
     // span would collapse into a single paragraph and lose its structure.
     lines.extend(
-        summary
+        report
+            .summary
             .lines()
             .map(|line| Line::from(Span::styled(line.to_string(), Style::new().fg(Color::Cyan)))),
     );
     lines
 }
 
+/// A task's newest session, rendered for the attention states (tasks #73/#110).
+/// A finished session is a post-mortem: its outcome (`capped` yellow — it clears
+/// when the quota resets — `failed` red and wanting its log read), agent, and
+/// end time. An open one shows agent and start time. Both end on the log path
+/// the `l` key pages. States where the session is history rather than context
+/// (`done`, `rejected`, a redispatch-ready task) render nothing.
 fn session_lines(session: &Session, state: TaskState) -> Vec<Line<'static>> {
     if !matches!(
         state,
@@ -1285,8 +1289,13 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     {
         lines.extend(score_lines(&b, app.effective_score(task, b.total)));
     }
-    if let Some(report) = app.rework_report(task.id) {
-        lines.extend(rework_lines(&report));
+    // Only where the report is the thing being acted on: a task under review,
+    // or handed off for someone else to review (DESIGN.md §8). Once a verdict
+    // has been given the summary is history, and the card is read for the body.
+    if matches!(task.state, TaskState::Review | TaskState::Waiting)
+        && let Some(report) = app.completion_report(task.id)
+    {
+        lines.extend(completion_lines(&report));
     }
     lines.push(Line::default());
     lines.extend(crate::markdown::body_lines(&task.body));
@@ -3630,6 +3639,94 @@ mod tests {
         );
         assert!(rows.iter().any(|r| r.contains("Alpha option")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("Bravo option")), "{rows:?}");
+    }
+
+    /// A review card leads with the agent's account of what it did, above the
+    /// body it was given (task #407) — on a first review, where there is no
+    /// rejection behind it, and on a rework, where the feedback heads it.
+    #[test]
+    fn review_card_shows_the_completion_summary_above_the_body() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store.set_weight(p.id, 3).unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "greet the reader".into(),
+                body: "acceptance: the greeting renders".into(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        store.apply(task.id, Action::Start).unwrap();
+        store
+            .apply(
+                task.id,
+                Action::Complete(Some("README.md: +2 lines\nmain.rs: untouched".into())),
+            )
+            .unwrap();
+
+        let width: u16 = 100;
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        let rows = |app: &App, terminal: &mut Terminal<TestBackend>| -> Vec<String> {
+            terminal
+                .draw(|f| {
+                    draw(f, app);
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(width as usize)
+                .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+                .collect()
+        };
+        let row_of = |rows: &[String], needle: &str| -> Option<usize> {
+            rows.iter().position(|r| r.contains(needle))
+        };
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+        let first = rows(&app, &mut terminal);
+        let heading = row_of(&first, "completion summary:").unwrap_or_else(|| panic!("{first:?}"));
+        // Each summary line on its own row, as the question block renders.
+        assert!(row_of(&first, "README.md: +2 lines").is_some(), "{first:?}");
+        let last = row_of(&first, "main.rs: untouched").unwrap_or_else(|| panic!("{first:?}"));
+        let body = row_of(&first, "acceptance: the greeting renders")
+            .unwrap_or_else(|| panic!("{first:?}"));
+        assert!(heading < last && last < body, "{first:?}");
+
+        // Sent back and completed again: the same block, headed by the feedback
+        // the new summary answers rather than by the neutral title.
+        app.store
+            .apply(task.id, Action::RejectWork("tests missing".into()))
+            .unwrap();
+        app.store
+            .apply(task.id, Action::Complete(Some("added the tests".into())))
+            .unwrap();
+        app.refresh().unwrap();
+        let second = rows(&app, &mut terminal);
+        assert!(
+            row_of(&second, "response to the review feedback:").is_some(),
+            "{second:?}"
+        );
+        assert!(row_of(&second, "added the tests").is_some(), "{second:?}");
+        assert!(
+            row_of(&second, "completion summary:").is_none(),
+            "{second:?}"
+        );
     }
 
     /// The cockpit key line only advertises the selection-only actions while a

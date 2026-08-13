@@ -29,8 +29,8 @@ pub use model::{
 };
 pub use pr::{Mergeability, PrPlan, PrRef, format_review_feedback, parse_mergeable, plan_pr};
 pub use review::{
-    PrRevisions, REVIEWED_EVENT, ReviewDiff, ReworkReport, parse_pr_revisions, plan_review_diff,
-    rework_report,
+    CompletionReport, PrRevisions, REVIEWED_EVENT, ReviewDiff, completion_report,
+    parse_pr_revisions, plan_review_diff, was_rejected,
 };
 pub use scheduler::{
     ActionRow, AttentionCosts, Candidate, DigestRow, EffectiveScore, Queue, QueueRow,
