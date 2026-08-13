@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Capped sessions are visible instead of silently stuck.** A usage cap does
+  not kill a backgrounded agent — the supervisor stays alive and waits for the
+  window to reset — so capped work used to ride the running strip looking
+  healthy for hours. Its row is now badged `⚠ capped ↻21:50`, with the reset
+  time where the agent named one and `⚠ capped · reset passed` once that time
+  has gone by. The task stays `running` and the session stays open: nothing is
+  dead and nothing needs redispatching. The badge clears itself once the
+  session is continued. Agents declare the capability with a new optional
+  `logs` verb (`{session}`), built in for `claude`; an agent without one, such
+  as `codex`, is probed for nothing and behaves exactly as before.
 - **Built-in viewers**, so a fresh install's first `o` works: `code`, `cursor`
   and `zed` ship compiled in and are probed against `PATH` in that order, the
   way the built-in agents already are. A `voro.toml` still wins — a
@@ -187,6 +197,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkout has any remote, network-free and memoised per checkout, rather than
   paying `pr`'s `gh` round-trip; a checkout whose remote is not GitHub reads as
   before and is refused at press time.
+- A backgrounded session that dies on a usage cap is recorded `capped` rather
+  than `failed`. The classification read Voro's own launch log, which for a
+  `--bg` launch holds nothing but the backgrounding banner — the launcher exits
+  at birth — so it could essentially never fire; it now reads the session's own
+  output through the agent's `logs` verb, keeping the log tail as the fallback
+  for agents defining none. The phrases it matches also cover what agents
+  actually write: a five-hour cap is worded "Session limit reached" and a weekly
+  one "Weekly limit reached", neither of which contains "usage limit", "rate
+  limit" or "quota exceeded", so the previous list matched almost no real cap.
+  Warnings short of a cap ("approaching", "80% of your", "not your") are
+  excluded, so the marker still never fires on a healthy session.
 - A headless `voro refine` is no longer marked `⚠ refine failed` seconds after
   it starts. The round runs the agent's own `dispatch` template, so under a
   `claude --bg`-style launcher the pid Voro recorded belonged to a launcher that

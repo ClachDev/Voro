@@ -4,6 +4,7 @@
 //! `docs/DESIGN.md`.
 
 mod agent;
+mod cap;
 pub mod config_edit;
 mod error;
 mod import;
@@ -21,8 +22,9 @@ pub use agent::{
     NEW_SESSION_PLACEHOLDER, PROMPT_FILE_PLACEHOLDER, Provenance, RenderedMessage, ResolvedAgent,
     SESSION_NAME_PLACEHOLDER, SESSION_PLACEHOLDER, SessionLiveness, TASK_ID_PLACEHOLDER,
     VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, ViewerTemplate,
-    is_builtin_viewer, parse_sessions_json, render_message,
+    is_builtin_viewer, parse_sessions_json, render_message, render_session,
 };
+pub use cap::{CAP_SIGNATURES, CapReading, read_cap, strip_ansi};
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};
 pub use model::{

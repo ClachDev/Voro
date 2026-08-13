@@ -5,8 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use voro_core::{
-    ActionRow, CompletionReport, DepKind, DepRef, DigestRow, EffectiveScore, Event, QueueRow,
-    ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
+    ActionRow, CapReading, CompletionReport, DepKind, DepRef, DigestRow, EffectiveScore, Event,
+    QueueRow, ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
 };
 
 use crate::app::{
@@ -728,6 +728,35 @@ fn strip_pr_span() -> Span<'static> {
     Span::styled("  PR", Style::new().fg(Color::Magenta))
 }
 
+/// The usage-cap badge on a running strip row (DESIGN.md §8): this session is
+/// alive but held at a cap, doing nothing until the window reopens.
+///
+/// Yellow rather than red, and no state change behind it, because nothing has
+/// gone wrong — the session is intact and will pick up where it left off. It is
+/// the *absence* of this badge on a stuck row that used to mislead: capped work
+/// sat on the strip with a climbing elapsed time and no way to tell it from work
+/// in progress.
+///
+/// Three shapes, in decreasing order of what Voro managed to learn. With a
+/// parsed reset time still ahead, `⚠ capped ↻21:50` — the operator can decide
+/// whether to wait. Past that time the window is open and the session is merely
+/// waiting to be nudged, which is a different situation and a different thing
+/// to do about it, so it says so. With no time parsed at all, the bare badge:
+/// the cap is the part worth knowing, and suppressing it for want of a
+/// timestamp would trade the whole signal for a detail.
+fn capped_span(reading: &CapReading, now_minutes: Option<u16>) -> Span<'static> {
+    let past = now_minutes.is_some_and(|now| reading.reset_passed(now));
+    let text = match (reading.reset_label(), past) {
+        (_, true) => "  ⚠ capped · reset passed".to_string(),
+        (Some(at), false) => format!("  ⚠ capped ↻{at}"),
+        (None, false) => "  ⚠ capped".to_string(),
+    };
+    Span::styled(
+        text,
+        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )
+}
+
 /// The stale-branch marker (DESIGN.md §8): a review task whose tracked PR
 /// reports a merge conflict, probed on demand for the selected task. Purely
 /// informational — it flags that the branch needs resolving before it can
@@ -1394,6 +1423,9 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                 if r.pr_url.is_some() {
                     spans.push(strip_pr_span());
                 }
+            }
+            if let Some(reading) = app.caps.get(&r.task_id) {
+                spans.push(capped_span(reading, app.now_minutes));
             }
             // A hand-off has nothing left to be live: the work is with someone
             // else, so a closed session is the expected shape, not an orphan.
@@ -2845,6 +2877,109 @@ mod tests {
             column(&strip[waiting_at], "dependency bump"),
             "the strip's title column moved between row kinds:\n{out}"
         );
+    }
+
+    /// The badge a capped-but-alive dispatch earns (DESIGN.md §8), end to end
+    /// through the real cockpit draw. The session is `running` throughout and
+    /// stays that way: a cap is a display fact about a session that will resume
+    /// on its own, not a death to be redispatched, so nothing here touches the
+    /// state machine.
+    #[test]
+    fn a_capped_session_is_badged_on_the_strip() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{CapReading, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "the held one".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap()
+            .id;
+        store.record_dispatch(task, "claude", None, None).unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+
+        // The detail pane names the selected task too, so read the strip's own
+        // rows: everything below its block header.
+        let row = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            terminal
+                .draw(|f| draw_cockpit(f, app, &mut HitMap::default()))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let lines: Vec<String> = buffer
+                .content()
+                .chunks(buffer.area().width as usize)
+                .map(|r| r.iter().map(|c| c.symbol()).collect())
+                .collect();
+            let at = lines
+                .iter()
+                .position(|l| l.contains("Running"))
+                .unwrap_or_else(|| panic!("no running strip was drawn:\n{}", lines.join("\n")));
+            lines[at + 1..]
+                .iter()
+                .find(|l| l.contains("the held one"))
+                .unwrap_or_else(|| {
+                    panic!("the dispatch is not on the strip:\n{}", lines.join("\n"))
+                })
+                .clone()
+        };
+
+        // No reading, no badge: an ordinary dispatch is unmarked.
+        assert!(!row(&app).contains("capped"), "{}", row(&app));
+
+        // A cap whose window is still an hour out names when it reopens.
+        app.caps.insert(
+            task,
+            CapReading {
+                reset_minutes: Some(21 * 60 + 50),
+            },
+        );
+        app.now_minutes = Some(20 * 60 + 50);
+        let line = row(&app);
+        assert!(line.contains("⚠ capped"), "{line}");
+        assert!(line.contains("↻21:50"), "{line}");
+        assert!(!line.contains("reset passed"), "{line}");
+        assert_eq!(
+            app.store.task(task).unwrap().state,
+            TaskState::Running,
+            "badging a cap must not move the task"
+        );
+
+        // Past that time the window is open and the session is only waiting to
+        // be nudged — a different situation, said differently.
+        app.now_minutes = Some(22 * 60);
+        let line = row(&app);
+        assert!(line.contains("⚠ capped · reset passed"), "{line}");
+
+        // A cap the agent named no time for still badges: the time is the
+        // optional half, and withholding the badge for want of it would trade
+        // the signal for a detail.
+        app.caps.insert(task, CapReading::default());
+        let line = row(&app);
+        assert!(line.contains("⚠ capped"), "{line}");
+        assert!(!line.contains('↻'), "{line}");
+        assert!(!line.contains("reset passed"), "{line}");
+
+        // And the badge clears itself once the reading goes away, which is what
+        // continuing the session does on the next pass.
+        app.caps.remove(&task);
+        assert!(!row(&app).contains("capped"), "{}", row(&app));
     }
 
     /// A full slate of in-flight work — the dispatch cap's worth of running
