@@ -106,9 +106,12 @@ agent's interface, not yours.
 `review` and rises to the top of the queue, and its detail card leads with the
 agent's completion summary — what it says it changed and how it verified.
 Press `o` to open its checkout in a viewer, or `g` to open its pull request
-(creating it when the project reviews through GitHub). With the account and the
-diff in front of you, press `enter` (`⏎ review`) to accept or reject the work;
-rejecting with a note re-dispatches the agent to address it.
+(creating it when the project reviews through GitHub). The viewer needs no
+setup: Voro ships with `code`, `cursor` and `zed` built in and opens the first
+one on your PATH; if none of them is there, `o` opens a small form to name the
+editor you do use instead. With the account and the diff in front of you, press
+`enter` (`⏎ review`) to accept or reject the work; rejecting with a note
+re-dispatches the agent to address it.
 
 Other keys worth knowing on a selected task: `s` change state, `x` the score
 breakdown, `h` its history, `e` edit, `l` the session log, and `q` to quit.
@@ -137,6 +140,9 @@ fresh install dispatches with no configuration: `voro dispatch <task-id>` (or th
 dispatch key in the TUI) launches a headless session on a ready task. The agent
 reports back through the return-path verbs (`voro ask/done/propose`), and its work
 lands in `review` where `voro open` or `voro pr` puts the diff in front of you.
+Viewers work the same way: `code`, `cursor` and `zed` are built in and probed on
+`PATH`, so `voro open` needs no configuration either. `voro agent list` and
+`voro viewer list` show the effective sets and where each entry comes from.
 
 ![Claude with Voro in tmux showing sessions and tasks](docs/images/claude-voro.png)
 

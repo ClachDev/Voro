@@ -18,11 +18,11 @@ mod template;
 mod transition;
 
 pub use agent::{
-    AgentSessionEntry, AgentTemplate, AgentsConfig, Launch, LaunchSpec, NEW_SESSION_PLACEHOLDER,
-    PROMPT_FILE_PLACEHOLDER, Provenance, RenderedMessage, ResolvedAgent, SESSION_NAME_PLACEHOLDER,
-    SESSION_PLACEHOLDER, SessionLiveness, TASK_ID_PLACEHOLDER, VIEWER_BASE_PLACEHOLDER,
-    VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, ViewerTemplate, parse_sessions_json,
-    render_message, render_session,
+    AgentSessionEntry, AgentTemplate, AgentsConfig, BUILTIN_VIEWER_NAMES, Launch, LaunchSpec,
+    NEW_SESSION_PLACEHOLDER, PROMPT_FILE_PLACEHOLDER, Provenance, RenderedMessage, ResolvedAgent,
+    SESSION_NAME_PLACEHOLDER, SESSION_PLACEHOLDER, SessionLiveness, TASK_ID_PLACEHOLDER,
+    VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, ViewerTemplate,
+    is_builtin_viewer, parse_sessions_json, render_message, render_session,
 };
 pub use cap::{CAP_SIGNATURES, CapReading, read_cap, strip_ansi};
 pub use error::{Error, Result};

@@ -9,7 +9,9 @@ use voro_core::{
     QueueRow, ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
 };
 
-use crate::app::{App, CockpitRow, Mode, Screen, TaskRow, ViewerOption, viewer_label};
+use crate::app::{
+    App, CockpitRow, Mode, Screen, TaskRow, ViewerFormState, ViewerOption, viewer_label,
+};
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
@@ -404,13 +406,14 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             frame.render_stateful_widget(list, area, &mut state);
             hits.push_list(area, state.offset(), count, Hit::PickerOption);
         }
-        Mode::ViewerForm {
+        Mode::ViewerForm(ViewerFormState {
             name,
             cmd,
             on_cmd,
             editing,
+            cmd_tracks_name,
             ..
-        } => {
+        }) => {
             let field = |label: &str, value: &str, active: bool| {
                 let style = if active {
                     Style::new().add_modifier(Modifier::REVERSED)
@@ -422,7 +425,7 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                     Span::styled(format!("{value}▏"), style),
                 ])
             };
-            let area = popup_area(frame, 72, 5);
+            let area = popup_area(frame, 72, 4);
             let title = if *editing {
                 format!("Edit viewer '{name}' — ⏎ to save, esc to cancel")
             } else {
@@ -437,15 +440,21 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             } else {
                 field("name", name, !*on_cmd)
             };
-            let para = Paragraph::new(vec![
-                name_line,
-                field("command", cmd, *on_cmd),
-                Line::from(Span::styled(
-                    "{path} = checkout/worktree · {branch} · {base}",
-                    Style::new().dim(),
-                )),
-            ])
-            .block(Block::default().borders(Borders::ALL).title(title));
+            // A command the form wrote is dim, focused or not, so that what was
+            // typed and what was filled in never look alike.
+            let mut cmd_style = Style::new();
+            if *on_cmd {
+                cmd_style = cmd_style.add_modifier(Modifier::REVERSED);
+            }
+            if *cmd_tracks_name {
+                cmd_style = cmd_style.dim();
+            }
+            let cmd_line = Line::from(vec![
+                Span::raw("command: "),
+                Span::styled(format!("{cmd}▏"), cmd_style),
+            ]);
+            let para = Paragraph::new(vec![name_line, cmd_line])
+                .block(Block::default().borders(Borders::ALL).title(title));
             frame.render_widget(para, area);
         }
         Mode::DefaultPicker {
@@ -1653,9 +1662,11 @@ fn draw_projects(frame: &mut Frame, app: &App, hits: &mut HitMap) {
 }
 
 /// The Config screen (DESIGN.md §5): the effective `voro.toml` surface. Agents
-/// (read-only) with provenance and the default marked, over the editable named
-/// viewers, with the legacy anonymous `[viewer]` shown read-only beneath them. A
-/// file that failed to parse is surfaced here rather than rendering empty.
+/// (read-only) with provenance and the default marked, over the viewers — the
+/// built-ins and the user's tables, each with its provenance, the user's
+/// editable — with the legacy anonymous `[viewer]` shown read-only beneath
+/// them. A file that failed to parse is surfaced here rather than rendering
+/// empty.
 fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     let [main, status] = Layout::vertical([
         Constraint::Min(3),
@@ -1738,14 +1749,23 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     );
     frame.render_widget(agents, agents_area);
 
-    // Viewers: the editable named entries, the default starred, then the
-    // anonymous [viewer] as a read-only trailing note when present.
+    // Viewers: every viewer `open` can run — the built-ins with the user's
+    // tables layered over them, each carrying its provenance like the agents
+    // pane above, the default starred — then the anonymous [viewer] as a
+    // read-only trailing note when present. A built-in row is dimmed, since
+    // e/d refuse it: it is overridden, not edited.
     let mut viewer_items: Vec<ListItem> = Vec::new();
     for v in &app.config_viewers {
         let marker = if v.is_default { "* " } else { "  " };
+        let name = if v.editable {
+            Span::raw(format!("{:<14}", v.name))
+        } else {
+            Span::styled(format!("{:<14}", v.name), Style::new().dim())
+        };
         viewer_items.push(ListItem::new(Line::from(vec![
             Span::raw(marker),
-            Span::raw(format!("{:<14}", v.name)),
+            name,
+            Span::styled(format!("{:<14}", v.provenance), Style::new().dim()),
             Span::styled(v.cmd.clone(), Style::new().dim()),
         ])));
     }
@@ -1759,7 +1779,6 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             ),
         ])));
     }
-    let empty = viewer_items.is_empty();
     // The selection only ever lands on a named viewer, never the anonymous note.
     let selected = if named == 0 {
         None
@@ -1781,13 +1800,6 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     // Same rule as the selection: the anonymous note below the named viewers is
     // not selectable, so it is not clickable either.
     hits.push_list(viewers_area, state.offset(), named, Hit::ViewerRow);
-    if empty {
-        let inner = viewers_area.inner(ratatui::layout::Margin::new(1, 1));
-        frame.render_widget(
-            Paragraph::new("no viewers yet — press a to add one").dim(),
-            inner,
-        );
-    }
 
     draw_status(frame, app, status);
 }

@@ -157,13 +157,80 @@ fn builtin_agents() -> &'static BTreeMap<String, AgentTemplate> {
     &BUILTINS
 }
 
+/// The viewers Voro ships with the binary, layered under any `voro.toml`
+/// exactly as [`BUILTIN_AGENTS`] is (DESIGN.md §11a), so a fresh install with
+/// an editor CLI on PATH opens a task's checkout with no config at all. A user
+/// `[viewers.<name>]` table of the same name replaces one wholesale.
+///
+/// Each opens its own window on a directory, because that is the only shape
+/// `open` can run: the viewer is spawned detached with no terminal (DESIGN.md
+/// §8), so a pager-driven command such as `git difftool -d` has nothing to draw
+/// on. They therefore take `{path}` alone rather than a `{base}...{branch}`
+/// range — an editor cannot open a diff range from its command line — which is
+/// what the README's review step promises anyway.
+const BUILTIN_VIEWERS: &str = "\
+[viewers.code]
+cmd = \"code -n {path}\"
+
+[viewers.cursor]
+cmd = \"cursor -n {path}\"
+
+[viewers.zed]
+cmd = \"zed {path}\"
+";
+
+/// The built-in viewers by name, in the order they are probed against PATH
+/// when nothing user-configured resolves: the first one installed wins
+/// (DESIGN.md §11a). Public because the messages that say what was looked for
+/// are written where the failure is surfaced, and none of them should spell
+/// the list again.
+pub const BUILTIN_VIEWER_NAMES: [&str; 3] = ["code", "cursor", "zed"];
+
+/// The parsed built-in viewers, layered under a user file the same way
+/// [`builtin_agents`] is. A malformed built-in is a bug here, not a user config
+/// error, so it panics.
+fn builtin_viewers() -> &'static BTreeMap<String, ViewerTemplate> {
+    static BUILTINS: LazyLock<BTreeMap<String, ViewerTemplate>> = LazyLock::new(|| {
+        let raw: RawConfig = toml::from_str(BUILTIN_VIEWERS).expect("built-in viewers TOML parses");
+        for (name, viewer) in &raw.viewers {
+            assert!(
+                !viewer.cmd.trim().is_empty(),
+                "built-in viewer '{name}' has a command"
+            );
+        }
+        for name in BUILTIN_VIEWER_NAMES {
+            assert!(
+                raw.viewers.contains_key(name),
+                "probe order names a built-in viewer, not '{name}'"
+            );
+        }
+        raw.viewers
+    });
+    &BUILTINS
+}
+
+/// Whether a name is a built-in viewer. The write surfaces ask, so removing or
+/// editing one is refused as "built in, override it" rather than reported as a
+/// viewer that isn't there.
+pub fn is_builtin_viewer(name: &str) -> bool {
+    builtin_viewers().contains_key(name)
+}
+
+/// A built-in viewer's command, so an override can start from what it replaces
+/// rather than from an empty field.
+pub fn builtin_viewer_cmd(name: &str) -> Option<&'static str> {
+    builtin_viewers().get(name).map(|v| v.cmd.as_str())
+}
+
 /// Header prose for the skeleton `agent init` writes. [`starter_config`]
 /// appends the current built-ins (commented) and example stanzas after it.
 const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #
-# This file is OPTIONAL. Voro ships with built-in `claude` and `codex` agents,
-# so a fresh install with one of those on PATH can dispatch with no config here.
-# Run `voro agent list` to see the effective agents and where each comes from.
+# This file is OPTIONAL. Voro ships with built-in `claude` and `codex` agents
+# and built-in `code`, `cursor` and `zed` viewers, so a fresh install with any
+# of those on PATH dispatches and opens a diff with no config here. Run
+# `voro agent list` and `voro viewer list` to see the effective sets and where
+# each entry comes from.
 #
 # Use this file to extend or override the built-ins, and to set app options:
 #
@@ -210,10 +277,15 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #     shown locally by `voro open` (DESIGN.md §8). A viewer cmd may carry
 #     `{path}` (the task's worktree, or the project checkout when it has none),
 #     `{branch}` (the task's branch, or empty), and `{base}` (the checkout's
-#     default branch); `{base}...{branch}` spells a diff range.
+#     default branch); `{base}...{branch}` spells a diff range. Viewers are
+#     built in like the agents — a table named `code`, `cursor` or `zed`
+#     replaces that built-in wholesale, any other name adds a viewer.
 #     `default_viewer` names the one used when a project does not pick a viewer
-#     itself (`voro project viewer <p> <name>`); a single anonymous [viewer]
-#     table is the older, still-valid spelling of the default.
+#     itself (`voro project viewer <p> <name>`); unset, Voro uses the sole
+#     viewer defined here, else the first built-in found on PATH. A single
+#     anonymous [viewer] table is the older, still-valid spelling of the
+#     default. A viewer must open its own window: `voro open` spawns it
+#     detached with no terminal, so a pager-driven command cannot draw.
 #   * price the queue — `max_running` caps how many dispatches ride at once
 #     (default 5; at the cap the queue offers no more), and a [costs] table
 #     divides each row's score by what its action asks of you, so a cheap
@@ -230,12 +302,16 @@ fn starter_config() -> String {
     let mut out = String::from(STARTER_HEADER);
     out.push_str(
         "\n# --------------------------------------------------------------------------\n\
-         # Built-in agents, exactly as shipped. Uncomment a block and edit it to\n\
-         # override that agent wholesale; leave it commented to keep the built-in,\n\
-         # which updates with Voro. Copy a block to model a new agent of your own.\n\
+         # Built-in agents and viewers, exactly as shipped. Uncomment a block and\n\
+         # edit it to override that entry wholesale; leave it commented to keep the\n\
+         # built-in, which updates with Voro. Copy a block to model one of your own.\n\
          # --------------------------------------------------------------------------\n#\n",
     );
-    for line in BUILTIN_AGENTS.lines() {
+    for line in BUILTIN_AGENTS
+        .lines()
+        .chain([""])
+        .chain(BUILTIN_VIEWERS.lines())
+    {
         if line.is_empty() {
             out.push_str("#\n");
         } else {
@@ -251,8 +327,6 @@ fn starter_config() -> String {
          # [agents.mine]\n\
          # dispatch = \"my-agent run {prompt_file}\"\n#\n\
          # default_viewer = \"zed\"\n#\n\
-         # [viewers.zed]\n\
-         # cmd = \"zed {path}\"\n#\n\
          # [viewers.difftool]\n\
          # cmd = \"git -C {path} difftool -d {base}...{branch}\"\n#\n\
          # max_running = 5\n#\n\
@@ -760,6 +834,14 @@ fn binary_on_path(name: &str) -> bool {
     std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
 }
 
+/// The first built-in viewer installed, the last resort of viewer resolution
+/// (DESIGN.md §11a). Probed by viewer name, which for the built-ins is also the
+/// binary name — a user table overriding one keeps that name, so an override
+/// changes what runs, not whether the probe finds it.
+fn probed_builtin_viewer(probe: &dyn Fn(&str) -> bool) -> Option<&'static str> {
+    BUILTIN_VIEWER_NAMES.into_iter().find(|name| probe(name))
+}
+
 /// The agent a task will be dispatched with: the task's own override if it
 /// has one, otherwise the config's global default, with every verb template
 /// resolved.
@@ -1052,19 +1134,36 @@ impl AgentsConfig {
         })
     }
 
-    /// The names of the `[viewers.*]` tables, sorted, for the TUI's viewer
-    /// picker and `viewer list`.
+    /// The names of the user's `[viewers.*]` tables, sorted: the *editable*
+    /// set, which is why the built-ins are not in it. Everything that offers a
+    /// viewer to run — the TUI's viewer picker, `viewer list` — wants
+    /// [`viewer_entries`](Self::viewer_entries) instead.
     pub fn viewer_names(&self) -> Vec<String> {
         self.viewers.keys().cloned().collect()
     }
 
-    /// A named viewer's command, without the default-resolution [`viewer_cmd`]
-    /// applies — for the Config screen, which lists each viewer beside its own
-    /// template.
-    ///
-    /// [`viewer_cmd`]: Self::viewer_cmd
-    pub fn named_viewer_cmd(&self, name: &str) -> Option<&str> {
-        self.viewers.get(name).map(|v| v.cmd.as_str())
+    /// Every effective viewer as `(name, cmd, provenance)`, sorted by name —
+    /// the built-ins with the user's tables layered over them, mirroring the
+    /// agents' [`entries`](Self::entries). What `viewer list`, the Config
+    /// screen and the default/review-action pickers show, since a built-in is
+    /// a legitimate thing to run, star, or pin a project to.
+    pub fn viewer_entries(&self) -> Vec<(&str, &str, Provenance)> {
+        let mut merged: BTreeMap<&str, (&str, Provenance)> = builtin_viewers()
+            .iter()
+            .map(|(name, viewer)| (name.as_str(), (viewer.cmd.as_str(), Provenance::BuiltIn)))
+            .collect();
+        for (name, viewer) in &self.viewers {
+            let prov = if is_builtin_viewer(name) {
+                Provenance::UserOverride
+            } else {
+                Provenance::User
+            };
+            merged.insert(name.as_str(), (viewer.cmd.as_str(), prov));
+        }
+        merged
+            .into_iter()
+            .map(|(name, (cmd, prov))| (name, cmd, prov))
+            .collect()
     }
 
     /// The anonymous `[viewer]` table's command, if the file defines one — the
@@ -1074,48 +1173,49 @@ impl AgentsConfig {
         self.viewer.as_ref().map(|v| v.cmd.as_str())
     }
 
-    /// The name of the viewer used when nothing picks one by name, for
-    /// `viewer list` to flag: the user's `default_viewer` when set (honoured
-    /// even if it names a missing viewer), else the sole `[viewers.*]` entry.
-    /// The anonymous `[viewer]` table has no name, so it yields `None` here
-    /// even though it resolves.
+    /// The name of the viewer `open` will run when nothing picks one by name,
+    /// for `viewer list` and the Config screen to star: the user's
+    /// `default_viewer` when set (honoured even if it names a missing viewer),
+    /// else the sole `[viewers.*]` entry, else the first built-in found on
+    /// PATH. The anonymous `[viewer]` table has no name, so it yields `None`
+    /// here even though it resolves.
     pub fn default_viewer_name(&self) -> Option<String> {
+        self.default_viewer_name_with(&binary_on_path)
+    }
+
+    /// [`default_viewer_name`](Self::default_viewer_name) with an injectable
+    /// PATH probe, so the built-in fallback is testable without depending on
+    /// what happens to be installed.
+    fn default_viewer_name_with(&self, probe: &dyn Fn(&str) -> bool) -> Option<String> {
         if self.default_viewer.is_some() {
             return self.default_viewer.clone();
         }
-        if self.viewer.is_none() && self.viewers.len() == 1 {
+        if self.viewer.is_some() {
+            return None;
+        }
+        if self.viewers.len() == 1 {
             return self.viewers.keys().next().cloned();
         }
-        None
+        probed_builtin_viewer(probe).map(str::to_string)
     }
 
-    /// Resolve a viewer command (DESIGN.md §11a): the named `[viewers.<name>]`
-    /// when a name is given, otherwise the default — `default_viewer` when set,
-    /// else the anonymous `[viewer]` table, else the sole `[viewers.*]` entry.
-    /// Errors carry what to configure.
+    /// Resolve a viewer command (DESIGN.md §11a). User configuration always
+    /// wins: with a name, the `[viewers.<name>]` table, falling back to the
+    /// built-in of that name; without one, `default_viewer`, else the anonymous
+    /// `[viewer]` table, else the sole `[viewers.*]` entry, else the first
+    /// built-in viewer found on PATH. Errors carry what to install or run.
     pub fn viewer_cmd(&self, name: Option<&str>) -> Result<&str> {
-        let invalid = |message: String| Error::AgentConfigInvalid {
-            path: self.path.clone(),
-            message,
-        };
-        let named =
-            |name: &str| {
-                self.viewers.get(name).map(|v| v.cmd.as_str()).ok_or_else(|| {
-                let known = if self.viewers.is_empty() {
-                    "none are defined".to_string()
-                } else {
-                    format!("defined viewers: {}", self.viewer_names().join(", "))
-                };
-                invalid(format!(
-                    "no viewer named '{name}' — {known}; add a [viewers.{name}] table with a \
-                     cmd such as 'zed {{path}}' or 'git difftool -d'"
-                ))
-            })
-            };
+        self.viewer_cmd_with(name, &binary_on_path)
+    }
+
+    /// [`viewer_cmd`](Self::viewer_cmd) with an injectable PATH probe, so the
+    /// resolution order is testable without depending on what happens to be
+    /// installed.
+    fn viewer_cmd_with(&self, name: Option<&str>, probe: &dyn Fn(&str) -> bool) -> Result<&str> {
         match name {
-            Some(name) => named(name),
+            Some(name) => self.named_viewer(name),
             None => match &self.default_viewer {
-                Some(default) => named(default),
+                Some(default) => self.named_viewer(default),
                 None => self
                     .viewer
                     .as_ref()
@@ -1124,16 +1224,33 @@ impl AgentsConfig {
                         1 => self.viewers.values().next().map(|v| v.cmd.as_str()),
                         _ => None,
                     })
-                    .ok_or_else(|| {
-                        invalid(
-                            "no viewer configured; add a [viewers.<name>] table with a cmd \
-                             such as 'zed {path}' or 'git difftool -d' to see a task's diff \
-                             (set `default_viewer` when defining several)"
-                                .to_string(),
-                        )
+                    .or_else(|| {
+                        probed_builtin_viewer(probe).and_then(|name| self.named_viewer(name).ok())
+                    })
+                    .ok_or_else(|| Error::NoViewer {
+                        probed: BUILTIN_VIEWER_NAMES.join("/"),
                     }),
             },
         }
+    }
+
+    /// A viewer by name: the user's table when it defines one, else the
+    /// built-in of that name — the same wholesale override the agents get.
+    fn named_viewer(&self, name: &str) -> Result<&str> {
+        self.viewers
+            .get(name)
+            .or_else(|| builtin_viewers().get(name))
+            .map(|v| v.cmd.as_str())
+            .ok_or_else(|| Error::UnknownViewer {
+                name: name.to_string(),
+                known: self
+                    .viewer_entries()
+                    .iter()
+                    .map(|(name, _, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                path: self.path.clone(),
+            })
     }
 
     /// The name of the agent used when a task has no override, for the CLI's
@@ -1319,6 +1436,17 @@ mod tests {
 
     fn parse(text: &str) -> Result<AgentsConfig> {
         AgentsConfig::parse(text, Path::new("/tmp/voro.toml"))
+    }
+
+    /// A PATH probe finding nothing, so a resolution test never depends on
+    /// what the developer happens to have installed.
+    fn none_installed(_: &str) -> bool {
+        false
+    }
+
+    /// A PATH probe finding exactly one binary.
+    fn only(installed: &'static str) -> impl Fn(&str) -> bool {
+        move |name| name == installed
     }
 
     #[test]
@@ -2022,14 +2150,129 @@ mod tests {
         assert_eq!(parse_sessions_json("[]").unwrap(), vec![]);
     }
 
+    /// Nothing installed, nothing configured: the failure asks for the one
+    /// thing the operator can act on — register the viewer they already use —
+    /// and only then says what was probed. It never tells them to install an
+    /// editor, and never calls the config file invalid: it may not even exist
+    /// (#405).
     #[test]
-    fn viewer_resolution_errors_with_guidance_when_nothing_is_configured() {
-        let message = config().viewer_cmd(None).unwrap_err().to_string();
-        assert!(message.contains("no viewer configured"), "{message}");
-        assert!(message.contains("[viewers.<name>]"), "{message}");
-        assert!(message.contains("/tmp/voro.toml"), "{message}");
+    fn viewer_resolution_errors_with_guidance_when_nothing_resolves() {
+        let message = config()
+            .viewer_cmd_with(None, &none_installed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.starts_with("no viewer set up — run `voro viewer add"),
+            "{message}"
+        );
+        assert!(message.contains("'zed {path}'"), "{message}");
+        // the probed built-ins are diagnosis, so they come after the action
+        let (action, diagnosis) = message.split_once("; ").unwrap();
+        assert!(diagnosis.contains("code/cursor/zed"), "{message}");
+        assert!(!action.contains("install"), "{message}");
+        assert!(!message.contains("invalid"), "{message}");
         assert!(config().viewer_names().is_empty());
-        assert_eq!(config().default_viewer_name(), None);
+        assert_eq!(config().default_viewer_name_with(&none_installed), None);
+    }
+
+    /// The whole point of the built-in layer (DESIGN.md §11a): a config that
+    /// defines no viewer at all still opens a task, given an editor on PATH.
+    #[test]
+    fn a_built_in_viewer_resolves_with_no_viewer_configured() {
+        let config = config();
+        assert_eq!(
+            config.viewer_cmd_with(None, &only("zed")).unwrap(),
+            "zed {path}"
+        );
+        assert_eq!(
+            config.default_viewer_name_with(&only("zed")).as_deref(),
+            Some("zed")
+        );
+        // probe order decides between two installed built-ins
+        assert_eq!(
+            config
+                .viewer_cmd_with(None, &|name| matches!(name, "cursor" | "zed"))
+                .unwrap(),
+            "cursor -n {path}"
+        );
+        // and a built-in is resolvable by name whether or not it is installed,
+        // which is what makes `default_viewer = "code"` work with no tables
+        assert_eq!(config.viewer_cmd(Some("code")).unwrap(), "code -n {path}");
+    }
+
+    /// User configuration always wins over the probe, in the documented order.
+    #[test]
+    fn user_viewers_outrank_the_probed_built_in() {
+        let installed = |_: &str| true;
+
+        let sole = parse("[viewers.mine]\ncmd = \"mine {path}\"").unwrap();
+        assert_eq!(
+            sole.viewer_cmd_with(None, &installed).unwrap(),
+            "mine {path}"
+        );
+        assert_eq!(
+            sole.default_viewer_name_with(&installed).as_deref(),
+            Some("mine")
+        );
+
+        let anonymous = parse("[viewer]\ncmd = \"anon {path}\"").unwrap();
+        assert_eq!(
+            anonymous.viewer_cmd_with(None, &installed).unwrap(),
+            "anon {path}"
+        );
+        // the anonymous table resolves but has no name to star
+        assert_eq!(anonymous.default_viewer_name_with(&installed), None);
+
+        let named = parse(
+            "default_viewer = \"mine\"\n[viewers.mine]\ncmd = \"mine {path}\"\n\
+             [viewers.other]\ncmd = \"other {path}\"",
+        )
+        .unwrap();
+        assert_eq!(
+            named.viewer_cmd_with(None, &installed).unwrap(),
+            "mine {path}"
+        );
+    }
+
+    /// A `[viewers.code]` table replaces the built-in wholesale, exactly as an
+    /// `[agents.claude]` table does — same name, user command, and a provenance
+    /// that says so.
+    #[test]
+    fn a_user_table_overrides_a_built_in_viewer_wholesale() {
+        let config = parse("[viewers.code]\ncmd = \"code --wait {path}\"").unwrap();
+        assert_eq!(
+            config.viewer_cmd(Some("code")).unwrap(),
+            "code --wait {path}"
+        );
+        // still found by the probe, still what the default resolves to
+        assert_eq!(
+            config.viewer_cmd_with(None, &only("code")).unwrap(),
+            "code --wait {path}"
+        );
+        let entries = config.viewer_entries();
+        let code = entries.iter().find(|(name, ..)| *name == "code").unwrap();
+        assert_eq!(code.2, Provenance::UserOverride);
+    }
+
+    #[test]
+    fn viewer_entries_layer_the_built_ins_under_the_user_tables() {
+        let config = parse("[viewers.mine]\ncmd = \"mine {path}\"").unwrap();
+        let entries: Vec<(&str, Provenance)> = config
+            .viewer_entries()
+            .into_iter()
+            .map(|(name, _, prov)| (name, prov))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("code", Provenance::BuiltIn),
+                ("cursor", Provenance::BuiltIn),
+                ("mine", Provenance::User),
+                ("zed", Provenance::BuiltIn),
+            ]
+        );
+        // viewer_names stays the editable set
+        assert_eq!(config.viewer_names(), vec!["mine"]);
     }
 
     #[test]
@@ -2079,18 +2322,28 @@ mod tests {
         assert_eq!(config.default_viewer_name().as_deref(), Some("zed"));
     }
 
+    /// Two viewers and no `default_viewer` names none of them, so resolution
+    /// carries on to the built-in probe rather than stopping — and says what to
+    /// install when that finds nothing either.
     #[test]
-    fn several_named_viewers_without_a_default_error_with_guidance() {
+    fn several_named_viewers_without_a_default_fall_through_to_the_built_ins() {
         let text = r#"
-            [viewers.zed]
-            cmd = "zed {path}"
+            [viewers.mine]
+            cmd = "mine {path}"
 
             [viewers.difftool]
             cmd = "git difftool -d"
         "#;
         let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
-        let message = config.viewer_cmd(None).unwrap_err().to_string();
-        assert!(message.contains("default_viewer"), "{message}");
+        assert_eq!(
+            config.viewer_cmd_with(None, &only("zed")).unwrap(),
+            "zed {path}"
+        );
+        let message = config
+            .viewer_cmd_with(None, &none_installed)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("no viewer set up"), "{message}");
     }
 
     #[test]
@@ -2101,8 +2354,13 @@ mod tests {
         "#;
         let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
         let message = config.viewer_cmd(Some("emacs")).unwrap_err().to_string();
-        assert!(message.contains("emacs"), "{message}");
-        assert!(message.contains("zed"), "{message}");
+        assert!(
+            message.starts_with("no viewer named 'emacs' — run"),
+            "{message}"
+        );
+        // the known set is every viewer that resolves, built-ins included
+        assert!(message.contains("code, cursor, zed"), "{message}");
+        assert!(!message.contains("invalid"), "{message}");
         // a default_viewer naming a missing table reports the same way
         let text = r#"default_viewer = "gone""#;
         let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
@@ -2116,7 +2374,7 @@ mod tests {
         assert_eq!(config.agent_names(), vec!["claude", "codex"]);
         assert_eq!(config.provenance("claude"), Some(Provenance::BuiltIn));
         assert!(config.viewer_names().is_empty());
-        assert!(config.viewer_cmd(None).is_err());
+        assert!(config.viewer_cmd_with(None, &none_installed).is_err());
         let claude = config.agent("claude").unwrap();
         assert!(claude.dispatch().contains("--bg"), "{}", claude.dispatch());
         assert!(
@@ -2132,7 +2390,11 @@ mod tests {
     #[test]
     fn starter_config_reproduces_the_builtins_commented_for_copying() {
         let skeleton = starter_config();
-        for line in BUILTIN_AGENTS.lines().filter(|l| !l.is_empty()) {
+        for line in BUILTIN_AGENTS
+            .lines()
+            .chain(BUILTIN_VIEWERS.lines())
+            .filter(|l| !l.is_empty())
+        {
             let commented = format!("# {line}");
             assert!(
                 skeleton.contains(&commented),

@@ -64,12 +64,17 @@ pub struct ConfigAgentRow {
     pub models: Option<(String, String, String)>,
 }
 
-/// A named viewer row on the Config screen — the editable half of the page.
+/// A named viewer row on the Config screen: every viewer `open` can run, the
+/// built-ins included, so the starred default is always visible. Only the rows
+/// backed by a `voro.toml` table are `editable` — a built-in is overridden
+/// rather than changed in place (DESIGN.md §11a).
 #[derive(Debug, Clone)]
 pub struct ConfigViewerRow {
     pub name: String,
     pub cmd: String,
     pub is_default: bool,
+    pub provenance: &'static str,
+    pub editable: bool,
 }
 
 /// One selectable row on the cockpit; indices point into the App caches.
@@ -129,6 +134,28 @@ impl PromptKind {
             PromptKind::RefineNote | PromptKind::SessionMessage => None,
         }
     }
+}
+
+/// The add/edit-viewer form's fields, which always travel together: the two
+/// values being edited, which field the cursor is on, whether this is an edit
+/// (which locks the name), the project to pin on success, and whether the
+/// command is still following the name.
+#[derive(Clone)]
+pub struct ViewerFormState {
+    pub name: String,
+    pub cmd: String,
+    pub on_cmd: bool,
+    pub editing: bool,
+    pub review_project: Option<i64>,
+    /// Whether the command is still *following* the name — rewritten to
+    /// `<name> {path}` on every keystroke in the name field, so the
+    /// operator watches the line they are about to save assemble itself
+    /// (DESIGN.md §5). Writing in the command field decouples it, and
+    /// emptying that field couples it again, which is the whole undo:
+    /// nothing they typed is ever overwritten, and nothing they did not
+    /// type is ever kept against their will. Always false on an edit,
+    /// where the command already exists and is theirs.
+    pub cmd_tracks_name: bool,
 }
 
 pub enum Mode {
@@ -211,15 +238,8 @@ pub enum Mode {
     },
     /// The add/edit-viewer form on the Config screen (DESIGN.md §5): a name and
     /// a command template. Both paths — the Config screen and the review-action
-    /// picker's "new viewer…" — share it. `editing` locks the name to an update;
-    /// `review_project` pins that project to the viewer once it is created.
-    ViewerForm {
-        name: String,
-        cmd: String,
-        on_cmd: bool,
-        editing: bool,
-        review_project: Option<i64>,
-    },
+    /// picker's "new viewer…" — share it.
+    ViewerForm(ViewerFormState),
     /// The current screen's full key map (DESIGN.md §9), opened with `?`. It is
     /// a peek rather than a screen — any key dismisses it — and it carries no
     /// state of its own, since the screen it describes is the App's.
@@ -504,8 +524,9 @@ pub struct App {
 
     /// The Config screen's view of `voro.toml` (DESIGN.md §5), reloaded every
     /// refresh so an edit — from either this screen or a dispatch — is reflected
-    /// immediately. Agents are read-only; the named viewers are what `config_sel`
-    /// selects for edit/delete.
+    /// immediately. Agents are read-only; the viewers are what `config_sel`
+    /// selects, and the ones a `voro.toml` table backs are what edit/delete act
+    /// on — a built-in row is selectable but refuses both.
     pub config_agents: Vec<ConfigAgentRow>,
     pub config_viewers: Vec<ConfigViewerRow>,
     /// The legacy anonymous `[viewer]` table's command, shown read-only.
@@ -890,19 +911,14 @@ impl App {
             .collect();
         let default_viewer = config.default_viewer_name();
         self.config_viewers = config
-            .viewer_names()
+            .viewer_entries()
             .into_iter()
-            .map(|name| {
-                let is_default = Some(name.as_str()) == default_viewer.as_deref();
-                let cmd = config
-                    .named_viewer_cmd(&name)
-                    .unwrap_or_default()
-                    .to_string();
-                ConfigViewerRow {
-                    name,
-                    cmd,
-                    is_default,
-                }
+            .map(|(name, cmd, provenance)| ConfigViewerRow {
+                is_default: Some(name) == default_viewer.as_deref(),
+                name: name.to_string(),
+                cmd: cmd.to_string(),
+                provenance: provenance.label(),
+                editable: provenance != voro_core::Provenance::BuiltIn,
             })
             .collect();
         self.config_anon_viewer = config.anonymous_viewer_cmd().map(str::to_string);
@@ -1192,7 +1208,11 @@ impl App {
     pub fn enter_hint(&self) -> Option<&'static str> {
         match self.screen {
             Screen::Projects => None,
-            Screen::Config => self.config_viewers.get(self.config_sel).map(|_| "⏎ edit"),
+            Screen::Config => self
+                .config_viewers
+                .get(self.config_sel)
+                .filter(|v| v.editable)
+                .map(|_| "⏎ edit"),
             Screen::Tasks => self.all.get(self.tasks_sel).map(|_| "⏎ view"),
             Screen::Cockpit => match self.cockpit_rows.get(self.cockpit_sel)? {
                 CockpitRow::Queue(i) => match self.queue.rows.get(*i)? {
@@ -1298,13 +1318,7 @@ impl App {
                 current,
                 sel,
             } => self.key_viewer_picker(key, project_id, options, current, sel),
-            Mode::ViewerForm {
-                name,
-                cmd,
-                on_cmd,
-                editing,
-                review_project,
-            } => self.key_viewer_form(key, name, cmd, on_cmd, editing, review_project),
+            Mode::ViewerForm(form) => self.key_viewer_form(key, form),
             // The key map is dismissed by any key, and `on_key` has already
             // restored `Mode::Normal`, so there is nothing left to do.
             Mode::KeyMap => {}
@@ -2222,7 +2236,7 @@ impl App {
     /// Open the selected task's checkout in a configured viewer (DESIGN.md
     /// §11a): the explicit viewer key, reaching the local diff even on a GitHub
     /// project. Only `review`/`running` tasks have a diff worth opening; anything
-    /// else, or a missing viewer, reports via the status line.
+    /// else reports via the status line.
     fn open_selected_in_viewer(&mut self) {
         let (id, state) = match self.selected_task() {
             Some(task) => (task.id, task.state),
@@ -2234,9 +2248,32 @@ impl App {
             ));
             return;
         }
-        match crate::dispatch::open(&mut self.store, &self.dispatch_ctx, id, None) {
+        let result = crate::dispatch::open(&mut self.store, &self.dispatch_ctx, id, None);
+        self.report_open(result);
+    }
+
+    /// What `o` does with what opening returned. No viewer set up at all is
+    /// *answered* rather than reported: the add-viewer form opens on the spot
+    /// (DESIGN.md §5), because the operator pressing `o` is one name and
+    /// command away from what they asked for, and sending them to the Config
+    /// screen to type the same two fields is a detour. Saving does not then
+    /// open the task — `o` again does — so the key never does two things at
+    /// once. Every other failure only reports, as before.
+    ///
+    /// Split from the keypress because the branch cannot otherwise be tested:
+    /// which arm runs depends on the developer's PATH, and a test that got it
+    /// wrong would launch a real editor.
+    fn report_open(&mut self, result: Result<String, crate::dispatch::OpenFailure>) {
+        match result {
             Ok(summary) => self.status = Some(summary),
-            Err(e) => self.status = Some(e),
+            Err(crate::dispatch::OpenFailure::NoViewer(_)) => {
+                self.status = Some(format!(
+                    "no viewer set up — name one here to open this task (no built-in {} on PATH)",
+                    voro_core::BUILTIN_VIEWER_NAMES.join("/")
+                ));
+                self.open_viewer_form(None, None);
+            }
+            Err(e) => self.status = Some(e.to_string()),
         }
     }
 
@@ -2638,11 +2675,13 @@ impl App {
             }
         };
         let mut options = vec![ViewerOption::Viewer(None)];
+        // The built-ins are offered among the named viewers: a project may pin
+        // one with no table defining it (DESIGN.md §11a).
         options.extend(
             config
-                .viewer_names()
+                .viewer_entries()
                 .into_iter()
-                .map(|name| ViewerOption::Viewer(Some(name))),
+                .map(|(name, ..)| ViewerOption::Viewer(Some(name.to_string()))),
         );
         // The quick path (DESIGN.md §5): a trailing entry that opens the
         // add-viewer form and pins this project to the viewer it creates.
@@ -2737,18 +2776,42 @@ impl App {
             Some((name, cmd)) => (name, cmd, true),
             None => (String::new(), String::new(), false),
         };
-        self.mode = Mode::ViewerForm {
+        self.mode = Mode::ViewerForm(ViewerFormState {
             name,
             cmd,
             // An edit starts on the command field, since the name is fixed.
             on_cmd: editing,
             editing,
             review_project,
-        };
+            // A new viewer's command follows its name until the operator
+            // writes one; an edit's is already written.
+            cmd_tracks_name: !editing,
+        });
     }
 
+    /// The command the form fills in for a name while it is still following it:
+    /// the built-in's own line where the name is one, else `<name> {path}`
+    /// (DESIGN.md §5). An empty name fills nothing rather than a bare
+    /// placeholder, so the field starts empty and stays that way until there is
+    /// something to run.
+    fn tracked_viewer_cmd(name: &str) -> String {
+        match name.trim().is_empty() {
+            true => String::new(),
+            false => voro_core::config_edit::assumed_viewer_cmd(name),
+        }
+    }
+
+    /// Edit the selected viewer's command. A built-in has no table to edit —
+    /// overriding it is an *add* of the same name — so it is refused with that
+    /// named rather than opening a form whose write would fail.
     fn edit_selected_viewer(&mut self) {
         match self.config_viewers.get(self.config_sel) {
+            Some(v) if !v.editable => {
+                self.status = Some(format!(
+                    "'{}' is built into voro — press a and name it '{}' to override it",
+                    v.name, v.name
+                ));
+            }
             Some(v) => {
                 let existing = (v.name.clone(), v.cmd.clone());
                 self.open_viewer_form(Some(existing), None);
@@ -2765,6 +2828,14 @@ impl App {
             self.status = Some("no viewer selected".into());
             return;
         };
+        if !viewer.editable {
+            self.status = Some(format!(
+                "'{}' is built into voro and cannot be deleted — press a and name it '{}' to \
+                 override it",
+                viewer.name, viewer.name
+            ));
+            return;
+        }
         let name = viewer.name.clone();
         let referencing =
             voro_core::config_edit::projects_referencing_viewer(&self.projects, &name);
@@ -2802,7 +2873,16 @@ impl App {
         };
         let (names, current) = match kind {
             DefaultKind::Agent => (config.agent_names(), config.default_name()),
-            DefaultKind::Viewer => (config.viewer_names(), config.default_viewer_name()),
+            // The built-ins are offered too: a default naming one is exactly
+            // what a fresh install wants to pin (DESIGN.md §11a).
+            DefaultKind::Viewer => (
+                config
+                    .viewer_entries()
+                    .into_iter()
+                    .map(|(name, ..)| name.to_string())
+                    .collect(),
+                config.default_viewer_name(),
+            ),
         };
         if names.is_empty() {
             self.status = Some(match kind {
@@ -2827,51 +2907,66 @@ impl App {
     /// command, its name locked); ⏎ advances name → command on an add, then
     /// submits. A failed write keeps the form open with the error on the status
     /// line so a typo is fixable without retyping.
-    fn key_viewer_form(
-        &mut self,
-        key: KeyEvent,
-        mut name: String,
-        mut cmd: String,
-        on_cmd: bool,
-        editing: bool,
-        review_project: Option<i64>,
-    ) {
+    fn key_viewer_form(&mut self, key: KeyEvent, form: ViewerFormState) {
+        let ViewerFormState {
+            mut name,
+            mut cmd,
+            on_cmd,
+            editing,
+            review_project,
+            mut cmd_tracks_name,
+        } = form;
         match key.code {
             KeyCode::Esc => return,
             KeyCode::Tab => {
                 let on_cmd = if editing { true } else { !on_cmd };
-                self.mode = Mode::ViewerForm {
+                self.mode = Mode::ViewerForm(ViewerFormState {
                     name,
                     cmd,
                     on_cmd,
                     editing,
                     review_project,
-                };
+                    cmd_tracks_name,
+                });
                 return;
             }
             KeyCode::Enter => {
                 if !on_cmd && !editing {
-                    self.mode = Mode::ViewerForm {
+                    self.mode = Mode::ViewerForm(ViewerFormState {
                         name,
                         cmd,
                         on_cmd: true,
                         editing,
                         review_project,
-                    };
+                        cmd_tracks_name,
+                    });
                     return;
                 }
                 self.submit_viewer_form(name, cmd, editing, review_project);
                 return;
             }
             KeyCode::Backspace => {
-                if on_cmd {
-                    cmd.pop();
-                } else {
-                    name.pop();
+                match (on_cmd, cmd_tracks_name) {
+                    // Nothing to delete in a command the form is writing: it
+                    // is a suggestion, not text the operator put there.
+                    (true, true) => {}
+                    (true, false) => {
+                        cmd.pop();
+                    }
+                    (false, _) => {
+                        name.pop();
+                    }
                 }
             }
             KeyCode::Char(c) => {
                 if on_cmd {
+                    // The first character typed over a following command takes
+                    // it over whole, rather than landing on the end of a line
+                    // the operator never wrote.
+                    if cmd_tracks_name {
+                        cmd.clear();
+                        cmd_tracks_name = false;
+                    }
                     cmd.push(c);
                 } else if !editing {
                     name.push(c);
@@ -2879,13 +2974,24 @@ impl App {
             }
             _ => {}
         }
-        self.mode = Mode::ViewerForm {
+        // Deleting back to an empty command hands it to the name again, so the
+        // suggestion is recoverable with the same key that discarded it. While
+        // it follows, it *is* the name's — re-derived on every keystroke — and
+        // an empty command means the same thing to the writer either way.
+        if on_cmd && !cmd_tracks_name && cmd.is_empty() {
+            cmd_tracks_name = true;
+        }
+        if cmd_tracks_name {
+            cmd = Self::tracked_viewer_cmd(&name);
+        }
+        self.mode = Mode::ViewerForm(ViewerFormState {
             name,
             cmd,
             on_cmd,
             editing,
             review_project,
-        };
+            cmd_tracks_name,
+        });
     }
 
     /// Write the viewer through the shared helper, then — for the quick path —
@@ -2897,6 +3003,13 @@ impl App {
         editing: bool,
         review_project: Option<i64>,
     ) {
+        // A blank command on an add is the common case, not a slip: it means
+        // the obvious line for that name (DESIGN.md §5). Resolved here as well
+        // as in the writer so the status line reports what was recorded.
+        let cmd = match (editing, cmd.trim().is_empty()) {
+            (false, true) => voro_core::config_edit::assumed_viewer_cmd(&name),
+            _ => cmd,
+        };
         let path = &self.dispatch_ctx.agents_path;
         let result = if editing {
             voro_core::config_edit::edit_viewer(path, &name, &cmd)
@@ -2905,20 +3018,26 @@ impl App {
         };
         if let Err(e) = result {
             self.status = Some(e.to_string());
-            self.mode = Mode::ViewerForm {
+            self.mode = Mode::ViewerForm(ViewerFormState {
                 name,
                 cmd,
                 on_cmd: true,
                 editing,
                 review_project,
-            };
+                // The command in hand is now what will be saved, whether the
+                // form wrote it or the operator did, so a retry edits it
+                // rather than watching it change under them.
+                cmd_tracks_name: false,
+            });
             return;
         }
         let trimmed = name.trim().to_string();
         let mut msg = if editing {
             format!("viewer '{trimmed}' updated")
         } else {
-            format!("viewer '{trimmed}' added")
+            // Name what was written, since on a blank command the operator
+            // never typed it.
+            format!("viewer '{trimmed}' added: {}", cmd.trim())
         };
         if voro_core::config_edit::missing_path_placeholder(&cmd) {
             msg.push_str(" (no {path} — runs in the checkout dir)");
@@ -2932,6 +3051,11 @@ impl App {
         self.status = Some(msg);
         let result = self.refresh();
         self.report(result);
+        // Land the selection on what was just written, so `e`/`d` act on it
+        // rather than on whichever row the list happens to sort first.
+        if let Some(i) = self.config_viewers.iter().position(|v| v.name == trimmed) {
+            self.config_sel = i;
+        }
     }
 
     /// Drive the default-agent/viewer picker: ⏎ writes the choice through the
@@ -4243,6 +4367,171 @@ mod tests {
         }
     }
 
+    /// The Config screen's row index for a viewer. The built-ins share the
+    /// list, so a test never assumes where a name sorts.
+    fn row(app: &App, name: &str) -> usize {
+        app.config_viewers
+            .iter()
+            .position(|v| v.name == name)
+            .unwrap_or_else(|| panic!("no viewer row named {name}"))
+    }
+
+    /// `o` with no viewer set up anywhere raises the add-viewer form rather
+    /// than only complaining (#405), and says why on the status line; every
+    /// other way opening can fail still just reports. Driven through
+    /// `report_open` rather than the key, since which arm a real keypress
+    /// takes depends on what the developer has installed.
+    #[test]
+    fn no_viewer_at_all_raises_the_add_viewer_form() {
+        let (store, ctx, _project) = scratch_env("open-no-viewer", None);
+        let path = ctx.agents_path.clone();
+        let mut app = App::new(store, ctx).unwrap();
+
+        app.report_open(Err(crate::dispatch::OpenFailure::NoViewer(
+            "no viewer set up — run `voro viewer add …`".into(),
+        )));
+        assert!(
+            matches!(
+                app.mode,
+                Mode::ViewerForm(ViewerFormState { editing: false, .. })
+            ),
+            "expected the add-viewer form to open"
+        );
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.starts_with("no viewer set up — name one here"),
+            "{status}"
+        );
+        assert!(status.contains("code/cursor/zed"), "{status}");
+        // the status line wraps rather than truncating (§9), so the diagnosis
+        // is never lost — but the action is what the operator acts on, so it
+        // still comes first
+        assert!(
+            status.find("name one here").unwrap() < status.find("no built-in").unwrap(),
+            "{status}"
+        );
+
+        // anything else opening can fail on is reported, not answered
+        app.mode = Mode::Normal;
+        app.report_open(Err(crate::dispatch::OpenFailure::Failed(
+            "no viewer named 'nope'".into(),
+        )));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status.as_deref(), Some("no viewer named 'nope'"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The command field writes itself from the name until the operator writes
+    /// one, and comes back when what they wrote is deleted (#405). The name is
+    /// the only thing they must know; the command is a suggestion they can
+    /// watch, take over, or undo.
+    #[test]
+    fn the_form_command_follows_the_name_until_it_is_written() {
+        let (store, ctx, _project) = scratch_env("config-follows", None);
+        let path = ctx.agents_path.clone();
+        let mut app = App::new(store, ctx).unwrap();
+        let form = |app: &App| -> (String, String, bool) {
+            match &app.mode {
+                Mode::ViewerForm(ViewerFormState {
+                    name,
+                    cmd,
+                    cmd_tracks_name,
+                    ..
+                }) => (name.clone(), cmd.clone(), *cmd_tracks_name),
+                _ => panic!("expected the viewer form"),
+            }
+        };
+
+        app.screen = Screen::Cockpit;
+        key(&mut app, KeyCode::Char('4'));
+        key(&mut app, KeyCode::Char('a'));
+        // an empty name fills nothing rather than a bare placeholder
+        assert_eq!(form(&app), (String::new(), String::new(), true));
+
+        // the command assembles itself keystroke by keystroke, backspace and all
+        type_str(&mut app, "zed");
+        assert_eq!(form(&app).1, "zed {path}");
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(form(&app).1, "ze {path}");
+
+        // a name that is a built-in's follows that built-in's own line
+        key(&mut app, KeyCode::Backspace);
+        key(&mut app, KeyCode::Backspace);
+        type_str(&mut app, "code");
+        assert_eq!(form(&app).1, "code -n {path}");
+
+        // on the command field, backspace leaves a suggestion alone — there is
+        // nothing there the operator typed
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(form(&app), ("code".into(), "code -n {path}".into(), true));
+
+        // …and the first character typed takes the field over whole
+        type_str(&mut app, "x");
+        assert_eq!(form(&app), ("code".into(), "x".into(), false));
+        type_str(&mut app, "y");
+        assert_eq!(form(&app).1, "xy");
+
+        // deleting back to empty hands it to the name again
+        key(&mut app, KeyCode::Backspace);
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(form(&app), ("code".into(), "code -n {path}".into(), true));
+
+        // a written command is not rewritten by a later name edit
+        type_str(&mut app, "mine {path}");
+        key(&mut app, KeyCode::Tab);
+        type_str(&mut app, "r");
+        assert_eq!(form(&app), ("coder".into(), "mine {path}".into(), false));
+
+        // and what is saved is what the form showed (⏎ on the name advances,
+        // ⏎ on the command saves)
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.config_viewers[row(&app, "coder")].cmd, "mine {path}");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Naming an editor is enough (#405): ⏎ through the command field records
+    /// `<name> {path}`, and a name that is a built-in's records that built-in's
+    /// own line, so an override starts from what it replaces.
+    #[test]
+    fn a_viewer_added_with_a_blank_command_gets_the_obvious_one() {
+        let (store, ctx, _project) = scratch_env("config-blank-cmd", None);
+        let path = ctx.agents_path.clone();
+        let mut app = App::new(store, ctx).unwrap();
+
+        // No project is registered, so the app opened on Projects, where the
+        // digits are weights; the jump below is a cockpit key.
+        app.screen = Screen::Cockpit;
+        key(&mut app, KeyCode::Char('4'));
+        key(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "emacsclient");
+        key(&mut app, KeyCode::Enter); // name -> command
+        key(&mut app, KeyCode::Enter); // submit with the command blank
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.config_viewers[row(&app, "emacsclient")].cmd,
+            "emacsclient {path}"
+        );
+        // the status names what was written, since it was never typed
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("emacsclient {path}"), "{status}");
+
+        // and overriding a built-in reproduces it rather than guessing at it
+        key(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "code");
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter);
+        let code = &app.config_viewers[row(&app, "code")];
+        assert_eq!(code.cmd, "code -n {path}");
+        assert_eq!(code.provenance, "user override");
+        assert!(code.editable);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     /// The Config screen (DESIGN.md §5): add, edit, set-default, and delete a
     /// viewer entirely through the TUI, each edit landing in `voro.toml` and
     /// reflected on the next refresh.
@@ -4257,55 +4546,100 @@ mod tests {
         app.screen = Screen::Cockpit;
         key(&mut app, KeyCode::Char('4'));
         assert_eq!(app.screen, Screen::Config);
-        assert!(app.config_viewers.is_empty());
-        // the built-in agents are listed read-only
+        // the built-in agents and viewers are both listed, the viewers'
+        // built-in rows read-only (#405)
         assert!(app.config_agents.iter().any(|a| a.name == "claude"));
+        assert!(
+            app.config_viewers
+                .iter()
+                .any(|v| v.name == "code" && !v.editable && v.provenance == "built-in")
+        );
+        assert!(app.config_viewers.iter().all(|v| !v.editable));
+
+        // e/d on a built-in row refuse, naming the override that replaces it
+        app.config_sel = row(&app, "code");
+        for k in ['d', 'e'] {
+            key(&mut app, KeyCode::Char(k));
+            let status = app.status.clone().unwrap_or_default();
+            assert!(status.contains("built into voro"), "{status}");
+            assert!(status.contains("override"), "{status}");
+            assert!(matches!(app.mode, Mode::Normal));
+        }
+        assert!(app.config_viewers.iter().any(|v| v.name == "code"));
 
         // add: a opens the form, name → Enter → command → Enter submits
         key(&mut app, KeyCode::Char('a'));
-        assert!(matches!(app.mode, Mode::ViewerForm { editing: false, .. }));
-        type_str(&mut app, "zed");
+        assert!(matches!(
+            app.mode,
+            Mode::ViewerForm(ViewerFormState { editing: false, .. })
+        ));
+        type_str(&mut app, "mine");
         key(&mut app, KeyCode::Enter);
-        type_str(&mut app, "zed {path}");
+        type_str(&mut app, "mine {path}");
         key(&mut app, KeyCode::Enter);
         assert!(matches!(app.mode, Mode::Normal));
-        assert_eq!(app.config_viewers.len(), 1);
-        assert_eq!(app.config_viewers[0].name, "zed");
-        assert_eq!(app.config_viewers[0].cmd, "zed {path}");
+        // the selection lands on what was just written
+        assert_eq!(app.config_viewers[app.config_sel].name, "mine");
+        assert_eq!(app.config_viewers[app.config_sel].cmd, "mine {path}");
+        assert_eq!(app.config_viewers[app.config_sel].provenance, "user");
         assert_eq!(
             AgentsConfig::load(&path)
                 .unwrap()
-                .viewer_cmd(Some("zed"))
+                .viewer_cmd(Some("mine"))
                 .unwrap(),
-            "zed {path}"
+            "mine {path}"
         );
 
         // edit: e opens the form with the name locked; append to the command
         key(&mut app, KeyCode::Char('e'));
-        assert!(matches!(app.mode, Mode::ViewerForm { editing: true, .. }));
+        assert!(matches!(
+            app.mode,
+            Mode::ViewerForm(ViewerFormState { editing: true, .. })
+        ));
         type_str(&mut app, " --wait");
         key(&mut app, KeyCode::Enter);
-        assert_eq!(app.config_viewers[0].cmd, "zed {path} --wait");
+        assert_eq!(
+            app.config_viewers[row(&app, "mine")].cmd,
+            "mine {path} --wait"
+        );
 
-        // default: V opens the picker; Enter sets zed as default_viewer
+        // default: V opens the picker over every viewer, built-ins included;
+        // walk to the top and back down to `mine`, since where the cursor
+        // starts depends on what is installed
         key(&mut app, KeyCode::Char('V'));
-        assert!(matches!(app.mode, Mode::DefaultPicker { .. }));
+        let names = match &app.mode {
+            Mode::DefaultPicker { names, .. } => names.clone(),
+            _ => panic!("expected the default picker to open"),
+        };
+        assert!(names.iter().any(|n| n == "code"), "{names:?}");
+        let target = names.iter().position(|n| n == "mine").unwrap();
+        for _ in 0..names.len() {
+            key(&mut app, KeyCode::Char('k'));
+        }
+        for _ in 0..target {
+            key(&mut app, KeyCode::Char('j'));
+        }
         key(&mut app, KeyCode::Enter);
-        assert!(app.config_viewers[0].is_default);
+        assert!(app.config_viewers[row(&app, "mine")].is_default);
         assert_eq!(
             AgentsConfig::load(&path)
                 .unwrap()
                 .default_viewer_name()
                 .as_deref(),
-            Some("zed")
+            Some("mine")
         );
 
         // delete: d removes it and clears the now-dangling default
+        app.config_sel = row(&app, "mine");
         key(&mut app, KeyCode::Char('d'));
-        assert!(app.config_viewers.is_empty());
+        assert!(app.config_viewers.iter().all(|v| v.name != "mine"));
         let config = AgentsConfig::load(&path).unwrap();
         assert!(config.viewer_names().is_empty());
-        assert_eq!(config.default_viewer_name(), None);
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("default_viewer")
+        );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -4322,7 +4656,8 @@ mod tests {
         let mut app = App::new(store, ctx).unwrap();
 
         key(&mut app, KeyCode::Char('4'));
-        assert_eq!(app.config_viewers.len(), 1);
+        app.config_sel = row(&app, "zed");
+        assert!(app.config_viewers[app.config_sel].editable);
         key(&mut app, KeyCode::Char('d'));
         assert!(
             app.status.as_deref().unwrap_or("").contains("demo2"),
@@ -4330,7 +4665,7 @@ mod tests {
             app.status
         );
         // still there, in the file and the view
-        assert_eq!(app.config_viewers.len(), 1);
+        assert!(app.config_viewers.iter().any(|v| v.name == "zed"));
         assert!(
             AgentsConfig::load(&path)
                 .unwrap()
@@ -4369,10 +4704,10 @@ mod tests {
         assert!(
             matches!(
                 app.mode,
-                Mode::ViewerForm {
+                Mode::ViewerForm(ViewerFormState {
                     review_project: Some(_),
                     ..
-                }
+                })
             ),
             "new viewer… should open the form carrying the project"
         );
