@@ -53,10 +53,13 @@ arguments:
 voro
 ```
 
-The cockpit has three screens — **Cockpit** (the next-action queue), **Tasks**
-(every task), and **Projects**. `tab` cycles between them, `j`/`k` move the
-selection, and the footer always shows the keys that apply to what you have
-selected. The walkthrough below drives one task from nothing to a reviewed diff.
+The cockpit has four screens — **Cockpit** (the next-action queue), **Tasks**
+(every task), **Projects**, and **Config**, which lists the agents Voro will
+dispatch to with the command each one runs, the viewers it opens diffs in, and
+the path of the `voro.toml` they were resolved from. `tab` cycles between them
+and `1`–`4` jump straight to one; `j`/`k` move the selection, and the footer
+always shows the keys that apply to what you have selected. The walkthrough
+below drives one task from nothing to a reviewed diff.
 
 **1. Register a project.** A first launch against an empty database already
 opens on the Projects screen — `tab` is the way there any other time. Press `a`
@@ -68,18 +71,29 @@ top of the queue.
 task body in your `$EDITOR`, or `N` to launch a planning session — an
 agent-assisted flow that drafts the body for you. Either way, **the body you end
 up with is the prompt** the dispatched agent receives, so it is worth writing
-like one.
+like one. The `state:` line in the template decides where the task lands: it
+starts at `ready`, so a template saved unedited joins the queue as ready work
+straight away — set it to `proposed` instead to route the task through the triage
+step below, or to `parked` to file it without it competing for attention yet.
 
-**3. Triage it into the queue.** A newly created task arrives as a proposal.
-Select it in the queue and press `enter` — the footer reads `⏎ triage` — to accept
-it into ready work. The queue always floats items that need you first (a
-question shows `⏎ answer`, a finished task shows `⏎ review`) above the
-highest-scoring ready tasks. When a proposal is worth keeping but badly written,
-the triage menu offers a fourth outcome instead of accepting it as it stands:
-`r` sends it to an agent to rewrite with a one-line note about what is wrong
-(`voro triage <id> refine --note "..."` on the CLI), and `R` opens an
-interactive session to talk the body into shape. Either way the task stays a
-proposal, marked `↻ refined`, so you triage the improved version next pass.
+**3. Triage it into the queue.** A proposal — a task you created with `state:
+proposed`, or one an agent filed with `voro propose` — needs a verdict from you
+before anything can work it. Proposals never take a queue slot each: they collapse
+into one digest row per project, so the first `enter` lands on that digest and the
+footer reads `⏎ expand`, folding it open to list the proposals underneath. Move
+down onto the proposal itself and the footer reads `⏎ triage`; `enter` there opens
+a menu of the three verdicts — `triage → ready` accepts it into ready work,
+`triage → parked` sets it aside, and `triage → rejected` closes it out. The queue
+always floats items that need you first (a question shows `⏎ resume`, a finished
+task shows `⏎ review`) above the highest-scoring ready tasks.
+
+When a proposal is worth keeping but badly written, refine it rather than ruling
+on it. Refine is not a verdict, so it is not one of the menu's outcomes — it is a
+key you press over the row itself: `r` sends the task to an agent to rewrite the
+body against a one-line note about what is wrong (`voro triage <id> refine --note
+"..."` on the CLI), and `R` opens an interactive session to talk the body into
+shape. Either way the task stays a proposal, marked `↻ refined`, so you triage the
+improved version next pass.
 
 **4. Dispatch it to an agent.** Select a ready task and press `d` to hand it to
 the default coding agent, or `D` to choose which agent. Voro launches a headless
