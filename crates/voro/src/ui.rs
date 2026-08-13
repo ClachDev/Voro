@@ -148,6 +148,7 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             let area = popup_area(frame, 44, height.max(3));
             let mut state = ListState::default().with_selected(Some(*sel));
             let title = match flow {
+                crate::app::CreateFlow::Quick => "Project to propose a task in",
                 crate::app::CreateFlow::Editor => "Project for the new task",
                 crate::app::CreateFlow::Plan => "Project to plan a task in",
             };
@@ -219,6 +220,22 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 Block::default()
                     .borders(Borders::ALL)
                     .title("Link PR (URL or owner/repo#n) — ⏎ to submit, esc to cancel"),
+            );
+            frame.render_widget(para, area);
+        }
+        Mode::QuickCreate { project_id, buffer } => {
+            let area = popup_area(frame, 72, 3);
+            let line = Line::from(vec![Span::raw(buffer.as_str()), Span::raw("▏")]);
+            let project = app
+                .projects
+                .iter()
+                .find(|p| p.id == *project_id)
+                .map(|p| p.name.as_str())
+                .unwrap_or("the project");
+            let para = Paragraph::new(line).wrap(Wrap { trim: false }).block(
+                Block::default().borders(Borders::ALL).title(format!(
+                    "New task in {project} — ⏎ to propose, esc to cancel"
+                )),
             );
             frame.render_widget(para, area);
         }
@@ -1962,7 +1979,7 @@ const REFINE_KEYS: [(&str, &str); 2] = [
     ("R", "refine a brief in an agent session"),
 ];
 const NEW_KEYS: [(&str, &str); 2] = [
-    ("n", "new task, written in $EDITOR"),
+    ("n", "new task, proposed by a background agent"),
     ("N", "new task, planned in an agent session"),
 ];
 
@@ -2029,6 +2046,7 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                 ("w", "hand a review task off, to wait"),
             ]);
             actions.extend(pairs(NEW_KEYS));
+            actions.push(("ctrl-n", "new task, written by hand in $EDITOR"));
             actions.push(("e", "edit the selected task"));
             vec![
                 ("Actions", actions),
@@ -2064,6 +2082,7 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                 ("w", "hand a review task off, to wait"),
             ]);
             actions.extend(pairs(NEW_KEYS));
+            actions.push(("ctrl-n", "new task, written by hand in $EDITOR"));
             actions.push(("e", "edit the selected task"));
             vec![
                 ("Actions", actions),

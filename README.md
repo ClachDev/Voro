@@ -67,14 +67,23 @@ to add one — Voro asks for a name and a path. Press `0`–`5` on a project to 
 its weight: the higher the weight, the harder that project's tasks pull toward the
 top of the queue.
 
-**2. Create a task.** From the Cockpit or Tasks screen, press `n` to write the
-task body in your `$EDITOR`, or `N` to launch a planning session — an
-agent-assisted flow that drafts the body for you. Either way, **the body you end
-up with is the prompt** the dispatched agent receives, so it is worth writing
-like one. The `state:` line in the template decides where the task lands: it
+**2. Create a task.** From the Cockpit or Tasks screen, press `n` and type one
+line saying what you want — ⏎ hands it to an agent in the background, which
+expands it into a title and a body and files the task for you. The cockpit never
+goes away and nothing waits: the proposal turns up in the queue a refresh or two
+later, ready for the triage step below. Press `N` instead to plan the task in an
+interactive session, when one line is not enough and you would rather talk it
+through, or `ctrl-n` to write the whole thing out by hand in your `$EDITOR` —
+the rare path, and the only one that sets the state, priority, agent and
+blockers at creation time. Its `state:` line decides where the task lands: it
 starts at `ready`, so a template saved unedited joins the queue as ready work
-straight away — set it to `proposed` instead to route the task through the triage
-step below, or to `parked` to file it without it competing for attention yet.
+straight away — set it to `proposed` instead to route the task through triage,
+or to `parked` to file it without it competing for attention yet.
+
+However the task arrives, **the body you end up with is the prompt** the
+dispatched agent receives, so it is worth being written like one — by the
+proposing agent here, and improvable with the refine keys below before you
+dispatch it.
 
 **3. Triage it into the queue.** A proposal — a task you created with `state:
 proposed`, or one an agent filed with `voro propose` — needs a verdict from you

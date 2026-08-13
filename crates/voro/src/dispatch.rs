@@ -186,6 +186,45 @@ Never modify Voro's database with raw SQL, which would bypass the state
 machine and event log.
 ";
 
+/// Rendered per quick propose (DESIGN.md §6/§8) and written as the whole
+/// prompt: the operator's one line, expanded by a headless agent into a task it
+/// files itself. Modelled on [`PLANNING_PROMPT_TEMPLATE`] and ending in the same
+/// `voro add`, but with no operator to interview — `{intent}` is everything the
+/// session gets. `{project}` is the project's name, `{project_arg}` the same
+/// name shell-quoted for the `add` line, and `{db}` the conditional `--db` flag
+/// every rendered verb carries, for the same reason: the command must name its
+/// database literally.
+const PROPOSE_PROMPT_TEMPLATE: &str = "\
+<!-- Voro quick propose: the deliverable is a task, not a PR -->
+You are an agent launched by Voro to turn the operator's one-line intent into a
+proposed task for the project `{project}`. There is no conversation to be had —
+this session is headless and the operator is elsewhere — so what they typed is
+the whole brief:
+
+    {intent}
+
+Expand it into a title and a body. The title names what the task achieves, in
+one imperative line. The body is a self-contained dispatchable prompt: the agent
+that picks the task up later gets no other context, so name the relevant files,
+spell out the decisions the intent already settles, and give concrete acceptance
+criteria. The checkout you are running in is there to read, so the body can name
+real files and code. Do not modify it, and do not do the task itself — writing
+its brief is the job.
+
+When the body is ready, write it to a file outside the checkout and create
+exactly one task with:
+
+    voro add {project_arg} \"<title>\"{db} --body-file <path>
+
+File that task even when the intent is thin: infer what you can and say in the
+body where you were guessing. A weak proposal is visible in the queue and the
+operator can refine it, where a session that files nothing leaves no trace of
+what they typed at all. Pass no state — the task is created in `proposed` and
+the operator triages it from the queue. That one command is the only change you
+may make: no second task, no `voro triage`, and never modify Voro's database
+with raw SQL, which would bypass the state machine and event log.
+";
+
 /// The note-driven refine (DESIGN.md §6): a headless agent rewrites a proposed
 /// task's body to honour the operator's one-line note, and applies it through
 /// `voro set --body-file` — the same "the CLI is the agent's interface" shape as
@@ -404,6 +443,22 @@ fn render_planning_prompt(project: &str, db_path: &Path) -> String {
     render(
         PLANNING_PROMPT_TEMPLATE,
         &[
+            ("{project_arg}", shell_quote(Path::new(project)).as_str()),
+            ("{project}", project),
+            ("{db}", db_flag(db_path).as_str()),
+        ],
+    )
+}
+
+/// Fill [`PROPOSE_PROMPT_TEMPLATE`] for a concrete project and intent. The
+/// intent is the operator's own text, so it goes through the single-pass
+/// renderer for the same reason a refine's seed does: a line that mentions
+/// `{db}` must reach the agent as it was typed.
+fn render_propose_prompt(project: &str, db_path: &Path, intent: &str) -> String {
+    render(
+        PROPOSE_PROMPT_TEMPLATE,
+        &[
+            ("{intent}", intent.trim()),
             ("{project_arg}", shell_quote(Path::new(project)).as_str()),
             ("{project}", project),
             ("{db}", db_flag(db_path).as_str()),
@@ -879,6 +934,74 @@ pub fn refine(
         "task {task_id} sent for refinement by '{}' as {session_name} (pid {pid}{ref_note}) — log {}",
         agent.name,
         log_path.display()
+    ))
+}
+
+/// Quick propose (DESIGN.md §6/§8): hand the operator's one-line intent to a
+/// headless agent, which expands it into a title and a dispatchable body and
+/// files the task itself with `voro add`. The third instance of the Expansion
+/// shape, and the thinnest — there is no task yet, so unlike a refine this opens
+/// no session row, moves no state, and captures no session reference. Nothing
+/// waits on it: the proposal appears in the queue on a later refresh, and a
+/// failure leaves its trace in the launch log and the session log rather than in
+/// the UI, since there is no row to hang it on.
+///
+/// The *default* agent runs it whatever the queue holds, for the same reason a
+/// refine's does: writing a brief is not executing it. The session is named
+/// `voro-propose-<project_id>` ([`Launch::Propose`]).
+pub fn propose(
+    store: &Store,
+    ctx: &DispatchCtx,
+    project_id: i64,
+    intent: &str,
+) -> Result<String, String> {
+    if intent.trim().is_empty() {
+        return Err("an intent is required".into());
+    }
+    let project = store.project(project_id).map_err(|e| e.to_string())?;
+    if project.archived {
+        return Err(format!(
+            "project '{}' is archived — `voro project unarchive {}` first",
+            project.name, project.name
+        ));
+    }
+    // The project's *default* repo, as a planning session uses: the agent drafts
+    // a task rather than executing one, and the task it files picks its own repo
+    // with `voro add --repo` (DESIGN.md §8).
+    let repo = store.default_repo(project_id).map_err(|e| e.to_string())?;
+    let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
+    let agent = config.resolve(None).map_err(|e| e.to_string())?;
+    // A proposal has no task id, and `dispatch` is the one launching verb whose
+    // template may carry `{task_id}` — so on this launch alone the placeholder
+    // would reach the shell as literal braces, which DESIGN.md §8 forbids
+    // outright. Refused here, naming the template to fix, in the same
+    // no-op-with-an-explanation style as an agent that defines no `plan` verb.
+    if agent.dispatch.contains(voro_core::TASK_ID_PLACEHOLDER) {
+        return Err(format!(
+            "agent '{}' dispatch carries {}, but a quick propose has no task to name — drop it \
+             from its [agents.{}] table (use {} instead), or plan the task with N",
+            agent.name,
+            voro_core::TASK_ID_PLACEHOLDER,
+            agent.name,
+            voro_core::SESSION_NAME_PLACEHOLDER,
+        ));
+    }
+
+    let spawned = spawn_expansion(
+        ctx,
+        Expansion {
+            launch: Launch::Propose { project_id },
+            agent: &agent,
+            deep: false,
+            prompt: render_propose_prompt(&project.name, &ctx.db_path, intent),
+            cwd: repo.path,
+        },
+    )?;
+    reap_expansion(spawned, ctx.launch_log_path());
+
+    Ok(format!(
+        "proposing task in {} — it appears in the queue once the agent files it",
+        project.name
     ))
 }
 
@@ -1693,6 +1816,65 @@ mod tests {
             })
             .unwrap()
             .id
+    }
+
+    /// A quick propose opens no session row and moves nothing: the whole of its
+    /// effect is the agent it spawned, whose deliverable is a `voro add` (task
+    /// #315). What the prompt carries is the operator's line and the `add`
+    /// command that files the task.
+    #[test]
+    fn propose_spawns_an_expansion_that_records_nothing() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let p = store
+            .create_project("proj", project.to_str().unwrap())
+            .unwrap();
+
+        let summary = propose(&store, &ctx, p.id, "  cache the score view  ").unwrap();
+        assert!(summary.contains("proposing task in proj"), "{summary}");
+
+        let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
+        assert!(prompt.contains("cache the score view"), "{prompt}");
+        assert!(prompt.contains("voro add 'proj'"), "{prompt}");
+        assert!(!prompt.contains('{'), "unsubstituted: {prompt}");
+        // Nothing was created, transitioned, or recorded — the agent's own
+        // `voro add` is what makes the task exist.
+        assert!(store.tasks().unwrap().is_empty());
+    }
+
+    /// An intent that says nothing spawns nothing, and an archived project is
+    /// refused before anything is written.
+    #[test]
+    fn propose_refuses_an_empty_intent_and_an_archived_project() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let p = store
+            .create_project("proj", project.to_str().unwrap())
+            .unwrap();
+
+        assert!(propose(&store, &ctx, p.id, "   ").is_err());
+        store.set_archived(p.id, true).unwrap();
+        let err = propose(&store, &ctx, p.id, "something").unwrap_err();
+        assert!(err.contains("archived"), "{err}");
+        assert!(!ctx.runtime_dir.exists(), "nothing was written");
+    }
+
+    /// A quick propose names no task, and `{task_id}` is legal on a `dispatch`
+    /// template — so the one launch that could leak an unbound placeholder onto
+    /// a command line is refused up front, naming the template to fix
+    /// (DESIGN.md §8).
+    #[test]
+    fn propose_refuses_a_dispatch_template_that_names_a_task() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"run --for {task_id} {prompt_file}\"\n",
+        );
+        let p = store
+            .create_project("proj", project.to_str().unwrap())
+            .unwrap();
+
+        let err = propose(&store, &ctx, p.id, "something").unwrap_err();
+        assert!(err.contains("{task_id}"), "{err}");
+        assert!(err.contains("stub"), "{err}");
+        assert!(!ctx.runtime_dir.exists(), "nothing was written");
     }
 
     #[test]
