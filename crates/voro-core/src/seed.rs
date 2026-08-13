@@ -1,16 +1,12 @@
 //! The dev store's fixture (DESIGN.md §5).
 //!
-//! Every row here is written through the ordinary store and transition APIs
-//! rather than assembled as SQL, which is what keeps the fixture honest: it is
-//! always at the current schema, and it can only contain states the machine of
-//! §6 can actually reach. A checked-in `.db` file promises neither — it freezes
-//! at the schema of the day it was copied and drifts from there.
+//! Every row is written through the ordinary store and transition APIs, so the
+//! fixture sits at the current schema and holds only states the machine of §6
+//! can reach.
 //!
-//! The repo paths are deliberately fictional, under the data directory rather
-//! than pointing at real checkouts. Nothing here creates them, so they are not
-//! git repositories and dispatch refuses them — a fixture should not be able to
-//! launch an agent against the operator's actual work. `git init` one by hand
-//! when a dev build genuinely needs to exercise dispatch.
+//! The repo paths are fictional, under the data directory. Nothing here creates
+//! them, so they are not git repositories and dispatch refuses them; `git init`
+//! one by hand when a dev build needs to exercise dispatch.
 
 use crate::error::Result;
 use crate::model::{DepKind, Priority, SessionOutcome, TaskState};
@@ -71,11 +67,9 @@ pub fn seed(store: &mut Store) -> Result<SeedSummary> {
     )?;
     store.apply(running.id, Action::Start)?;
     store.set_branch(running.id, Some("import-follows-transfers"))?;
-    // No pid, deliberately. Reconcile-on-read probes a live session's liveness
-    // and finalises it when the process is gone, so a fixture that recorded the
-    // *seeding* process's pid would have its `running` and `refining` rows
-    // decay to `stalled` and `proposed` on the very next command. An absent pid
-    // reads as "liveness unknown", which is what leaves the row standing.
+    // Fixture sessions record no pid: reconcile-on-read finalises a live
+    // session whose process is gone, and an absent pid reads as liveness
+    // unknown, which leaves the row standing.
     store.create_session(running.id, "claude", None, Some("/tmp/voro-dev/import.log"))?;
     age(store, running.id, "-40 minutes")?;
     tasks += 1;
@@ -248,8 +242,8 @@ pub fn seed(store: &mut Store) -> Result<SeedSummary> {
     age(store, blocker.id, "-2 days")?;
     tasks += 1;
 
-    // Adding an open blocker demotes this to `parked` on its own — the one
-    // fixture row whose state is chosen by the machine rather than written.
+    // An open blocker demotes this to `parked` (§6): the machine chooses this
+    // row's state, the fixture does not.
     let blocked = ready_task(
         store,
         mote.id,
@@ -411,13 +405,9 @@ fn proposed_task(
     })
 }
 
-/// Backdate a task so the fixture's queue has a spread of ages to sort by.
-/// `state_since` is the age input to the score (§7), and a board where every
-/// row was created in the same second orders by nothing but priority — which
-/// would leave the age bonus, the one part of scoring most likely to be got
-/// wrong, entirely unexercised. This writes `state_since` directly because it
-/// is fixture setup rather than a transition; task *state* is never written
-/// this way.
+/// Backdate a task so the fixture's queue has a spread of ages to sort by;
+/// `state_since` is the age input to the score (§7). Fixture setup writes it
+/// directly. Task *state* is never written this way.
 fn age(store: &mut Store, task_id: i64, offset: &str) -> Result<()> {
     store.conn.execute(
         "UPDATE tasks SET state_since = datetime('now', ?1), created_at = datetime('now', ?1) \

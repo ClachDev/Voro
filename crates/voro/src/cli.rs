@@ -2002,8 +2002,8 @@ fn plural(n: usize, noun: &str) -> String {
 /// Task counts by state (DESIGN.md §12) as a scriptable readout, excluding
 /// parked projects so the numbers match the queue and header.
 /// Fixture data, for the dev store only (DESIGN.md §5). The refusal is on the
-/// database in play rather than on how the binary was built, so no combination
-/// of flags and environment seeds over the operator's board.
+/// database in play, not on how the binary was built, so no combination of
+/// flags and environment seeds over the operator's board.
 fn seed_verb(store: &mut Store, ctx: &DispatchCtx, force: bool) -> Result<String, String> {
     if ctx.db_path == Store::production_db_path() {
         return Err(format!(

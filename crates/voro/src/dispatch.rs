@@ -270,14 +270,11 @@ const REF_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SPAWN_CLOCK_SLACK_MS: i64 = 2000;
 
 /// The ` --db <path>` flag every rendered verb carries when the database in play
-/// is not the one an installed `voro` resolves to unaided — empty otherwise,
-/// since that is what the verbs already do (DESIGN.md §8).
-///
-/// The comparison is against the production path rather than
-/// `default_db_path`, which varies with how *this* binary was built (§5). A
-/// dev build dispatching from the dev store must still render the flag: the
-/// agent it launches runs the installed `voro` from `PATH`, so an omitted flag
-/// would silently aim the return path at the operator's store.
+/// is not the operator's store — empty otherwise, since that is what a bare
+/// verb resolves to (DESIGN.md §8). The agent a dispatch launches runs the
+/// installed `voro` from `PATH`, so the comparison is against the production
+/// path (§5) rather than whichever store this binary defaults to: a dispatch
+/// from the dev store renders the flag and keeps the return path on it.
 fn db_flag(db_path: &Path) -> String {
     if db_path == Store::production_db_path() {
         String::new()

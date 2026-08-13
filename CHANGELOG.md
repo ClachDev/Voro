@@ -11,16 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **A dev build no longer opens your real database.** A `voro` running out of a
-  Cargo `target/` directory now uses `~/.local/share/voro/dev.db`, seeded on
-  first run with a fixture board covering every task state, both live and dead
-  sessions, each dependency kind, a multi-repo project and an archived one.
-  `voro seed --force` rebuilds it; seeding the operator's store is refused.
-  Dispatch exports `VORO_DB` so a session's return path finds the right store,
-  which also put the operator's database in the environment of every agent
-  working in a worktree — a `cargo run` there inherited it and could apply an
-  unreleased migration to real data. An inherited `VORO_DB` naming the real
-  store is now declined by a dev build; an explicit `--db` is still honoured.
+- **A build from a `target/` directory opens a dev store, not your real one.** A
+  `voro` run out of `target/debug` or `target/release` now uses
+  `~/.local/share/voro/dev.db`, seeded on first run with a fixture board
+  covering every task state, both live and dead sessions, each dependency kind,
+  a multi-repo project and an archived one. `voro seed --force` rebuilds it;
+  seeding the operator's store is refused. Such a build also takes no database
+  from the environment: dispatch exports `VORO_DB` so a session's return path
+  finds the store its dispatcher was on, which put the operator's database in
+  the environment of every agent working in a worktree, and a `cargo run` there
+  inherited it. An explicit `--db` is still honoured. This chooses a default
+  and bounds nothing — `cargo install --path` builds a working checkout into an
+  ordinary install location, where it counts as installed — so what protects
+  the schema is the journal and the version check below.
 - **The store records which migrations it is made of.** A `schema_migrations`
   journal keeps each applied migration's SQL alongside the build that applied
   it, and every open checks it against the migrations the running binary

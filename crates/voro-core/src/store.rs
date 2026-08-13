@@ -43,11 +43,9 @@ fn path_is_cargo_target(path: &Path) -> bool {
         .any(|pair| pair[0] == "target" && (pair[1] == "debug" || pair[1] == "release"))
 }
 
-/// Write the journal rows for a migration pass (§5). Everything applied before
-/// the journal existed is backfilled unverifiable, since claiming to know text
-/// that was never recorded would defeat the point; what this pass applied is
-/// recorded verbatim, signed with the build that applied it so a later
-/// divergence report can name the culprit.
+/// Write the journal rows for a migration pass (§5). Migrations applied before
+/// the journal existed are backfilled with a NULL `sql`; what this pass applies
+/// is recorded verbatim, signed with the build that applied it.
 fn record_in_journal(tx: &Connection, from_version: usize) -> Result<()> {
     let found: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
@@ -75,9 +73,8 @@ fn record_in_journal(tx: &Connection, from_version: usize) -> Result<()> {
     Ok(())
 }
 
-/// How the build signs the journal. The executable's path is the diagnostic
-/// that matters here: "which voro did this" is exactly the question a
-/// divergence raises, and a path under a worktree answers it outright.
+/// How a build signs the journal: crate version and the running executable's
+/// path, which is what identifies the build behind a divergence.
 fn applied_by() -> String {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -85,9 +82,8 @@ fn applied_by() -> String {
     format!("voro {} at {exe}", env!("CARGO_PKG_VERSION"))
 }
 
-/// How to get out of a database carrying a migration this build does not have.
-/// Restoring leads, because the alternative — running the build that applied
-/// it — entrenches a schema that by definition is not the released one.
+/// The way out of a database carrying a migration this build does not have:
+/// the dev store is rebuilt, the operator's is restored from a snapshot.
 fn remedy_for_divergence(path: Option<&Path>) -> String {
     if path.is_some_and(|p| p == Store::dev_db_path()) {
         format!(
@@ -104,10 +100,8 @@ fn remedy_for_divergence(path: Option<&Path>) -> String {
     }
 }
 
-/// How to get out of a database whose schema is ahead of this build. The dev
-/// store is disposable, so its way out is to throw it away; the operator's
-/// store is not, so its way out is a binary that understands it, or a snapshot
-/// from before the migration.
+/// The way out of a database whose schema is ahead of this build: the dev
+/// store is rebuilt, the operator's is restored from a snapshot.
 fn remedy_for_schema_ahead(path: Option<&Path>) -> String {
     if path.is_some_and(|p| p == Store::dev_db_path()) {
         format!(
@@ -132,8 +126,7 @@ pub struct Store {
 }
 
 /// Drop every row, leaving the schema in place — the reset behind
-/// `voro seed --force`. Only ever aimed at the dev store; the CLI is what
-/// refuses any other target.
+/// `voro seed --force`. The CLI is what confines this to the dev store.
 impl Store {
     pub fn truncate_all(&mut self) -> Result<()> {
         let tx = self.conn.transaction()?;
@@ -211,23 +204,22 @@ impl Store {
         data_home.join("voro")
     }
 
-    /// The operator's store (DESIGN.md §5). Fixed regardless of how the running
-    /// binary was built, so a dev build can recognise it as the one database it
-    /// must not open by default.
+    /// The operator's store (DESIGN.md §5), at a path that does not vary with
+    /// how the running binary was built. Dispatch renders `--db` against it,
+    /// and `voro seed` refuses it.
     pub fn production_db_path() -> PathBuf {
         Store::data_dir().join("voro.db")
     }
 
-    /// The store a dev build uses instead (DESIGN.md §5). Seeded on first open
-    /// and disposable: deleting it costs nothing, which is what makes it the
-    /// safe default for a binary carrying unreleased migrations.
+    /// The store a build out of a `target/` directory opens instead (DESIGN.md
+    /// §5). Seeded on first open and disposable: `voro seed --force` rebuilds
+    /// it, and deleting it costs nothing.
     pub fn dev_db_path() -> PathBuf {
         Store::data_dir().join("dev.db")
     }
 
     /// Where snapshots taken before a migration land: beside the database they
-    /// protect, so a store opened with `--db` keeps its own history rather than
-    /// scattering copies through the operator's data directory.
+    /// protect, so a store opened with `--db` keeps its own history.
     pub fn backup_dir_for(path: &Path) -> PathBuf {
         path.parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -236,16 +228,10 @@ impl Store {
     }
 
     /// True when this binary was run out of a Cargo `target/` directory rather
-    /// than installed — used to pick a sensible default store, and for nothing
-    /// else.
-    ///
-    /// It is deliberately *not* a safety boundary, because it cannot be one:
+    /// than installed. It picks the default store and bounds nothing:
     /// `cargo install --path` builds a working checkout, unreleased migrations
-    /// and all, into an ordinary install location, and this check sees an
-    /// install. What protects the operator's schema is the journal and the
-    /// counter (§5), which reason about what a database actually contains
-    /// rather than about where an executable happens to live. A default-chooser
-    /// is allowed to have blind spots; a guard is not.
+    /// and all, into an ordinary install location, where this reads as an
+    /// install. The journal and the counter (§5) are what protect the schema.
     pub fn is_dev_build() -> bool {
         std::env::current_exe().is_ok_and(|exe| path_is_cargo_target(&exe))
     }
@@ -269,8 +255,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", true)?;
         let mut store = Store { conn };
         let version = store.schema_version()?;
-        // Before the counter is consulted, since a divergence is the more
-        // specific fact and the counter cannot see it at all.
+        // Ahead of the version check, which cannot see a divergence.
         store.verify_journal(path)?;
         if version > MIGRATIONS.len() {
             return Err(Error::SchemaAhead {
@@ -289,11 +274,10 @@ impl Store {
     }
 
     /// Check the journal (§5) against the migrations this build carries. The
-    /// counter can only report a database that is *ahead*; this reports one
-    /// that is *different*, which is the case two branches numbering a
-    /// migration alike produce and the counter is structurally blind to.
-    /// History predating the journal has a NULL `sql` and is skipped — it
-    /// cannot be verified, and saying so is better than implying otherwise.
+    /// counter reports a database that is *ahead*; this reports one that is
+    /// *different*, which two branches numbering a migration alike produce.
+    /// History predating the journal has a NULL `sql` and is skipped as
+    /// unverifiable.
     fn verify_journal(&self, path: Option<&Path>) -> Result<()> {
         if !self.has_journal()? {
             return Ok(());
@@ -312,7 +296,7 @@ impl Store {
         })?;
         for row in rows {
             let (idx, applied, applied_at, applied_by) = row?;
-            // Beyond what this build knows is the counter's story to tell.
+            // Indices beyond this build's list are the counter's to report.
             let Some(carried) = MIGRATIONS.get(idx - 1) else {
                 continue;
             };
@@ -343,14 +327,10 @@ impl Store {
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as usize)
     }
 
-    /// Copy the database beside itself before a migration touches it. A
+    /// Copy the database beside itself before a migration touches it, since a
     /// migration that renames or drops a column is not reversible from the
-    /// migrated file alone, so the pre-migration copy is the only thing that
-    /// makes the advice in [`Error::SchemaAhead`] — restore a snapshot —
-    /// something the operator can actually act on. A database with no schema
-    /// yet has nothing to lose, and a failure to write the copy is reported
-    /// rather than fatal: refusing to open over a full disk would be a worse
-    /// outcome than migrating without a snapshot.
+    /// migrated file alone. A database with no schema yet is skipped, and a
+    /// failure to write the copy is reported rather than fatal.
     fn snapshot(&self, path: &Path, version: usize) -> Result<()> {
         if version == 0 || !path.exists() {
             return Ok(());
