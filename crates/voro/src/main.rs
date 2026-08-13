@@ -40,25 +40,29 @@ fn split_db(args: Vec<String>) -> (PathBuf, Vec<String>) {
     (db, rest)
 }
 
-/// The database a run with no `--db` uses. `VORO_DB` is how a dispatched
-/// session inherits the store its dispatcher was on (DESIGN.md §8), and it is
-/// therefore also how the operator's store reaches a process that never asked
-/// for it — a dev build launched from inside a session's worktree. A dev build
-/// declines that inheritance and stays on the dev store (DESIGN.md §5). An
-/// explicit `--db` is a deliberate act and is honoured either way.
+/// The database a run with no `--db` uses. `VORO_DB` is a *default provider*:
+/// dispatch exports it so a session's return path finds the store its
+/// dispatcher was on (DESIGN.md §8), which makes it something a process
+/// inherits rather than something it asks for. A build out of a `target/`
+/// directory overrides defaults, so it takes no database from the environment
+/// at all — `--db` if given, the dev store otherwise (§5). Naming a path is
+/// deliberate; inheriting one is not, and the rule is about which of those it
+/// is rather than about which path the variable happens to hold.
 fn resolved_db() -> PathBuf {
     let inherited = std::env::var_os("VORO_DB").map(PathBuf::from);
-    if Store::is_dev_build() && inherited.as_deref() == Some(Store::production_db_path().as_path())
-    {
-        eprintln!(
-            "voro: this build runs from a target/ directory, so it is ignoring the inherited \
-             VORO_DB pointing at {} and using {} instead. Pass --db explicitly to override.",
-            Store::production_db_path().display(),
-            Store::dev_db_path().display()
-        );
-        return Store::dev_db_path();
+    match inherited {
+        Some(path) if !Store::is_dev_build() => path,
+        Some(path) => {
+            eprintln!(
+                "voro: this build runs from a target/ directory, so it is ignoring the inherited \
+                 VORO_DB ({}) and using {} instead. Pass --db explicitly to override.",
+                path.display(),
+                Store::dev_db_path().display()
+            );
+            Store::dev_db_path()
+        }
+        None => Store::default_db_path(),
     }
-    inherited.unwrap_or_else(Store::default_db_path)
 }
 
 /// Report a startup failure the way the CLI verbs report theirs — the error's

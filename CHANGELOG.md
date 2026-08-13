@@ -21,8 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   working in a worktree — a `cargo run` there inherited it and could apply an
   unreleased migration to real data. An inherited `VORO_DB` naming the real
   store is now declined by a dev build; an explicit `--db` is still honoured.
-- **Two guards on opening a store.** A database whose schema is ahead of the
-  running binary is refused with an error naming the way out, instead of
+- **The store records which migrations it is made of.** A `schema_migrations`
+  journal keeps each applied migration's SQL alongside the build that applied
+  it, and every open checks it against the migrations the running binary
+  carries. `user_version` is a counter, so it cannot distinguish two branches
+  that each add a migration 17 — the binary carrying the other 17 applies
+  nothing, refuses nothing, and dies at the first query on a missing column.
+  That case is now refused up front, naming the migration, the build that
+  applied it, and the snapshot to restore. Migrations applied before the
+  journal existed are recorded as unverifiable rather than assumed. One new
+  rule follows: an applied migration is immutable, and editing one is reported
+  as a divergence.
+- **Two further guards on opening a store.** A database whose schema is ahead of
+  the running binary is refused with an error naming the way out, instead of
   silently skipping the migration and failing later as a missing column; and
   any open that is about to migrate first copies the file to `backups/` beside
   it, so a migration that renames or drops a column stays recoverable.

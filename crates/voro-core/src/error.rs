@@ -19,6 +19,19 @@ pub enum Error {
         remedy: String,
     },
 
+    #[error(
+        "this database's migration {idx} differs from the one this build carries: it was applied \
+         {applied_at} by {applied_by}. The version numbers agree, so nothing else will catch \
+         this — and since the two migrations are not the same text, this build cannot assume the \
+         schema it is about to query. {remedy}"
+    )]
+    SchemaDiverged {
+        idx: usize,
+        applied_at: String,
+        applied_by: String,
+        remedy: String,
+    },
+
     #[error("task {0} not found")]
     TaskNotFound(i64),
 

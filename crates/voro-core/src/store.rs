@@ -26,6 +26,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0014_docs.sql"),
     include_str!("../migrations/0015_dep_kind_in_key.sql"),
     include_str!("../migrations/0016_add_refining_state.sql"),
+    include_str!("../migrations/0017_schema_migrations.sql"),
 ];
 
 /// Whether a path lies inside a Cargo build directory — a `target` component
@@ -42,6 +43,67 @@ fn path_is_cargo_target(path: &Path) -> bool {
         .any(|pair| pair[0] == "target" && (pair[1] == "debug" || pair[1] == "release"))
 }
 
+/// Write the journal rows for a migration pass (§5). Everything applied before
+/// the journal existed is backfilled unverifiable, since claiming to know text
+/// that was never recorded would defeat the point; what this pass applied is
+/// recorded verbatim, signed with the build that applied it so a later
+/// divergence report can name the culprit.
+fn record_in_journal(tx: &Connection, from_version: usize) -> Result<()> {
+    let found: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+        [],
+        |row| row.get(0),
+    )?;
+    if found == 0 {
+        return Ok(());
+    }
+    for idx in 1..=from_version {
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_migrations (idx, sql, applied_at, applied_by)
+             VALUES (?1, NULL, datetime('now'), NULL)",
+            params![idx as i64],
+        )?;
+    }
+    let by = applied_by();
+    for idx in (from_version + 1)..=MIGRATIONS.len() {
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_migrations (idx, sql, applied_at, applied_by)
+             VALUES (?1, ?2, datetime('now'), ?3)",
+            params![idx as i64, MIGRATIONS[idx - 1], by],
+        )?;
+    }
+    Ok(())
+}
+
+/// How the build signs the journal. The executable's path is the diagnostic
+/// that matters here: "which voro did this" is exactly the question a
+/// divergence raises, and a path under a worktree answers it outright.
+fn applied_by() -> String {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "an unknown executable".to_string());
+    format!("voro {} at {exe}", env!("CARGO_PKG_VERSION"))
+}
+
+/// How to get out of a database carrying a migration this build does not have.
+/// Restoring leads, because the alternative — running the build that applied
+/// it — entrenches a schema that by definition is not the released one.
+fn remedy_for_divergence(path: Option<&Path>) -> String {
+    if path.is_some_and(|p| p == Store::dev_db_path()) {
+        format!(
+            "It is the dev store, which is disposable — rebuild it at this build's schema with \
+             `voro seed --force`, or delete {} and it will be reseeded on the next run.",
+            Store::dev_db_path().display()
+        )
+    } else {
+        format!(
+            "Restore the snapshot taken before that migration from {}; failing that, run the \
+             build named above, which is the only one whose schema matches this database.",
+            Store::backup_dir_for(path.unwrap_or(&Store::production_db_path())).display()
+        )
+    }
+}
+
 /// How to get out of a database whose schema is ahead of this build. The dev
 /// store is disposable, so its way out is to throw it away; the operator's
 /// store is not, so its way out is a binary that understands it, or a snapshot
@@ -55,8 +117,9 @@ fn remedy_for_schema_ahead(path: Option<&Path>) -> String {
         )
     } else {
         format!(
-            "Run the build that migrated it — `cargo install --path crates/voro` from a checkout \
-             carrying that migration — or restore a pre-migration snapshot from {}.",
+            "Restore a pre-migration snapshot from {}; failing that, run the build that migrated \
+             it — though if that build was never released, doing so entrenches a schema no other \
+             build can open.",
             Store::backup_dir_for(path.unwrap_or(&Store::production_db_path())).display()
         )
     }
@@ -173,12 +236,16 @@ impl Store {
     }
 
     /// True when this binary was run out of a Cargo `target/` directory rather
-    /// than installed. Such a build may carry migrations that no released
-    /// binary knows, and applying those to the operator's store strands it at a
-    /// schema every other build refuses — so a dev build defaults to the dev
-    /// store instead. The check is on the running executable, not on a
-    /// compile-time path, so it holds for `cargo run` from the primary checkout
-    /// exactly as it does for a build inside a worktree.
+    /// than installed — used to pick a sensible default store, and for nothing
+    /// else.
+    ///
+    /// It is deliberately *not* a safety boundary, because it cannot be one:
+    /// `cargo install --path` builds a working checkout, unreleased migrations
+    /// and all, into an ordinary install location, and this check sees an
+    /// install. What protects the operator's schema is the journal and the
+    /// counter (§5), which reason about what a database actually contains
+    /// rather than about where an executable happens to live. A default-chooser
+    /// is allowed to have blind spots; a guard is not.
     pub fn is_dev_build() -> bool {
         std::env::current_exe().is_ok_and(|exe| path_is_cargo_target(&exe))
     }
@@ -202,6 +269,9 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", true)?;
         let mut store = Store { conn };
         let version = store.schema_version()?;
+        // Before the counter is consulted, since a divergence is the more
+        // specific fact and the counter cannot see it at all.
+        store.verify_journal(path)?;
         if version > MIGRATIONS.len() {
             return Err(Error::SchemaAhead {
                 version,
@@ -216,6 +286,55 @@ impl Store {
         }
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Check the journal (§5) against the migrations this build carries. The
+    /// counter can only report a database that is *ahead*; this reports one
+    /// that is *different*, which is the case two branches numbering a
+    /// migration alike produce and the counter is structurally blind to.
+    /// History predating the journal has a NULL `sql` and is skipped — it
+    /// cannot be verified, and saying so is better than implying otherwise.
+    fn verify_journal(&self, path: Option<&Path>) -> Result<()> {
+        if !self.has_journal()? {
+            return Ok(());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT idx, sql, applied_at, applied_by FROM schema_migrations
+             WHERE sql IS NOT NULL ORDER BY idx",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (idx, applied, applied_at, applied_by) = row?;
+            // Beyond what this build knows is the counter's story to tell.
+            let Some(carried) = MIGRATIONS.get(idx - 1) else {
+                continue;
+            };
+            if applied != *carried {
+                return Err(Error::SchemaDiverged {
+                    idx,
+                    applied_at,
+                    applied_by: applied_by.unwrap_or_else(|| "an unrecorded build".to_string()),
+                    remedy: remedy_for_divergence(path),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn has_journal(&self) -> Result<bool> {
+        let found: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(found > 0)
     }
 
     fn schema_version(&self) -> Result<usize> {
@@ -298,6 +417,7 @@ impl Store {
             tx.execute_batch(sql)?;
             tx.pragma_update(None, "user_version", (i + 1) as i64)?;
         }
+        record_in_journal(&tx, version)?;
         tx.commit()?;
         Ok(())
     }
@@ -1854,7 +1974,12 @@ mod schema_guard_tests {
         assert!(message.contains("schema version"), "{message}");
         // The remedy is the point of the error: a version mismatch the operator
         // cannot act on is the cryptic failure this guard exists to replace.
-        assert!(message.contains("cargo install"), "{message}");
+        // Restoring leads, since running the build that migrated it entrenches
+        // an unreleased schema.
+        assert!(
+            message.contains("Restore a pre-migration snapshot"),
+            "{message}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1891,6 +2016,95 @@ mod schema_guard_tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The case the counter cannot see: two branches each author a migration
+    /// at the same index, so the database and the binary agree on the version
+    /// and disagree on the schema.
+    #[test]
+    fn a_migration_applied_from_a_different_branch_is_refused_at_the_same_version() {
+        let dir = scratch("diverged");
+        let path = dir.join("voro.db");
+        Store::open(&path).unwrap();
+        // Rewrite the last applied migration as a rival branch's version of it,
+        // leaving user_version untouched — exactly what a colliding 0017 does.
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE schema_migrations SET sql = ?1, applied_by = ?2 WHERE idx = ?3",
+                params![
+                    "ALTER TABLE projects RENAME COLUMN review_action TO viewer;",
+                    "voro 0.1.0 at /home/u/.claude/worktrees/project-viewer/target/debug/voro",
+                    MIGRATIONS.len() as i64
+                ],
+            )
+            .unwrap();
+
+        let message = match Store::open(&path) {
+            Ok(_) => panic!("a divergent schema should not open"),
+            Err(e) => e.to_string(),
+        };
+        // The counter alone would have said nothing here.
+        let version: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        assert!(message.contains("project-viewer"), "{message}");
+        assert!(message.contains("Restore"), "{message}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_journal_records_what_was_applied_and_by_whom() {
+        let dir = scratch("journal");
+        let path = dir.join("voro.db");
+        Store::open(&path).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, MIGRATIONS.len() as i64);
+        let (sql, by): (String, String) = conn
+            .query_row(
+                "SELECT sql, applied_by FROM schema_migrations WHERE idx = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sql, MIGRATIONS[0]);
+        assert!(by.starts_with("voro "), "{by}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// History from before the journal existed is recorded as unverifiable
+    /// rather than invented, and must not read as a divergence.
+    #[test]
+    fn pre_journal_history_is_backfilled_unverifiable_and_opens_cleanly() {
+        let dir = scratch("backfill");
+        let path = dir.join("voro.db");
+        let conn = Connection::open(&path).unwrap();
+        for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
+            .unwrap();
+        drop(conn);
+
+        Store::open(&path).unwrap();
+        Store::open(&path).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let unverifiable: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE sql IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unverifiable, (MIGRATIONS.len() - 1) as i64);
         std::fs::remove_dir_all(&dir).ok();
     }
 
