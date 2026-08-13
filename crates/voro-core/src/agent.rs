@@ -262,8 +262,8 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #     built in like the agents — a table named `code`, `cursor` or `zed`
 #     replaces that built-in wholesale, any other name adds a viewer.
 #     `default_viewer` names the one used when a project does not pick a viewer
-#     itself (`voro project action <p> viewer:<name>`); unset, Voro uses the
-#     sole viewer defined here, else the first built-in found on PATH. A single
+#     itself (`voro project viewer <p> <name>`); unset, Voro uses the sole
+#     viewer defined here, else the first built-in found on PATH. A single
 #     anonymous [viewer] table is the older, still-valid spelling of the
 #     default. A viewer must open its own window: `voro open` spawns it
 #     detached with no terminal, so a pager-driven command cannot draw.
@@ -864,8 +864,8 @@ pub struct AgentsConfig {
     /// The anonymous `[viewer]` table — the pre-names single viewer, still
     /// honoured as a default when no `default_viewer` is set.
     viewer: Option<ViewerTemplate>,
-    /// The named `[viewers.<name>]` tables a project's review action can
-    /// pick from (DESIGN.md §8/§11a).
+    /// The named `[viewers.<name>]` tables a project can pick from
+    /// (DESIGN.md §8/§11a).
     viewers: BTreeMap<String, ViewerTemplate>,
     /// The user-set `default_viewer`, naming a `[viewers.*]` entry.
     default_viewer: Option<String>,
@@ -1074,7 +1074,8 @@ impl AgentsConfig {
 
     /// The names of the user's `[viewers.*]` tables, sorted: the *editable*
     /// set, which is why the built-ins are not in it. Everything that offers a
-    /// viewer to run wants [`viewer_entries`](Self::viewer_entries) instead.
+    /// viewer to run — the TUI's viewer picker, `viewer list` — wants
+    /// [`viewer_entries`](Self::viewer_entries) instead.
     pub fn viewer_names(&self) -> Vec<String> {
         self.viewers.keys().cloned().collect()
     }

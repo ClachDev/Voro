@@ -15,7 +15,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::agent::{VIEWER_PATH_PLACEHOLDER, is_builtin_viewer};
 use crate::error::{Error, Result};
-use crate::model::{Project, ReviewAction};
+use crate::model::Project;
 
 /// The command a viewer gets when none is given: for a built-in name, exactly
 /// what that built-in runs, so overriding one starts from what it replaces;
@@ -125,14 +125,13 @@ pub fn missing_path_placeholder(cmd: &str) -> bool {
     !cmd.contains(VIEWER_PATH_PLACEHOLDER)
 }
 
-/// The projects whose review action names this viewer explicitly
-/// (`viewer:<name>`), so deleting it can be refused with them named (DESIGN.md
-/// §5). A project on `viewer` (the unnamed default) is not counted — it follows
+/// The projects that name this viewer, so deleting it can be refused with them
+/// named (DESIGN.md §5). A project naming no viewer is not counted — it follows
 /// whatever the default resolves to rather than pinning this name.
 pub fn projects_referencing_viewer<'a>(projects: &'a [Project], name: &str) -> Vec<&'a Project> {
     projects
         .iter()
-        .filter(|p| matches!(&p.review_action, ReviewAction::Viewer(Some(n)) if n == name))
+        .filter(|p| p.viewer.as_deref() == Some(name))
         .collect()
 }
 
@@ -140,9 +139,8 @@ fn validate_viewer(name: &str, cmd: &str) -> Result<()> {
     if name.is_empty() {
         return Err(invalid("viewer name is required".into()));
     }
-    // A name with whitespace or a colon cannot be referenced as `viewer:<name>`
-    // by a project's review action, so refuse it rather than create an
-    // unreachable viewer.
+    // A name is typed as one word — on the command line and as the bare TOML
+    // key of its `[viewers.<name>]` table — so refuse one that cannot be.
     if name.chars().any(|c| c.is_whitespace() || c == ':') {
         return Err(invalid(format!(
             "viewer name '{name}' cannot contain spaces or ':'"

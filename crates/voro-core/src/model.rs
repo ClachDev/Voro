@@ -308,92 +308,17 @@ impl fmt::Display for RefineOutcome {
     }
 }
 
-/// Which viewer a project's local diffs open in (DESIGN.md §8/§11a). The two
-/// review keys are static — `g`/`pr` are always the GitHub PR flow, `o`/`open`
-/// always a local viewer — so this no longer chooses between media; it names
-/// the `voro.toml` viewer `o`/`open` resolve for this project. `Auto` and `Pr`
-/// survive as stored values that name no viewer, leaving the default one.
-/// Stored on the project (`projects.review_action`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum ReviewAction {
-    /// No viewer named — the default viewer. Stored as NULL, the unconfigured
-    /// default.
-    #[default]
-    Auto,
-    /// No viewer named either, kept so a project pinned to the GitHub flow
-    /// before the keys split still reads and writes.
-    Pr,
-    /// A local viewer from `voro.toml`: the named `[viewers.<name>]` when one
-    /// is given, otherwise the default viewer.
-    Viewer(Option<String>),
-}
-
-impl ReviewAction {
-    /// Parse the stored/CLI form: `auto`, `pr`, `viewer`, or `viewer:<name>`.
-    pub fn parse(s: &str) -> Result<ReviewAction> {
-        match s {
-            "auto" => Ok(ReviewAction::Auto),
-            "pr" => Ok(ReviewAction::Pr),
-            "viewer" => Ok(ReviewAction::Viewer(None)),
-            other => match other.strip_prefix("viewer:") {
-                Some(name) if !name.trim().is_empty() => {
-                    Ok(ReviewAction::Viewer(Some(name.trim().to_string())))
-                }
-                _ => Err(Error::Invalid(format!(
-                    "unknown review action '{s}' — expected auto, pr, viewer, or viewer:<name>"
-                ))),
-            },
-        }
-    }
-
-    /// The `voro.toml` viewer this project's local diffs open in, or `None` for
-    /// the default viewer.
-    pub fn viewer(&self) -> Option<&str> {
-        match self {
-            ReviewAction::Viewer(Some(name)) => Some(name),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for ReviewAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ReviewAction::Auto => f.pad("auto"),
-            ReviewAction::Pr => f.pad("pr"),
-            ReviewAction::Viewer(None) => f.pad("viewer"),
-            ReviewAction::Viewer(Some(name)) => f.pad(&format!("viewer:{name}")),
-        }
-    }
-}
-
-impl FromSql for ReviewAction {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        match value {
-            ValueRef::Null => Ok(ReviewAction::Auto),
-            _ => ReviewAction::parse(value.as_str()?).map_err(|e| FromSqlError::Other(Box::new(e))),
-        }
-    }
-}
-
-impl ToSql for ReviewAction {
-    /// `Auto` writes NULL — absence of configuration — so the column stays
-    /// empty until the operator pins a medium.
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        match self {
-            ReviewAction::Auto => Ok(rusqlite::types::Null.into()),
-            other => Ok(other.to_string().into()),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub id: i64,
     pub name: String,
     pub weight: i64,
-    /// How `pr` shows this project's review diffs (DESIGN.md §8/§11a).
-    pub review_action: ReviewAction,
+    /// The `voro.toml` viewer this project's local diffs open in (DESIGN.md
+    /// §8/§11a): a `[viewers.<name>]` name, or `None` for the default viewer.
+    /// The review keys are static — `g`/`pr` are always the GitHub PR flow,
+    /// `o`/`open` always a local viewer — so this picks no medium, only the
+    /// viewer `o`/`open` resolve for this project.
+    pub viewer: Option<String>,
     /// Retired (DESIGN.md §5): the project and all its tasks leave the cockpit
     /// — queue, stats, running strip — until unarchived. Tasks freeze in
     /// whatever state they hold; only the projects screen still shows the
@@ -785,35 +710,5 @@ mod tests {
         assert_eq!(format!("{:10}", NextAction::Do), "do        ");
         assert_eq!(format!("{:10}", NextAction::ReviewPr), "review PR ");
         assert_eq!(format!("{:10}", NextAction::Redispatch), "redispatch");
-    }
-
-    #[test]
-    fn review_action_parses_and_displays_every_form() {
-        for (text, action) in [
-            ("auto", ReviewAction::Auto),
-            ("pr", ReviewAction::Pr),
-            ("viewer", ReviewAction::Viewer(None)),
-            ("viewer:zed", ReviewAction::Viewer(Some("zed".into()))),
-        ] {
-            assert_eq!(ReviewAction::parse(text).unwrap(), action, "{text}");
-            assert_eq!(action.to_string(), text);
-        }
-        assert!(ReviewAction::parse("github").is_err());
-        assert!(ReviewAction::parse("viewer:").is_err());
-        assert!(ReviewAction::parse("viewer:  ").is_err());
-    }
-
-    /// The narrowed role (DESIGN.md §8): the action names the viewer `o`/`open`
-    /// resolve, and only the `viewer:<name>` form names one — the two legacy
-    /// forms leave the default viewer rather than choosing a medium.
-    #[test]
-    fn review_action_names_the_projects_viewer() {
-        assert_eq!(
-            ReviewAction::Viewer(Some("zed".into())).viewer(),
-            Some("zed")
-        );
-        assert_eq!(ReviewAction::Viewer(None).viewer(), None);
-        assert_eq!(ReviewAction::Auto.viewer(), None);
-        assert_eq!(ReviewAction::Pr.viewer(), None);
     }
 }

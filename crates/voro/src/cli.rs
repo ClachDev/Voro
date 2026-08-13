@@ -10,10 +10,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use voro_core::{
     Action, AgentsConfig, DepKind, Doc, Event, NewTask, NextAction, PrRef, Priority, Project,
-    QueueRow, RefineOutcome, Repo, ReviewAction, Store, Task, TaskEdit, TaskState, Triage, WipGate,
-    scheduler,
+    QueueRow, RefineOutcome, Repo, Store, Task, TaskEdit, TaskState, Triage, WipGate, scheduler,
 };
 
+use crate::app::viewer_label;
 use crate::dispatch::{self, DispatchCtx};
 use crate::import;
 use crate::pr::ForgeMemo;
@@ -38,13 +38,11 @@ projects
   project delete <project>        delete a project with no tasks — park it
                                   (weight 0) or archive it instead to retire
                                   one that has any
-  project action <project> <auto|pr|viewer[:NAME]>
-                                  set which viewer `open` shows the project's
-                                  local diffs in: viewer:NAME picks a
-                                  [viewers.NAME] entry from voro.toml, while
-                                  auto, pr, and bare viewer all leave the
-                                  default one (`pr` is always GitHub now, so
-                                  the medium is no longer a project setting)
+  project viewer <project> [NAME] set which viewer `open` shows the project's
+                                  local diffs in: NAME picks a [viewers.NAME]
+                                  entry from voro.toml, and naming none leaves
+                                  the default viewer (`pr` is always GitHub, so
+                                  the medium is not a project setting)
   weight <project> <0-5>          set a project's weight (0 parks it)
 
 repos                             a project allocates attention; its repos
@@ -194,13 +192,12 @@ dispatch
                                   NAME is one, which is how you override it.
                                   A cmd may carry {path}, {branch}, {base}
                                   (e.g. 'code -n {path}')
-  viewer remove <name>            delete a viewer; refused while a project's
-                                  review action still names it, and for a
-                                  built-in, which is overridden rather than
-                                  removed
+  viewer remove <name>            delete a viewer; refused while a project
+                                  still names it, and for a built-in, which is
+                                  overridden rather than removed
   open <task-id>                  open a review/running task's checkout in a
                                   viewer to see its diff — the only local-diff
-                                  spelling, and the one `project action` names
+                                  spelling, and the one `project viewer` names
                                   a viewer for. Uses the built-in code/cursor/
                                   zed found on PATH when voro.toml names none
   pr <task-id> [--yes]            show the task's diff on GitHub, always: jump
@@ -379,14 +376,32 @@ enum Verb {
 
 #[derive(Subcommand)]
 enum ProjectCmd {
-    Add { name: String, path: String },
+    Add {
+        name: String,
+        path: String,
+    },
     List,
-    Rename { project: String, name: String },
-    Path { project: String, path: String },
-    Archive { project: String },
-    Unarchive { project: String },
-    Delete { project: String },
-    Action { project: String, action: String },
+    Rename {
+        project: String,
+        name: String,
+    },
+    Path {
+        project: String,
+        path: String,
+    },
+    Archive {
+        project: String,
+    },
+    Unarchive {
+        project: String,
+    },
+    Delete {
+        project: String,
+    },
+    Viewer {
+        project: String,
+        name: Option<String>,
+    },
 }
 
 /// The checkouts under a project (DESIGN.md §3/§5). A project always has at
@@ -902,9 +917,9 @@ fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
         ProjectCmd::List => {
             let mut out = String::new();
             for p in store.projects().map_err(|e| e.to_string())? {
-                let action = match &p.review_action {
-                    ReviewAction::Auto => String::new(),
-                    other => format!("  [{other}]"),
+                let viewer = match &p.viewer {
+                    Some(name) => format!("  [viewer:{name}]"),
+                    None => String::new(),
                 };
                 let archived = if p.archived { "  [archived]" } else { "" };
                 // The path column stays the default repo's, so a single-repo
@@ -921,7 +936,7 @@ fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
                 };
                 writeln!(
                     out,
-                    "{:3}  w{}  {}  {}{extra}{action}{archived}",
+                    "{:3}  w{}  {}  {}{extra}{viewer}{archived}",
                     p.id, p.weight, p.name, path
                 )
                 .unwrap();
@@ -976,15 +991,16 @@ fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
                 .map_err(|e| e.to_string())?;
             Ok(format!("project {} '{}' deleted", project.id, project.name))
         }
-        ProjectCmd::Action { project, action } => {
+        ProjectCmd::Viewer { project, name } => {
             let project = resolve_project(store, &project)?;
-            let action = ReviewAction::parse(&action).map_err(|e| e.to_string())?;
             let p = store
-                .set_review_action(project.id, &action)
+                .set_viewer(project.id, name.as_deref())
                 .map_err(|e| e.to_string())?;
             Ok(format!(
-                "{} review action {} -> {}",
-                p.name, project.review_action, p.review_action
+                "{} viewer: {} -> {}",
+                p.name,
+                viewer_label(project.viewer.as_deref()),
+                viewer_label(p.viewer.as_deref())
             ))
         }
     }
@@ -1587,7 +1603,7 @@ fn doc_link_echo(docs: &[Doc]) -> String {
 }
 
 /// `pr <task-id> [--yes]` (DESIGN.md §8/§11c): the GitHub half of "show me this
-/// task's diff", whatever the project's review action says. With a tracked PR,
+/// task's diff", whatever viewer the project names. With a tracked PR,
 /// open it in a browser. Without one, create the PR from the review task's
 /// done-time state — asserting PR-readiness, confirming unless `--yes`. A
 /// checkout that cannot take a PR errors pointing at `voro open`, which is the
@@ -2201,7 +2217,7 @@ fn explain_verb(store: &mut Store, id: i64, ctx: &DispatchCtx) -> Result<String,
 /// `viewer list/add/remove` (DESIGN.md §8/§11a): read and edit the viewers
 /// `voro.toml` defines. `add`/`remove` route through the same comment-preserving
 /// write helper the TUI Config screen uses; `remove` needs the store to refuse
-/// deleting a viewer a project's review action still names.
+/// deleting a viewer a project still names.
 fn viewer_verb(store: &mut Store, cmd: ViewerCmd, ctx: &DispatchCtx) -> Result<String, String> {
     let path = &ctx.agents_path;
     match cmd {
@@ -2229,8 +2245,8 @@ fn viewer_verb(store: &mut Store, cmd: ViewerCmd, ctx: &DispatchCtx) -> Result<S
             if !referencing.is_empty() {
                 let names: Vec<&str> = referencing.iter().map(|p| p.name.as_str()).collect();
                 return Err(format!(
-                    "viewer '{name}' is the review action of {} — repoint {} with `voro project \
-                     action <project> <auto|pr|viewer:NAME>` before removing it",
+                    "viewer '{name}' is the viewer of {} — repoint {} with `voro project \
+                     viewer <project> [NAME]` before removing it",
                     names.join(", "),
                     if referencing.len() == 1 { "it" } else { "them" }
                 ));
@@ -2626,14 +2642,14 @@ mod tests {
         let out = call(&mut s, &["viewer", "add", "difftool", "git difftool -d"]).unwrap();
         assert!(out.contains("{path}"), "{out}");
 
-        // a project pinned to viewer:mine blocks its removal, naming the project
+        // a project naming mine blocks its removal, naming the project
         call(&mut s, &["project", "add", "demo", "/tmp/demo"]).unwrap();
-        call(&mut s, &["project", "action", "demo", "viewer:mine"]).unwrap();
+        call(&mut s, &["project", "viewer", "demo", "mine"]).unwrap();
         let e = call(&mut s, &["viewer", "remove", "mine"]).unwrap_err();
-        assert!(e.contains("demo") && e.contains("review action"), "{e}");
+        assert!(e.contains("demo") && e.contains("is the viewer of"), "{e}");
 
         // repoint the project, then removal succeeds and list loses it
-        call(&mut s, &["project", "action", "demo", "auto"]).unwrap();
+        call(&mut s, &["project", "viewer", "demo"]).unwrap();
         let out = call(&mut s, &["viewer", "remove", "mine"]).unwrap();
         assert!(out.contains("removed"), "{out}");
         let listed = call(&mut s, &["viewer", "list"]).unwrap();
@@ -4193,7 +4209,7 @@ mod tests {
         assert!(out.contains("--summary-file"), "{out}");
     }
 
-    // --- the review action's viewer, and the static `pr` (DESIGN.md §8/§11a) ---
+    // --- the project's viewer, and the static `pr` (DESIGN.md §8/§11a) ---
 
     /// A DispatchCtx whose voro.toml is the given text, isolated under a temp
     /// root — the CLI-test face of the dispatch fixtures, for verbs that read
@@ -4225,25 +4241,27 @@ mod tests {
     }
 
     #[test]
-    fn project_action_sets_shows_and_rejects() {
+    fn project_viewer_sets_clears_and_shows() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        let out = ok(&mut s, &["project", "action", "demo", "viewer:zed"]);
-        assert!(out.contains("auto -> viewer:zed"), "{out}");
+        let out = ok(&mut s, &["project", "viewer", "demo", "zed"]);
+        assert!(out.contains("default viewer -> zed"), "{out}");
         assert!(
             ok(&mut s, &["project", "list"]).contains("[viewer:zed]"),
-            "list must show a pinned action"
+            "list must show the viewer a project names"
         );
 
-        ok(&mut s, &["project", "action", "demo", "auto"]);
+        // naming no viewer clears it back to the default, which earns no marker
+        let out = ok(&mut s, &["project", "viewer", "demo"]);
+        assert!(out.contains("zed -> default viewer"), "{out}");
         assert!(
             !ok(&mut s, &["project", "list"]).contains("[viewer"),
-            "auto is the default and earns no marker"
+            "the default viewer earns no marker"
         );
 
-        let e = err(&mut s, &["project", "action", "demo", "github"]);
-        assert!(e.contains("auto, pr, viewer"), "{e}");
-        assert!(ok(&mut s, &["help"]).contains("project action"), "help");
+        let e = err(&mut s, &["project", "viewer", "nope", "zed"]);
+        assert!(e.contains("nope"), "{e}");
+        assert!(ok(&mut s, &["help"]).contains("project viewer"), "help");
     }
 
     #[test]
@@ -4277,7 +4295,7 @@ mod tests {
 
     /// `pr` is statically the GitHub medium (DESIGN.md §8): on a checkout that
     /// cannot take a pull request it errors pointing at `voro open`, and the
-    /// project's review action — a viewer, here — does not redirect it. The
+    /// viewer the project names does not redirect it. The
     /// viewer would leave a marker behind, so its absence is the assertion.
     #[test]
     fn pr_on_a_non_github_checkout_errors_pointing_at_open() {
@@ -4290,7 +4308,7 @@ mod tests {
             &mut s,
             &["project", "add", "demo", project_dir.to_str().unwrap()],
         );
-        ok(&mut s, &["project", "action", "demo", "viewer:marker"]);
+        ok(&mut s, &["project", "viewer", "demo", "marker"]);
         // PR-ready in every way but the checkout, so the refusal can only be
         // about the medium.
         let id = review_task(&mut s, Some("feat/thing"), Some("did it"));
@@ -4357,7 +4375,7 @@ mod tests {
     fn done_warning_promises_no_pr_failure_on_a_viewer_project() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        ok(&mut s, &["project", "action", "demo", "viewer:zed"]);
+        ok(&mut s, &["project", "viewer", "demo", "zed"]);
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
         ok(&mut s, &["start", "1"]);
         let out = ok(&mut s, &["done", "1", "--branch", "feat/x"]);

@@ -123,6 +123,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but `voro show`'s event log — and no PR or configured viewer to fall back on,
   on the fresh install where that matters most. A rework's block is unchanged
   but for its heading, and shows nothing while the rework is still in flight.
+- The per-project review action is now what it does: a viewer name. Since the
+  review keys split — `pr` always GitHub, `open` always a local viewer — the
+  setting decided only which `[viewers.<name>]` table a project's local diffs
+  open in, so `projects.review_action` becomes `projects.viewer` and holds that
+  name or nothing. Existing databases convert in place: `viewer:<name>` keeps
+  its name, and `auto`, `pr`, and a bare `viewer` — three spellings of "name no
+  viewer" — all become the default viewer. `voro project action <p>
+  <auto|pr|viewer[:NAME]>` is now `voro project viewer <p> [NAME]`, naming no
+  viewer to fall back to the default, and the projects screen's `v` picker
+  offers the default and each named viewer instead of two entries that did
+  nothing distinguishable.
 - The cockpit key line advertises `d/D dispatch` only on a `ready` or `stalled`
   row, where dispatch can actually act, rather than on any selection — which
   also makes room for the new `a/A message` slot within the line's ten.

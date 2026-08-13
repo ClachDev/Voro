@@ -3,8 +3,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::ui::Hit;
 use voro_core::{
     Action, ActionRow, AgentsConfig, CompletionReport, DepKind, DepRef, DigestRow, Event, PrRef,
-    Priority, Project, Queue, QueueRow, RefineOutcome, ReviewAction, RunningRow, ScoreBreakdown,
-    StateCounts, Store, Task, TaskState, Triage, WipGate, scheduler,
+    Priority, Project, Queue, QueueRow, RefineOutcome, RunningRow, ScoreBreakdown, StateCounts,
+    Store, Task, TaskState, Triage, WipGate, scheduler,
 };
 
 /// Lines `PgDn`/`PgUp` move the focus card in one press. A fixed step, since
@@ -32,14 +32,21 @@ pub enum DefaultKind {
     Viewer,
 }
 
-/// One option in the review-action picker (DESIGN.md §8/§11a). Beyond the real
-/// [`ReviewAction`] choices, the trailing `NewViewer` entry opens the add-viewer
-/// form and pins the project to the viewer it creates — first-time viewer setup
-/// without a detour through the Config screen.
+/// One option in the project's viewer picker (DESIGN.md §8/§11a). Beyond the
+/// viewers themselves — `None` for the config default, then each named one —
+/// the trailing `NewViewer` entry opens the add-viewer form and pins the
+/// project to the viewer it creates, first-time viewer setup without a detour
+/// through the Config screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReviewActionOption {
-    Action(ReviewAction),
+pub enum ViewerOption {
+    Viewer(Option<String>),
     NewViewer,
+}
+
+/// How a project's viewer choice reads on screen and at the shell: the name it
+/// pins, or the config default when it names none (DESIGN.md §8).
+pub fn viewer_label(viewer: Option<&str>) -> &str {
+    viewer.unwrap_or("default viewer")
 }
 
 /// An agent row on the Config screen (DESIGN.md §5): the effective set with
@@ -217,16 +224,16 @@ pub enum Mode {
         sel: usize,
         back: Option<u16>,
     },
-    /// Picking a project's review action on the projects screen (DESIGN.md
-    /// §8/§11a): auto, pr, the default viewer, each named viewer from
-    /// `voro.toml`, and a trailing "new viewer…" that opens the add-viewer form.
-    /// Loaded fresh so a just-added viewer shows up.
-    ReviewActionPicker {
+    /// Picking a project's viewer on the projects screen (DESIGN.md §8/§11a):
+    /// the default viewer, each named viewer from `voro.toml`, and a trailing
+    /// "new viewer…" that opens the add-viewer form. Loaded fresh so a
+    /// just-added viewer shows up.
+    ViewerPicker {
         project_id: i64,
-        options: Vec<ReviewActionOption>,
-        /// The project's action as stored, flagged in the list independently
-        /// of cursor position.
-        current: ReviewAction,
+        options: Vec<ViewerOption>,
+        /// The viewer the project names as stored, flagged in the list
+        /// independently of cursor position.
+        current: Option<String>,
         sel: usize,
     },
     /// The add/edit-viewer form on the Config screen (DESIGN.md §5): a name and
@@ -257,7 +264,7 @@ impl Mode {
             | Mode::Transition { sel, .. }
             | Mode::AgentPicker { sel, .. }
             | Mode::DocPicker { sel, .. }
-            | Mode::ReviewActionPicker { sel, .. }
+            | Mode::ViewerPicker { sel, .. }
             | Mode::DefaultPicker { sel, .. } => Some(*sel),
             _ => None,
         }
@@ -269,7 +276,7 @@ impl Mode {
             | Mode::Transition { sel, .. }
             | Mode::AgentPicker { sel, .. }
             | Mode::DocPicker { sel, .. }
-            | Mode::ReviewActionPicker { sel, .. }
+            | Mode::ViewerPicker { sel, .. }
             | Mode::DefaultPicker { sel, .. } => Some(sel),
             _ => None,
         }
@@ -1181,12 +1188,12 @@ impl App {
                 sel,
                 back,
             } => self.key_doc_picker(key, task_id, docs, sel, back),
-            Mode::ReviewActionPicker {
+            Mode::ViewerPicker {
                 project_id,
                 options,
                 current,
                 sel,
-            } => self.key_review_action_picker(key, project_id, options, current, sel),
+            } => self.key_viewer_picker(key, project_id, options, current, sel),
             Mode::ViewerForm(form) => self.key_viewer_form(key, form),
             // The key map is dismissed by any key, and `on_key` has already
             // restored `Mode::Normal`, so there is nothing left to do.
@@ -2458,7 +2465,7 @@ impl App {
     /// The projects screen's local keys (DESIGN.md §9). `0`–`5` sets the
     /// selected project's weight; `r` opens the AddProject form pre-filled to
     /// rename/re-path, `a` opens it blank, `d` deletes behind the store's own
-    /// guard (only projects with no tasks), `v` picks the review action, `A`
+    /// guard (only projects with no tasks), `v` picks the viewer, `A`
     /// toggles archived (DESIGN.md §5). Movement and screen switching are
     /// handled by `key_normal`.
     fn key_projects(&mut self, key: KeyEvent) {
@@ -2502,8 +2509,8 @@ impl App {
             }
             KeyCode::Char('v') => {
                 if let Some(project) = self.projects.get(self.projects_sel) {
-                    let (id, current) = (project.id, project.review_action.clone());
-                    self.open_review_action_picker(id, current);
+                    let (id, current) = (project.id, project.viewer.clone());
+                    self.open_viewer_picker(id, current);
                 }
             }
             KeyCode::Char('A') => {
@@ -2523,11 +2530,11 @@ impl App {
         }
     }
 
-    /// Open the review-action picker for a project (DESIGN.md §8/§11a): auto,
-    /// pr, the default viewer, and each named viewer from `voro.toml`. The
-    /// config is loaded fresh so a just-added `[viewers.*]` table shows up;
-    /// the cursor starts on the project's current action.
-    fn open_review_action_picker(&mut self, project_id: i64, current: ReviewAction) {
+    /// Open the viewer picker for a project (DESIGN.md §8/§11a): the default
+    /// viewer, then each named viewer from `voro.toml`. The config is loaded
+    /// fresh so a just-added `[viewers.*]` table shows up; the cursor starts on
+    /// the viewer the project names.
+    fn open_viewer_picker(&mut self, project_id: i64, current: Option<String>) {
         let config = match AgentsConfig::load(&self.dispatch_ctx.agents_path) {
             Ok(config) => config,
             Err(e) => {
@@ -2535,22 +2542,23 @@ impl App {
                 return;
             }
         };
-        let mut options = vec![
-            ReviewActionOption::Action(ReviewAction::Auto),
-            ReviewActionOption::Action(ReviewAction::Pr),
-            ReviewActionOption::Action(ReviewAction::Viewer(None)),
-        ];
-        options.extend(config.viewer_entries().into_iter().map(|(name, ..)| {
-            ReviewActionOption::Action(ReviewAction::Viewer(Some(name.to_string())))
-        }));
+        let mut options = vec![ViewerOption::Viewer(None)];
+        // The built-ins are offered among the named viewers: a project may pin
+        // one with no table defining it (DESIGN.md §11a).
+        options.extend(
+            config
+                .viewer_entries()
+                .into_iter()
+                .map(|(name, ..)| ViewerOption::Viewer(Some(name.to_string()))),
+        );
         // The quick path (DESIGN.md §5): a trailing entry that opens the
         // add-viewer form and pins this project to the viewer it creates.
-        options.push(ReviewActionOption::NewViewer);
+        options.push(ViewerOption::NewViewer);
         let sel = options
             .iter()
-            .position(|o| matches!(o, ReviewActionOption::Action(a) if *a == current))
+            .position(|o| matches!(o, ViewerOption::Viewer(v) if *v == current))
             .unwrap_or(0);
-        self.mode = Mode::ReviewActionPicker {
+        self.mode = Mode::ViewerPicker {
             project_id,
             options,
             current,
@@ -2558,15 +2566,15 @@ impl App {
         };
     }
 
-    /// Drive the review-action picker: ⏎ stores the highlighted action via
-    /// `set_review_action` and refreshes so the projects row reflects it;
+    /// Drive the viewer picker: ⏎ stores the highlighted viewer via
+    /// `set_viewer` and refreshes so the projects row reflects it;
     /// esc cancels without touching anything.
-    fn key_review_action_picker(
+    fn key_viewer_picker(
         &mut self,
         key: KeyEvent,
         project_id: i64,
-        options: Vec<ReviewActionOption>,
-        current: ReviewAction,
+        options: Vec<ViewerOption>,
+        current: Option<String>,
         mut sel: usize,
     ) {
         match key.code {
@@ -2577,19 +2585,20 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => sel = sel.saturating_sub(1),
             KeyCode::Enter => {
                 match options.get(sel) {
-                    Some(ReviewActionOption::Action(action)) => {
-                        let action = action.clone();
+                    Some(ViewerOption::Viewer(viewer)) => {
+                        let viewer = viewer.clone();
                         let result = self
                             .store
-                            .set_review_action(project_id, &action)
+                            .set_viewer(project_id, viewer.as_deref())
                             .and_then(|_| self.refresh());
                         if self.report(result).is_some() {
-                            self.status = Some(format!("review action -> {action}"));
+                            self.status =
+                                Some(format!("viewer -> {}", viewer_label(viewer.as_deref())));
                         }
                     }
                     // Open the shared add-viewer form; on success it pins this
                     // project to the new viewer (DESIGN.md §5).
-                    Some(ReviewActionOption::NewViewer) => {
+                    Some(ViewerOption::NewViewer) => {
                         self.open_viewer_form(None, Some(project_id));
                     }
                     None => {}
@@ -2598,7 +2607,7 @@ impl App {
             }
             _ => {}
         }
-        self.mode = Mode::ReviewActionPicker {
+        self.mode = Mode::ViewerPicker {
             project_id,
             options,
             current,
@@ -2625,7 +2634,7 @@ impl App {
 
     /// Open the add/edit-viewer form. `existing` pre-fills it for an edit (name
     /// locked); `review_project` threads through the quick path so a viewer
-    /// created from the review-action picker becomes that project's action.
+    /// created from the viewer picker becomes that project's viewer.
     fn open_viewer_form(
         &mut self,
         existing: Option<(String, String)>,
@@ -2679,8 +2688,8 @@ impl App {
         }
     }
 
-    /// Delete the selected viewer, refusing when a project's review action still
-    /// names it (DESIGN.md §5) — the same refusal as `voro viewer remove`, with
+    /// Delete the selected viewer, refusing when a project still names it
+    /// (DESIGN.md §5) — the same refusal as `voro viewer remove`, with
     /// the offending projects named. Deleting the default clears `default_viewer`.
     fn delete_selected_viewer(&mut self) {
         let Some(viewer) = self.config_viewers.get(self.config_sel) else {
@@ -2701,7 +2710,7 @@ impl App {
         if !referencing.is_empty() {
             let names: Vec<&str> = referencing.iter().map(|p| p.name.as_str()).collect();
             self.status = Some(format!(
-                "'{name}' is the review action of {} — repoint it first (v on the projects screen)",
+                "'{name}' is the viewer of {} — repoint it first (v on the projects screen)",
                 names.join(", ")
             ));
             return;
@@ -2902,9 +2911,8 @@ impl App {
             msg.push_str(" (no {path} — runs in the checkout dir)");
         }
         if let Some(project_id) = review_project {
-            let action = voro_core::ReviewAction::Viewer(Some(trimmed.clone()));
-            match self.store.set_review_action(project_id, &action) {
-                Ok(_) => msg.push_str(" — set as this project's review action"),
+            match self.store.set_viewer(project_id, Some(&trimmed)) {
+                Ok(_) => msg.push_str(" — set as this project's viewer"),
                 Err(e) => msg = e.to_string(),
             }
         }
@@ -4497,19 +4505,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// Deleting a viewer a project's review action still names is refused on the
+    /// Deleting a viewer a project still names is refused on the
     /// Config screen too, naming the project (DESIGN.md §5).
     #[test]
     fn config_screen_refuses_to_delete_a_referenced_viewer() {
         let toml = "[viewers.zed]\ncmd = \"zed {path}\"\n";
         let (mut store, ctx, _project) = scratch_env("config-ref", Some(toml));
         let project = store.create_project("demo2", "/tmp/demo2").unwrap();
-        store
-            .set_review_action(
-                project.id,
-                &voro_core::ReviewAction::Viewer(Some("zed".into())),
-            )
-            .unwrap();
+        store.set_viewer(project.id, Some("zed")).unwrap();
         let path = ctx.agents_path.clone();
         let mut app = App::new(store, ctx).unwrap();
 
@@ -4534,11 +4537,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// The quick path (DESIGN.md §5): the projects screen's review-action picker
+    /// The quick path (DESIGN.md §5): the projects screen's viewer picker
     /// grows a "new viewer…" entry that opens the add-viewer form and, on
     /// success, pins the project to the viewer it created.
     #[test]
-    fn review_action_picker_new_viewer_creates_and_pins_it() {
+    fn viewer_picker_new_viewer_creates_and_pins_it() {
         let (mut store, ctx, project_path) = scratch_env("config-quickpath", None);
         let project = store
             .create_project("demo", project_path.to_str().unwrap())
@@ -4546,13 +4549,13 @@ mod tests {
         let path = ctx.agents_path.clone();
         let mut app = App::new(store, ctx).unwrap();
 
-        // onto the projects screen, open the review-action picker
+        // onto the projects screen, open the viewer picker
         key(&mut app, KeyCode::Char('3'));
         assert_eq!(app.screen, Screen::Projects);
         key(&mut app, KeyCode::Char('v'));
         let n = match &app.mode {
-            Mode::ReviewActionPicker { options, .. } => options.len(),
-            _ => panic!("expected the review-action picker to open"),
+            Mode::ViewerPicker { options, .. } => options.len(),
+            _ => panic!("expected the viewer picker to open"),
         };
         // the last option is "new viewer…"; move to it and select
         for _ in 0..n {
@@ -4582,8 +4585,8 @@ mod tests {
                 .contains(&"emacs".to_string())
         );
         assert_eq!(
-            app.store.project(project.id).unwrap().review_action,
-            voro_core::ReviewAction::Viewer(Some("emacs".into()))
+            app.store.project(project.id).unwrap().viewer.as_deref(),
+            Some("emacs")
         );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -5936,9 +5939,7 @@ mod tests {
 
         let mut store = Store::open_in_memory().unwrap();
         let project = store.create_project("demo", dir.to_str().unwrap()).unwrap();
-        store
-            .set_review_action(project.id, &ReviewAction::Viewer(Some("zed".into())))
-            .unwrap();
+        store.set_viewer(project.id, Some("zed")).unwrap();
         let task = store
             .create_task(NewTask {
                 project_id: project.id,
