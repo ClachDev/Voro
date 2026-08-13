@@ -13,7 +13,7 @@ use std::path::Path;
 
 use toml_edit::{DocumentMut, Item, Table, value};
 
-use crate::agent::VIEWER_PATH_PLACEHOLDER;
+use crate::agent::{VIEWER_PATH_PLACEHOLDER, is_builtin_viewer};
 use crate::error::{Error, Result};
 use crate::model::{Project, ReviewAction};
 
@@ -44,7 +44,7 @@ pub fn edit_viewer(path: &Path, name: &str, cmd: &str) -> Result<()> {
     }
     let mut doc = load_doc(path)?;
     if !viewer_exists(&doc, name) {
-        return Err(invalid(format!("no viewer named '{name}' to edit")));
+        return Err(missing(name, "edit"));
     }
     set_viewer_cmd(&mut doc, name, cmd)?;
     write_doc(path, &doc)
@@ -58,7 +58,7 @@ pub fn delete_viewer(path: &Path, name: &str) -> Result<bool> {
     let name = name.trim();
     let mut doc = load_doc(path)?;
     if !viewer_exists(&doc, name) {
-        return Err(invalid(format!("no viewer named '{name}' to delete")));
+        return Err(missing(name, "delete"));
     }
     remove_viewer(&mut doc, name);
     let cleared = default_viewer_matches(&doc, name);
@@ -69,12 +69,13 @@ pub fn delete_viewer(path: &Path, name: &str) -> Result<bool> {
     Ok(cleared)
 }
 
-/// Set `default_viewer` to an existing viewer, validated so the picker can't
-/// point the default at a viewer that isn't there.
+/// Set `default_viewer` to a viewer that resolves — a `[viewers.<name>]` table
+/// or a built-in — so the picker can't point the default at a viewer that
+/// isn't there.
 pub fn set_default_viewer(path: &Path, name: &str) -> Result<()> {
     let name = name.trim();
     let mut doc = load_doc(path)?;
-    if !viewer_exists(&doc, name) {
+    if !viewer_exists(&doc, name) && !is_builtin_viewer(name) {
         return Err(invalid(format!(
             "no viewer named '{name}' — define it before making it the default"
         )));
@@ -134,6 +135,19 @@ fn validate_viewer(name: &str, cmd: &str) -> Result<()> {
 
 fn invalid(message: String) -> Error {
     Error::Invalid(message)
+}
+
+/// The refusal for a name this file does not define. A built-in is not missing
+/// but unwritable — it lives in the binary — so it is refused separately, with
+/// the override that *is* writable named (DESIGN.md §11a).
+fn missing(name: &str, verb: &str) -> Error {
+    if is_builtin_viewer(name) {
+        return invalid(format!(
+            "viewer '{name}' is built into voro, so there is nothing here to {verb} — run \
+             `voro viewer add {name} '<cmd>'` to override it with your own"
+        ));
+    }
+    invalid(format!("no viewer named '{name}' to {verb}"))
 }
 
 /// Read the file into an editable document, or an empty one when it does not
@@ -339,10 +353,58 @@ cmd = \"git -C {path} difftool -d {base}...{branch}\"  # inline note
         assert!(cleared);
         let config = AgentsConfig::load(&path).unwrap();
         assert!(config.viewer_names().is_empty());
-        assert_eq!(config.default_viewer_name(), None);
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("default_viewer"),
+        );
 
-        let missing = delete_viewer(&path, "zed").unwrap_err().to_string();
+        let missing = delete_viewer(&path, "emacs").unwrap_err().to_string();
         assert!(missing.contains("no viewer named"), "{missing}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A built-in viewer lives in the binary, so the write helpers cannot touch
+    /// it — but they can be told to override it, and it is a legitimate default
+    /// with no table of its own (#405).
+    #[test]
+    fn built_in_viewers_are_unwritable_but_overridable_and_defaultable() {
+        let dir = scratch("builtin");
+        let path = dir.join("voro.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for message in [
+            delete_viewer(&path, "code").unwrap_err().to_string(),
+            edit_viewer(&path, "code", "code {path}")
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(message.contains("built into voro"), "{message}");
+            assert!(message.contains("voro viewer add code"), "{message}");
+        }
+
+        // a built-in may be the default without any table defining it
+        set_default_viewer(&path, "code").unwrap();
+        assert_eq!(
+            AgentsConfig::load(&path)
+                .unwrap()
+                .default_viewer_name()
+                .as_deref(),
+            Some("code")
+        );
+
+        // adding one of its name overrides it, and is then editable
+        add_viewer(&path, "code", "code --wait {path}").unwrap();
+        assert_eq!(
+            AgentsConfig::load(&path)
+                .unwrap()
+                .viewer_cmd(Some("code"))
+                .unwrap(),
+            "code --wait {path}"
+        );
+        edit_viewer(&path, "code", "code -n {path}").unwrap();
+        delete_viewer(&path, "code").unwrap();
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

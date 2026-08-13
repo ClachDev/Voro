@@ -100,6 +100,24 @@ pub enum Error {
     #[error("invalid agents config at {}: {message}", path.display())]
     AgentConfigInvalid { path: PathBuf, message: String },
 
+    #[error(
+        "no viewer found — install {probed}, or run `voro viewer add <name> '<cmd>'`; \
+         none of the built-in viewers are on PATH and {} defines none",
+        path.display()
+    )]
+    NoViewer { probed: String, path: PathBuf },
+
+    #[error(
+        "no viewer named '{name}' — run `voro viewer add {name} '<cmd>'` to define it in {}; \
+         available viewers: {known}",
+        path.display()
+    )]
+    UnknownViewer {
+        name: String,
+        known: String,
+        path: PathBuf,
+    },
+
     #[error("no agent named '{name}' ({origin}) in {}; defined agents: {known}", path.display())]
     UnknownAgent {
         name: String,

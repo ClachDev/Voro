@@ -185,18 +185,22 @@ dispatch
   dispatch <task-id> [--agent NAME]
                                   spawn a headless agent session on a ready
                                   task; --agent overrides the resolved agent
-  viewer list                     list the viewers voro.toml defines; * marks
-                                  the default used when nothing names one
+  viewer list                     list effective viewers (built-in + user)
+                                  with provenance; * marks the default used
+                                  when nothing names one
   viewer add <name> <cmd>         define a [viewers.NAME] entry in voro.toml
                                   (comment-preserving); cmd may carry {path},
-                                  {branch}, {base} (e.g. 'zed {path}')
+                                  {branch}, {base} (e.g. 'zed {path}'). Naming
+                                  a built-in overrides it wholesale
   viewer remove <name>            delete a viewer; refused while a project's
-                                  review action still names it
+                                  review action still names it, and for a
+                                  built-in, which is overridden rather than
+                                  removed
   open <task-id>                  open a review/running task's checkout in a
-                                  voro.toml viewer to see its diff — the only
-                                  local-diff spelling, and the one `project
-                                  action` names a viewer for; reports what to
-                                  configure if none is set
+                                  viewer to see its diff — the only local-diff
+                                  spelling, and the one `project action` names
+                                  a viewer for. Uses the built-in code/cursor/
+                                  zed found on PATH when voro.toml names none
   pr <task-id> [--yes]            show the task's diff on GitHub, always: jump
                                   to the tracked PR in a browser, or push the
                                   review task's branch and open a ready PR
@@ -2222,35 +2226,36 @@ fn viewer_verb(store: &mut Store, cmd: ViewerCmd, ctx: &DispatchCtx) -> Result<S
         }
         ViewerCmd::List => {
             let config = AgentsConfig::load(path).map_err(|e| e.to_string())?;
-            let names = config.viewer_names();
             let default = config.default_viewer_name();
             let mut out = String::new();
-            for name in &names {
-                let marker = if Some(name.as_str()) == default.as_deref() {
+            // The built-ins are listed beside the user's tables, as `agent
+            // list` does: each is a viewer `open` can actually run.
+            for (name, cmd, provenance) in config.viewer_entries() {
+                let marker = if Some(name) == default.as_deref() {
                     "* "
                 } else {
                     "  "
                 };
-                let cmd = config.viewer_cmd(Some(name)).map_err(|e| e.to_string())?;
-                writeln!(out, "{marker}{name}  {cmd}").unwrap();
+                writeln!(out, "{marker}{name:<12} {:<14} {cmd}", provenance.label()).unwrap();
             }
             // The anonymous [viewer] table has no name but still resolves as
             // the default; show it so `list` reflects what `open` will run.
             if default.is_none()
-                && let Ok(cmd) = config.viewer_cmd(None)
+                && let Some(cmd) = config.anonymous_viewer_cmd()
             {
-                writeln!(out, "* [viewer]  {cmd}").unwrap();
+                writeln!(out, "* {:<12} {:<14} {cmd}", "[viewer]", "user").unwrap();
             }
-            if out.is_empty() {
+            writeln!(out, "\n({} — * is the default)", path.display()).unwrap();
+            // Nothing starred and no anonymous table means no built-in is
+            // installed either, so `open` has nothing to run: say so here
+            // rather than leaving it to be discovered by pressing `o`.
+            if default.is_none() && config.anonymous_viewer_cmd().is_none() {
                 writeln!(
                     out,
-                    "no viewers configured — add a [viewers.<name>] table to {} with a cmd \
-                     such as 'zed {{path}}' or 'git difftool -d'",
-                    path.display()
+                    "no viewer resolves — install one of the built-ins, or run \
+                     `voro viewer add <name> '<cmd>'` to define your own"
                 )
                 .unwrap();
-            } else {
-                writeln!(out, "\n({} — * is the default)", path.display()).unwrap();
             }
             Ok(out)
         }
@@ -2572,17 +2577,25 @@ mod tests {
         };
 
         // add then list shows it — `viewer list` gains its inverse
-        let out = call(&mut s, &["viewer", "add", "zed", "zed {path}"]).unwrap();
-        assert!(out.contains("zed"), "{out}");
+        let out = call(&mut s, &["viewer", "add", "mine", "mine {path}"]).unwrap();
+        assert!(out.contains("mine"), "{out}");
         let listed = call(&mut s, &["viewer", "list"]).unwrap();
         assert!(
-            listed.contains("zed") && listed.contains("zed {path}"),
+            listed.contains("mine") && listed.contains("mine {path}"),
             "{listed}"
         );
 
         // a duplicate name is refused
-        let e = call(&mut s, &["viewer", "add", "zed", "zed ."]).unwrap_err();
+        let e = call(&mut s, &["viewer", "add", "mine", "mine ."]).unwrap_err();
         assert!(e.contains("already exists"), "{e}");
+
+        // a built-in is overridden rather than removed (#405)
+        let e = call(&mut s, &["viewer", "remove", "zed"]).unwrap_err();
+        assert!(e.contains("built into voro"), "{e}");
+        call(&mut s, &["viewer", "add", "zed", "zed --wait {path}"]).unwrap();
+        let listed = call(&mut s, &["viewer", "list"]).unwrap();
+        assert!(listed.contains("user override"), "{listed}");
+        call(&mut s, &["viewer", "remove", "zed"]).unwrap();
 
         // an empty command is refused
         let e = call(&mut s, &["viewer", "add", "emacs", "   "]).unwrap_err();
@@ -2592,18 +2605,18 @@ mod tests {
         let out = call(&mut s, &["viewer", "add", "difftool", "git difftool -d"]).unwrap();
         assert!(out.contains("{path}"), "{out}");
 
-        // a project pinned to viewer:zed blocks its removal, naming the project
+        // a project pinned to viewer:mine blocks its removal, naming the project
         call(&mut s, &["project", "add", "demo", "/tmp/demo"]).unwrap();
-        call(&mut s, &["project", "action", "demo", "viewer:zed"]).unwrap();
-        let e = call(&mut s, &["viewer", "remove", "zed"]).unwrap_err();
+        call(&mut s, &["project", "action", "demo", "viewer:mine"]).unwrap();
+        let e = call(&mut s, &["viewer", "remove", "mine"]).unwrap_err();
         assert!(e.contains("demo") && e.contains("review action"), "{e}");
 
         // repoint the project, then removal succeeds and list loses it
         call(&mut s, &["project", "action", "demo", "auto"]).unwrap();
-        let out = call(&mut s, &["viewer", "remove", "zed"]).unwrap();
+        let out = call(&mut s, &["viewer", "remove", "mine"]).unwrap();
         assert!(out.contains("removed"), "{out}");
         let listed = call(&mut s, &["viewer", "list"]).unwrap();
-        assert!(!listed.contains("zed"), "{listed}");
+        assert!(!listed.contains("mine"), "{listed}");
         assert!(listed.contains("difftool"), "{listed}");
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -4220,18 +4233,24 @@ mod tests {
              [viewers.difftool]\ncmd = \"git difftool -d\"\n",
         );
         let out = run_with(&mut s, &["viewer", "list"], &ctx).unwrap();
-        assert!(out.contains("* zed  zed {path}"), "{out}");
-        assert!(out.contains("  difftool  git difftool -d"), "{out}");
+        assert!(out.contains("* zed"), "{out}");
+        assert!(out.contains("user override"), "{out}");
+        assert!(out.contains("git difftool -d"), "{out}");
 
         // the anonymous [viewer] table shows as the default it resolves to
         let ctx = ctx_with_toml("[viewer]\ncmd = \"zed {path}\"\n");
         let out = run_with(&mut s, &["viewer", "list"], &ctx).unwrap();
-        assert!(out.contains("* [viewer]  zed {path}"), "{out}");
+        assert!(out.contains("* [viewer]"), "{out}");
 
-        // nothing configured: say what to add rather than printing nothing
+        // nothing configured: the built-ins are still listed, with provenance,
+        // since each is a viewer `open` can run (#405)
         let ctx = ctx_with_toml("");
         let out = run_with(&mut s, &["viewer", "list"], &ctx).unwrap();
-        assert!(out.contains("no viewers configured"), "{out}");
+        assert!(!out.contains("no viewers configured"), "{out}");
+        for name in ["code", "cursor", "zed"] {
+            assert!(out.contains(name), "{out}");
+        }
+        assert!(out.contains("built-in"), "{out}");
         assert!(ok(&mut s, &["help"]).contains("viewer list"), "help");
     }
 

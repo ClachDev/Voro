@@ -57,12 +57,17 @@ pub struct ConfigAgentRow {
     pub models: Option<(String, String, String)>,
 }
 
-/// A named viewer row on the Config screen — the editable half of the page.
+/// A named viewer row on the Config screen: every viewer `open` can run, the
+/// built-ins included, so the starred default is always visible. Only the rows
+/// backed by a `voro.toml` table are `editable` — a built-in is overridden
+/// rather than changed in place (DESIGN.md §11a).
 #[derive(Debug, Clone)]
 pub struct ConfigViewerRow {
     pub name: String,
     pub cmd: String,
     pub is_default: bool,
+    pub provenance: &'static str,
+    pub editable: bool,
 }
 
 /// One selectable row on the cockpit; indices point into the App caches.
@@ -476,8 +481,9 @@ pub struct App {
 
     /// The Config screen's view of `voro.toml` (DESIGN.md §5), reloaded every
     /// refresh so an edit — from either this screen or a dispatch — is reflected
-    /// immediately. Agents are read-only; the named viewers are what `config_sel`
-    /// selects for edit/delete.
+    /// immediately. Agents are read-only; the viewers are what `config_sel`
+    /// selects, and the ones a `voro.toml` table backs are what edit/delete act
+    /// on — a built-in row is selectable but refuses both.
     pub config_agents: Vec<ConfigAgentRow>,
     pub config_viewers: Vec<ConfigViewerRow>,
     /// The legacy anonymous `[viewer]` table's command, shown read-only.
@@ -856,19 +862,14 @@ impl App {
             .collect();
         let default_viewer = config.default_viewer_name();
         self.config_viewers = config
-            .viewer_names()
+            .viewer_entries()
             .into_iter()
-            .map(|name| {
-                let is_default = Some(name.as_str()) == default_viewer.as_deref();
-                let cmd = config
-                    .named_viewer_cmd(&name)
-                    .unwrap_or_default()
-                    .to_string();
-                ConfigViewerRow {
-                    name,
-                    cmd,
-                    is_default,
-                }
+            .map(|(name, cmd, provenance)| ConfigViewerRow {
+                is_default: Some(name) == default_viewer.as_deref(),
+                name: name.to_string(),
+                cmd: cmd.to_string(),
+                provenance: provenance.label(),
+                editable: provenance != voro_core::Provenance::BuiltIn,
             })
             .collect();
         self.config_anon_viewer = config.anonymous_viewer_cmd().map(str::to_string);
@@ -1061,7 +1062,11 @@ impl App {
     pub fn enter_hint(&self) -> Option<&'static str> {
         match self.screen {
             Screen::Projects => None,
-            Screen::Config => self.config_viewers.get(self.config_sel).map(|_| "⏎ edit"),
+            Screen::Config => self
+                .config_viewers
+                .get(self.config_sel)
+                .filter(|v| v.editable)
+                .map(|_| "⏎ edit"),
             Screen::Tasks => self.all.get(self.tasks_sel).map(|_| "⏎ view"),
             Screen::Cockpit => match self.cockpit_rows.get(self.cockpit_sel)? {
                 CockpitRow::Queue(i) => match self.queue.rows.get(*i)? {
@@ -2503,12 +2508,9 @@ impl App {
             ReviewActionOption::Action(ReviewAction::Pr),
             ReviewActionOption::Action(ReviewAction::Viewer(None)),
         ];
-        options.extend(
-            config
-                .viewer_names()
-                .into_iter()
-                .map(|name| ReviewActionOption::Action(ReviewAction::Viewer(Some(name)))),
-        );
+        options.extend(config.viewer_entries().into_iter().map(|(name, ..)| {
+            ReviewActionOption::Action(ReviewAction::Viewer(Some(name.to_string())))
+        }));
         // The quick path (DESIGN.md §5): a trailing entry that opens the
         // add-viewer form and pins this project to the viewer it creates.
         options.push(ReviewActionOption::NewViewer);
@@ -2611,8 +2613,17 @@ impl App {
         };
     }
 
+    /// Edit the selected viewer's command. A built-in has no table to edit —
+    /// overriding it is an *add* of the same name — so it is refused with that
+    /// named rather than opening a form whose write would fail.
     fn edit_selected_viewer(&mut self) {
         match self.config_viewers.get(self.config_sel) {
+            Some(v) if !v.editable => {
+                self.status = Some(format!(
+                    "'{}' is built into voro — press a and name it '{}' to override it",
+                    v.name, v.name
+                ));
+            }
             Some(v) => {
                 let existing = (v.name.clone(), v.cmd.clone());
                 self.open_viewer_form(Some(existing), None);
@@ -2629,6 +2640,14 @@ impl App {
             self.status = Some("no viewer selected".into());
             return;
         };
+        if !viewer.editable {
+            self.status = Some(format!(
+                "'{}' is built into voro and cannot be deleted — press a and name it '{}' to \
+                 override it",
+                viewer.name, viewer.name
+            ));
+            return;
+        }
         let name = viewer.name.clone();
         let referencing =
             voro_core::config_edit::projects_referencing_viewer(&self.projects, &name);
@@ -2666,7 +2685,16 @@ impl App {
         };
         let (names, current) = match kind {
             DefaultKind::Agent => (config.agent_names(), config.default_name()),
-            DefaultKind::Viewer => (config.viewer_names(), config.default_viewer_name()),
+            // The built-ins are offered too: a default naming one is exactly
+            // what a fresh install wants to pin (DESIGN.md §11a).
+            DefaultKind::Viewer => (
+                config
+                    .viewer_entries()
+                    .into_iter()
+                    .map(|(name, ..)| name.to_string())
+                    .collect(),
+                config.default_viewer_name(),
+            ),
         };
         if names.is_empty() {
             self.status = Some(match kind {
@@ -2797,6 +2825,11 @@ impl App {
         self.status = Some(msg);
         let result = self.refresh();
         self.report(result);
+        // Land the selection on what was just written, so `e`/`d` act on it
+        // rather than on whichever row the list happens to sort first.
+        if let Some(i) = self.config_viewers.iter().position(|v| v.name == trimmed) {
+            self.config_sel = i;
+        }
     }
 
     /// Drive the default-agent/viewer picker: ⏎ writes the choice through the
@@ -4101,6 +4134,15 @@ mod tests {
         }
     }
 
+    /// The Config screen's row index for a viewer. The built-ins share the
+    /// list, so a test never assumes where a name sorts.
+    fn row(app: &App, name: &str) -> usize {
+        app.config_viewers
+            .iter()
+            .position(|v| v.name == name)
+            .unwrap_or_else(|| panic!("no viewer row named {name}"))
+    }
+
     /// The Config screen (DESIGN.md §5): add, edit, set-default, and delete a
     /// viewer entirely through the TUI, each edit landing in `voro.toml` and
     /// reflected on the next refresh.
@@ -4115,27 +4157,45 @@ mod tests {
         app.screen = Screen::Cockpit;
         key(&mut app, KeyCode::Char('4'));
         assert_eq!(app.screen, Screen::Config);
-        assert!(app.config_viewers.is_empty());
-        // the built-in agents are listed read-only
+        // the built-in agents and viewers are both listed, the viewers'
+        // built-in rows read-only (#405)
         assert!(app.config_agents.iter().any(|a| a.name == "claude"));
+        assert!(
+            app.config_viewers
+                .iter()
+                .any(|v| v.name == "code" && !v.editable && v.provenance == "built-in")
+        );
+        assert!(app.config_viewers.iter().all(|v| !v.editable));
+
+        // e/d on a built-in row refuse, naming the override that replaces it
+        app.config_sel = row(&app, "code");
+        for k in ['d', 'e'] {
+            key(&mut app, KeyCode::Char(k));
+            let status = app.status.clone().unwrap_or_default();
+            assert!(status.contains("built into voro"), "{status}");
+            assert!(status.contains("override"), "{status}");
+            assert!(matches!(app.mode, Mode::Normal));
+        }
+        assert!(app.config_viewers.iter().any(|v| v.name == "code"));
 
         // add: a opens the form, name → Enter → command → Enter submits
         key(&mut app, KeyCode::Char('a'));
         assert!(matches!(app.mode, Mode::ViewerForm { editing: false, .. }));
-        type_str(&mut app, "zed");
+        type_str(&mut app, "mine");
         key(&mut app, KeyCode::Enter);
-        type_str(&mut app, "zed {path}");
+        type_str(&mut app, "mine {path}");
         key(&mut app, KeyCode::Enter);
         assert!(matches!(app.mode, Mode::Normal));
-        assert_eq!(app.config_viewers.len(), 1);
-        assert_eq!(app.config_viewers[0].name, "zed");
-        assert_eq!(app.config_viewers[0].cmd, "zed {path}");
+        // the selection lands on what was just written
+        assert_eq!(app.config_viewers[app.config_sel].name, "mine");
+        assert_eq!(app.config_viewers[app.config_sel].cmd, "mine {path}");
+        assert_eq!(app.config_viewers[app.config_sel].provenance, "user");
         assert_eq!(
             AgentsConfig::load(&path)
                 .unwrap()
-                .viewer_cmd(Some("zed"))
+                .viewer_cmd(Some("mine"))
                 .unwrap(),
-            "zed {path}"
+            "mine {path}"
         );
 
         // edit: e opens the form with the name locked; append to the command
@@ -4143,27 +4203,48 @@ mod tests {
         assert!(matches!(app.mode, Mode::ViewerForm { editing: true, .. }));
         type_str(&mut app, " --wait");
         key(&mut app, KeyCode::Enter);
-        assert_eq!(app.config_viewers[0].cmd, "zed {path} --wait");
+        assert_eq!(
+            app.config_viewers[row(&app, "mine")].cmd,
+            "mine {path} --wait"
+        );
 
-        // default: V opens the picker; Enter sets zed as default_viewer
+        // default: V opens the picker over every viewer, built-ins included;
+        // walk to the top and back down to `mine`, since where the cursor
+        // starts depends on what is installed
         key(&mut app, KeyCode::Char('V'));
-        assert!(matches!(app.mode, Mode::DefaultPicker { .. }));
+        let names = match &app.mode {
+            Mode::DefaultPicker { names, .. } => names.clone(),
+            _ => panic!("expected the default picker to open"),
+        };
+        assert!(names.iter().any(|n| n == "code"), "{names:?}");
+        let target = names.iter().position(|n| n == "mine").unwrap();
+        for _ in 0..names.len() {
+            key(&mut app, KeyCode::Char('k'));
+        }
+        for _ in 0..target {
+            key(&mut app, KeyCode::Char('j'));
+        }
         key(&mut app, KeyCode::Enter);
-        assert!(app.config_viewers[0].is_default);
+        assert!(app.config_viewers[row(&app, "mine")].is_default);
         assert_eq!(
             AgentsConfig::load(&path)
                 .unwrap()
                 .default_viewer_name()
                 .as_deref(),
-            Some("zed")
+            Some("mine")
         );
 
         // delete: d removes it and clears the now-dangling default
+        app.config_sel = row(&app, "mine");
         key(&mut app, KeyCode::Char('d'));
-        assert!(app.config_viewers.is_empty());
+        assert!(app.config_viewers.iter().all(|v| v.name != "mine"));
         let config = AgentsConfig::load(&path).unwrap();
         assert!(config.viewer_names().is_empty());
-        assert_eq!(config.default_viewer_name(), None);
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("default_viewer")
+        );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -4185,7 +4266,8 @@ mod tests {
         let mut app = App::new(store, ctx).unwrap();
 
         key(&mut app, KeyCode::Char('4'));
-        assert_eq!(app.config_viewers.len(), 1);
+        app.config_sel = row(&app, "zed");
+        assert!(app.config_viewers[app.config_sel].editable);
         key(&mut app, KeyCode::Char('d'));
         assert!(
             app.status.as_deref().unwrap_or("").contains("demo2"),
@@ -4193,7 +4275,7 @@ mod tests {
             app.status
         );
         // still there, in the file and the view
-        assert_eq!(app.config_viewers.len(), 1);
+        assert!(app.config_viewers.iter().any(|v| v.name == "zed"));
         assert!(
             AgentsConfig::load(&path)
                 .unwrap()

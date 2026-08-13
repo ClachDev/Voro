@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Built-in viewers**, so a fresh install's first `o` works: `code`, `cursor`
+  and `zed` ship compiled in and are probed against `PATH` in that order, the
+  way the built-in agents already are. A `voro.toml` still wins — a
+  `[viewers.code]` table overrides that built-in wholesale — and `voro viewer
+  list` and the Config screen now show the built-ins beside your own with each
+  one's provenance, starring whichever the next `open` will run. A built-in is
+  overridden rather than edited or deleted, and both surfaces say so. When
+  nothing resolves at all, the failure leads with what to do (install one, or
+  `voro viewer add <name> '<cmd>'`) instead of reporting a config file that may
+  not exist as an invalid *agents* config.
 - **A build from a `target/` directory opens a dev store, not your real one.** A
   `voro` run out of `target/debug` or `target/release` now uses
   `~/.local/share/voro/dev.db`, seeded on first run with a fixture board

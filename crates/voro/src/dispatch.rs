@@ -2592,15 +2592,20 @@ mod tests {
         assert!(contents.contains("exit status: 3"), "{contents}");
     }
 
+    /// A viewer name nothing resolves reports the action first and never calls
+    /// the config file invalid — it may not even exist (#405). The
+    /// nothing-resolves-at-all message is `voro-core`'s, tested there against
+    /// an injected PATH probe rather than the developer's own PATH.
     #[test]
-    fn open_without_a_viewer_reports_what_to_configure() {
+    fn open_with_an_unknown_viewer_reports_what_to_run() {
         // the fixture's voro.toml defines no viewer at all
         let (mut store, ctx, project) = fixture("cat {prompt_file}");
         let id = review_task(&mut store, &project);
 
-        let err = open(&mut store, &ctx, id, None).unwrap_err();
-        assert!(err.contains("[viewers.<name>]"), "{err}");
+        let err = open(&mut store, &ctx, id, Some("nope")).unwrap_err();
+        assert!(err.starts_with("no viewer named 'nope' — run"), "{err}");
         assert!(err.contains(ctx.agents_path.to_str().unwrap()), "{err}");
+        assert!(!err.contains("invalid"), "{err}");
     }
 
     #[test]
