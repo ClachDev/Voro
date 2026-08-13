@@ -125,6 +125,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A minimum supported Rust version, and an Install section that matches what
+  is actually published.** The workspace declares `rust-version = "1.88"` — the
+  floor its dependency tree already imposes, above the 1.85 that edition 2024
+  alone would need — so `cargo install voro` on an older toolchain now refuses
+  up front naming the version required, rather than failing deep in a
+  dependency. The README says so too, and no longer implies a prebuilt binary
+  exists for every Unix: binaries are published for `x86_64-unknown-linux-gnu`
+  and `aarch64-apple-darwin`, and every other platform, an Intel Mac included,
+  is pointed at the source build. It also warns that `~/.cargo/bin`, where the
+  shell installer puts the binary, is not on the `PATH` of someone who has never
+  installed Rust.
 - **`n` proposes a task from one typed line, in the background.** It opens a
   one-line modal rather than the `$EDITOR` form; ⏎ hands what you typed to a
   headless agent, which expands it into a title and a dispatchable body and
