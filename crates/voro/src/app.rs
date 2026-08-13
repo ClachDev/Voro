@@ -413,6 +413,11 @@ pub struct App {
     /// half-written done report a dispatched session left behind, which a PR
     /// cannot be opened from. Re-derived per refresh, never stored.
     pub incomplete_report: std::collections::HashSet<i64>,
+    /// Review tasks whose checkout has no git remote (DESIGN.md §8): there is
+    /// nowhere to open a pull request, so their rows advertise the local review
+    /// path instead of a `pr` that could only fail. Re-derived per refresh from
+    /// the checkouts themselves, one `git remote` per distinct repo.
+    pub local_review: std::collections::HashSet<i64>,
     /// Proposals whose last refine round rewrote the body (DESIGN.md §6): what
     /// renders the `↻ refined` marker, so the operator triages the improved
     /// version knowing it moved. Re-derived per refresh and cleared by triage
@@ -537,6 +542,7 @@ impl App {
             counts: StateCounts::default(),
             all: Vec::new(),
             incomplete_report: std::collections::HashSet::new(),
+            local_review: std::collections::HashSet::new(),
             refined: std::collections::HashSet::new(),
             refine_failed: std::collections::HashSet::new(),
             deps: std::collections::HashMap::new(),
@@ -655,6 +661,15 @@ impl App {
                     .incomplete_report_flag(r.task.id)
                     .ok()?
                     .then_some(r.task.id)
+            })
+            .collect();
+        let mut forges = crate::pr::ForgeMemo::default();
+        self.local_review = all
+            .iter()
+            .filter(|r| r.task.state == TaskState::Review && r.task.pr_url.is_none())
+            .filter_map(|r| {
+                let repo = self.store.repo_for_task(&r.task).ok()?;
+                (!forges.takes_pull_requests(&repo.path)).then_some(r.task.id)
             })
             .collect();
         let proposals = || all.iter().filter(|r| r.task.state == TaskState::Proposed);
@@ -1415,6 +1430,18 @@ impl App {
     /// The repo a task names, as (name, path), or `None` when it runs in its
     /// project's default — the detail pane renders the line only when it says
     /// something the project row does not.
+    /// The verb a task's row advertises (DESIGN.md §3), degraded to the local
+    /// review path where the checkout has no remote to open a pull request on
+    /// (§8). Every rendered `next:` resolves through here so the advertisement
+    /// and the key that serves it cannot drift apart.
+    pub fn next_action(&self, task: &voro_core::Task) -> Option<voro_core::NextAction> {
+        let verb = task.next_action()?;
+        Some(match self.local_review.contains(&task.id) {
+            true => verb.without_pull_requests(),
+            false => verb,
+        })
+    }
+
     pub fn task_repo(&self, task: &voro_core::Task) -> Option<(String, String)> {
         task.repo_id?;
         let repo = self.store.repo_for_task(task).ok()?;

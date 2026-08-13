@@ -125,14 +125,15 @@ impl Default for AttentionCosts {
 impl AttentionCosts {
     /// The divisor for one next action. `redispatch` prices as `dispatch`
     /// because it *is* one — the operator's move is the same keypress, and it
-    /// opens the same session; `pr` and `review PR` are the same review either
-    /// way, differing only in the medium the diff arrives on (§3).
+    /// opens the same session; `pr`, `review PR`, and `open` are the same
+    /// review either way, differing only in the medium the diff arrives on
+    /// (§3).
     pub fn of(&self, action: NextAction) -> f64 {
         match action {
             NextAction::Answer => self.answer,
             NextAction::Triage => self.triage,
             NextAction::Dispatch | NextAction::Redispatch => self.dispatch,
-            NextAction::Pr | NextAction::ReviewPr => self.review,
+            NextAction::Pr | NextAction::ReviewPr | NextAction::Open => self.review,
             NextAction::Do => self.human_do,
         }
     }
@@ -739,6 +740,15 @@ mod tests {
                 format!("#{small}"),
             ]
         );
+    }
+
+    /// Reading a diff costs the same whatever medium it arrives on, so a row
+    /// whose `pr` degraded to `open` (DESIGN.md §8) keeps its place in the
+    /// queue — the advertisement changed, not the price.
+    #[test]
+    fn the_local_review_path_prices_as_a_review() {
+        let costs = AttentionCosts::default();
+        assert_eq!(costs.of(NextAction::Open), costs.of(NextAction::Pr));
     }
 
     #[test]

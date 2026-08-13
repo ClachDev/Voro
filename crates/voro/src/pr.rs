@@ -353,6 +353,46 @@ pub fn ensure_github_repo(repo_path: &str, local_diff: &str) -> Result<(), Strin
     }
 }
 
+/// Whether a checkout could take a pull request at all, decided from its git
+/// remotes alone (DESIGN.md §8): a repository with nowhere to push has no forge
+/// to open one on, whichever forge that would have been. This is what the
+/// advertised next action is derived through, so unlike [`ensure_github_repo`]
+/// — the press-time guard, which asks `gh` the sharper question and pays a
+/// round-trip for it — it must stay network-free and cheap enough to run behind
+/// a rendered row. The two answers can differ in exactly one direction: a
+/// checkout with a remote that is not GitHub still advertises `pr` and is
+/// refused at press time, which is the same dead end as before rather than a
+/// new one. Anything git cannot answer reads as "yes", leaving the row as it
+/// was.
+pub fn takes_pull_requests(repo_path: &str) -> bool {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("remote")
+        .stdin(Stdio::null())
+        .output();
+    match output {
+        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        _ => true,
+    }
+}
+
+/// [`takes_pull_requests`] memoised by checkout path, so a screen or a `list`
+/// pays one `git remote` per distinct repo rather than one per row.
+#[derive(Default)]
+pub struct ForgeMemo(std::collections::HashMap<String, bool>);
+
+impl ForgeMemo {
+    pub fn takes_pull_requests(&mut self, repo_path: &str) -> bool {
+        if let Some(&known) = self.0.get(repo_path) {
+            return known;
+        }
+        let answer = takes_pull_requests(repo_path);
+        self.0.insert(repo_path.to_string(), answer);
+        answer
+    }
+}
+
 /// Push the task's branch to `origin` so `gh pr create --head` can find it. The
 /// dispatched agent deliberately has no push permission; `pr` is
 /// operator-invoked, so this push is on the operator's behalf (DESIGN.md §8).
