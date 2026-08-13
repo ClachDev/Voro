@@ -141,6 +141,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Two errors a first-time user is likeliest to meet now say what to do about
+  them. An editor that will not run reports the variable and the command it
+  came from rather than a bare exit code — `could not run $EDITOR
+  (definitely-not-an-editor): not found` in place of `editor exited with exit
+  status: 127` — and a missing `gh` is named as the GitHub CLI, with where to
+  install it, instead of an `os error 2` that reads as if the checkout were
+  missing.
 - A review task in a project with nowhere to push no longer advertises `next:
   pr`, an action that could only fail there. Where the task's checkout has no
   git remote, every surface that names a next action — the cockpit detail card,

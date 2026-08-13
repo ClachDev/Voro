@@ -26,7 +26,7 @@ pub fn fetch_issues(checkout: &str, gh_repo: Option<&str>) -> Result<String, Str
     cmd.current_dir(checkout);
     let output = cmd
         .output()
-        .map_err(|e| format!("failed to run `gh issue list`: {e}"))?;
+        .map_err(|e| crate::pr::gh_unavailable(&e, "to list issues"))?;
     if !output.status.success() {
         return Err(format!(
             "`gh issue list` failed: {}",

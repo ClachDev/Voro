@@ -224,7 +224,7 @@ pub fn open_url(url: &str) -> Result<String, String> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("cannot run `gh` to open the PR: {e}"))?;
+        .map_err(|e| gh_unavailable(&e, "to open the PR"))?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -346,10 +346,29 @@ pub fn ensure_github_repo(repo_path: &str, local_diff: &str) -> Result<(), Strin
             "{repo_path} is not a GitHub repository, so there is no pull request to open — \
              use {local_diff} to see this task's diff in a viewer"
         )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "{GH_MISSING}, or use {local_diff} to see this task's diff in a viewer"
+        )),
         Err(e) => Err(format!(
             "cannot run `gh` in {repo_path} ({e}), so no pull request can be reached — \
              use {local_diff} to see this task's diff in a viewer"
         )),
+    }
+}
+
+/// What a missing `gh` should say. Printed raw, its `No such file or directory
+/// (os error 2)` reads as if the *checkout* were missing, and names neither the
+/// tool nor the fix.
+const GH_MISSING: &str = "`gh` (the GitHub CLI) is not installed — install it from cli.github.com";
+
+/// How a failure to *spawn* `gh` should read, given what the call was for. A
+/// missing binary is the likeliest cause by a wide margin and is the one an
+/// OS error explains worst, so it gets [`GH_MISSING`].
+pub fn gh_unavailable(e: &std::io::Error, purpose: &str) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        GH_MISSING.to_string()
+    } else {
+        format!("cannot run `gh` {purpose}: {e}")
     }
 }
 
@@ -431,7 +450,7 @@ fn gh_pr_create(repo_path: &str, plan: &PrPlan) -> Result<String, String> {
         .current_dir(repo_path)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("cannot run `gh pr create`: {e}"))?;
+        .map_err(|e| gh_unavailable(&e, "to create the pull request"))?;
     if !output.status.success() {
         return Err(format!(
             "`gh pr create` failed: {}",
@@ -464,7 +483,7 @@ fn gh_api(pr: &PrRef, path: &str) -> Result<String, String> {
     }
     let output = cmd
         .output()
-        .map_err(|e| format!("failed to run `gh api {path}`: {e}"))?;
+        .map_err(|e| gh_unavailable(&e, &format!("to fetch {path}")))?;
     if !output.status.success() {
         return Err(format!(
             "`gh api {path}` failed: {}",
@@ -472,4 +491,29 @@ fn gh_api(pr: &PrRef, path: &str) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    /// The cause an OS error explains worst — `gh` simply not being installed,
+    /// which prints as a missing file and so reads as a missing checkout.
+    #[test]
+    fn a_missing_gh_names_the_tool_and_the_fix() {
+        let message = gh_unavailable(&Error::from(ErrorKind::NotFound), "to open the PR");
+        assert!(message.contains("GitHub CLI"), "{message}");
+        assert!(message.contains("cli.github.com"), "{message}");
+        assert!(!message.contains("os error"), "{message}");
+    }
+
+    /// Anything else is unguessable, so it keeps the raw cause and says what
+    /// the call was for.
+    #[test]
+    fn another_spawn_failure_keeps_its_cause() {
+        let message = gh_unavailable(&Error::from(ErrorKind::PermissionDenied), "to open the PR");
+        assert!(message.contains("to open the PR"), "{message}");
+        assert!(message.contains("permission denied"), "{message}");
+    }
 }
