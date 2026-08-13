@@ -475,6 +475,27 @@ pub struct App {
     /// The background threads capturing the revisions rejections were made
     /// against (DESIGN.md §8), drained by `poll_reviewed_capture`.
     capture: crate::probe::ReviewedCapture,
+    /// Which in-flight sessions can be read for a usage cap: task id, the
+    /// session reference to read, and the agent's `logs` command. Resolved on
+    /// refresh, where the agents config is already loaded, so the tick that
+    /// starts a probe does no I/O of its own to decide what to probe.
+    cap_targets: Vec<(i64, String, String)>,
+    /// Which in-flight tasks are sitting on a usage cap right now, and when
+    /// each window reopens if the agent said (DESIGN.md §8). Purely a reading
+    /// of current session output — no column, no event, no state change — so it
+    /// clears itself once the operator continues the session and fresh output
+    /// displaces the cap message.
+    pub caps: std::collections::HashMap<i64, voro_core::CapReading>,
+    /// The background threads taking those readings, drained by
+    /// `poll_cap_probes`.
+    cap_probe: crate::probe::CapProbe,
+    /// The local wall clock as minutes past midnight, for deciding whether a
+    /// badged reset time has gone by. Refreshed on a slow cadence rather than
+    /// per frame: reading it costs a subprocess, and a badge that flips from
+    /// "waiting" to "window open" within half a minute is timely enough.
+    pub now_minutes: Option<u16>,
+    /// When `now_minutes` was last read.
+    clock_read_at: Option<std::time::Instant>,
 
     pub cockpit_rows: Vec<CockpitRow>,
     pub cockpit_sel: usize,
@@ -568,6 +589,11 @@ impl App {
             conflict_selected: None,
             probe: crate::probe::ConflictProbe::default(),
             capture: crate::probe::ReviewedCapture::default(),
+            cap_targets: Vec::new(),
+            caps: std::collections::HashMap::new(),
+            cap_probe: crate::probe::CapProbe::default(),
+            now_minutes: None,
+            clock_read_at: None,
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
             tasks_sel: 0,
@@ -735,6 +761,7 @@ impl App {
         };
         self.costs = costs;
         self.queue = scheduler::queue(&candidates, &costs, gate);
+        self.cap_targets = self.resolve_cap_targets(config.as_ref().ok());
 
         self.cockpit_rows = self.build_cockpit_rows();
 
@@ -962,6 +989,103 @@ impl App {
         if let Some(source) = crate::pr::reviewed_source(&self.store, task_id) {
             self.capture.start(task_id, source);
         }
+    }
+
+    /// Which in-flight sessions can be asked whether they are sitting on a
+    /// usage cap (DESIGN.md §8). A target needs all three of a strip row with
+    /// work under way, an open session carrying the reference the agent knows
+    /// it by, and an agent defining a `logs` verb — so an agent without one
+    /// contributes no targets and is probed for nothing, which is how the whole
+    /// feature stays absent for `codex` rather than failing loudly on it.
+    fn resolve_cap_targets(&self, config: Option<&AgentsConfig>) -> Vec<(i64, String, String)> {
+        let Some(config) = config else {
+            return Vec::new();
+        };
+        self.running
+            .iter()
+            .filter(|r| matches!(r.task_state, TaskState::Running | TaskState::Refining))
+            .filter_map(|r| {
+                let session = self.last_sessions.get(&r.task_id)?;
+                if session.ended_at.is_some() {
+                    return None;
+                }
+                let session_ref = session.session_ref.clone()?;
+                let logs = config.agent(&session.agent)?.logs()?.to_string();
+                Some((r.task_id, session_ref, logs))
+            })
+            .collect()
+    }
+
+    /// Advance the usage-cap readings behind the running strip's badge
+    /// (DESIGN.md §8). Both halves are non-blocking: the `logs` verb runs on a
+    /// background thread, because replaying a session's screen takes the better
+    /// part of a second and the render path may never wait on that.
+    ///
+    /// A reading that comes back empty *removes* the badge rather than leaving
+    /// the last one standing, which is the whole of the self-clearing rule: the
+    /// operator continues a capped session, its next output no longer says
+    /// "limit reached", and the badge is gone on the following pass.
+    pub fn poll_cap_probes(&mut self) {
+        for (task_id, reading) in self.cap_probe.take_results() {
+            match reading {
+                Some(reading) => {
+                    self.caps.insert(task_id, reading);
+                }
+                None => {
+                    self.caps.remove(&task_id);
+                }
+            }
+        }
+
+        // A task that has left the strip — finished, stalled, redispatched —
+        // keeps neither a badge nor a debounce.
+        let live: std::collections::HashSet<i64> =
+            self.cap_targets.iter().map(|(id, _, _)| *id).collect();
+        self.caps.retain(|id, _| live.contains(id));
+        self.cap_probe.retain(&live);
+
+        let now = std::time::Instant::now();
+        let due: Vec<(i64, String, String)> = self
+            .cap_targets
+            .iter()
+            .filter(|(id, _, _)| self.cap_probe.due(*id, now))
+            .cloned()
+            .collect();
+        for (task_id, session_ref, logs) in due {
+            self.cap_probe.start(task_id, session_ref, logs, now);
+        }
+
+        self.refresh_clock(now);
+    }
+
+    /// Hand back a reading as though a background probe had produced it, so
+    /// the drain half can be tested without waiting out a real interval.
+    #[cfg(test)]
+    pub fn inject_cap_result(&mut self, task_id: i64, reading: Option<voro_core::CapReading>) {
+        self.cap_probe.inject_result(task_id, reading);
+    }
+
+    /// How many in-flight sessions can be read for a cap this pass.
+    #[cfg(test)]
+    pub fn cap_target_ids(&self) -> Vec<i64> {
+        self.cap_targets.iter().map(|(id, _, _)| *id).collect()
+    }
+
+    /// Keep the wall clock the reset badge is judged against roughly current,
+    /// without paying for it on frames where nothing reads it.
+    fn refresh_clock(&mut self, now: std::time::Instant) {
+        const CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+        if self.caps.is_empty() {
+            return;
+        }
+        if self
+            .clock_read_at
+            .is_some_and(|at| now.saturating_duration_since(at) < CLOCK_INTERVAL)
+        {
+            return;
+        }
+        self.clock_read_at = Some(now);
+        self.now_minutes = crate::session_probe::local_minutes();
     }
 
     /// Record every revision a background capture has finished (DESIGN.md §8).
@@ -4693,6 +4817,142 @@ mod tests {
     /// Every session verb, the ordinary configuration.
     fn all_verbs() -> &'static [&'static str] {
         &["sessions", "attach", "resume", "message"]
+    }
+
+    // --- capped-but-alive sessions (task #415) ---
+
+    /// A project with one live dispatch whose agent's `logs` verb prints
+    /// `logs_output`, which is the whole of what the cap probe reads.
+    /// `define_logs` takes the verb away, for the degradation case.
+    fn cap_env(define_logs: bool, logs_output: &str) -> (App, i64, std::path::PathBuf) {
+        let (mut store, ctx, project_path) = scratch_env("caps", None);
+        let listing = project_path.parent().unwrap().join("listing.json");
+        // The session stays listed live, so reconcile-on-read leaves the task
+        // `running` and the strip keeps its row while the probe runs.
+        write_listing(
+            &listing,
+            &format!(
+                r#"[{{"sessionId": "ref-1", "state": "working", "pid": {}}}]"#,
+                std::process::id()
+            ),
+        );
+        let logs = if define_logs {
+            format!("logs = \"printf '%s' '{logs_output}' # {{session}}\"\n")
+        } else {
+            String::new()
+        };
+        std::fs::write(
+            &ctx.agents_path,
+            format!(
+                "default_agent = \"stub\"\n\n[agents.stub]\n\
+                 dispatch = \"cat {{prompt_file}} && sleep 30\"\n\
+                 sessions = \"cat '{}'\"\n{logs}",
+                listing.display()
+            ),
+        )
+        .unwrap();
+        let project = store
+            .create_project("demo", project_path.to_str().unwrap())
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: project.id,
+                repo_id: None,
+                title: "held work".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
+        let session_id = store.sessions_for(task.id).unwrap()[0].id;
+        store.set_session_ref(session_id, "ref-1").unwrap();
+        let mut app = App::new(store, ctx).unwrap();
+        app.refresh().unwrap();
+        (app, task.id, project_path)
+    }
+
+    /// Drive the probe until its reading lands, which is a background thread
+    /// running a subprocess and so not instant.
+    fn settle_cap(app: &mut App, task_id: i64, want: bool) {
+        for _ in 0..200 {
+            app.poll_cap_probes();
+            if app.caps.contains_key(&task_id) == want {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the cap reading never settled to {want}");
+    }
+
+    /// The headline case (DESIGN.md §8): a dispatch alive and sitting on a cap
+    /// is read as capped, with the reset time the agent named — and the task is
+    /// left exactly where it was, because the session is intact and will resume
+    /// on its own.
+    #[test]
+    fn a_live_capped_dispatch_is_read_with_its_reset_time() {
+        let (mut app, task_id, project_path) =
+            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+        assert_eq!(app.cap_target_ids(), vec![task_id]);
+
+        settle_cap(&mut app, task_id, true);
+        assert_eq!(
+            app.caps[&task_id].reset_label().as_deref(),
+            Some("21:50"),
+            "the reset time is read off the agent's own output"
+        );
+        assert_eq!(
+            app.store.task(task_id).unwrap().state,
+            TaskState::Running,
+            "a cap is a display fact, not a transition"
+        );
+        assert!(
+            app.store.sessions_for(task_id).unwrap()[0]
+                .ended_at
+                .is_none(),
+            "the session stays open"
+        );
+
+        // Continuing the session displaces the cap message; the next reading
+        // comes back empty and the badge goes with it.
+        app.inject_cap_result(task_id, None);
+        settle_cap(&mut app, task_id, false);
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// A working session is read and badged for nothing, so the probe running
+    /// at all costs an uncapped fleet no marks.
+    #[test]
+    fn a_live_healthy_dispatch_is_read_as_uncapped() {
+        let (mut app, task_id, project_path) = cap_env(true, "running the test suite");
+        for _ in 0..20 {
+            app.poll_cap_probes();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.caps.is_empty(), "{:?}", app.caps);
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// An agent defining no `logs` verb is probed for nothing at all — no
+    /// target, no subprocess, no badge, and no error either. This is the whole
+    /// of what `codex` sees of this feature.
+    #[test]
+    fn an_agent_without_the_verb_is_never_probed() {
+        let (mut app, _, project_path) = cap_env(false, "Session limit reached");
+        assert!(app.cap_target_ids().is_empty());
+        for _ in 0..5 {
+            app.poll_cap_probes();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.caps.is_empty(), "{:?}", app.caps);
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }
 
     /// `A` on a running task whose session is still listed queues the agent's

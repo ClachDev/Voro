@@ -78,6 +78,7 @@ sessions   = "claude agents --json"
 attach     = "claude attach {session}"
 resume     = "claude --resume {session}"
 message    = "claude -p --resume {session} --fork-session --session-id {new_session} \"$(cat {prompt_file})\""
+logs       = "claude logs \"$(printf %.8s {session})\" 2>/dev/null | tail -c 20000"
 plan       = "claude --name \"{session_name}\" --permission-mode auto --model {model} \"$(cat {prompt_file})\""
 model      = "opus"
 model_deep = "fable"
@@ -141,6 +142,21 @@ resume   = "codex resume {session}"
   continued. A `message` template without the placeholder resumes in place and
   keeps the reference it had. `{new_session}` is refused on every other verb:
   it names the session a send opens, and nothing else opens one.
+- `logs` prints a session's recent output, taking `{session}` alone. Voro reads
+  it for exactly one thing: whether that session is sitting on a **usage cap**
+  (DESIGN.md §8). A cap does not kill a backgrounded session — the supervisor
+  stays alive and waits for the window to reset — so without this a capped
+  dispatch rides the running strip looking healthy for hours; with it, the row
+  is badged `⚠ capped ↻21:50`. The same reading tells a capped death from an
+  ordinary one, which the launch log cannot do for a `--bg` launch whose
+  launcher exits at birth having logged only its backgrounding banner.
+  Everything about it is best-effort: the output may be a terminal capture
+  (escape sequences are stripped before matching), the exit status is not
+  consulted, and an agent that defines no `logs` is probed for nothing and
+  badged for nothing — `codex` names none. Tail the output in the template, as
+  the built-in does; Voro reads whatever it prints. Note the built-in's
+  truncation: `claude logs` keys on the *job* id, the first eight characters of
+  the session id, so `{session}` is trimmed rather than passed whole.
 - `plan` runs an interactive *foreground* session for the TUI's agent-assisted
   task creation (DESIGN.md §8): `{prompt_file}` holds the planning brief, and
   the command owns the terminal until the conversation ends, so it must not

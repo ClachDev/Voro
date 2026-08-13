@@ -41,6 +41,18 @@
 //! by construction — so a refining session with no ref falls back to its pid
 //! rather than becoming unprobeable.
 //!
+//! Whether a *dead* session died capped is read from the same per-agent verb
+//! set, through an optional `logs` (task #415). Voro's own launch log — the
+//! only channel there used to be — cannot answer for a supervisor-owned launch:
+//! the launcher exits at birth having written nothing but the backgrounding
+//! banner, so the scan could essentially never report `capped` for a `--bg`
+//! dispatch, whatever killed it. An agent that can print a session's recent
+//! output is asked for it instead, and the log tail stays the fallback for
+//! agents that cannot. The *live* half of the same reading — a session held at
+//! a cap without dying, which is what a cap actually does to a `--bg` dispatch
+//! — is not taken here at all: it is slow enough to need its own off-loop
+//! runner ([`crate::probe::CapProbe`]), and it changes nothing in the database.
+//!
 //! There is no daemon watching for process exit. Reconciliation runs on read:
 //! `App::refresh` and every CLI verb call [`reconcile_live_sessions`] before
 //! consulting session or task state, so a dead session is finalised the next
@@ -50,18 +62,14 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use voro_core::{AgentSessionEntry, AgentsConfig, Result, Store, TaskState};
+use voro_core::{AgentSessionEntry, AgentsConfig, Result, Store, TaskState, read_cap};
 
-use crate::session_probe::{listing_says_live, pid_is_alive, run_sessions_command};
+use crate::session_probe::{
+    listing_says_live, pid_is_alive, read_session_cap, run_sessions_command,
+};
 
 /// How much of a session's log tail to scan for a usage-cap signature.
 const LOG_TAIL_BYTES: u64 = 4096;
-
-/// Phrases that plausibly mean "usage cap", checked case-insensitively
-/// against the log tail. Deliberately narrow (DESIGN.md §8): not a general log
-/// parser — anything it misses is reported `failed` rather than misattributed
-/// as `capped`.
-const CAP_SIGNATURES: [&str; 3] = ["usage limit", "rate limit", "quota exceeded"];
 
 /// Reconcile every session still marked live, per its task's state (DESIGN.md
 /// §8). The probe-or-not decision is made here; [`Store::reconcile_session`]
@@ -130,10 +138,24 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
         if alive {
             continue;
         }
-        let likely_capped = session
-            .log_path
-            .as_deref()
-            .is_some_and(log_tail_looks_capped);
+        // Classify the death from the session's *own* output where the agent
+        // can produce it (DESIGN.md §8). Voro's launch log is the wrong place
+        // to ask for a supervisor-owned launch: the launcher exits at birth
+        // having written only the backgrounding banner, so scanning it could
+        // essentially never report `capped` for a `--bg` dispatch however the
+        // session actually died. It stays the fallback for agents defining no
+        // `logs` verb, where it is the only text there is.
+        let logs_cmd = config
+            .as_ref()
+            .and_then(|c| c.agent(&session.agent))
+            .and_then(|a| a.logs());
+        let likely_capped = match logs_cmd.zip(session.session_ref.as_deref()) {
+            Some((cmd, session_ref)) => read_session_cap(cmd, session_ref).is_some(),
+            None => session
+                .log_path
+                .as_deref()
+                .is_some_and(log_tail_looks_capped),
+        };
         if store
             .reconcile_session(session.id, false, likely_capped)?
             .is_some()
@@ -144,8 +166,9 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
     Ok(finalised)
 }
 
-/// Best-effort usage-cap detector (DESIGN.md §8): scan the log tail for the
-/// phrases in [`CAP_SIGNATURES`].
+/// Best-effort usage-cap detector for an agent with no `logs` verb (DESIGN.md
+/// §8): read the launch log's tail and put it through the same classifier the
+/// session-output path uses, so both channels agree on what a cap looks like.
 fn log_tail_looks_capped(path: &str) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
@@ -155,12 +178,11 @@ fn log_tail_looks_capped(path: &str) -> bool {
     if file.seek(SeekFrom::Start(start)).is_err() {
         return false;
     }
-    let mut tail = String::new();
-    if file.read_to_string(&mut tail).is_err() {
+    let mut tail = Vec::new();
+    if file.read_to_end(&mut tail).is_err() {
         return false;
     }
-    let tail = tail.to_lowercase();
-    CAP_SIGNATURES.iter().any(|sig| tail.contains(sig))
+    read_cap(&String::from_utf8_lossy(&tail)).is_some()
 }
 
 #[cfg(test)]
@@ -601,6 +623,112 @@ mod tests {
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- capped deaths read the session's own output (task #415) ---
+
+    /// A `voro.toml` whose `claude` agent lists no sessions and prints
+    /// `logs_output` for any session, plus the log file path a launch would
+    /// have written, so a test can set the two channels against each other.
+    fn logs_fixture(name: &str, logs_output: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("voro-reconcile-logs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let agents_path = dir.join("voro.toml");
+        std::fs::write(
+            &agents_path,
+            format!(
+                "default_agent = \"claude\"\n\n[agents.claude]\n\
+                 dispatch = \"cat {{prompt_file}}\"\n\
+                 logs = \"printf '%s' '{logs_output}' # {{session}}\"\n"
+            ),
+        )
+        .unwrap();
+        let log = dir.join("launch.log");
+        (agents_path, log, dir)
+    }
+
+    /// The whole point of the `logs` verb on the dead path (DESIGN.md §8): a
+    /// `--bg` launch's own log holds nothing but the backgrounding banner, so
+    /// the session that died capped is only legible in the agent's own record
+    /// of it. Before this, the scan read the banner, found nothing, and reported
+    /// every capped bg dispatch as a plain failure.
+    #[test]
+    fn a_dead_session_is_classified_capped_from_its_own_output() {
+        let (agents_path, log, dir) = logs_fixture("capped", "Session limit reached");
+        std::fs::write(&log, "[voro] launched in background, pid 1234\n").unwrap();
+        let (mut s, task_id) = running_task();
+        let session = s
+            .create_session(
+                task_id,
+                "claude",
+                Some(dead_pid()),
+                Some(log.to_str().unwrap()),
+            )
+            .unwrap();
+        s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 1);
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
+        assert_eq!(
+            s.session(session.id).unwrap().outcome,
+            Some(SessionOutcome::Capped)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half: a session whose output says nothing about a cap is a
+    /// plain failure, and the verb's answer overrides the launch log rather
+    /// than being ORed with it — a banner that happened to contain the phrase
+    /// cannot re-label a death the agent itself accounts for otherwise.
+    #[test]
+    fn a_dead_session_the_verb_calls_healthy_is_a_plain_failure() {
+        let (agents_path, log, dir) = logs_fixture("failed", "compiling... done.");
+        std::fs::write(&log, "hit the usage limit\n").unwrap();
+        let (mut s, task_id) = running_task();
+        let session = s
+            .create_session(
+                task_id,
+                "claude",
+                Some(dead_pid()),
+                Some(log.to_str().unwrap()),
+            )
+            .unwrap();
+        s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 1);
+        assert_eq!(
+            s.session(session.id).unwrap().outcome,
+            Some(SessionOutcome::Failed)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An agent defining no `logs` verb is reconciled exactly as before, from
+    /// the launch log — and now catches the wordings the original three
+    /// signatures missed, since both channels share one classifier.
+    #[test]
+    fn a_verbless_agent_still_classifies_from_the_launch_log() {
+        let (mut s, task_id) = running_task();
+        let dead = dead_pid();
+        let log = std::env::temp_dir().join(format!(
+            "voro-reconcile-verbless-{}-{dead}.log",
+            std::process::id()
+        ));
+        std::fs::write(&log, "Session limit reached · resets 9pm").unwrap();
+
+        let session = s
+            .create_session(task_id, "manual", Some(dead), Some(log.to_str().unwrap()))
+            .unwrap();
+        assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 1);
+        assert_eq!(
+            s.session(session.id).unwrap().outcome,
+            Some(SessionOutcome::Capped)
+        );
+        let _ = std::fs::remove_file(&log);
     }
 
     // --- refine rounds read the same listing (task #379) ---

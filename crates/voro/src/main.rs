@@ -141,6 +141,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the keypress, which is soon enough: nothing reads the revision until
         // the rework comes back.
         app.poll_reviewed_capture();
+        // Advance the usage-cap readings behind the running strip's badge
+        // (DESIGN.md §8). A capped `--bg` session never dies, so nothing else
+        // would ever notice it; the `logs` verb that reads it is slow, so it
+        // runs on a background thread and lands a tick or two later.
+        app.poll_cap_probes();
         if let Some(request) = app.pending_editor.take() {
             // $EDITOR owns the terminal for the duration; tear the TUI down
             // around it rather than fighting over raw mode.
