@@ -9,6 +9,29 @@ pub enum Error {
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    #[error(
+        "this database is at schema version {version}, but this build of voro knows only {known} \
+         migration(s) — a newer build migrated it, and this one cannot read it safely. {remedy}"
+    )]
+    SchemaAhead {
+        version: usize,
+        known: usize,
+        remedy: String,
+    },
+
+    #[error(
+        "this database's migration {idx} differs from the one this build carries: it was applied \
+         {applied_at} by {applied_by}. The version numbers agree, so nothing else will catch \
+         this — and since the two migrations are not the same text, this build cannot assume the \
+         schema it is about to query. {remedy}"
+    )]
+    SchemaDiverged {
+        idx: usize,
+        applied_at: String,
+        applied_by: String,
+        remedy: String,
+    },
+
     #[error("task {0} not found")]
     TaskNotFound(i64),
 

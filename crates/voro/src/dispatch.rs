@@ -270,10 +270,13 @@ const REF_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SPAWN_CLOCK_SLACK_MS: i64 = 2000;
 
 /// The ` --db <path>` flag every rendered verb carries when the database in play
-/// is not the default one the CLI resolves to unaided — empty otherwise, since
-/// that is what the verbs already do (DESIGN.md §8).
+/// is not the operator's store — empty otherwise, since that is what a bare
+/// verb resolves to (DESIGN.md §8). The agent a dispatch launches runs the
+/// installed `voro` from `PATH`, so the comparison is against the production
+/// path (§5) rather than whichever store this binary defaults to: a dispatch
+/// from the dev store renders the flag and keeps the return path on it.
 fn db_flag(db_path: &Path) -> String {
-    if db_path == Store::default_db_path() {
+    if db_path == Store::production_db_path() {
         String::new()
     } else {
         format!(" --db {}", shell_quote(db_path))
@@ -1228,7 +1231,7 @@ fn spawn_session(
     // `## Feedback` section are all it has to answer.
     let rework = store
         .events_for(task_id)
-        .map(|events| voro_core::rework_report(&events).is_some())
+        .map(|events| voro_core::was_rejected(&events))
         .unwrap_or(false);
     let prompt = format!(
         "{}{body}",
@@ -1648,7 +1651,7 @@ mod tests {
         );
 
         // the default db is what the verbs resolve to unaided, so no flag
-        let default = render_preamble(62, &Store::default_db_path(), None, &[], false);
+        let default = render_preamble(62, &Store::production_db_path(), None, &[], false);
         assert!(default.contains("voro ask 62 --question"), "{default}");
         assert!(!default.contains("--db"), "{default}");
     }
@@ -1658,7 +1661,7 @@ mod tests {
         // no assigned branch: the agent is told to register the name it picks,
         // but branch-assignment wording and a completion `voro done --branch`
         // are absent, since no name is known.
-        let plain = render_preamble(62, &Store::default_db_path(), None, &[], false);
+        let plain = render_preamble(62, &Store::production_db_path(), None, &[], false);
         assert!(!plain.contains("git branch `"), "{plain}");
         assert!(plain.contains("voro set 62 --branch <name>"), "{plain}");
         assert!(!plain.contains("voro done 62 --branch"), "{plain}");
@@ -1676,7 +1679,7 @@ mod tests {
         // it at completion.
         let branched = render_preamble(
             62,
-            &Store::default_db_path(),
+            &Store::production_db_path(),
             Some("feat/parser"),
             &[],
             false,
@@ -1712,7 +1715,7 @@ mod tests {
         // because the harness names the branch itself, both cases spell out the
         // rename onto the branch Voro tracks.
         for (branch, name) in [(None, "<name>"), (Some("feat/parser"), "feat/parser")] {
-            let rendered = render_preamble(62, &Store::default_db_path(), branch, &[], false);
+            let rendered = render_preamble(62, &Store::production_db_path(), branch, &[], false);
             assert!(rendered.contains("`EnterWorktree` tool"), "{rendered}");
             assert!(
                 rendered.contains(&format!("git switch -c {name}")),
@@ -1736,7 +1739,7 @@ mod tests {
         // A task linked to a plan gets it handed over rather than having to
         // rediscover it from hints in the body (DESIGN.md §3/§8). The location
         // is absolute, since a linked doc may live in another checkout.
-        let db = Store::default_db_path();
+        let db = Store::production_db_path();
         let docs = [
             (
                 "Strategy 2026".to_string(),
@@ -1774,7 +1777,7 @@ mod tests {
     /// instruction, and a task nobody rejected carries none (DESIGN.md §8).
     #[test]
     fn preamble_tells_a_redispatched_rework_to_answer_the_feedback() {
-        let db = Store::default_db_path();
+        let db = Store::production_db_path();
         let reworking = render_preamble(62, &db, None, &[], true);
         assert!(
             reworking.contains("been through review once already"),
@@ -1796,7 +1799,7 @@ mod tests {
     fn the_rework_message_carries_the_feedback_and_the_instruction() {
         let message = rework_message(
             62,
-            &Store::default_db_path(),
+            &Store::production_db_path(),
             "  tests are missing, and the docs are stale  ",
         );
         assert!(
@@ -3068,7 +3071,7 @@ mod tests {
 
     #[test]
     fn planning_prompt_renders_the_db_flag_only_for_a_non_default_database() {
-        let rendered = render_planning_prompt("proj", &Store::default_db_path());
+        let rendered = render_planning_prompt("proj", &Store::production_db_path());
         assert!(
             rendered.contains("voro add 'proj' \"<title>\" --body-file"),
             "{rendered}"

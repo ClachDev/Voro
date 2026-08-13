@@ -58,7 +58,8 @@ The cockpit has three screens — **Cockpit** (the next-action queue), **Tasks**
 selection, and the footer always shows the keys that apply to what you have
 selected. The walkthrough below drives one task from nothing to a reviewed diff.
 
-**1. Register a project.** Go to the Projects screen (`tab` to it) and press `a`
+**1. Register a project.** A first launch against an empty database already
+opens on the Projects screen — `tab` is the way there any other time. Press `a`
 to add one — Voro asks for a name and a path. Press `0`–`5` on a project to set
 its weight: the higher the weight, the harder that project's tasks pull toward the
 top of the queue.
@@ -88,11 +89,12 @@ per [`docs/agent-integration.md`](docs/agent-integration.md). Those verbs are th
 agent's interface, not yours.
 
 **5. Review what lands.** When the agent calls `done`, the task moves to
-`review` and rises to the top of the queue. Press `o` to open its checkout in a
-viewer, or `g` to open its pull request (creating it when the project reviews
-through GitHub). With the diff in front of you, press `enter` (`⏎ review`) to
-accept or reject the work; rejecting with a note re-dispatches the agent to
-address it.
+`review` and rises to the top of the queue, and its detail card leads with the
+agent's completion summary — what it says it changed and how it verified.
+Press `o` to open its checkout in a viewer, or `g` to open its pull request
+(creating it when the project reviews through GitHub). With the account and the
+diff in front of you, press `enter` (`⏎ review`) to accept or reject the work;
+rejecting with a note re-dispatches the agent to address it.
 
 Other keys worth knowing on a selected task: `s` change state, `x` the score
 breakdown, `h` its history, `e` edit, `l` the session log, and `q` to quit.

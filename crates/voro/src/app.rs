@@ -2,14 +2,19 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::ui::Hit;
 use voro_core::{
-    Action, ActionRow, AgentsConfig, DepKind, DepRef, DigestRow, Event, PrRef, Priority, Project,
-    Queue, QueueRow, RefineOutcome, ReviewAction, ReworkReport, RunningRow, ScoreBreakdown,
+    Action, ActionRow, AgentsConfig, CompletionReport, DepKind, DepRef, DigestRow, Event, PrRef,
+    Priority, Project, Queue, QueueRow, RefineOutcome, ReviewAction, RunningRow, ScoreBreakdown,
     StateCounts, Store, Task, TaskState, Triage, WipGate, scheduler,
 };
 
 /// Lines `PgDn`/`PgUp` move the focus card in one press. A fixed step, since
 /// the key handler runs without the pane's geometry.
 const DETAIL_PAGE_STEP: i64 = 10;
+
+/// What an operator with no project registered is told, wherever they meet the
+/// fact: the empty cockpit's box and `n`'s refusal say the same thing in the
+/// same words, and in the keys README.md teaches.
+pub const NO_PROJECTS_HINT: &str = "no projects yet — press tab to Projects, then a to add one";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -413,6 +418,11 @@ pub struct App {
     /// half-written done report a dispatched session left behind, which a PR
     /// cannot be opened from. Re-derived per refresh, never stored.
     pub incomplete_report: std::collections::HashSet<i64>,
+    /// Review tasks whose checkout has no git remote (DESIGN.md §8): there is
+    /// nowhere to open a pull request, so their rows advertise the local review
+    /// path instead of a `pr` that could only fail. Re-derived per refresh from
+    /// the checkouts themselves, one `git remote` per distinct repo.
+    pub local_review: std::collections::HashSet<i64>,
     /// Proposals whose last refine round rewrote the body (DESIGN.md §6): what
     /// renders the `↻ refined` marker, so the operator triages the improved
     /// version knowing it moved. Re-derived per refresh and cleared by triage
@@ -537,6 +547,7 @@ impl App {
             counts: StateCounts::default(),
             all: Vec::new(),
             incomplete_report: std::collections::HashSet::new(),
+            local_review: std::collections::HashSet::new(),
             refined: std::collections::HashSet::new(),
             refine_failed: std::collections::HashSet::new(),
             deps: std::collections::HashMap::new(),
@@ -567,6 +578,18 @@ impl App {
             last_data_version: 0,
         };
         app.refresh()?;
+        // A database with nothing registered opens where the first step is
+        // (DESIGN.md §9): the cockpit has nothing to show and its `n` cannot
+        // proceed without a project. Startup only — `refresh` runs after every
+        // mutation and on every external-change poll, and the screen is the
+        // operator's after that.
+        if app.projects.is_empty() {
+            app.screen = Screen::Projects;
+            app.status = Some(
+                "welcome to voro — press a to add your first project, then n to create a task"
+                    .into(),
+            );
+        }
         app.last_data_version = app.store.data_version()?;
         Ok(app)
     }
@@ -655,6 +678,15 @@ impl App {
                     .incomplete_report_flag(r.task.id)
                     .ok()?
                     .then_some(r.task.id)
+            })
+            .collect();
+        let mut forges = crate::pr::ForgeMemo::default();
+        self.local_review = all
+            .iter()
+            .filter(|r| r.task.state == TaskState::Review && r.task.pr_url.is_none())
+            .filter_map(|r| {
+                let repo = self.store.repo_for_task(&r.task).ok()?;
+                (!forges.takes_pull_requests(&repo.path)).then_some(r.task.id)
             })
             .collect();
         let proposals = || all.iter().filter(|r| r.task.state == TaskState::Proposed);
@@ -1415,6 +1447,18 @@ impl App {
     /// The repo a task names, as (name, path), or `None` when it runs in its
     /// project's default — the detail pane renders the line only when it says
     /// something the project row does not.
+    /// The verb a task's row advertises (DESIGN.md §3), degraded to the local
+    /// review path where the checkout has no remote to open a pull request on
+    /// (§8). Every rendered `next:` resolves through here so the advertisement
+    /// and the key that serves it cannot drift apart.
+    pub fn next_action(&self, task: &voro_core::Task) -> Option<voro_core::NextAction> {
+        let verb = task.next_action()?;
+        Some(match self.local_review.contains(&task.id) {
+            true => verb.without_pull_requests(),
+            false => verb,
+        })
+    }
+
     pub fn task_repo(&self, task: &voro_core::Task) -> Option<(String, String)> {
         task.repo_id?;
         let repo = self.store.repo_for_task(task).ok()?;
@@ -1506,7 +1550,7 @@ impl App {
     /// none.
     fn new_task(&mut self, flow: CreateFlow) {
         match self.projects.len() {
-            0 => self.status = Some("no projects yet — add one on the projects screen (3)".into()),
+            0 => self.status = Some(NO_PROJECTS_HINT.into()),
             1 => self.start_create(self.projects[0].id, flow),
             _ => self.mode = Mode::PickProject { sel: 0, flow },
         }
@@ -1966,12 +2010,11 @@ impl App {
         self.store.events_for(task_id).unwrap_or_default()
     }
 
-    /// The rework cycle a task is in, if any (DESIGN.md §8): the newest
-    /// rejection feedback and the summary answering it. `None` for a task
-    /// nobody has sent back, which is what keeps a first review's detail pane
-    /// exactly as it was.
-    pub fn rework_report(&self, task_id: i64) -> Option<ReworkReport> {
-        voro_core::rework_report(&self.store.events_for(task_id).ok()?)
+    /// What the selected task last reported (DESIGN.md §8): the completion
+    /// summary of the cycle in hand, and the rejection feedback it answers if
+    /// it is a rework. `None` for a task that has reported nothing.
+    pub fn completion_report(&self, task_id: i64) -> Option<CompletionReport> {
+        voro_core::completion_report(&self.store.events_for(task_id).ok()?)
     }
 
     /// The selected task's id and agent override, if it is `ready` or `stalled`
@@ -3154,6 +3197,56 @@ mod tests {
         App::new(store, dummy_ctx()).unwrap()
     }
 
+    /// A store with nothing in it at all — the first run Voro has to land well.
+    fn empty_app() -> App {
+        App::new(Store::open_in_memory().unwrap(), dummy_ctx()).unwrap()
+    }
+
+    /// The first run: with no project registered the cockpit has nothing to
+    /// show and its `n` cannot proceed, so the app opens where the first step
+    /// is (DESIGN.md §9), saying why.
+    #[test]
+    fn a_clean_database_opens_on_the_projects_screen() {
+        let app = empty_app();
+        assert_eq!(app.screen, Screen::Projects);
+        let status = app.status.clone().expect("the landing explains itself");
+        assert!(status.contains("press a"), "{status}");
+        assert!(status.contains('n'), "{status}");
+    }
+
+    #[test]
+    fn a_database_with_a_project_opens_on_the_cockpit() {
+        let app = app_with(&[]);
+        assert_eq!(app.screen, Screen::Cockpit);
+        assert_eq!(app.status, None);
+    }
+
+    /// The landing is decided once, at startup. `refresh` runs after every
+    /// mutation and on every external-change poll, so deciding there would yank
+    /// the operator to Projects mid-session — for instance on the cockpit of a
+    /// database whose last project they just deleted.
+    #[test]
+    fn refresh_leaves_the_screen_where_the_operator_put_it() {
+        let mut app = empty_app();
+        app.screen = Screen::Cockpit;
+        app.refresh().unwrap();
+        assert_eq!(app.screen, Screen::Cockpit);
+    }
+
+    /// `n` with no projects refuses in the keys README.md teaches — `tab` and
+    /// `a`, not a screen number.
+    #[test]
+    fn new_task_without_projects_points_at_tab_and_a() {
+        let mut app = empty_app();
+        app.screen = Screen::Cockpit;
+        for press in ['n', 'N'] {
+            app.status = None;
+            key(&mut app, KeyCode::Char(press));
+            assert_eq!(app.status.as_deref(), Some(NO_PROJECTS_HINT));
+            assert!(app.pending_editor.is_none());
+        }
+    }
+
     /// Enter on a needs-input inbox row resumes the task directly — the
     /// operator answered in the agent's own session, so there is no answer
     /// prompt (DESIGN.md §6/§8), just the `needs-input → running` transition.
@@ -3987,6 +4080,9 @@ mod tests {
         let path = ctx.agents_path.clone();
         let mut app = App::new(store, ctx).unwrap();
 
+        // No project is registered, so the app opened on Projects, where the
+        // digits are weights; the jump below is a cockpit key.
+        app.screen = Screen::Cockpit;
         key(&mut app, KeyCode::Char('4'));
         assert_eq!(app.screen, Screen::Config);
         assert!(app.config_viewers.is_empty());

@@ -11,6 +11,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A build from a `target/` directory opens a dev store, not your real one.** A
+  `voro` run out of `target/debug` or `target/release` now uses
+  `~/.local/share/voro/dev.db`, seeded on first run with a fixture board
+  covering every task state, both live and dead sessions, each dependency kind,
+  a multi-repo project and an archived one. `voro seed --force` rebuilds it;
+  seeding the operator's store is refused. Such a build also takes no database
+  from the environment: dispatch exports `VORO_DB` so a session's return path
+  finds the store its dispatcher was on, which put the operator's database in
+  the environment of every agent working in a worktree, and a `cargo run` there
+  inherited it. An explicit `--db` is still honoured. This chooses a default
+  and bounds nothing — `cargo install --path` builds a working checkout into an
+  ordinary install location, where it counts as installed — so what protects
+  the schema is the journal and the version check below.
+- **The store records which migrations it is made of.** A `schema_migrations`
+  journal keeps each applied migration's SQL alongside the build that applied
+  it, and every open checks it against the migrations the running binary
+  carries. `user_version` is a counter, so it cannot distinguish two branches
+  that each add a migration 17 — the binary carrying the other 17 applies
+  nothing, refuses nothing, and dies at the first query on a missing column.
+  That case is now refused up front, naming the migration, the build that
+  applied it, and the snapshot to restore. Migrations applied before the
+  journal existed are recorded as unverifiable rather than assumed. One new
+  rule follows: an applied migration is immutable, and editing one is reported
+  as a divergence.
+- **Two further guards on opening a store.** A database whose schema is ahead of
+  the running binary is refused with an error naming the way out, instead of
+  silently skipping the migration and failing later as a missing column; and
+  any open that is about to migrate first copies the file to `backups/` beside
+  it, so a migration that renames or drops a column stays recoverable.
+  Startup failures now print their message rather than a `Debug` dump.
 - **Quick-message a task's session**: `a` in the TUI collects one line and sends
   it straight into the task's recorded agent session, headlessly, without
   suspending the cockpit — for a `needs-input`, `review`, or `waiting` task
@@ -64,6 +94,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The review card shows the agent's completion summary.** A task in `review`
+  or `waiting` renders what the agent reported at `done` — its account of what
+  changed and how it was verified — above the task body, in the TUI detail pane
+  and in `voro show`. It was previously rendered only on a task that had been
+  rejected once, which left a first review with no account of the work anywhere
+  but `voro show`'s event log — and no PR or configured viewer to fall back on,
+  on the fresh install where that matters most. A rework's block is unchanged
+  but for its heading, and shows nothing while the rework is still in flight.
 - The cockpit key line advertises `d/D dispatch` only on a `ready` or `stalled`
   row, where dispatch can actually act, rather than on any selection — which
   also makes room for the new `a/A message` slot within the line's ten.
@@ -106,6 +144,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status: 127` — and a missing `gh` is named as the GitHub CLI, with where to
   install it, instead of an `os error 2` that reads as if the checkout were
   missing.
+- A review task in a project with nowhere to push no longer advertises `next:
+  pr`, an action that could only fail there. Where the task's checkout has no
+  git remote, every surface that names a next action — the cockpit detail card,
+  the browser and `voro list` suffixes, `voro show`, and the `voro inbox` verb
+  column — now reads `next: open` and points at `o` rather than `g`. The keys
+  themselves are unchanged: `g`/`pr` is still always GitHub and still refuses a
+  checkout `gh` cannot address, and `o`/`open` is still always the local viewer.
+  The advertisement rides a rendered row, so it asks git alone whether the
+  checkout has any remote, network-free and memoised per checkout, rather than
+  paying `pr`'s `gh` round-trip; a checkout whose remote is not GitHub reads as
+  before and is refused at press time.
 - A headless `voro refine` is no longer marked `⚠ refine failed` seconds after
   it starts. The round runs the agent's own `dispatch` template, so under a
   `claude --bg`-style launcher the pid Voro recorded belonged to a launcher that

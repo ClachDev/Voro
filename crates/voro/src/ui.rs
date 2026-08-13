@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use voro_core::{
-    ActionRow, DepKind, DepRef, DigestRow, EffectiveScore, Event, QueueRow, ReworkReport,
+    ActionRow, CompletionReport, DepKind, DepRef, DigestRow, EffectiveScore, Event, QueueRow,
     ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
 };
 
@@ -869,15 +869,48 @@ fn doc_picker_row(app: &App, task_id: i64, doc: &voro_core::Doc) -> Line<'static
 /// A review row's next action rendered as a browser suffix (DESIGN.md §3). The
 /// browser shows state in its own column, so only `review` — whose verb reads
 /// the tracked PR, not the state alone — earns the suffix.
-fn review_next_span(task: &voro_core::Task) -> Option<Span<'static>> {
+fn review_next_span(app: &App, task: &voro_core::Task) -> Option<Span<'static>> {
     if task.state != voro_core::TaskState::Review {
         return None;
     }
-    let verb = task.next_action()?;
+    let verb = app.next_action(task)?;
     Some(Span::styled(
         format!("  next: {verb}"),
         Style::new().fg(Color::Blue),
     ))
+}
+
+/// What the agent reported (DESIGN.md §8): the completion summary of the cycle
+/// in hand, rendered above the body — the body is the instruction that has
+/// already been carried out, the summary is the account of carrying it out, and
+/// the account is what a verdict is given against. It is the only such account
+/// a project with no PR and no configured viewer has, so the card cannot leave
+/// it to `voro show`. On a rework it is headed by the feedback it answers,
+/// which is the other half of making a re-review proportional to the fix — the
+/// operator reads *what the agent says it changed* here and the diff since the
+/// rejected revision beside it.
+fn completion_lines(report: &CompletionReport) -> Vec<Line<'static>> {
+    let heading = match report.feedback {
+        Some(_) => "response to the review feedback:",
+        None => "completion summary:",
+    };
+    let mut lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            heading,
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    // One `Line` per source line, as the question block does: ratatui does not
+    // break lines inside a `Span`, so a point-by-point summary rendered as one
+    // span would collapse into a single paragraph and lose its structure.
+    lines.extend(
+        report
+            .summary
+            .lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), Style::new().fg(Color::Cyan)))),
+    );
+    lines
 }
 
 /// A task's newest session, rendered for the attention states (tasks #73/#110).
@@ -886,35 +919,6 @@ fn review_next_span(task: &voro_core::Task) -> Option<Span<'static>> {
 /// end time. An open one shows agent and start time. Both end on the log path
 /// the `l` key pages. States where the session is history rather than context
 /// (`done`, `rejected`, a redispatch-ready task) render nothing.
-/// The response to a rejection (DESIGN.md §8): the summary the rework came back
-/// with, rendered against the feedback it answers. This is the other half of
-/// making a re-review proportional to the fix — the operator reads *what the
-/// agent says it changed* here, and the diff since the rejected revision beside
-/// it, instead of rediscovering both from the whole PR. Only a task that has
-/// been sent back renders it; a first review's summary is the PR body and is
-/// read there.
-fn rework_lines(report: &ReworkReport) -> Vec<Line<'static>> {
-    let Some(summary) = &report.summary else {
-        return Vec::new();
-    };
-    let mut lines = vec![
-        Line::default(),
-        Line::from(Span::styled(
-            "response to the review feedback:",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )),
-    ];
-    // One `Line` per source line, as the question block does: ratatui does not
-    // break lines inside a `Span`, so a point-by-point summary rendered as one
-    // span would collapse into a single paragraph and lose its structure.
-    lines.extend(
-        summary
-            .lines()
-            .map(|line| Line::from(Span::styled(line.to_string(), Style::new().fg(Color::Cyan)))),
-    );
-    lines
-}
-
 fn session_lines(session: &Session, state: TaskState) -> Vec<Line<'static>> {
     if !matches!(
         state,
@@ -1115,7 +1119,14 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     });
     if empty {
         let inner = area.inner(ratatui::layout::Margin::new(1, 1));
-        frame.render_widget(Paragraph::new("nothing to do — press n").dim(), inner);
+        // With nothing registered, `n` has nothing to create a task against, so
+        // the empty box points at registration instead (DESIGN.md §9).
+        let hint = if app.projects.is_empty() {
+            crate::app::NO_PROJECTS_HINT
+        } else {
+            "nothing to do — press n"
+        };
+        frame.render_widget(Paragraph::new(hint).dim(), inner);
     }
 }
 
@@ -1250,9 +1261,10 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         // A review task with a branch and no summary: `pr` would fail, so say
         // what is needed rather than the optimistic "next: pr".
         lines.push(Line::from(incomplete_report_span()));
-    } else if let Some(verb) = task.next_action() {
+    } else if let Some(verb) = app.next_action(task) {
         let hint = match verb {
             voro_core::NextAction::Pr => "  (g opens one from the summary)",
+            voro_core::NextAction::Open => "  (o shows the diff in a viewer)",
             _ => "",
         };
         lines.push(Line::from(Span::styled(
@@ -1285,8 +1297,13 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     {
         lines.extend(score_lines(&b, app.effective_score(task, b.total)));
     }
-    if let Some(report) = app.rework_report(task.id) {
-        lines.extend(rework_lines(&report));
+    // Only where the report is the thing being acted on: a task under review,
+    // or handed off for someone else to review (DESIGN.md §8). Once a verdict
+    // has been given the summary is history, and the card is read for the body.
+    if matches!(task.state, TaskState::Review | TaskState::Waiting)
+        && let Some(report) = app.completion_report(task.id)
+    {
+        lines.extend(completion_lines(&report));
     }
     lines.push(Line::default());
     lines.extend(crate::markdown::body_lines(&task.body));
@@ -1446,24 +1463,38 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             }
             if app.incomplete_report.contains(&r.task.id) {
                 spans.push(incomplete_report_span());
-            } else if let Some(span) = review_next_span(&r.task) {
+            } else if let Some(span) = review_next_span(app, &r.task) {
                 spans.push(span);
             }
             spans.extend(blocker_spans(r));
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let mut state = ListState::default().with_selected(if app.all.is_empty() {
-        None
-    } else {
-        Some(app.tasks_sel)
-    });
+    let empty = items.is_empty();
+    let mut state =
+        ListState::default().with_selected(if empty { None } else { Some(app.tasks_sel) });
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("All tasks"))
         .highlight_style(SELECTED);
     frame.render_stateful_widget(list, list_area, &mut state);
     hits.push_list(list_area, state.offset(), app.all.len(), Hit::TaskRow);
+    if empty {
+        let inner = list_area.inner(ratatui::layout::Margin::new(1, 1));
+        frame.render_widget(Paragraph::new(tasks_empty_message(app)).dim(), inner);
+    }
     draw_status(frame, app, status);
+}
+
+/// What an empty task browser says. The two cases need different advice: with no
+/// project registered `n` cannot create anything, so the message points at the
+/// projects screen in the same words the `n` key itself uses; otherwise `n` is
+/// the way in.
+fn tasks_empty_message(app: &App) -> &'static str {
+    if app.projects.is_empty() {
+        "no projects yet — add one on the projects screen (3)"
+    } else {
+        "no tasks yet — press n to add one"
+    }
 }
 
 /// The dependency section of a detail view (task #103), both directions, one
@@ -2214,6 +2245,39 @@ mod tests {
         app
     }
 
+    /// An empty cockpit says what the next press actually is: with nothing
+    /// registered `n` cannot create anything, so the box points at Projects.
+    #[test]
+    fn an_empty_cockpit_points_at_projects_until_one_exists() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::Store;
+
+        let render = |app: &crate::app::App| {
+            let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw(f, app);
+                })
+                .unwrap();
+            screen_text(&terminal)
+        };
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut bare = crate::app::App::new(Store::open_in_memory().unwrap(), ctx).unwrap();
+        bare.screen = crate::app::Screen::Cockpit;
+        bare.status = None;
+        let text = render(&bare);
+        assert!(text.contains(crate::app::NO_PROJECTS_HINT), "{text}");
+
+        let mut registered = app_with_status("", 0, 0);
+        registered.status = None;
+        let text = render(&registered);
+        assert!(text.contains("nothing to do — press n"), "{text}");
+    }
+
     #[test]
     fn wrap_status_breaks_on_words_and_keeps_every_one() {
         let lines = wrap_status(GH_REFUSAL, 40);
@@ -2374,6 +2438,9 @@ mod tests {
             ref_capture_timeout: std::time::Duration::ZERO,
         };
         let mut app = App::new(store, ctx).unwrap();
+        // No project is registered, so the app opened on Projects, where the
+        // digits are weights; the jump below is a cockpit key.
+        app.screen = Screen::Cockpit;
         app.on_key(KeyEvent::from(KeyCode::Char('4')));
         assert_eq!(app.screen, Screen::Config);
 
@@ -2471,6 +2538,51 @@ mod tests {
         assert!(!open.style.add_modifier.contains(Modifier::DIM));
     }
 
+    /// An empty browser explains itself rather than drawing a blank box, and
+    /// distinguishes its two cases: nothing can be created until a project
+    /// exists, so only a store that has one points at `n`.
+    #[test]
+    fn browser_render_explains_an_empty_list() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::Store;
+
+        let render = |store: Store| -> String {
+            let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                "/nonexistent/voro.db",
+            ));
+            let mut app = App::new(store, ctx).unwrap();
+            app.toggle_screen();
+            assert_eq!(app.screen, crate::app::Screen::Tasks);
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            terminal
+                .draw(|f| draw_tasks(f, &app, &mut HitMap::default()))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        let bare = render(Store::open_in_memory().unwrap());
+        assert!(
+            bare.contains("no projects yet — add one on the projects screen (3)"),
+            "empty browser with no projects did not point at the projects screen: {bare}"
+        );
+
+        let mut store = Store::open_in_memory().unwrap();
+        store.create_project("voro", "/tmp/voro").unwrap();
+        let no_tasks = render(store);
+        assert!(
+            no_tasks.contains("no tasks yet — press n to add one"),
+            "empty browser with a project did not point at n: {no_tasks}"
+        );
+    }
+
     /// End-to-end: a real store with a parked task blocked by one open and one
     /// closed task, rendered through the actual browser draw path, must show the
     /// suffix naming both blockers.
@@ -2528,6 +2640,81 @@ mod tests {
             rendered.contains(&format!("blocked by #{}, #{}", open.id, closed.id)),
             "browser did not annotate the parked row with its blockers: {rendered}"
         );
+    }
+
+    /// The detail card advertises what the project can actually do (DESIGN.md
+    /// §8): in a checkout with no remote, `g` has nowhere to open a pull
+    /// request, so the card names the local viewer and the key that reaches it.
+    #[test]
+    fn the_detail_card_advertises_the_local_path_without_a_remote() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::process::{Command, Stdio};
+        use voro_core::{Action, NewTask, Store};
+
+        let project = std::env::temp_dir().join(format!(
+            "voro-ui-remoteless-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["init", "-q"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store
+            .create_project("voro", project.to_str().unwrap())
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "the finished work".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap()
+            .id;
+        store.record_dispatch(task, "claude", None, None).unwrap();
+        store
+            .apply(task, Action::Complete(Some("did it".into())))
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let app = App::new(store, ctx).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal
+            .draw(|f| draw_cockpit(f, &app, &mut HitMap::default()))
+            .unwrap();
+        let out: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(out.contains("next: open"), "{out}");
+        assert!(out.contains("(o shows the diff in a viewer)"), "{out}");
+        assert!(!out.contains("next: pr"), "{out}");
+
+        std::fs::remove_dir_all(&project).ok();
     }
 
     /// End-to-end through the real cockpit draw (DESIGN.md §9): a hand-off
@@ -3874,6 +4061,94 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("Bravo option")), "{rows:?}");
     }
 
+    /// A review card leads with the agent's account of what it did, above the
+    /// body it was given (task #407) — on a first review, where there is no
+    /// rejection behind it, and on a rework, where the feedback heads it.
+    #[test]
+    fn review_card_shows_the_completion_summary_above_the_body() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store.set_weight(p.id, 3).unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "greet the reader".into(),
+                body: "acceptance: the greeting renders".into(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        store.apply(task.id, Action::Start).unwrap();
+        store
+            .apply(
+                task.id,
+                Action::Complete(Some("README.md: +2 lines\nmain.rs: untouched".into())),
+            )
+            .unwrap();
+
+        let width: u16 = 100;
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        let rows = |app: &App, terminal: &mut Terminal<TestBackend>| -> Vec<String> {
+            terminal
+                .draw(|f| {
+                    draw(f, app);
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(width as usize)
+                .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+                .collect()
+        };
+        let row_of = |rows: &[String], needle: &str| -> Option<usize> {
+            rows.iter().position(|r| r.contains(needle))
+        };
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+        let first = rows(&app, &mut terminal);
+        let heading = row_of(&first, "completion summary:").unwrap_or_else(|| panic!("{first:?}"));
+        // Each summary line on its own row, as the question block renders.
+        assert!(row_of(&first, "README.md: +2 lines").is_some(), "{first:?}");
+        let last = row_of(&first, "main.rs: untouched").unwrap_or_else(|| panic!("{first:?}"));
+        let body = row_of(&first, "acceptance: the greeting renders")
+            .unwrap_or_else(|| panic!("{first:?}"));
+        assert!(heading < last && last < body, "{first:?}");
+
+        // Sent back and completed again: the same block, headed by the feedback
+        // the new summary answers rather than by the neutral title.
+        app.store
+            .apply(task.id, Action::RejectWork("tests missing".into()))
+            .unwrap();
+        app.store
+            .apply(task.id, Action::Complete(Some("added the tests".into())))
+            .unwrap();
+        app.refresh().unwrap();
+        let second = rows(&app, &mut terminal);
+        assert!(
+            row_of(&second, "response to the review feedback:").is_some(),
+            "{second:?}"
+        );
+        assert!(row_of(&second, "added the tests").is_some(), "{second:?}");
+        assert!(
+            row_of(&second, "completion summary:").is_none(),
+            "{second:?}"
+        );
+    }
+
     /// The cockpit key line only advertises the selection-only actions while a
     /// task is selected — with an empty queue there is nothing for them to act
     /// on, so they drop out.
@@ -3888,8 +4163,10 @@ mod tests {
             ))
         };
 
-        let empty = App::new(Store::open_in_memory().unwrap(), ctx()).unwrap();
-        assert_eq!(empty.screen, Screen::Cockpit);
+        let mut empty = App::new(Store::open_in_memory().unwrap(), ctx()).unwrap();
+        // A project-less database opens on Projects (DESIGN.md §9); the cockpit
+        // this test is about is the one reached by tabbing back to it.
+        empty.screen = Screen::Cockpit;
         assert!(empty.selected_task_id().is_none());
         let labels: Vec<&str> = key_hints(&empty).iter().map(|(_, l)| *l).collect();
         for dropped in ["dispatch", "deep"] {
