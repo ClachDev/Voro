@@ -1168,8 +1168,8 @@ impl App {
         self.detail_scroll = (self.detail_scroll as i64 + delta).clamp(0, max) as u16;
     }
 
-    /// Tab cycles cockpit → tasks → projects → config → cockpit; `1`/`2`/`3`/`4`
-    /// jump directly (DESIGN.md §9).
+    /// Tab cycles cockpit → tasks → projects → config → cockpit; `alt-1` to
+    /// `alt-4` jump directly (DESIGN.md §9).
     pub fn toggle_screen(&mut self) {
         self.screen = match self.screen {
             Screen::Cockpit => Screen::Tasks,
@@ -1407,39 +1407,60 @@ impl App {
             }
             _ => {}
         }
-        // The projects screen's keys (DESIGN.md §9) reinterpret the digit keys
-        // as weights, so its handler gets first refusal before the global
-        // `1`/`2`/`3` screen jump below.
+        // Direct screen jumps carry the modifier (DESIGN.md §9), which leaves
+        // the bare digits to the numbers on the selected row. The arm sits ahead
+        // of the two screens that handle their own keys below, so the jumps
+        // reach every screen.
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('1') => {
+                    self.screen = Screen::Cockpit;
+                    return;
+                }
+                KeyCode::Char('2') => {
+                    self.screen = Screen::Tasks;
+                    return;
+                }
+                KeyCode::Char('3') => {
+                    self.screen = Screen::Projects;
+                    return;
+                }
+                KeyCode::Char('4') => {
+                    self.screen = Screen::Config;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // The projects screen's digits are the selected project's weight, so its
+        // handler gets first refusal before the priority arm below.
         if self.screen == Screen::Projects {
             self.key_projects(key);
             return;
         }
         // The Config screen has its own letter actions that would collide with
         // the global ones (`a`, `d`, `e`), so it too intercepts before the match
-        // below; it keeps the digit jumps, which mean nothing else there.
+        // below; it binds no digits at all.
         if self.screen == Screen::Config {
             self.key_config(key);
             return;
         }
-        // Direct screen jumps, on the screens where digits mean nothing else.
-        match key.code {
-            KeyCode::Char('1') => {
-                self.screen = Screen::Cockpit;
-                return;
+        // A bare digit sets the number on the selected row, which on the cockpit
+        // and the task browser is the task's priority — the binding the detail
+        // popup has always had (DESIGN.md §9). `4`/`5` are the digits the
+        // projects screen's weights reach and priority does not.
+        if !key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char(c @ '0'..='3') => {
+                    self.set_selected_priority(c);
+                    return;
+                }
+                KeyCode::Char('4' | '5') => {
+                    self.status = Some("priority is P0–P3".into());
+                    return;
+                }
+                _ => {}
             }
-            KeyCode::Char('2') => {
-                self.screen = Screen::Tasks;
-                return;
-            }
-            KeyCode::Char('3') => {
-                self.screen = Screen::Projects;
-                return;
-            }
-            KeyCode::Char('4') => {
-                self.screen = Screen::Config;
-                return;
-            }
-            _ => {}
         }
         match key.code {
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2657,8 +2678,9 @@ impl App {
     }
 
     /// The projects screen's local keys (DESIGN.md §9). `0`–`5` sets the
-    /// selected project's weight; `r` opens the AddProject form pre-filled to
-    /// rename/re-path, `a` opens it blank, `d` deletes behind the store's own
+    /// selected project's weight — the one place a bare digit means weight
+    /// rather than a task's priority; `r` opens the AddProject form pre-filled
+    /// to rename/re-path, `a` opens it blank, `d` deletes behind the store's own
     /// guard (only projects with no tasks), `v` picks the viewer, `A`
     /// toggles archived (DESIGN.md §5). Movement and screen switching are
     /// handled by `key_normal`.
@@ -2811,12 +2833,9 @@ impl App {
 
     /// The Config screen's local keys (DESIGN.md §5): `a` adds a viewer, `e`/⏎
     /// edits the selected one's command, `d` deletes it, `V`/`A` pick the default
-    /// viewer/agent. Digits still jump screens; movement is `key_normal`'s.
+    /// viewer/agent. Movement and the alt-digit screen jumps are `key_normal`'s.
     fn key_config(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('1') => self.screen = Screen::Cockpit,
-            KeyCode::Char('2') => self.screen = Screen::Tasks,
-            KeyCode::Char('3') => self.screen = Screen::Projects,
             KeyCode::Char('a') => self.open_viewer_form(None, None),
             KeyCode::Char('e') | KeyCode::Enter => self.edit_selected_viewer(),
             KeyCode::Char('d') => self.delete_selected_viewer(),
@@ -3385,13 +3404,46 @@ impl App {
         self.mode = Mode::Detail { task_id, scroll };
     }
 
-    /// Re-prioritise the viewed task in place (task #88), the review-time fast
-    /// path that skips the edit form. Routes through `voro-core` so the change
-    /// is logged, then refreshes to re-score and re-sort.
+    /// Set the priority of whichever task the selection resolves to — the bare
+    /// digit the cockpit and the task browser share with the detail popup
+    /// (DESIGN.md §9). A digit with nothing to act on says why rather than
+    /// passing unremarked: a collapsed digest names no single task, and an empty
+    /// queue names none at all.
+    fn set_selected_priority(&mut self, digit: char) {
+        let Ok(priority) = Priority::from_int((digit as u8 - b'0') as i64) else {
+            return;
+        };
+        match self.selected_task_id() {
+            Some(id) => self.set_priority(id, priority),
+            None => self.status = Some(self.no_priority_target().into()),
+        }
+    }
+
+    /// Why a bare digit found no task to prioritise.
+    fn no_priority_target(&self) -> &'static str {
+        if self.screen == Screen::Cockpit
+            && let Some(CockpitRow::Queue(i)) = self.cockpit_rows.get(self.cockpit_sel)
+            && self.digest(*i).is_some()
+        {
+            return "select a proposal inside the digest (⏎ expands) to set its priority";
+        }
+        "nothing selected"
+    }
+
+    /// Re-prioritise a task in place (task #88), the review-time fast path that
+    /// skips the edit form. Routes through `voro-core` so the change is logged,
+    /// then refreshes to re-score and re-sort. The status line names the task,
+    /// since the digit now fires on a row picked out of a queue rather than only
+    /// on the one task the popup framed.
     fn set_priority(&mut self, task_id: i64, priority: Priority) {
+        let before = self.store.task(task_id).ok().map(|t| t.priority);
         match self.store.set_priority(task_id, priority) {
-            Ok(_) => {
-                self.status = Some(format!("priority set to {priority}"));
+            Ok(task) => {
+                let from = before.map_or_else(String::new, |old| format!("{old} -> "));
+                self.status = Some(format!(
+                    "#{} {} priority {from}{priority}",
+                    task.id, task.title
+                ));
                 let result = self.refresh();
                 self.report(result);
             }
@@ -3461,6 +3513,10 @@ mod tests {
 
     fn ctrl_key(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::new(code, KeyModifiers::CONTROL));
+    }
+
+    fn alt_key(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::ALT));
     }
 
     /// A `DispatchCtx` that is never actually used to spawn anything in these
@@ -4304,7 +4360,7 @@ mod tests {
 
         // the flags outlive the popup and the screen switch
         key(&mut app, KeyCode::Esc);
-        key(&mut app, KeyCode::Char('1'));
+        alt_key(&mut app, KeyCode::Char('1'));
         assert_eq!(app.screen, Screen::Cockpit);
         assert!(app.show_score && app.show_history);
     }
@@ -4387,12 +4443,11 @@ mod tests {
 
     // --- projects screen (task, DESIGN.md §9) ---
 
-    /// Tab cycles cockpit → tasks → projects → cockpit, and `1`/`2`/`3` jump to
-    /// a screen directly from the task-oriented screens. On the projects screen
-    /// the digits set weight instead, so it is reached with `3` and left via
-    /// tab.
+    /// Tab cycles cockpit → tasks → projects → config → cockpit, and the
+    /// alt-digits jump to a screen directly — from every screen, including the
+    /// two that handle their own keys (DESIGN.md §9).
     #[test]
-    fn tab_and_digits_move_between_the_four_screens() {
+    fn tab_and_alt_digits_move_between_the_four_screens() {
         let mut app = app_with(&[]);
         assert_eq!(app.screen, Screen::Cockpit);
         key(&mut app, KeyCode::Tab);
@@ -4404,22 +4459,140 @@ mod tests {
         key(&mut app, KeyCode::Tab);
         assert_eq!(app.screen, Screen::Cockpit);
 
-        key(&mut app, KeyCode::Char('2'));
+        alt_key(&mut app, KeyCode::Char('2'));
         assert_eq!(app.screen, Screen::Tasks);
-        key(&mut app, KeyCode::Char('1'));
+        alt_key(&mut app, KeyCode::Char('1'));
         assert_eq!(app.screen, Screen::Cockpit);
-        key(&mut app, KeyCode::Char('4'));
+        alt_key(&mut app, KeyCode::Char('4'));
         assert_eq!(app.screen, Screen::Config);
-        // The config screen's letter keys are its own, but the digit jumps still
-        // work and tab cycles on.
-        key(&mut app, KeyCode::Char('3'));
+        // The config screen's letter keys are its own, and the jump out of it is
+        // the shared alt binding.
+        alt_key(&mut app, KeyCode::Char('3'));
         assert_eq!(app.screen, Screen::Projects);
-        // On the projects screen the digit jump is superseded by weight-setting;
-        // tab is the way back out.
+        // The projects screen's own digits are weights, but the modifier gets
+        // past them.
+        alt_key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.screen, Screen::Tasks);
         key(&mut app, KeyCode::Tab);
-        assert_eq!(app.screen, Screen::Config);
-        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.screen, Screen::Projects);
+        alt_key(&mut app, KeyCode::Char('1'));
         assert_eq!(app.screen, Screen::Cockpit);
+    }
+
+    // --- bare digits set the selected row's number (DESIGN.md §9) ---
+
+    /// The daily act, one keystroke on the row already selected: `0`–`3` on the
+    /// cockpit re-prioritises the task under the cursor through the store.
+    #[test]
+    fn digit_on_the_cockpit_sets_the_selected_tasks_priority() {
+        let mut app = app_with(&[TaskState::Ready]);
+        let id = app.queue_task_ids()[0];
+        let title = app.store.task(id).unwrap().title;
+        assert_eq!(app.store.task(id).unwrap().priority, Priority::P1);
+
+        key(&mut app, KeyCode::Char('0'));
+        assert_eq!(app.store.task(id).unwrap().priority, Priority::P0);
+        assert_eq!(
+            app.screen,
+            Screen::Cockpit,
+            "the digit is not a screen jump"
+        );
+        let status = app.status.clone().unwrap_or_default();
+        for needle in [format!("#{id}"), title, "P1 -> P0".into()] {
+            assert!(
+                status.contains(&needle),
+                "the status line should name {needle:?}: {status}"
+            );
+        }
+
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.store.task(id).unwrap().priority, Priority::P3);
+    }
+
+    /// A digest names no single task, so the digit says which selection it
+    /// wants rather than passing unremarked; folded open, the proposal beneath
+    /// it takes the priority.
+    #[test]
+    fn digit_on_a_digest_reports_and_reaches_the_proposal_once_expanded() {
+        let mut app = app_with(&[TaskState::Proposed]);
+        let id = app.all[0].task.id;
+
+        key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.store.task(id).unwrap().priority, Priority::P1);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("digest"),
+            "the digest row should say why the digit did nothing: {status}"
+        );
+
+        assert_eq!(select_proposal(&mut app), id);
+        key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.store.task(id).unwrap().priority, Priority::P2);
+    }
+
+    /// Weight runs to 5 and priority stops at P3, so the operator arriving from
+    /// the projects screen meets an explanation rather than silence.
+    #[test]
+    fn digits_beyond_p3_report_the_priority_range() {
+        let mut app = app_with(&[TaskState::Ready]);
+        let id = app.queue_task_ids()[0];
+        for digit in ['4', '5'] {
+            key(&mut app, KeyCode::Char(digit));
+            assert_eq!(app.store.task(id).unwrap().priority, Priority::P1);
+            assert_eq!(app.status.as_deref(), Some("priority is P0–P3"));
+            assert_eq!(app.screen, Screen::Cockpit);
+        }
+    }
+
+    /// An empty queue has nothing to prioritise, and says so.
+    #[test]
+    fn digit_with_nothing_selected_reports_it() {
+        let mut app = app_with(&[]);
+        key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.status.as_deref(), Some("nothing selected"));
+    }
+
+    /// The same binding on the task browser, where naming the task matters most
+    /// — the operator is looking at a list of them.
+    #[test]
+    fn digit_on_the_tasks_screen_sets_priority_and_names_the_task() {
+        let mut app = app_with(&[TaskState::Ready]);
+        let id = app.all[0].task.id;
+        let title = app.all[0].task.title.clone();
+        alt_key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.screen, Screen::Tasks);
+
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.store.task(id).unwrap().priority, Priority::P3);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains(&format!("#{id}")) && status.contains(&title),
+            "the status line should name the task: {status}"
+        );
+        assert!(status.contains("P3"), "{status}");
+    }
+
+    /// The popup's own `0`–`3` (task #88) still sets the viewed task's priority
+    /// in place, through the same call the two screens now share.
+    #[test]
+    fn digit_in_the_detail_popup_sets_priority_without_closing_it() {
+        let mut app = app_with(&[TaskState::Ready]);
+        let id = app.all[0].task.id;
+        alt_key(&mut app, KeyCode::Char('2'));
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Detail { .. }));
+
+        key(&mut app, KeyCode::Char('0'));
+        assert_eq!(app.store.task(id).unwrap().priority, Priority::P0);
+        assert!(matches!(app.mode, Mode::Detail { .. }));
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&format!("#{id}")),
+            "{:?}",
+            app.status
+        );
     }
 
     /// Type each character of `s` as a `Char` key press.
@@ -4505,8 +4678,7 @@ mod tests {
             }
         };
 
-        app.screen = Screen::Cockpit;
-        key(&mut app, KeyCode::Char('4'));
+        alt_key(&mut app, KeyCode::Char('4'));
         key(&mut app, KeyCode::Char('a'));
         // an empty name fills nothing rather than a bare placeholder
         assert_eq!(form(&app), (String::new(), String::new(), true));
@@ -4564,10 +4736,7 @@ mod tests {
         let path = ctx.agents_path.clone();
         let mut app = App::new(store, ctx).unwrap();
 
-        // No project is registered, so the app opened on Projects, where the
-        // digits are weights; the jump below is a cockpit key.
-        app.screen = Screen::Cockpit;
-        key(&mut app, KeyCode::Char('4'));
+        alt_key(&mut app, KeyCode::Char('4'));
         key(&mut app, KeyCode::Char('a'));
         type_str(&mut app, "emacsclient");
         key(&mut app, KeyCode::Enter); // name -> command
@@ -4603,10 +4772,7 @@ mod tests {
         let path = ctx.agents_path.clone();
         let mut app = App::new(store, ctx).unwrap();
 
-        // No project is registered, so the app opened on Projects, where the
-        // digits are weights; the jump below is a cockpit key.
-        app.screen = Screen::Cockpit;
-        key(&mut app, KeyCode::Char('4'));
+        alt_key(&mut app, KeyCode::Char('4'));
         assert_eq!(app.screen, Screen::Config);
         // the built-in agents and viewers are both listed, the viewers'
         // built-in rows read-only (#405)
@@ -4717,7 +4883,7 @@ mod tests {
         let path = ctx.agents_path.clone();
         let mut app = App::new(store, ctx).unwrap();
 
-        key(&mut app, KeyCode::Char('4'));
+        alt_key(&mut app, KeyCode::Char('4'));
         app.config_sel = row(&app, "zed");
         assert!(app.config_viewers[app.config_sel].editable);
         key(&mut app, KeyCode::Char('d'));
@@ -4751,7 +4917,7 @@ mod tests {
         let mut app = App::new(store, ctx).unwrap();
 
         // onto the projects screen, open the viewer picker
-        key(&mut app, KeyCode::Char('3'));
+        alt_key(&mut app, KeyCode::Char('3'));
         assert_eq!(app.screen, Screen::Projects);
         key(&mut app, KeyCode::Char('v'));
         let n = match &app.mode {
@@ -4794,12 +4960,14 @@ mod tests {
     }
 
     /// The morning ritual: `0`–`5` on the projects screen sets the selected
-    /// project's weight through the store in a single keystroke.
+    /// project's weight through the store in a single keystroke — and nothing
+    /// about that keystroke can be mistaken for a screen jump, which is the
+    /// collision this binding scheme exists to remove (DESIGN.md §9).
     #[test]
     fn digit_on_projects_screen_sets_weight_through_the_store() {
         let mut app = app_with(&[]);
         let project_id = app.projects[0].id;
-        key(&mut app, KeyCode::Char('3'));
+        alt_key(&mut app, KeyCode::Char('3'));
         assert_eq!(app.screen, Screen::Projects);
 
         key(&mut app, KeyCode::Char('5'));
@@ -4809,21 +4977,34 @@ mod tests {
         key(&mut app, KeyCode::Char('0'));
         assert_eq!(app.store.project(project_id).unwrap().weight, 0);
 
-        // `1`/`2`/`3` set weight here rather than jumping screens, so every
-        // value 0–5 is reachable.
-        for digit in ['1', '2', '3'] {
+        // Every value 0–5 is reachable, and no bare digit leaves the screen.
+        for digit in ['1', '2', '3', '4', '5'] {
             key(&mut app, KeyCode::Char(digit));
-            assert_eq!(app.screen, Screen::Projects);
+            assert_eq!(
+                app.screen,
+                Screen::Projects,
+                "bare {digit} should weight the project, not switch screens"
+            );
             let expected = digit.to_digit(10).unwrap() as i64;
             assert_eq!(app.store.project(project_id).unwrap().weight, expected);
         }
+
+        // The modifier is the other half of the bargain: it jumps without
+        // touching the weight it passes over.
+        alt_key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.screen, Screen::Cockpit);
+        assert_eq!(app.store.project(project_id).unwrap().weight, 5);
+        alt_key(&mut app, KeyCode::Char('3'));
+        alt_key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.screen, Screen::Tasks);
+        assert_eq!(app.store.project(project_id).unwrap().weight, 5);
     }
 
     #[test]
     fn projects_screen_rename_prefills_and_saves() {
         let mut app = app_with(&[]);
         let project_id = app.projects[0].id;
-        key(&mut app, KeyCode::Char('3'));
+        alt_key(&mut app, KeyCode::Char('3'));
 
         key(&mut app, KeyCode::Char('r'));
         match &app.mode {
@@ -4874,7 +5055,7 @@ mod tests {
     #[test]
     fn projects_screen_add_opens_a_blank_form() {
         let mut app = app_with(&[]);
-        key(&mut app, KeyCode::Char('3'));
+        alt_key(&mut app, KeyCode::Char('3'));
         key(&mut app, KeyCode::Char('a'));
         match &app.mode {
             Mode::AddProject {
@@ -4899,7 +5080,7 @@ mod tests {
         let mut app = app_with(&[TaskState::Ready, TaskState::NeedsInput]);
         let project_id = app.projects[0].id;
         assert_eq!(app.queue.rows.len(), 2);
-        key(&mut app, KeyCode::Char('3'));
+        alt_key(&mut app, KeyCode::Char('3'));
 
         key(&mut app, KeyCode::Char('A'));
         assert!(app.store.project(project_id).unwrap().archived);
@@ -4919,7 +5100,7 @@ mod tests {
     #[test]
     fn projects_screen_deletes_a_taskless_project() {
         let mut app = app_with(&[]);
-        key(&mut app, KeyCode::Char('3'));
+        alt_key(&mut app, KeyCode::Char('3'));
         key(&mut app, KeyCode::Char('d'));
         assert!(app.projects.is_empty());
         assert_eq!(app.screen, Screen::Projects);
@@ -4929,7 +5110,7 @@ mod tests {
     #[test]
     fn projects_screen_delete_refuses_when_project_has_a_task() {
         let mut app = app_with(&[TaskState::Ready]);
-        key(&mut app, KeyCode::Char('3'));
+        alt_key(&mut app, KeyCode::Char('3'));
         key(&mut app, KeyCode::Char('d'));
         assert_eq!(app.projects.len(), 1);
         assert!(app.status.as_deref().unwrap_or("").contains("park"));
@@ -6950,7 +7131,7 @@ mod tests {
             .unwrap();
         app.refresh().unwrap();
 
-        key(&mut app, KeyCode::Char('2'));
+        alt_key(&mut app, KeyCode::Char('2'));
         key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Char('j'));
         assert!(matches!(app.mode, Mode::Detail { scroll: 1, .. }));

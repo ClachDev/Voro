@@ -2057,10 +2057,10 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
             "Screens",
             vec![
                 ("tab", current),
-                ("1", "cockpit"),
-                ("2", "tasks"),
-                ("3", "projects"),
-                ("4", "config"),
+                ("alt-1", "cockpit"),
+                ("alt-2", "tasks"),
+                ("alt-3", "projects"),
+                ("alt-4", "config"),
             ],
         )
     };
@@ -2070,6 +2070,7 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
             actions.extend(pairs(DISPATCH_KEYS));
             actions.extend(pairs(REFINE_KEYS));
             actions.extend([
+                ("0-3", "set the task's priority"),
                 ("s", "change state"),
                 ("!", "toggle deep — the agent's strongest model"),
                 ("c", "link and unlink documents"),
@@ -2108,6 +2109,7 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
             actions.extend(pairs(DISPATCH_KEYS));
             actions.extend(pairs(REFINE_KEYS));
             actions.extend([
+                ("0-3", "set the task's priority"),
                 ("s", "change state"),
                 ("!", "toggle deep — the agent's strongest model"),
                 ("c", "link and unlink documents"),
@@ -2157,8 +2159,7 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                     ("q", "quit"),
                 ],
             ),
-            // The digit keys are weights here, so tab is the only way out.
-            ("Screens", vec![("tab", "next screen")]),
+            screens("next screen"),
         ],
         Screen::Config => vec![
             (
@@ -2179,15 +2180,7 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                     ("q", "quit"),
                 ],
             ),
-            (
-                "Screens",
-                vec![
-                    ("tab", "next screen"),
-                    ("1", "cockpit"),
-                    ("2", "tasks"),
-                    ("3", "projects"),
-                ],
-            ),
+            screens("next screen"),
         ],
     }
 }
@@ -2279,6 +2272,13 @@ mod tests {
     /// key to press instead.
     const GH_REFUSAL: &str = "/home/michael/Projects/demoproj is not a GitHub repository, \
          so there is no pull request to open — use `o` to see this task's diff in a viewer";
+
+    /// Jump to a screen the way the operator does, with the alt-digit binding
+    /// (DESIGN.md §9) — a bare digit is a weight or a priority.
+    fn alt_screen(app: &mut crate::app::App, digit: char) {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.on_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::ALT));
+    }
 
     /// Every screen's status region, read back as one whitespace-normalised
     /// string, so a message that wrapped across rows reads as itself again.
@@ -2453,7 +2453,6 @@ mod tests {
     fn every_screen_wraps_a_long_status() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
         let normalised = GH_REFUSAL.split_whitespace().collect::<Vec<_>>().join(" ");
         for (key, screen) in [
@@ -2462,7 +2461,7 @@ mod tests {
             ('4', Screen::Config),
         ] {
             let mut app = app_with_status(GH_REFUSAL, 1, 0);
-            app.on_key(KeyEvent::from(KeyCode::Char(key)));
+            alt_screen(&mut app, key);
             assert_eq!(app.screen, screen);
             // Switching screens is free to clear the message; re-arm it.
             app.status = Some(GH_REFUSAL.into());
@@ -2509,7 +2508,6 @@ mod tests {
         use crate::app::App;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use ratatui::crossterm::event::{KeyCode, KeyEvent};
         use voro_core::Store;
 
         let dir = std::env::temp_dir().join(format!(
@@ -2533,10 +2531,7 @@ mod tests {
             message_grace: std::time::Duration::from_millis(300),
         };
         let mut app = App::new(store, ctx).unwrap();
-        // No project is registered, so the app opened on Projects, where the
-        // digits are weights; the jump below is a cockpit key.
-        app.screen = Screen::Cockpit;
-        app.on_key(KeyEvent::from(KeyCode::Char('4')));
+        alt_screen(&mut app, '4');
         assert_eq!(app.screen, Screen::Config);
 
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -3493,8 +3488,7 @@ mod tests {
 
     /// Drive the app onto the projects screen with the real key handler.
     fn key_to_projects(app: &mut crate::app::App) {
-        use ratatui::crossterm::event::{KeyCode, KeyEvent};
-        app.on_key(KeyEvent::from(KeyCode::Char('3')));
+        alt_screen(app, '3');
     }
 
     /// End-to-end: with the score and history toggles on, the cockpit detail
@@ -3675,7 +3669,7 @@ mod tests {
         }
 
         // The same lines in the tasks-screen Detail popup, on the target row.
-        app.on_key(KeyEvent::from(KeyCode::Char('2')));
+        alt_screen(&mut app, '2');
         app.on_key(KeyEvent::from(KeyCode::Char('j')));
         app.on_key(KeyEvent::from(KeyCode::Enter));
         assert!(
@@ -4047,7 +4041,7 @@ mod tests {
             "/nonexistent/voro.db",
         ));
         let mut app = App::new(store, ctx).unwrap();
-        app.on_key(KeyEvent::from(KeyCode::Char('2'))); // tasks screen
+        alt_screen(&mut app, '2'); // tasks screen
         app.on_key(KeyEvent::from(KeyCode::Enter)); // open the Detail popup
         app.on_key(KeyEvent::from(KeyCode::Char('x')));
         app.on_key(KeyEvent::from(KeyCode::Char('h')));
@@ -5248,7 +5242,7 @@ mod tests {
         }
 
         let mut app = test_app(store);
-        app.on_key(KeyEvent::from(KeyCode::Char('2')));
+        alt_screen(&mut app, '2');
         assert_eq!(app.screen, Screen::Tasks);
         // Walk the selection off the bottom of the pane so the list scrolls.
         for _ in 0..35 {
@@ -5309,14 +5303,14 @@ mod tests {
         let mut app = crate::app::App::new(store, ctx).unwrap();
         let mut terminal = TestTerminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
 
-        app.on_key(KeyEvent::from(KeyCode::Char('3')));
+        alt_screen(&mut app, '3');
         let hits = frame(&app, &mut terminal);
         let (x, y) = point_of(&terminal, "gamma");
         app.on_mouse(x, y, &hits);
         assert_eq!(app.projects[app.projects_sel].name, "gamma");
 
-        // The projects screen reads the digit keys as weights, so tab across
-        // rather than jumping with `4`.
+        // A bare digit on the projects screen is a weight, so leave by the keys
+        // that are not: tab across to Config.
         app.on_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.screen, Screen::Config);
         let hits = frame(&app, &mut terminal);
