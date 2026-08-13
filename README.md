@@ -25,20 +25,30 @@ end-to-end. Expect churn.
 Voro is Unix-only — Linux and macOS. It installs a single binary, `voro`, that is
 both the TUI cockpit (run with no arguments) and the CLI (`voro <verb>`).
 
-The quickest path is the prebuilt shell installer, which downloads the right
-binary for your platform and drops it in Cargo's bin directory (`~/.cargo/bin`):
+Prebuilt binaries are published for two targets only: `x86_64-unknown-linux-gnu`
+and `aarch64-apple-darwin`, which is to say 64-bit Intel and AMD Linux and Apple
+Silicon macOS. Every other Unix — an Intel Mac, an ARM Linux box — is supported
+by building from source, covered at the end of this section.
+
+On one of those two platforms, the quickest path is the prebuilt shell
+installer, which downloads the right binary and drops it in Cargo's bin
+directory (`~/.cargo/bin`):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ClachDev/Voro/releases/latest/download/voro-installer.sh | sh
 ```
 
-Prefer to place the binary yourself? Each [GitHub
-Release](https://github.com/ClachDev/Voro/releases) also carries tarballs —
-`x86_64-unknown-linux-gnu` for Linux and `aarch64-apple-darwin` for Apple Silicon
-macOS — alongside their checksums. Download one, extract it, and put `voro` on
-your `PATH`.
+If you have never installed Rust, `~/.cargo/bin` is unlikely to be on your
+`PATH`, and the shell will not find `voro` afterwards. Add the directory to your
+shell's `PATH` and start a new shell.
 
-To build and install from source instead:
+Prefer to place the binary yourself? Each [GitHub
+Release](https://github.com/ClachDev/Voro/releases) also carries tarballs for
+those same two targets alongside their checksums. Download one, extract it, and
+put `voro` on your `PATH`.
+
+To build and install from source instead — and on any platform without a
+prebuilt binary, this is the way in — you need Rust 1.88 or newer:
 
 ```bash
 cargo install voro
