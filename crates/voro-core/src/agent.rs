@@ -44,6 +44,16 @@ pub const SESSION_NAME_PLACEHOLDER: &str = "{session_name}";
 /// UUID, a Codex session id, a tmux session name).
 pub const SESSION_PLACEHOLDER: &str = "{session}";
 
+/// The fresh-reference substitution in the `message` template, bound to a v4
+/// UUID Voro generates for the send (DESIGN.md §8). An agent whose sessions are
+/// held by a supervisor cannot be resumed headlessly while that supervisor
+/// lives; it can be *forked*, which continues the same conversation under a
+/// reference the caller names up front. A `message` template carrying this
+/// placeholder is declaring that shape, and the session row follows the fork:
+/// what Voro binds here becomes the session's reference. Optional — a template
+/// without it resumes in place and keeps the reference it had.
+pub const NEW_SESSION_PLACEHOLDER: &str = "{new_session}";
+
 /// The model substitution in a verb template, resolved from the agent's own
 /// `model`/`model_deep`/`model_plan` keys (DESIGN.md §8). Voro is model-blind:
 /// the values are opaque strings it pastes into the command and never
@@ -94,13 +104,17 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// deliberate: a verb is an opaque per-agent contract, which is exactly what
 /// lets an agent define a subset of them and degrade per-verb. `codex` defines
 /// no `message` and the TUI's quick-message key says so on the status line.
+/// It forks rather than resumes in place ([`NEW_SESSION_PLACEHOLDER`]): a
+/// `claude --bg` session keeps its supervisor process after finishing its turn,
+/// and that supervisor refuses a headless `--resume` for as long as it lives,
+/// so the plain resume was a send that could never land (DESIGN.md §8).
 const BUILTIN_AGENTS: &str = "\
 [agents.claude]
 dispatch   = \"claude --bg --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
 sessions   = \"claude agents --json\"
 attach     = \"claude attach {session}\"
 resume     = \"claude --resume {session}\"
-message    = \"claude -p --resume {session} \\\"$(cat {prompt_file})\\\"\"
+message    = \"claude -p --resume {session} --fork-session --session-id {new_session} \\\"$(cat {prompt_file})\\\"\"
 plan       = \"claude --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
 model      = \"opus\"
 model_deep = \"fable\"
@@ -155,7 +169,9 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #       attach    open a running session interactively    ({session})
 #       resume    reopen a finished session interactively  ({session})
 #       message   say one thing into a session headlessly, no terminal
-#                 ({session} and {prompt_file})
+#                 ({session} and {prompt_file}, plus the optional
+#                 {new_session}: a fresh reference for an agent that can only
+#                 be joined by forking, which the session row then follows)
 #       plan      run an interactive foreground planning session ({prompt_file})
 #     `plan` may carry `{session_name}` too, but not `{task_id}`: a planning
 #     session drafts a task rather than naming one.
@@ -425,20 +441,44 @@ fn render_launch(template: &str, spec: &LaunchSpec, model: Option<&str>) -> Stri
     render(template, &bindings)
 }
 
-/// Bind a `message` template's two placeholders in one pass, so neither value's
-/// own braces are re-scanned: the session reference Voro captured at dispatch
-/// and the file holding the message. Both are shell-quoted — the reference is
-/// agent-opaque text, not a token Voro may assume is bare.
-pub fn render_message(template: &str, session_ref: &str, prompt_file: &Path) -> String {
+/// A `message` template rendered into a runnable command line, plus the
+/// reference the session will answer to afterwards where the agent forks
+/// ([`NEW_SESSION_PLACEHOLDER`]). The caller records that reference only once
+/// the send is under way, so a command that never ran leaves the session
+/// pointing where it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedMessage {
+    pub command: String,
+    /// The fresh reference bound to `{new_session}`, or `None` for a template
+    /// that resumes its session in place.
+    pub new_session_ref: Option<String>,
+}
+
+/// Bind a `message` template's placeholders in one pass, so no value's own
+/// braces are re-scanned: the session reference Voro captured at dispatch, the
+/// file holding the message, and — for a template that forks — a freshly
+/// generated v4 UUID for the session the send opens. All are shell-quoted; the
+/// references are agent-opaque text, not tokens Voro may assume are bare.
+pub fn render_message(template: &str, session_ref: &str, prompt_file: &Path) -> RenderedMessage {
     let session = shell_quote(Path::new(session_ref));
     let prompt_file = shell_quote(prompt_file);
-    render(
-        template,
-        &[
-            (SESSION_PLACEHOLDER, session.as_str()),
-            (PROMPT_FILE_PLACEHOLDER, prompt_file.as_str()),
-        ],
-    )
+    let new_session_ref = template
+        .contains(NEW_SESSION_PLACEHOLDER)
+        .then(|| uuid::Uuid::new_v4().to_string());
+    let new_session = new_session_ref
+        .as_deref()
+        .map(|r| shell_quote(Path::new(r)));
+    let mut bindings = vec![
+        (SESSION_PLACEHOLDER, session.as_str()),
+        (PROMPT_FILE_PLACEHOLDER, prompt_file.as_str()),
+    ];
+    if let Some(new_session) = &new_session {
+        bindings.push((NEW_SESSION_PLACEHOLDER, new_session.as_str()));
+    }
+    RenderedMessage {
+        command: render(template, &bindings),
+        new_session_ref,
+    }
 }
 
 /// A viewer command template from `voro.toml` (DESIGN.md §11a): a shell command
@@ -621,6 +661,23 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
                      the reference Voro captured at launch"
                 )));
             }
+        }
+    }
+    // `{new_session}` names the session a *send* opens, so `message` is the one
+    // verb that can bind it; anywhere else it would reach the shell as literal
+    // braces.
+    for (verb, template) in [
+        ("dispatch", Some(dispatch.as_str())),
+        ("sessions", agent.sessions.as_deref()),
+        ("attach", agent.attach.as_deref()),
+        ("resume", agent.resume.as_deref()),
+        ("plan", agent.plan.as_deref()),
+    ] {
+        if template.is_some_and(|t| t.contains(NEW_SESSION_PLACEHOLDER)) {
+            return Err(invalid(format!(
+                "agent '{name}' {verb} carries {NEW_SESSION_PLACEHOLDER}, which is bound only on \
+                 message — it names the session a headless send forks into"
+            )));
         }
     }
     // `plan` serves a target that has no task: a planning session drafts a task
@@ -1680,9 +1737,74 @@ mod tests {
             Path::new("/run/msg-1.md"),
         );
         assert_eq!(
-            rendered,
+            rendered.command,
             "claude -p --resume '3f6c-1111' \"$(cat '/run/msg-1.md')\""
         );
+        // A template that resumes in place keeps the reference it was given.
+        assert_eq!(rendered.new_session_ref, None);
+    }
+
+    /// A `message` template that forks names the session it forks into, and
+    /// Voro supplies that name: a fresh v4 UUID, shell-quoted like the rest,
+    /// handed back so the session row can follow the fork (DESIGN.md §8).
+    #[test]
+    fn render_message_binds_a_fresh_reference_for_a_forking_verb() {
+        let rendered = render_message(
+            "claude -p --resume {session} --fork-session --session-id {new_session} \
+             \"$(cat {prompt_file})\"",
+            "3f6c-1111",
+            Path::new("/run/msg-1.md"),
+        );
+        let new_ref = rendered.new_session_ref.expect("a fresh reference");
+        assert_ne!(new_ref, "3f6c-1111");
+        assert_eq!(new_ref.len(), 36, "a v4 uuid: {new_ref}");
+        assert!(
+            rendered
+                .command
+                .contains(&format!("--session-id '{new_ref}'")),
+            "{}",
+            rendered.command
+        );
+        // and a second send forks somewhere else again
+        let again = render_message(
+            "claude --session-id {new_session} --resume {session} {prompt_file}",
+            "3f6c-1111",
+            Path::new("/run/msg-2.md"),
+        );
+        assert_ne!(again.new_session_ref, Some(new_ref));
+    }
+
+    /// The placeholder is bound only where a send happens; on any other verb it
+    /// would reach the shell as literal braces, so it is refused at load.
+    #[test]
+    fn new_session_is_refused_outside_the_message_verb() {
+        for (verb, template) in [
+            ("attach", "join {session} {new_session}"),
+            ("resume", "reopen {session} {new_session}"),
+            ("plan", "plan --session-id {new_session} {prompt_file}"),
+        ] {
+            let text = format!(
+                "[agents.a]\ndispatch = \"run {{prompt_file}}\"\n{verb} = \"{template}\"\n"
+            );
+            let e = parse(&text).unwrap_err().to_string();
+            assert!(e.contains("{new_session}"), "{verb}: {e}");
+            assert!(e.contains(verb), "{verb}: {e}");
+        }
+        // and on the dispatch template itself, which starts a session rather
+        // than joining one
+        let e = parse("[agents.a]\ndispatch = \"run --session-id {new_session} {prompt_file}\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("dispatch carries {new_session}"), "{e}");
+    }
+
+    /// The built-in `claude` message verb forks, because a `--bg` session's
+    /// supervisor refuses a headless resume while it lives (DESIGN.md §8).
+    #[test]
+    fn the_builtin_claude_message_verb_forks() {
+        let message = builtin_agents()["claude"].message().unwrap();
+        assert!(message.contains("--fork-session"), "{message}");
+        assert!(message.contains(NEW_SESSION_PLACEHOLDER), "{message}");
     }
 
     /// The one-pass rule (§8): a value carrying its own braces reaches the
@@ -1694,7 +1816,7 @@ mod tests {
             "{prompt_file}",
             Path::new("/run/m.md"),
         );
-        assert_eq!(rendered, "say '{prompt_file}' '/run/m.md'");
+        assert_eq!(rendered.command, "say '{prompt_file}' '/run/m.md'");
     }
 
     /// A stale `continue` line — from a pre-pivot config or the old codex
