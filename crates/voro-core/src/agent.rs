@@ -453,6 +453,12 @@ pub enum Launch {
     /// carrying the project's name. Project names are unique (schema §5), so
     /// two projects cannot claim one session name.
     Plan { project: String },
+    /// A headless agent expanding the operator's one-line intent into a task it
+    /// files itself (DESIGN.md §6/§8). Like a planning session it belongs to no
+    /// task — it is drafting one — so it names its project instead; the id
+    /// serves here, since `propose` already occupies the position a bare number
+    /// would otherwise be read in.
+    Propose { project_id: i64 },
 }
 
 impl Launch {
@@ -466,6 +472,7 @@ impl Launch {
             Launch::Dispatch { task_id } => format!("voro-{task_id}"),
             Launch::Refine { task_id } => format!("voro-{task_id}-refine"),
             Launch::Plan { project } => format!("voro-plan-{}", sanitize_for_name(project)),
+            Launch::Propose { project_id } => format!("voro-propose-{project_id}"),
         }
     }
 
@@ -476,6 +483,7 @@ impl Launch {
             Launch::Dispatch { task_id } => format!("task-{task_id}"),
             Launch::Refine { task_id } => format!("refine-{task_id}"),
             Launch::Plan { project } => format!("plan-{}", sanitize_for_name(project)),
+            Launch::Propose { project_id } => format!("propose-{project_id}"),
         }
     }
 
@@ -485,7 +493,7 @@ impl Launch {
     pub fn task_id(&self) -> Option<i64> {
         match self {
             Launch::Dispatch { task_id } | Launch::Refine { task_id } => Some(*task_id),
-            Launch::Plan { .. } => None,
+            Launch::Plan { .. } | Launch::Propose { .. } => None,
         }
     }
 }
@@ -2489,6 +2497,21 @@ mod tests {
         assert_eq!(dispatch.task_id(), Some(42));
         assert_eq!(refine.task_id(), Some(42));
         assert_eq!(plan.task_id(), None);
+    }
+
+    #[test]
+    fn a_quick_propose_names_its_project_and_has_no_task() {
+        // Like a planning session it is drafting a task rather than naming one,
+        // so it carries no task id; `propose` occupies the position a bare
+        // number would otherwise be read as a task id in.
+        let propose = Launch::Propose { project_id: 2 };
+        assert_eq!(propose.session_name(), "voro-propose-2");
+        assert_eq!(propose.slug(), "propose-2");
+        assert_eq!(propose.task_id(), None);
+        assert_ne!(
+            propose.session_name(),
+            Launch::Dispatch { task_id: 2 }.session_name()
+        );
     }
 
     #[test]

@@ -189,6 +189,13 @@ pub enum Mode {
         task_id: i64,
         buffer: String,
     },
+    /// Collecting the one line `n` expands into a task (DESIGN.md §6/§8). Like
+    /// `LinkPr` and unlike `Prompt` it names no task — there is none yet — so it
+    /// carries the project the proposal will land in instead.
+    QuickCreate {
+        project_id: i64,
+        buffer: String,
+    },
     /// Confirming that `pr` should push a review task's branch and open a ready
     /// PR (DESIGN.md §8). Confirming runs the same `crate::pr::create` the CLI
     /// calls; a tracked PR skips this and jumps to the PR instead.
@@ -283,11 +290,15 @@ impl Mode {
     }
 }
 
-/// Which create flow the project picker feeds (DESIGN.md §8/§9): the manual
-/// `$EDITOR` form on `n`, or an interactive agent planning session on `N` —
-/// the same lowercase-default, uppercase-variant pairing as `d`/`D`.
+/// Which create flow the project picker feeds (DESIGN.md §8/§9). Three paths
+/// reach a task, and the case convention orders them: `n` collects one line in
+/// a modal and hands it to a background agent that writes the task and files it,
+/// `N` opens the interactive planning session, and `ctrl-n` — the rare path, and
+/// the only one that sets state, priority and dependencies at creation time —
+/// opens the manual `$EDITOR` form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateFlow {
+    Quick,
     Editor,
     Plan,
 }
@@ -1294,6 +1305,9 @@ impl App {
                 buffer,
             } => self.key_prompt(key, task_id, kind, buffer),
             Mode::LinkPr { task_id, buffer } => self.key_link_pr(key, task_id, buffer),
+            Mode::QuickCreate { project_id, buffer } => {
+                self.key_quick_create(key, project_id, buffer)
+            }
             Mode::ConfirmPr {
                 task_id,
                 branch,
@@ -1435,7 +1449,10 @@ impl App {
             KeyCode::Char('r') => self.refine_selected(RefineFlow::Note),
             KeyCode::Char('R') => self.refine_selected(RefineFlow::Interactive),
             KeyCode::Enter => self.activate_selection(),
-            KeyCode::Char('n') => self.new_task(CreateFlow::Editor),
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.new_task(CreateFlow::Editor)
+            }
+            KeyCode::Char('n') => self.new_task(CreateFlow::Quick),
             KeyCode::Char('N') => self.new_task(CreateFlow::Plan),
             KeyCode::Char('e') => {
                 if let Some(id) = self.selected_task_id() {
@@ -1704,13 +1721,20 @@ impl App {
         }
     }
 
-    /// Launch the chosen create flow on a project: queue the `$EDITOR` form,
-    /// or assemble a planning session (DESIGN.md §8) for main() to run in the
-    /// foreground. An agent without a `plan` verb — or any other assembly
-    /// failure — reports what to configure through the status line, the same
-    /// "no-op with an explanation" style as the dispatch keys.
+    /// Launch the chosen create flow on a project: open the one-line modal the
+    /// background agent expands, queue the `$EDITOR` form, or assemble a
+    /// planning session (DESIGN.md §8) for main() to run in the foreground. An
+    /// agent without a `plan` verb — or any other assembly failure — reports
+    /// what to configure through the status line, the same "no-op with an
+    /// explanation" style as the dispatch keys.
     fn start_create(&mut self, project_id: i64, flow: CreateFlow) {
         match flow {
+            CreateFlow::Quick => {
+                self.mode = Mode::QuickCreate {
+                    project_id,
+                    buffer: String::new(),
+                };
+            }
             CreateFlow::Editor => {
                 self.pending_editor = Some(EditorRequest::Create { project_id });
             }
@@ -2388,6 +2412,44 @@ impl App {
             _ => {}
         }
         self.mode = Mode::LinkPr { task_id, buffer };
+    }
+
+    /// Drive the quick-create prompt (DESIGN.md §6/§8). Enter hands the typed
+    /// line to a background agent, esc cancels. The buffer is one line — the
+    /// terse intent the agent expands — so this stays a simple line editor.
+    fn key_quick_create(&mut self, key: KeyEvent, project_id: i64, mut buffer: String) {
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Enter => {
+                self.quick_propose(project_id, &buffer);
+                return;
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Char(c) => buffer.push(c),
+            _ => {}
+        }
+        self.mode = Mode::QuickCreate { project_id, buffer };
+    }
+
+    /// Quick propose (DESIGN.md §6/§8): spawn the headless agent that expands
+    /// the typed line into a task and files it with `voro add`. Nothing waits on
+    /// it and no task exists yet, so there is nothing to refresh onto — the
+    /// proposal shows up in the untriaged count and the queue on a later
+    /// refresh, exactly as one an agent filed with `voro propose` does. An empty
+    /// line asked for nothing, so it spawns nothing.
+    fn quick_propose(&mut self, project_id: i64, intent: &str) {
+        if intent.trim().is_empty() {
+            self.status = Some("cancelled".into());
+            return;
+        }
+        self.status = Some(
+            match crate::dispatch::propose(&self.store, &self.dispatch_ctx, project_id, intent) {
+                Ok(summary) => summary,
+                Err(e) => e,
+            },
+        );
     }
 
     /// Validate and track a PR reference on a task, then refresh. An unparseable
@@ -6431,6 +6493,158 @@ mod tests {
             launch.command
         );
         assert_eq!(launch.cwd, "/tmp/demo");
+    }
+
+    // --- quick propose (task #315) ---
+
+    /// An agents config whose `dispatch` verb only copies the prompt file, so a
+    /// spawned expansion is observable through the prompt it wrote without
+    /// anything real being launched. The project's checkout is re-pointed at the
+    /// scratch directory, since a spawn needs a cwd that exists.
+    fn app_with_stub_dispatch() -> App {
+        let mut app = app_with_agents(
+            "default_agent = \"stub\"\n\n[agents.stub]\ndispatch = \"cat {prompt_file}\"\n",
+        );
+        let checkout = app.dispatch_ctx.runtime_dir.with_file_name("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let project_id = app.projects[0].id;
+        app.store
+            .set_default_repo_path(project_id, checkout.to_str().unwrap())
+            .unwrap();
+        app.refresh().unwrap();
+        app
+    }
+
+    /// Every prompt the app's dispatch context has written, newest last.
+    fn written_prompts(app: &App) -> Vec<String> {
+        let mut paths: Vec<_> = std::fs::read_dir(&app.dispatch_ctx.runtime_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| Some(e.ok()?.path()))
+                    .filter(|p| p.to_string_lossy().ends_with(".prompt.md"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        paths.sort();
+        paths
+            .iter()
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect()
+    }
+
+    /// `n` is the background quick propose (DESIGN.md §8): with one project it
+    /// opens the one-line modal on it directly, suspending nothing — no
+    /// `$EDITOR` request, no foreground planning session.
+    #[test]
+    fn quick_create_key_opens_the_modal_on_the_only_project() {
+        let mut app = app_with_stub_dispatch();
+        let project_id = app.projects[0].id;
+
+        key(&mut app, KeyCode::Char('n'));
+        match &app.mode {
+            Mode::QuickCreate {
+                project_id: id,
+                buffer,
+            } => {
+                assert_eq!(*id, project_id);
+                assert!(buffer.is_empty(), "buffer was {buffer:?}");
+            }
+            _ => panic!("n should open the quick-create modal"),
+        }
+        assert!(app.pending_editor.is_none());
+        assert!(app.pending_plan.is_none());
+    }
+
+    /// ⏎ on a typed line spawns the expansion and returns to the queue: the
+    /// prompt the agent gets carries the line as typed and names the project it
+    /// files into, and the status line says the proposal is on its way.
+    #[test]
+    fn quick_create_submit_spawns_the_expansion_and_reports_it() {
+        let mut app = app_with_stub_dispatch();
+
+        key(&mut app, KeyCode::Char('n'));
+        for c in "cache the score decomposition".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+
+        assert!(matches!(app.mode, Mode::Normal));
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(status.contains("proposing task in demo"), "{status}");
+
+        let prompts = written_prompts(&app);
+        assert_eq!(prompts.len(), 1, "one expansion, one prompt");
+        let prompt = &prompts[0];
+        assert!(
+            prompt.contains("cache the score decomposition"),
+            "the typed line seeds the prompt: {prompt}"
+        );
+        assert!(prompt.contains("voro add 'demo'"), "{prompt}");
+    }
+
+    /// Backspace edits the line, esc abandons it: neither spawns anything, and
+    /// a blank submit is a cancel rather than a proposal with no intent.
+    #[test]
+    fn quick_create_cancels_on_esc_and_on_a_blank_line() {
+        let mut app = app_with_stub_dispatch();
+
+        key(&mut app, KeyCode::Char('n'));
+        key(&mut app, KeyCode::Char('x'));
+        key(&mut app, KeyCode::Backspace);
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status.as_deref(), Some("cancelled"));
+        assert!(written_prompts(&app).is_empty());
+
+        key(&mut app, KeyCode::Char('n'));
+        for c in "something".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(written_prompts(&app).is_empty());
+    }
+
+    /// With several projects `n` routes through the same picker the other create
+    /// flows use, carrying the quick flow; ⏎ there opens the modal on the picked
+    /// project rather than proposing into it blind.
+    #[test]
+    fn quick_create_key_routes_through_the_project_picker() {
+        let mut app = app_with_stub_dispatch();
+        let second = app.store.create_project("second", "/tmp/second").unwrap();
+        app.refresh().unwrap();
+
+        key(&mut app, KeyCode::Char('n'));
+        assert!(matches!(
+            app.mode,
+            Mode::PickProject {
+                flow: CreateFlow::Quick,
+                ..
+            }
+        ));
+
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Enter);
+        match &app.mode {
+            Mode::QuickCreate { project_id, .. } => assert_eq!(*project_id, second.id),
+            _ => panic!("⏎ in the picker should open the quick-create modal"),
+        }
+        assert!(written_prompts(&app).is_empty(), "nothing spawns yet");
+    }
+
+    /// `ctrl-n` keeps the manual `$EDITOR` form, the only path that sets state,
+    /// priority and dependencies at creation time (DESIGN.md §8).
+    #[test]
+    fn ctrl_n_still_queues_the_editor_form() {
+        let mut app = app_with_stub_dispatch();
+        let project_id = app.projects[0].id;
+
+        ctrl_key(&mut app, KeyCode::Char('n'));
+        assert!(matches!(app.mode, Mode::Normal));
+        match app.pending_editor {
+            Some(EditorRequest::Create { project_id: id }) => assert_eq!(id, project_id),
+            _ => panic!("ctrl-n should queue the manual create form"),
+        }
     }
 
     /// `N` when the resolved agent defines no `plan` verb degrades to a status

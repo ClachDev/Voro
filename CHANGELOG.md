@@ -125,6 +125,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`n` proposes a task from one typed line, in the background.** It opens a
+  one-line modal rather than the `$EDITOR` form; ⏎ hands what you typed to a
+  headless agent, which expands it into a title and a dispatchable body and
+  files the task with `voro add`. The TUI never suspends and nothing waits on
+  the agent — the proposal appears in the queue as `proposed` on a later
+  refresh, like any other, and a launch that fails leaves its trace in
+  `launches.log` and the session log rather than on screen. `N` still opens the
+  interactive planning session, and the manual `$EDITOR` form moves to `ctrl-n`,
+  still the only path that sets state, priority, agent and blockers at creation
+  time. A quick propose runs the `dispatch` verb on a launch that names no task,
+  so an agent whose `dispatch` template carries `{task_id}` is refused up front,
+  naming the template to fix, rather than launching with the placeholder
+  unsubstituted.
 - **The review card shows the agent's completion summary.** A task in `review`
   or `waiting` renders what the agent reported at `done` — its account of what
   changed and how it was verified — above the task body, in the TUI detail pane
