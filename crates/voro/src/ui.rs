@@ -1463,17 +1463,31 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let mut state = ListState::default().with_selected(if app.all.is_empty() {
-        None
-    } else {
-        Some(app.tasks_sel)
-    });
+    let empty = items.is_empty();
+    let mut state =
+        ListState::default().with_selected(if empty { None } else { Some(app.tasks_sel) });
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("All tasks"))
         .highlight_style(SELECTED);
     frame.render_stateful_widget(list, list_area, &mut state);
     hits.push_list(list_area, state.offset(), app.all.len(), Hit::TaskRow);
+    if empty {
+        let inner = list_area.inner(ratatui::layout::Margin::new(1, 1));
+        frame.render_widget(Paragraph::new(tasks_empty_message(app)).dim(), inner);
+    }
     draw_status(frame, app, status);
+}
+
+/// What an empty task browser says. The two cases need different advice: with no
+/// project registered `n` cannot create anything, so the message points at the
+/// projects screen in the same words the `n` key itself uses; otherwise `n` is
+/// the way in.
+fn tasks_empty_message(app: &App) -> &'static str {
+    if app.projects.is_empty() {
+        "no projects yet — add one on the projects screen (3)"
+    } else {
+        "no tasks yet — press n to add one"
+    }
 }
 
 /// The dependency section of a detail view (task #103), both directions, one
@@ -2479,6 +2493,51 @@ mod tests {
         let open = spans.iter().find(|s| s.content == "#7").unwrap();
         assert!(closed.style.add_modifier.contains(Modifier::DIM));
         assert!(!open.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    /// An empty browser explains itself rather than drawing a blank box, and
+    /// distinguishes its two cases: nothing can be created until a project
+    /// exists, so only a store that has one points at `n`.
+    #[test]
+    fn browser_render_explains_an_empty_list() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::Store;
+
+        let render = |store: Store| -> String {
+            let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                "/nonexistent/voro.db",
+            ));
+            let mut app = App::new(store, ctx).unwrap();
+            app.toggle_screen();
+            assert_eq!(app.screen, crate::app::Screen::Tasks);
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            terminal
+                .draw(|f| draw_tasks(f, &app, &mut HitMap::default()))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        let bare = render(Store::open_in_memory().unwrap());
+        assert!(
+            bare.contains("no projects yet — add one on the projects screen (3)"),
+            "empty browser with no projects did not point at the projects screen: {bare}"
+        );
+
+        let mut store = Store::open_in_memory().unwrap();
+        store.create_project("voro", "/tmp/voro").unwrap();
+        let no_tasks = render(store);
+        assert!(
+            no_tasks.contains("no tasks yet — press n to add one"),
+            "empty browser with a project did not point at n: {no_tasks}"
+        );
     }
 
     /// End-to-end: a real store with a parked task blocked by one open and one
