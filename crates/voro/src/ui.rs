@@ -1119,7 +1119,14 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     });
     if empty {
         let inner = area.inner(ratatui::layout::Margin::new(1, 1));
-        frame.render_widget(Paragraph::new("nothing to do — press n").dim(), inner);
+        // With nothing registered, `n` has nothing to create a task against, so
+        // the empty box points at registration instead (DESIGN.md §9).
+        let hint = if app.projects.is_empty() {
+            crate::app::NO_PROJECTS_HINT
+        } else {
+            "nothing to do — press n"
+        };
+        frame.render_widget(Paragraph::new(hint).dim(), inner);
     }
 }
 
@@ -2238,6 +2245,39 @@ mod tests {
         app
     }
 
+    /// An empty cockpit says what the next press actually is: with nothing
+    /// registered `n` cannot create anything, so the box points at Projects.
+    #[test]
+    fn an_empty_cockpit_points_at_projects_until_one_exists() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::Store;
+
+        let render = |app: &crate::app::App| {
+            let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw(f, app);
+                })
+                .unwrap();
+            screen_text(&terminal)
+        };
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut bare = crate::app::App::new(Store::open_in_memory().unwrap(), ctx).unwrap();
+        bare.screen = crate::app::Screen::Cockpit;
+        bare.status = None;
+        let text = render(&bare);
+        assert!(text.contains(crate::app::NO_PROJECTS_HINT), "{text}");
+
+        let mut registered = app_with_status("", 0, 0);
+        registered.status = None;
+        let text = render(&registered);
+        assert!(text.contains("nothing to do — press n"), "{text}");
+    }
+
     #[test]
     fn wrap_status_breaks_on_words_and_keeps_every_one() {
         let lines = wrap_status(GH_REFUSAL, 40);
@@ -2398,6 +2438,9 @@ mod tests {
             ref_capture_timeout: std::time::Duration::ZERO,
         };
         let mut app = App::new(store, ctx).unwrap();
+        // No project is registered, so the app opened on Projects, where the
+        // digits are weights; the jump below is a cockpit key.
+        app.screen = Screen::Cockpit;
         app.on_key(KeyEvent::from(KeyCode::Char('4')));
         assert_eq!(app.screen, Screen::Config);
 
@@ -4120,8 +4163,10 @@ mod tests {
             ))
         };
 
-        let empty = App::new(Store::open_in_memory().unwrap(), ctx()).unwrap();
-        assert_eq!(empty.screen, Screen::Cockpit);
+        let mut empty = App::new(Store::open_in_memory().unwrap(), ctx()).unwrap();
+        // A project-less database opens on Projects (DESIGN.md §9); the cockpit
+        // this test is about is the one reached by tabbing back to it.
+        empty.screen = Screen::Cockpit;
         assert!(empty.selected_task_id().is_none());
         let labels: Vec<&str> = key_hints(&empty).iter().map(|(_, l)| *l).collect();
         for dropped in ["dispatch", "deep"] {

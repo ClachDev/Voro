@@ -11,6 +11,11 @@ use voro_core::{
 /// the key handler runs without the pane's geometry.
 const DETAIL_PAGE_STEP: i64 = 10;
 
+/// What an operator with no project registered is told, wherever they meet the
+/// fact: the empty cockpit's box and `n`'s refusal say the same thing in the
+/// same words, and in the keys README.md teaches.
+pub const NO_PROJECTS_HINT: &str = "no projects yet — press tab to Projects, then a to add one";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Cockpit,
@@ -573,6 +578,18 @@ impl App {
             last_data_version: 0,
         };
         app.refresh()?;
+        // A database with nothing registered opens where the first step is
+        // (DESIGN.md §9): the cockpit has nothing to show and its `n` cannot
+        // proceed without a project. Startup only — `refresh` runs after every
+        // mutation and on every external-change poll, and the screen is the
+        // operator's after that.
+        if app.projects.is_empty() {
+            app.screen = Screen::Projects;
+            app.status = Some(
+                "welcome to voro — press a to add your first project, then n to create a task"
+                    .into(),
+            );
+        }
         app.last_data_version = app.store.data_version()?;
         Ok(app)
     }
@@ -1533,7 +1550,7 @@ impl App {
     /// none.
     fn new_task(&mut self, flow: CreateFlow) {
         match self.projects.len() {
-            0 => self.status = Some("no projects yet — add one on the projects screen (3)".into()),
+            0 => self.status = Some(NO_PROJECTS_HINT.into()),
             1 => self.start_create(self.projects[0].id, flow),
             _ => self.mode = Mode::PickProject { sel: 0, flow },
         }
@@ -3180,6 +3197,56 @@ mod tests {
         App::new(store, dummy_ctx()).unwrap()
     }
 
+    /// A store with nothing in it at all — the first run Voro has to land well.
+    fn empty_app() -> App {
+        App::new(Store::open_in_memory().unwrap(), dummy_ctx()).unwrap()
+    }
+
+    /// The first run: with no project registered the cockpit has nothing to
+    /// show and its `n` cannot proceed, so the app opens where the first step
+    /// is (DESIGN.md §9), saying why.
+    #[test]
+    fn a_clean_database_opens_on_the_projects_screen() {
+        let app = empty_app();
+        assert_eq!(app.screen, Screen::Projects);
+        let status = app.status.clone().expect("the landing explains itself");
+        assert!(status.contains("press a"), "{status}");
+        assert!(status.contains('n'), "{status}");
+    }
+
+    #[test]
+    fn a_database_with_a_project_opens_on_the_cockpit() {
+        let app = app_with(&[]);
+        assert_eq!(app.screen, Screen::Cockpit);
+        assert_eq!(app.status, None);
+    }
+
+    /// The landing is decided once, at startup. `refresh` runs after every
+    /// mutation and on every external-change poll, so deciding there would yank
+    /// the operator to Projects mid-session — for instance on the cockpit of a
+    /// database whose last project they just deleted.
+    #[test]
+    fn refresh_leaves_the_screen_where_the_operator_put_it() {
+        let mut app = empty_app();
+        app.screen = Screen::Cockpit;
+        app.refresh().unwrap();
+        assert_eq!(app.screen, Screen::Cockpit);
+    }
+
+    /// `n` with no projects refuses in the keys README.md teaches — `tab` and
+    /// `a`, not a screen number.
+    #[test]
+    fn new_task_without_projects_points_at_tab_and_a() {
+        let mut app = empty_app();
+        app.screen = Screen::Cockpit;
+        for press in ['n', 'N'] {
+            app.status = None;
+            key(&mut app, KeyCode::Char(press));
+            assert_eq!(app.status.as_deref(), Some(NO_PROJECTS_HINT));
+            assert!(app.pending_editor.is_none());
+        }
+    }
+
     /// Enter on a needs-input inbox row resumes the task directly — the
     /// operator answered in the agent's own session, so there is no answer
     /// prompt (DESIGN.md §6/§8), just the `needs-input → running` transition.
@@ -4013,6 +4080,9 @@ mod tests {
         let path = ctx.agents_path.clone();
         let mut app = App::new(store, ctx).unwrap();
 
+        // No project is registered, so the app opened on Projects, where the
+        // digits are weights; the jump below is a cockpit key.
+        app.screen = Screen::Cockpit;
         key(&mut app, KeyCode::Char('4'));
         assert_eq!(app.screen, Screen::Config);
         assert!(app.config_viewers.is_empty());
