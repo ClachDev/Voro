@@ -421,7 +421,7 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                     Span::styled(format!("{value}▏"), style),
                 ])
             };
-            let area = popup_area(frame, 72, 5);
+            let area = popup_area(frame, 72, 4);
             let title = if *editing {
                 format!("Edit viewer '{name}' — ⏎ to save, esc to cancel")
             } else {
@@ -437,9 +437,7 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 field("name", name, !*on_cmd)
             };
             // A command the form wrote is dim, focused or not, so that what was
-            // typed and what was filled in never look alike. That is the whole
-            // announcement: the line below stays the placeholder legend, which
-            // is the part of this form nobody can infer.
+            // typed and what was filled in never look alike.
             let mut cmd_style = Style::new();
             if *on_cmd {
                 cmd_style = cmd_style.add_modifier(Modifier::REVERSED);
@@ -451,15 +449,8 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 Span::raw("command: "),
                 Span::styled(format!("{cmd}▏"), cmd_style),
             ]);
-            let para = Paragraph::new(vec![
-                name_line,
-                cmd_line,
-                Line::from(Span::styled(
-                    "{path} = checkout/worktree · {branch} · {base}",
-                    Style::new().dim(),
-                )),
-            ])
-            .block(Block::default().borders(Borders::ALL).title(title));
+            let para = Paragraph::new(vec![name_line, cmd_line])
+                .block(Block::default().borders(Borders::ALL).title(title));
             frame.render_widget(para, area);
         }
         Mode::DefaultPicker {
