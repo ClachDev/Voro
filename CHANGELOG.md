@@ -11,6 +11,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A build from a `target/` directory opens a dev store, not your real one.** A
+  `voro` run out of `target/debug` or `target/release` now uses
+  `~/.local/share/voro/dev.db`, seeded on first run with a fixture board
+  covering every task state, both live and dead sessions, each dependency kind,
+  a multi-repo project and an archived one. `voro seed --force` rebuilds it;
+  seeding the operator's store is refused. Such a build also takes no database
+  from the environment: dispatch exports `VORO_DB` so a session's return path
+  finds the store its dispatcher was on, which put the operator's database in
+  the environment of every agent working in a worktree, and a `cargo run` there
+  inherited it. An explicit `--db` is still honoured. This chooses a default
+  and bounds nothing — `cargo install --path` builds a working checkout into an
+  ordinary install location, where it counts as installed — so what protects
+  the schema is the journal and the version check below.
+- **The store records which migrations it is made of.** A `schema_migrations`
+  journal keeps each applied migration's SQL alongside the build that applied
+  it, and every open checks it against the migrations the running binary
+  carries. `user_version` is a counter, so it cannot distinguish two branches
+  that each add a migration 17 — the binary carrying the other 17 applies
+  nothing, refuses nothing, and dies at the first query on a missing column.
+  That case is now refused up front, naming the migration, the build that
+  applied it, and the snapshot to restore. Migrations applied before the
+  journal existed are recorded as unverifiable rather than assumed. One new
+  rule follows: an applied migration is immutable, and editing one is reported
+  as a divergence.
+- **Two further guards on opening a store.** A database whose schema is ahead of
+  the running binary is refused with an error naming the way out, instead of
+  silently skipping the migration and failing later as a missing column; and
+  any open that is about to migrate first copies the file to `backups/` beside
+  it, so a migration that renames or drops a column stays recoverable.
+  Startup failures now print their message rather than a `Debug` dump.
 - **Quick-message a task's session**: `a` in the TUI collects one line and sends
   it straight into the task's recorded agent session, headlessly, without
   suspending the cockpit — for a `needs-input`, `review`, or `waiting` task
