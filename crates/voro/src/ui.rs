@@ -869,11 +869,11 @@ fn doc_picker_row(app: &App, task_id: i64, doc: &voro_core::Doc) -> Line<'static
 /// A review row's next action rendered as a browser suffix (DESIGN.md §3). The
 /// browser shows state in its own column, so only `review` — whose verb reads
 /// the tracked PR, not the state alone — earns the suffix.
-fn review_next_span(task: &voro_core::Task) -> Option<Span<'static>> {
+fn review_next_span(app: &App, task: &voro_core::Task) -> Option<Span<'static>> {
     if task.state != voro_core::TaskState::Review {
         return None;
     }
-    let verb = task.next_action()?;
+    let verb = app.next_action(task)?;
     Some(Span::styled(
         format!("  next: {verb}"),
         Style::new().fg(Color::Blue),
@@ -1250,9 +1250,10 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         // A review task with a branch and no summary: `pr` would fail, so say
         // what is needed rather than the optimistic "next: pr".
         lines.push(Line::from(incomplete_report_span()));
-    } else if let Some(verb) = task.next_action() {
+    } else if let Some(verb) = app.next_action(task) {
         let hint = match verb {
             voro_core::NextAction::Pr => "  (g opens one from the summary)",
+            voro_core::NextAction::Open => "  (o shows the diff in a viewer)",
             _ => "",
         };
         lines.push(Line::from(Span::styled(
@@ -1443,7 +1444,7 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             }
             if app.incomplete_report.contains(&r.task.id) {
                 spans.push(incomplete_report_span());
-            } else if let Some(span) = review_next_span(&r.task) {
+            } else if let Some(span) = review_next_span(app, &r.task) {
                 spans.push(span);
             }
             spans.extend(blocker_spans(r));
@@ -2286,6 +2287,81 @@ mod tests {
             rendered.contains(&format!("blocked by #{}, #{}", open.id, closed.id)),
             "browser did not annotate the parked row with its blockers: {rendered}"
         );
+    }
+
+    /// The detail card advertises what the project can actually do (DESIGN.md
+    /// §8): in a checkout with no remote, `g` has nowhere to open a pull
+    /// request, so the card names the local viewer and the key that reaches it.
+    #[test]
+    fn the_detail_card_advertises_the_local_path_without_a_remote() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::process::{Command, Stdio};
+        use voro_core::{Action, NewTask, Store};
+
+        let project = std::env::temp_dir().join(format!(
+            "voro-ui-remoteless-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["init", "-q"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store
+            .create_project("voro", project.to_str().unwrap())
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "the finished work".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap()
+            .id;
+        store.record_dispatch(task, "claude", None, None).unwrap();
+        store
+            .apply(task, Action::Complete(Some("did it".into())))
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let app = App::new(store, ctx).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal
+            .draw(|f| draw_cockpit(f, &app, &mut HitMap::default()))
+            .unwrap();
+        let out: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(out.contains("next: open"), "{out}");
+        assert!(out.contains("(o shows the diff in a viewer)"), "{out}");
+        assert!(!out.contains("next: pr"), "{out}");
+
+        std::fs::remove_dir_all(&project).ok();
     }
 
     /// End-to-end through the real cockpit draw (DESIGN.md §9): a hand-off

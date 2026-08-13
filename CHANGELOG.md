@@ -99,6 +99,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A review task in a project with nowhere to push no longer advertises `next:
+  pr`, an action that could only fail there. Where the task's checkout has no
+  git remote, every surface that names a next action — the cockpit detail card,
+  the browser and `voro list` suffixes, `voro show`, and the `voro inbox` verb
+  column — now reads `next: open` and points at `o` rather than `g`. The keys
+  themselves are unchanged: `g`/`pr` is still always GitHub and still refuses a
+  checkout `gh` cannot address, and `o`/`open` is still always the local viewer.
+  The advertisement rides a rendered row, so it asks git alone whether the
+  checkout has any remote, network-free and memoised per checkout, rather than
+  paying `pr`'s `gh` round-trip; a checkout whose remote is not GitHub reads as
+  before and is refused at press time.
 - A headless `voro refine` is no longer marked `⚠ refine failed` seconds after
   it starts. The round runs the agent's own `dispatch` template, so under a
   `claude --bg`-style launcher the pid Voro recorded belonged to a launcher that

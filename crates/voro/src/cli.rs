@@ -9,13 +9,14 @@ use std::fmt::Write as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use voro_core::{
-    Action, AgentsConfig, DepKind, Doc, Event, NewTask, PrRef, Priority, Project, QueueRow,
-    RefineOutcome, Repo, ReviewAction, Store, Task, TaskEdit, TaskState, Triage, WipGate,
+    Action, AgentsConfig, DepKind, Doc, Event, NewTask, NextAction, PrRef, Priority, Project,
+    QueueRow, RefineOutcome, Repo, ReviewAction, Store, Task, TaskEdit, TaskState, Triage, WipGate,
     scheduler,
 };
 
 use crate::dispatch::{self, DispatchCtx};
 use crate::import;
+use crate::pr::ForgeMemo;
 
 const HELP: &str = "\
 voro — prioritised attention across projects
@@ -1723,6 +1724,7 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
         writeln!(out, "branch: {branch}").unwrap();
     }
     if let Some(verb) = task.next_action() {
+        let verb = advertised(store, &mut ForgeMemo::default(), &task, verb);
         writeln!(out, "next: {verb}").unwrap();
     }
     if store
@@ -1844,6 +1846,7 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
         None => None,
     };
     let projects = store.projects().map_err(|e| e.to_string())?;
+    let mut forges = ForgeMemo::default();
     let mut out = String::new();
     for task in store.tasks().map_err(|e| e.to_string())? {
         if state_filter.is_some_and(|s| task.state != s)
@@ -1861,7 +1864,7 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
             .unwrap_or("?");
         let incomplete = incomplete_report_suffix(store, task.id);
         let suffix = if incomplete.is_empty() {
-            review_next_suffix(&task)
+            review_next_suffix(store, &mut forges, &task)
         } else {
             incomplete.to_string()
         };
@@ -1880,12 +1883,28 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
 /// A review row's next action as a browser suffix (DESIGN.md §3). The list
 /// shows state in its own column, so only `review` — whose verb reads the
 /// tracked PR, not the state alone — earns the suffix.
-fn review_next_suffix(task: &Task) -> String {
+fn review_next_suffix(store: &Store, forges: &mut ForgeMemo, task: &Task) -> String {
     if task.state != TaskState::Review {
         return String::new();
     }
-    task.next_action()
-        .map_or_else(String::new, |verb| format!("  next: {verb}"))
+    task.next_action().map_or_else(String::new, |verb| {
+        format!("  next: {}", advertised(store, forges, task, verb))
+    })
+}
+
+/// The verb a row advertises (DESIGN.md §3): the derived one, except that `pr`
+/// degrades to the local review path in a checkout with no remote to open a
+/// pull request on (§8) — a recommendation that could only fail is worse than
+/// none. A checkout that cannot be resolved keeps the derived verb, so nothing
+/// but a definite answer moves a row.
+fn advertised(store: &Store, forges: &mut ForgeMemo, task: &Task, verb: NextAction) -> NextAction {
+    if verb != NextAction::Pr {
+        return verb;
+    }
+    match store.repo_for_task(task) {
+        Ok(repo) if !forges.takes_pull_requests(&repo.path) => verb.without_pull_requests(),
+        _ => verb,
+    }
 }
 
 fn inbox_verb(store: &mut Store, ctx: &DispatchCtx) -> Result<String, String> {
@@ -1896,6 +1915,7 @@ fn inbox_verb(store: &mut Store, ctx: &DispatchCtx) -> Result<String, String> {
         max_running: config.max_running(),
     };
     let queue = scheduler::queue(&candidates, &config.costs(), gate);
+    let mut forges = ForgeMemo::default();
     let mut out = String::new();
     // The capacity line stands in for the dispatch rows the gate suppressed,
     // so an inbox with no startable work still says why (DESIGN.md §7).
@@ -1958,7 +1978,7 @@ fn inbox_verb(store: &mut Store, ctx: &DispatchCtx) -> Result<String, String> {
                     "{:5.1}  #{} {:10} {} {}: {}",
                     row.effective,
                     c.task.id,
-                    row.action.as_str(),
+                    advertised(store, &mut forges, &c.task, row.action),
                     c.task.priority,
                     c.project_name,
                     c.task.title
@@ -3160,6 +3180,65 @@ mod tests {
         ok(&mut s, &["set", &complete.to_string(), "--pr", "acme/w#1"]);
         let out = ok(&mut s, &["list"]);
         assert!(out.contains("next: review PR"), "{out}");
+    }
+
+    /// A checkout with no remote has nowhere to open a pull request, so every
+    /// surface that advertises a verb names the local review path instead of a
+    /// `pr` that could only fail (DESIGN.md §8). Adding a remote puts `pr`
+    /// back, and a tracked PR is untouched either way.
+    #[test]
+    fn a_review_row_in_a_remoteless_checkout_advertises_open() {
+        use std::process::{Command, Stdio};
+
+        let project = std::env::temp_dir().join(format!(
+            "voro-cli-remoteless-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+
+        let mut s = store();
+        ok(
+            &mut s,
+            &["project", "add", "demo", project.to_str().unwrap()],
+        );
+        let id = review_task(&mut s, Some("feat/thing"), Some("did it"));
+
+        let show = ok(&mut s, &["show", &id.to_string()]);
+        assert!(show.contains("next: open"), "{show}");
+        let list = ok(&mut s, &["list"]);
+        assert!(list.contains("next: open"), "{list}");
+        let inbox = ok(&mut s, &["inbox"]);
+        assert!(inbox.contains(&format!("#{id} open ")), "{inbox}");
+
+        // A tracked PR outranks the checkout: the diff already lives there.
+        ok(&mut s, &["set", &id.to_string(), "--pr", "acme/w#1"]);
+        let show = ok(&mut s, &["show", &id.to_string()]);
+        assert!(show.contains("next: review PR"), "{show}");
+
+        ok(&mut s, &["set", &id.to_string(), "--no-pr"]);
+        git(&["remote", "add", "origin", "https://github.com/acme/w.git"]);
+        let show = ok(&mut s, &["show", &id.to_string()]);
+        assert!(show.contains("next: pr"), "{show}");
+        let inbox = ok(&mut s, &["inbox"]);
+        assert!(inbox.contains(&format!("#{id} pr ")), "{inbox}");
+
+        std::fs::remove_dir_all(&project).ok();
     }
 
     #[test]

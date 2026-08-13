@@ -511,6 +511,10 @@ pub enum NextAction {
     Pr,
     /// A review task whose PR is open: review it there.
     ReviewPr,
+    /// A review task in a checkout no pull request can be opened from: read the
+    /// diff in a local viewer. Never derived from state alone — a caller that
+    /// knows the checkout degrades [`NextAction::Pr`] to it.
+    Open,
     /// A ready human-only task: only the human can execute it.
     Do,
     /// A stalled task: its dispatch died, restart it with the prior
@@ -527,9 +531,23 @@ impl NextAction {
             NextAction::Answer => "answer",
             NextAction::Pr => "pr",
             NextAction::ReviewPr => "review PR",
+            NextAction::Open => "open",
             NextAction::Do => "do",
             NextAction::Redispatch => "redispatch",
             NextAction::Dispatch => "dispatch",
+        }
+    }
+
+    /// The same verb in a checkout that cannot take a pull request (DESIGN.md
+    /// §8): `pr` there is a recommendation that can only fail, so it degrades
+    /// to the local review path the operator does have. Every other verb is
+    /// forge-independent and passes through. Pure — whether a given checkout
+    /// can take a pull request is decided in the `voro` crate, which owns the
+    /// git and `gh` seams, and handed here.
+    pub fn without_pull_requests(self) -> NextAction {
+        match self {
+            NextAction::Pr => NextAction::Open,
+            other => other,
         }
     }
 }
@@ -724,6 +742,42 @@ mod tests {
             task_in(TaskState::Ready, Some("https://x"), false).next_action(),
             Some(NextAction::Dispatch)
         );
+    }
+
+    /// The one verb that depends on the checkout rather than the task: where no
+    /// pull request can be opened, `pr` reads as the local review path instead
+    /// (DESIGN.md §8). Every other verb is forge-independent and holds still.
+    #[test]
+    fn without_pull_requests_degrades_pr_and_nothing_else() {
+        assert_eq!(NextAction::Pr.without_pull_requests(), NextAction::Open);
+        for verb in [
+            NextAction::Triage,
+            NextAction::Answer,
+            NextAction::ReviewPr,
+            NextAction::Open,
+            NextAction::Do,
+            NextAction::Redispatch,
+            NextAction::Dispatch,
+        ] {
+            assert_eq!(verb.without_pull_requests(), verb, "{verb}");
+        }
+    }
+
+    /// `open` is never derived from state — a checkout that cannot take a pull
+    /// request is what produces it, and the derivation stays pure.
+    #[test]
+    fn open_is_not_derived_from_state() {
+        for state in TaskState::ALL {
+            for pr_url in [None, Some("https://x")] {
+                for human in [false, true] {
+                    assert_ne!(
+                        task_in(state, pr_url, human).next_action(),
+                        Some(NextAction::Open),
+                        "{state} pr_url={pr_url:?} human={human}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
