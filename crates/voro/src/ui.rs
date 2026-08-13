@@ -920,28 +920,49 @@ fn review_next_span(app: &App, task: &voro_core::Task) -> Option<Span<'static>> 
 /// which is the other half of making a re-review proportional to the fix — the
 /// operator reads *what the agent says it changed* here and the diff since the
 /// rejected revision beside it.
-fn completion_lines(report: &CompletionReport) -> Vec<Line<'static>> {
+fn completion_lines(report: &CompletionReport, width: u16) -> Vec<Line<'static>> {
     let heading = match report.feedback {
         Some(_) => "response to the review feedback:",
         None => "completion summary:",
     };
-    let mut lines = vec![
-        Line::default(),
-        Line::from(Span::styled(
-            heading,
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )),
-    ];
-    // One `Line` per source line, as the question block does: ratatui does not
-    // break lines inside a `Span`, so a point-by-point summary rendered as one
-    // span would collapse into a single paragraph and lose its structure.
-    lines.extend(
-        report
-            .summary
-            .lines()
-            .map(|line| Line::from(Span::styled(line.to_string(), Style::new().fg(Color::Cyan)))),
-    );
+    let mut lines = vec![Line::default()];
+    lines.extend(agent_voice_block(heading, &report.summary, width));
     lines
+}
+
+/// The gutter that marks a block as the agent's own words rather than the
+/// operator's instruction. Two columns wide, repeated on every visual line.
+const GUTTER: &str = "│ ";
+
+/// An agent-authored block — a completion summary, its rework variant, or a
+/// question — rendered as markdown behind a quote-style gutter (task #430).
+/// The content is styled exactly as a task body is, so cyan text means inline
+/// code here as it does there; the voice is carried by the bar in the margin
+/// instead of by a colour wash. Lines are wrapped to fit inside the gutter
+/// before it is prefixed, because the card's `Paragraph` re-wraps a long line
+/// without repeating anything and would leave the bar broken part-way down.
+fn agent_voice_block(heading: &str, text: &str, width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        heading.to_string(),
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(crate::markdown::body_lines(text));
+    let inner = (width as usize).saturating_sub(GUTTER.chars().count());
+    crate::markdown::wrap_lines(lines, inner)
+        .into_iter()
+        .map(|line| {
+            // A blank line keeps a bare bar, so the block reads as one column
+            // for its full height rather than as fragments.
+            let bar = if line.width() == 0 {
+                GUTTER.trim_end()
+            } else {
+                GUTTER
+            };
+            let mut spans = vec![Span::styled(bar, Style::new().fg(Color::Cyan))];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// A task's newest session, rendered for the attention states (tasks #73/#110).
@@ -1246,6 +1267,10 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         }
     };
 
+    // The gutter blocks below wrap themselves, so they need the width the
+    // paragraph would have wrapped them at; the scroll clamp reuses it.
+    let inner = block.inner(area);
+
     let mut meta = vec![Span::raw(format!(
         "#{} · {} · {} · {}",
         task.id, project, task.priority, task.state
@@ -1258,19 +1283,12 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled(task.title.clone(), Style::new().bold())),
         Line::from(meta),
     ];
+    // The detail pane is where the operator reads the full question before
+    // answering it in-session (DESIGN.md §6), so it renders whole.
+    let mut agent_voice = false;
     if let Some(q) = &task.question {
-        // One `Line` per line of the question: ratatui does not break lines
-        // inside a `Span`, so a multi-line question rendered as a single span
-        // would collapse to one line. The detail pane is where the operator
-        // reads the full question before answering it in-session (DESIGN.md §6).
-        for (i, qline) in q.lines().enumerate() {
-            let text = if i == 0 {
-                format!("question: {qline}")
-            } else {
-                qline.to_string()
-            };
-            lines.push(Line::from(Span::styled(text, Style::new().fg(Color::Cyan))));
-        }
+        lines.extend(agent_voice_block("question:", q, inner.width));
+        agent_voice = true;
     }
     if app.refined.contains(&task.id) {
         lines.push(Line::from(refined_span()));
@@ -1334,9 +1352,19 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     if matches!(task.state, TaskState::Review | TaskState::Waiting)
         && let Some(report) = app.completion_report(task.id)
     {
-        lines.extend(completion_lines(&report));
+        lines.extend(completion_lines(&report, inner.width));
+        agent_voice = true;
     }
     lines.push(Line::default());
+    // Name the body only when a block above it speaks in the agent's voice, so
+    // the reader knows which voice they are in; a heading over the only content
+    // on the card would be noise.
+    if agent_voice && !task.body.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "task:",
+            Style::new().add_modifier(Modifier::BOLD),
+        )));
+    }
     lines.extend(crate::markdown::body_lines(&task.body));
     if app.show_history {
         lines.push(Line::default());
@@ -1347,7 +1375,6 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     // Measure the wrapped body height against the inner area to clamp the
     // scroll and decide whether to advertise it. `line_count` wants the text
     // width, so pass the inner width with the block off this measuring paragraph.
-    let inner = block.inner(area);
     let total = para.line_count(inner.width) as u16;
     let max_scroll = total.saturating_sub(inner.height);
     app.detail_max_scroll.set(max_scroll);
@@ -4138,8 +4165,8 @@ mod tests {
     }
 
     /// A multi-line question renders across multiple lines in the cockpit
-    /// detail pane (DESIGN.md §6) — ratatui does not break a `Span` on a
-    /// newline, so each line of the question is its own `Line`.
+    /// detail pane (DESIGN.md §6), each behind the agent-voice gutter that
+    /// marks the block as the agent's own words (task #430).
     #[test]
     fn detail_pane_renders_a_multi_line_question_across_lines() {
         use crate::app::App;
@@ -4193,12 +4220,144 @@ mod tests {
             .chunks(width as usize)
             .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
             .collect();
+        for expected in [
+            "│ question:",
+            "│ Pick a schema:",
+            "│ Alpha option",
+            "│ Bravo option",
+        ] {
+            assert!(rows.iter().any(|r| r.contains(expected)), "{rows:?}");
+        }
+    }
+
+    /// The agent's blocks are parsed as markdown, not printed raw (task #430):
+    /// bold and inline code are styled rather than showing their markers, and
+    /// every visual line of the block — continuations included, at a pane too
+    /// narrow to hold the line — carries the cyan gutter.
+    #[test]
+    fn agent_voice_blocks_parse_markdown_behind_a_gutter() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Color;
+        use voro_core::{Action, NewTask, Store};
+
+        let summary = "**Landed** the `parser`.\n\n- rewrote the lexer so every token \
+                       carries its span through to the reporter\n- covered it";
+        let app = |width: u16| {
+            let mut store = Store::open_in_memory().unwrap();
+            let p = store.create_project("voro", "/tmp/voro").unwrap();
+            store.set_weight(p.id, 3).unwrap();
+            let task = store
+                .create_task(NewTask {
+                    project_id: p.id,
+                    repo_id: None,
+                    title: "parse it".into(),
+                    body: "acceptance: **it parses**".into(),
+                    priority: Priority::P2,
+                    state: TaskState::Ready,
+                    agent: None,
+                    human: false,
+                    deep: false,
+                })
+                .unwrap();
+            store.apply(task.id, Action::Start).unwrap();
+            store
+                .apply(task.id, Action::Complete(Some(summary.into())))
+                .unwrap();
+            let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                "/nonexistent/voro.db",
+            ));
+            let app = App::new(store, ctx).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw(f, &app);
+                })
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        // The detail pane is the right-hand half of the cockpit, so a row of
+        // the buffer holds other panes too; the block's rows are the ones with
+        // a gutter, and a cell is looked up by its position in the row.
+        let rows = |buf: &ratatui::buffer::Buffer, width: u16| -> Vec<String> {
+            buf.content()
+                .chunks(width as usize)
+                .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+                .collect()
+        };
+
+        // The pane's own border is a `│` too, so the gutter is identified by
+        // the column it sits in rather than by the glyph alone.
+        let col_of = |row: &str, needle: &str| row.find(needle).map(|b| row[..b].chars().count());
+        let char_at = |row: &str, col: usize| row.chars().nth(col).unwrap_or(' ');
+        let locate = |rows: &[String], needle: &str| -> (usize, usize) {
+            rows.iter()
+                .enumerate()
+                .find_map(|(y, r)| col_of(r, needle).map(|c| (y, c)))
+                .unwrap_or_else(|| panic!("no {needle:?} in {rows:?}"))
+        };
+
+        let wide = app(140);
+        let wide_rows = rows(&wide, 140);
+        let (heading, gutter) = locate(&wide_rows, "│ completion summary:");
+        for expected in [
+            "│ completion summary:",
+            "│ Landed the parser.",
+            "│ • rewrote the lexer",
+            "│ • covered it",
+        ] {
+            assert!(
+                wide_rows.iter().any(|r| r.contains(expected)),
+                "{wide_rows:?}"
+            );
+        }
+        // The bar runs the block's full height — the blank line between the
+        // summary and its bullets included.
+        for y in heading..heading + 5 {
+            assert_eq!(
+                char_at(&wide_rows[y], gutter),
+                '│',
+                "row {y}: {wide_rows:?}"
+            );
+        }
+        // The markers themselves are gone: styling replaced them.
+        let all: String = wide_rows.concat();
+        assert!(!all.contains("**Landed**"), "{all}");
+        assert!(!all.contains("`parser`"), "{all}");
+
+        // The styling lands on the right cells: bold "Landed", cyan "parser",
+        // and neither colour bleeding onto the plain text between them.
+        let row = heading as u16 + 1;
+        let cell = |dx: u16| wide.cell((gutter as u16 + dx, row)).unwrap();
+        assert_eq!(cell(0).symbol(), "│");
+        assert_eq!(cell(0).fg, Color::Cyan);
+        assert!(cell(2).modifier.contains(Modifier::BOLD), "'L' of Landed");
+        assert_eq!(cell(2).fg, Color::Reset, "bold, not cyan");
+        // "│ Landed the parser." — the 'p' of the inline code is 13 in.
+        assert_eq!(cell(13).symbol(), "p");
+        assert_eq!(cell(13).fg, Color::Cyan, "inline code stays cyan");
+        assert!(!cell(13).modifier.contains(Modifier::BOLD));
+        // The body is named, and named in the operator's voice: no gutter, so
+        // its text starts in the column the bar occupies above.
+        let (task_row, task_col) = locate(&wide_rows, "task:");
+        assert_eq!(task_col, gutter, "{wide_rows:?}");
+
+        // Narrow enough that the bullet cannot fit on one row: the
+        // continuation keeps the gutter, which is what pre-wrapping buys.
+        let narrow_rows = rows(&app(60), 60);
+        let (bullet, ncol) = locate(&narrow_rows, "│ • rewrote the lexer");
         assert!(
-            rows.iter().any(|r| r.contains("question: Pick a schema:")),
-            "{rows:?}"
+            !narrow_rows[bullet].contains("reporter"),
+            "the line was meant to be too long to fit: {narrow_rows:?}"
         );
-        assert!(rows.iter().any(|r| r.contains("Alpha option")), "{rows:?}");
-        assert!(rows.iter().any(|r| r.contains("Bravo option")), "{rows:?}");
+        assert_eq!(
+            char_at(&narrow_rows[bullet + 1], ncol),
+            '│',
+            "continuation lost the gutter: {narrow_rows:?}"
+        );
+        let (tail, _) = locate(&narrow_rows, "reporter");
+        assert!(tail > bullet && tail <= task_row + 6, "{narrow_rows:?}");
     }
 
     /// A review card leads with the agent's account of what it did, above the
@@ -4260,13 +4419,19 @@ mod tests {
         ));
         let mut app = App::new(store, ctx).unwrap();
         let first = rows(&app, &mut terminal);
-        let heading = row_of(&first, "completion summary:").unwrap_or_else(|| panic!("{first:?}"));
-        // Each summary line on its own row, as the question block renders.
-        assert!(row_of(&first, "README.md: +2 lines").is_some(), "{first:?}");
-        let last = row_of(&first, "main.rs: untouched").unwrap_or_else(|| panic!("{first:?}"));
+        let heading =
+            row_of(&first, "│ completion summary:").unwrap_or_else(|| panic!("{first:?}"));
+        // Each summary line on its own row behind the gutter, as the question
+        // block renders (task #430).
+        assert!(
+            row_of(&first, "│ README.md: +2 lines").is_some(),
+            "{first:?}"
+        );
+        let last = row_of(&first, "│ main.rs: untouched").unwrap_or_else(|| panic!("{first:?}"));
+        let named = row_of(&first, "task:").unwrap_or_else(|| panic!("{first:?}"));
         let body = row_of(&first, "acceptance: the greeting renders")
             .unwrap_or_else(|| panic!("{first:?}"));
-        assert!(heading < last && last < body, "{first:?}");
+        assert!(heading < last && last < named && named < body, "{first:?}");
 
         // Sent back and completed again: the same block, headed by the feedback
         // the new summary answers rather than by the neutral title.
@@ -4279,10 +4444,10 @@ mod tests {
         app.refresh().unwrap();
         let second = rows(&app, &mut terminal);
         assert!(
-            row_of(&second, "response to the review feedback:").is_some(),
+            row_of(&second, "│ response to the review feedback:").is_some(),
             "{second:?}"
         );
-        assert!(row_of(&second, "added the tests").is_some(), "{second:?}");
+        assert!(row_of(&second, "│ added the tests").is_some(), "{second:?}");
         assert!(
             row_of(&second, "completion summary:").is_none(),
             "{second:?}"

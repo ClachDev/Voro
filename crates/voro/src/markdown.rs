@@ -1,10 +1,12 @@
-//! A tiny, hand-rolled renderer for the markdown subset used in task bodies,
-//! matching the `editor.rs` precedent of avoiding a parser dependency. It is
-//! presentation only: `body_lines` turns a body string into styled ratatui
-//! lines for the TUI popup and detail pane. Anything it does not understand
-//! degrades to the literal text — content is never dropped or mangled — and it
-//! is deliberately isolated behind one pure function so a real parser could be
-//! swapped in later.
+//! A tiny, hand-rolled renderer for the markdown subset used in task bodies
+//! and in the agent's own blocks on the detail card, matching the `editor.rs`
+//! precedent of avoiding a parser dependency. It is presentation only:
+//! `body_lines` turns a body string into styled ratatui lines for the TUI
+//! popup and detail pane, and `wrap_lines` breaks those lines to a width for
+//! callers that must prefix every visual line. Anything it does not understand
+//! degrades to the literal text — content is never dropped or mangled — and
+//! the parsing is deliberately isolated behind one pure function so a real
+//! parser could be swapped in later.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -62,6 +64,90 @@ pub fn body_lines(body: &str) -> Vec<Line<'static>> {
             }
         })
         .collect()
+}
+
+/// Word-wrap already-styled lines to `width` columns, preserving each span's
+/// style across the break. A word wider than the whole width is broken at the
+/// width rather than overflowing. Callers that prefix every visual line — the
+/// detail card's gutter blocks — need the breaks decided here, since the
+/// `Paragraph` that renders the result repeats no prefix when it wraps; lines
+/// returned from here fit by construction, so it has nothing left to wrap.
+pub fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return lines;
+    }
+    lines
+        .into_iter()
+        .flat_map(|line| wrap_line(line, width))
+        .collect()
+}
+
+/// The display width of one character, measured as ratatui measures it so the
+/// widths agree with the wrapping this replaces.
+fn char_width(ch: char) -> usize {
+    let mut buf = [0u8; 4];
+    Span::raw(&*ch.encode_utf8(&mut buf)).width()
+}
+
+fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if line.width() <= width {
+        return vec![line];
+    }
+    let cells: Vec<(char, Style, usize)> = line
+        .spans
+        .iter()
+        .flat_map(|span| {
+            span.content
+                .chars()
+                .map(move |ch| (ch, span.style, char_width(ch)))
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < cells.len() {
+        let mut end = start;
+        let mut used = 0;
+        while end < cells.len() && used + cells[end].2 <= width {
+            used += cells[end].2;
+            end += 1;
+        }
+        // A single character wider than the whole width still has to advance.
+        let end = end.max(start + 1);
+        if end >= cells.len() {
+            out.push(line_of(&cells[start..]));
+            break;
+        }
+        // Break at the last space that fits, so a word is not split; the
+        // whitespace at the break is consumed rather than starting a line.
+        match cells[start..=end].iter().rposition(|c| c.0.is_whitespace()) {
+            Some(rel) if rel > 0 => {
+                let brk = start + rel;
+                out.push(line_of(&cells[start..brk]));
+                start = brk;
+                while start < cells.len() && cells[start].0.is_whitespace() {
+                    start += 1;
+                }
+            }
+            _ => {
+                out.push(line_of(&cells[start..end]));
+                start = end;
+            }
+        }
+    }
+    out
+}
+
+/// Reassemble characters into a line, merging runs that share a style.
+fn line_of(cells: &[(char, Style, usize)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for &(ch, style, _) in cells {
+        match spans.last_mut() {
+            Some(last) if last.style == style => last.content.to_mut().push(ch),
+            _ => spans.push(Span::styled(ch.to_string(), style)),
+        }
+    }
+    Line::from(spans)
 }
 
 /// Render a single non-code line: headings and bullets are block-level, the
@@ -299,6 +385,45 @@ mod tests {
             parts(&out[0]),
             vec![("a lone ` backtick".into(), false, false, false)]
         );
+    }
+
+    #[test]
+    fn wrapping_breaks_on_words_and_keeps_styles() {
+        let out = wrap_lines(body_lines("a **strong** word here"), 10);
+        assert_eq!(out.len(), 2);
+        assert_eq!(text(&out[0]), "a strong");
+        assert_eq!(text(&out[1]), "word here");
+        // The bold survives the break it did not fall on.
+        assert_eq!(
+            parts(&out[0]),
+            vec![
+                ("a ".into(), false, false, false),
+                ("strong".into(), true, false, false),
+            ]
+        );
+        // A style spanning the break keeps both halves.
+        let out = wrap_lines(body_lines("**one two three**"), 8);
+        assert_eq!(out.len(), 2);
+        assert!(parts(&out[0])[0].1 && parts(&out[1])[0].1);
+        assert_eq!(text(&out[0]), "one two");
+        assert_eq!(text(&out[1]), "three");
+    }
+
+    #[test]
+    fn wrapping_leaves_short_lines_and_breaks_long_words() {
+        let out = wrap_lines(body_lines("short\n\nalso short"), 20);
+        assert_eq!(out.len(), 3);
+        assert_eq!(text(&out[1]), "");
+        // No whitespace to break on: the word is cut at the width.
+        let out = wrap_lines(body_lines("supercalifragilistic"), 6);
+        assert_eq!(out.len(), 4);
+        assert_eq!(text(&out[0]), "superc");
+        assert_eq!(
+            out.iter().map(text).collect::<String>(),
+            "supercalifragilistic"
+        );
+        // Every line fits the width it was given.
+        assert!(out.iter().all(|l| l.width() <= 6));
     }
 
     #[test]
