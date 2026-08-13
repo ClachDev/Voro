@@ -129,6 +129,28 @@ impl PromptKind {
     }
 }
 
+/// The add/edit-viewer form's fields, which always travel together: the two
+/// values being edited, which field the cursor is on, whether this is an edit
+/// (which locks the name), the project to pin on success, and whether the
+/// command is still following the name.
+#[derive(Clone)]
+pub struct ViewerFormState {
+    pub name: String,
+    pub cmd: String,
+    pub on_cmd: bool,
+    pub editing: bool,
+    pub review_project: Option<i64>,
+    /// Whether the command is still *following* the name — rewritten to
+    /// `<name> {path}` on every keystroke in the name field, so the
+    /// operator watches the line they are about to save assemble itself
+    /// (DESIGN.md §5). Writing in the command field decouples it, and
+    /// emptying that field couples it again, which is the whole undo:
+    /// nothing they typed is ever overwritten, and nothing they did not
+    /// type is ever kept against their will. Always false on an edit,
+    /// where the command already exists and is theirs.
+    pub cmd_tracks_name: bool,
+}
+
 pub enum Mode {
     Normal,
     AddProject {
@@ -209,15 +231,8 @@ pub enum Mode {
     },
     /// The add/edit-viewer form on the Config screen (DESIGN.md §5): a name and
     /// a command template. Both paths — the Config screen and the review-action
-    /// picker's "new viewer…" — share it. `editing` locks the name to an update;
-    /// `review_project` pins that project to the viewer once it is created.
-    ViewerForm {
-        name: String,
-        cmd: String,
-        on_cmd: bool,
-        editing: bool,
-        review_project: Option<i64>,
-    },
+    /// picker's "new viewer…" — share it.
+    ViewerForm(ViewerFormState),
     /// The current screen's full key map (DESIGN.md §9), opened with `?`. It is
     /// a peek rather than a screen — any key dismisses it — and it carries no
     /// state of its own, since the screen it describes is the App's.
@@ -1172,13 +1187,7 @@ impl App {
                 current,
                 sel,
             } => self.key_review_action_picker(key, project_id, options, current, sel),
-            Mode::ViewerForm {
-                name,
-                cmd,
-                on_cmd,
-                editing,
-                review_project,
-            } => self.key_viewer_form(key, name, cmd, on_cmd, editing, review_project),
+            Mode::ViewerForm(form) => self.key_viewer_form(key, form),
             // The key map is dismissed by any key, and `on_key` has already
             // restored `Mode::Normal`, so there is nothing left to do.
             Mode::KeyMap => {}
@@ -2626,14 +2635,29 @@ impl App {
             Some((name, cmd)) => (name, cmd, true),
             None => (String::new(), String::new(), false),
         };
-        self.mode = Mode::ViewerForm {
+        self.mode = Mode::ViewerForm(ViewerFormState {
             name,
             cmd,
             // An edit starts on the command field, since the name is fixed.
             on_cmd: editing,
             editing,
             review_project,
-        };
+            // A new viewer's command follows its name until the operator
+            // writes one; an edit's is already written.
+            cmd_tracks_name: !editing,
+        });
+    }
+
+    /// The command the form fills in for a name while it is still following it:
+    /// the built-in's own line where the name is one, else `<name> {path}`
+    /// (DESIGN.md §5). An empty name fills nothing rather than a bare
+    /// placeholder, so the field starts empty and stays that way until there is
+    /// something to run.
+    fn tracked_viewer_cmd(name: &str) -> String {
+        match name.trim().is_empty() {
+            true => String::new(),
+            false => voro_core::config_edit::assumed_viewer_cmd(name),
+        }
     }
 
     /// Edit the selected viewer's command. A built-in has no table to edit —
@@ -2742,51 +2766,66 @@ impl App {
     /// command, its name locked); ⏎ advances name → command on an add, then
     /// submits. A failed write keeps the form open with the error on the status
     /// line so a typo is fixable without retyping.
-    fn key_viewer_form(
-        &mut self,
-        key: KeyEvent,
-        mut name: String,
-        mut cmd: String,
-        on_cmd: bool,
-        editing: bool,
-        review_project: Option<i64>,
-    ) {
+    fn key_viewer_form(&mut self, key: KeyEvent, form: ViewerFormState) {
+        let ViewerFormState {
+            mut name,
+            mut cmd,
+            on_cmd,
+            editing,
+            review_project,
+            mut cmd_tracks_name,
+        } = form;
         match key.code {
             KeyCode::Esc => return,
             KeyCode::Tab => {
                 let on_cmd = if editing { true } else { !on_cmd };
-                self.mode = Mode::ViewerForm {
+                self.mode = Mode::ViewerForm(ViewerFormState {
                     name,
                     cmd,
                     on_cmd,
                     editing,
                     review_project,
-                };
+                    cmd_tracks_name,
+                });
                 return;
             }
             KeyCode::Enter => {
                 if !on_cmd && !editing {
-                    self.mode = Mode::ViewerForm {
+                    self.mode = Mode::ViewerForm(ViewerFormState {
                         name,
                         cmd,
                         on_cmd: true,
                         editing,
                         review_project,
-                    };
+                        cmd_tracks_name,
+                    });
                     return;
                 }
                 self.submit_viewer_form(name, cmd, editing, review_project);
                 return;
             }
             KeyCode::Backspace => {
-                if on_cmd {
-                    cmd.pop();
-                } else {
-                    name.pop();
+                match (on_cmd, cmd_tracks_name) {
+                    // Nothing to delete in a command the form is writing: it
+                    // is a suggestion, not text the operator put there.
+                    (true, true) => {}
+                    (true, false) => {
+                        cmd.pop();
+                    }
+                    (false, _) => {
+                        name.pop();
+                    }
                 }
             }
             KeyCode::Char(c) => {
                 if on_cmd {
+                    // The first character typed over a following command takes
+                    // it over whole, rather than landing on the end of a line
+                    // the operator never wrote.
+                    if cmd_tracks_name {
+                        cmd.clear();
+                        cmd_tracks_name = false;
+                    }
                     cmd.push(c);
                 } else if !editing {
                     name.push(c);
@@ -2794,13 +2833,24 @@ impl App {
             }
             _ => {}
         }
-        self.mode = Mode::ViewerForm {
+        // Deleting back to an empty command hands it to the name again, so the
+        // suggestion is recoverable with the same key that discarded it. While
+        // it follows, it *is* the name's — re-derived on every keystroke — and
+        // an empty command means the same thing to the writer either way.
+        if on_cmd && !cmd_tracks_name && cmd.is_empty() {
+            cmd_tracks_name = true;
+        }
+        if cmd_tracks_name {
+            cmd = Self::tracked_viewer_cmd(&name);
+        }
+        self.mode = Mode::ViewerForm(ViewerFormState {
             name,
             cmd,
             on_cmd,
             editing,
             review_project,
-        };
+            cmd_tracks_name,
+        });
     }
 
     /// Write the viewer through the shared helper, then — for the quick path —
@@ -2827,13 +2877,17 @@ impl App {
         };
         if let Err(e) = result {
             self.status = Some(e.to_string());
-            self.mode = Mode::ViewerForm {
+            self.mode = Mode::ViewerForm(ViewerFormState {
                 name,
                 cmd,
                 on_cmd: true,
                 editing,
                 review_project,
-            };
+                // The command in hand is now what will be saved, whether the
+                // form wrote it or the operator did, so a retry edits it
+                // rather than watching it change under them.
+                cmd_tracks_name: false,
+            });
             return;
         }
         let trimmed = name.trim().to_string();
@@ -4190,7 +4244,10 @@ mod tests {
             "no viewer set up — run `voro viewer add …`".into(),
         )));
         assert!(
-            matches!(app.mode, Mode::ViewerForm { editing: false, .. }),
+            matches!(
+                app.mode,
+                Mode::ViewerForm(ViewerFormState { editing: false, .. })
+            ),
             "expected the add-viewer form to open"
         );
         let status = app.status.clone().unwrap_or_default();
@@ -4214,6 +4271,77 @@ mod tests {
         )));
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(app.status.as_deref(), Some("no viewer named 'nope'"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The command field writes itself from the name until the operator writes
+    /// one, and comes back when what they wrote is deleted (#405). The name is
+    /// the only thing they must know; the command is a suggestion they can
+    /// watch, take over, or undo.
+    #[test]
+    fn the_form_command_follows_the_name_until_it_is_written() {
+        let (store, ctx, _project) = scratch_env("config-follows", None);
+        let path = ctx.agents_path.clone();
+        let mut app = App::new(store, ctx).unwrap();
+        let form = |app: &App| -> (String, String, bool) {
+            match &app.mode {
+                Mode::ViewerForm(ViewerFormState {
+                    name,
+                    cmd,
+                    cmd_tracks_name,
+                    ..
+                }) => (name.clone(), cmd.clone(), *cmd_tracks_name),
+                _ => panic!("expected the viewer form"),
+            }
+        };
+
+        app.screen = Screen::Cockpit;
+        key(&mut app, KeyCode::Char('4'));
+        key(&mut app, KeyCode::Char('a'));
+        // an empty name fills nothing rather than a bare placeholder
+        assert_eq!(form(&app), (String::new(), String::new(), true));
+
+        // the command assembles itself keystroke by keystroke, backspace and all
+        type_str(&mut app, "zed");
+        assert_eq!(form(&app).1, "zed {path}");
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(form(&app).1, "ze {path}");
+
+        // a name that is a built-in's follows that built-in's own line
+        key(&mut app, KeyCode::Backspace);
+        key(&mut app, KeyCode::Backspace);
+        type_str(&mut app, "code");
+        assert_eq!(form(&app).1, "code -n {path}");
+
+        // on the command field, backspace leaves a suggestion alone — there is
+        // nothing there the operator typed
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(form(&app), ("code".into(), "code -n {path}".into(), true));
+
+        // …and the first character typed takes the field over whole
+        type_str(&mut app, "x");
+        assert_eq!(form(&app), ("code".into(), "x".into(), false));
+        type_str(&mut app, "y");
+        assert_eq!(form(&app).1, "xy");
+
+        // deleting back to empty hands it to the name again
+        key(&mut app, KeyCode::Backspace);
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(form(&app), ("code".into(), "code -n {path}".into(), true));
+
+        // a written command is not rewritten by a later name edit
+        type_str(&mut app, "mine {path}");
+        key(&mut app, KeyCode::Tab);
+        type_str(&mut app, "r");
+        assert_eq!(form(&app), ("coder".into(), "mine {path}".into(), false));
+
+        // and what is saved is what the form showed (⏎ on the name advances,
+        // ⏎ on the command saves)
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.config_viewers[row(&app, "coder")].cmd, "mine {path}");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -4294,7 +4422,10 @@ mod tests {
 
         // add: a opens the form, name → Enter → command → Enter submits
         key(&mut app, KeyCode::Char('a'));
-        assert!(matches!(app.mode, Mode::ViewerForm { editing: false, .. }));
+        assert!(matches!(
+            app.mode,
+            Mode::ViewerForm(ViewerFormState { editing: false, .. })
+        ));
         type_str(&mut app, "mine");
         key(&mut app, KeyCode::Enter);
         type_str(&mut app, "mine {path}");
@@ -4314,7 +4445,10 @@ mod tests {
 
         // edit: e opens the form with the name locked; append to the command
         key(&mut app, KeyCode::Char('e'));
-        assert!(matches!(app.mode, Mode::ViewerForm { editing: true, .. }));
+        assert!(matches!(
+            app.mode,
+            Mode::ViewerForm(ViewerFormState { editing: true, .. })
+        ));
         type_str(&mut app, " --wait");
         key(&mut app, KeyCode::Enter);
         assert_eq!(
@@ -4428,10 +4562,10 @@ mod tests {
         assert!(
             matches!(
                 app.mode,
-                Mode::ViewerForm {
+                Mode::ViewerForm(ViewerFormState {
                     review_project: Some(_),
                     ..
-                }
+                })
             ),
             "new viewer… should open the form carrying the project"
         );

@@ -25,7 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file that may not exist as an invalid *agents* config. Naming the editor is
   enough: the command is now optional in both the form and `voro viewer add`,
   defaulting to `<name> {path}`, or to a built-in's own line when you name one
-  to override it, with the form showing what it will write as you type.
+  to override it. In the form it *follows* the name as you type — dim until you
+  take it over, which the first character you type in the field does whole —
+  and deleting what you wrote hands it back to the name.
 - **A build from a `target/` directory opens a dev store, not your real one.** A
   `voro` run out of `target/debug` or `target/release` now uses
   `~/.local/share/voro/dev.db`, seeded on first run with a fixture board

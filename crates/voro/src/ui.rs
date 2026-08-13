@@ -9,7 +9,7 @@ use voro_core::{
     ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
 };
 
-use crate::app::{App, CockpitRow, Mode, ReviewActionOption, Screen, TaskRow};
+use crate::app::{App, CockpitRow, Mode, ReviewActionOption, Screen, TaskRow, ViewerFormState};
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
@@ -402,13 +402,14 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             frame.render_stateful_widget(list, area, &mut state);
             hits.push_list(area, state.offset(), count, Hit::PickerOption);
         }
-        Mode::ViewerForm {
+        Mode::ViewerForm(ViewerFormState {
             name,
             cmd,
             on_cmd,
             editing,
+            cmd_tracks_name,
             ..
-        } => {
+        }) => {
             let field = |label: &str, value: &str, active: bool| {
                 let style = if active {
                     Style::new().add_modifier(Modifier::REVERSED)
@@ -435,24 +436,35 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             } else {
                 field("name", name, !*on_cmd)
             };
-            // What a blank command will be filled with, live as the name is
-            // typed: `<name> {path}` is the answer for nearly every editor CLI
-            // and the part a new operator cannot guess, so the form says it
-            // rather than leaving an empty field to be puzzled over. On an
-            // edit there is nothing to assume — the command is already there.
-            let hint = match (*editing, cmd.trim().is_empty(), name.trim().is_empty()) {
-                (false, true, false) => format!(
-                    "blank command runs: {}",
-                    voro_core::config_edit::assumed_viewer_cmd(name)
-                ),
-                (false, true, true) => {
-                    "name an editor on PATH; a blank command runs `<name> {path}`".to_string()
-                }
-                _ => "{path} = checkout/worktree · {branch} · {base}".to_string(),
+            // The command writes itself from the name until the operator
+            // writes one (§5), so the hint says which of those is happening:
+            // an empty form asks for the name it needs, a following command
+            // says it is following and how to take it over, and a written one
+            // gets the placeholder legend it is being written with.
+            let hint = match (*cmd_tracks_name, name.trim().is_empty()) {
+                (true, true) => "name an editor on PATH — the command writes itself",
+                (true, false) => "command follows the name — type here to write your own",
+                (false, _) => "{path} = checkout/worktree · {branch} · {base}",
             };
+            // A command the form wrote is dim until it is taken over, so what
+            // was typed and what was filled in never look alike.
+            let cmd_style = match (*cmd_tracks_name, *on_cmd) {
+                (true, false) => Style::new().dim(),
+                _ => Style::new(),
+            };
+            let cmd_line = Line::from(vec![
+                Span::raw("command: "),
+                Span::styled(
+                    format!("{cmd}▏"),
+                    match *on_cmd {
+                        true => Style::new().add_modifier(Modifier::REVERSED),
+                        false => cmd_style,
+                    },
+                ),
+            ]);
             let para = Paragraph::new(vec![
                 name_line,
-                field("command", cmd, *on_cmd),
+                cmd_line,
                 Line::from(Span::styled(hint, Style::new().dim())),
             ])
             .block(Block::default().borders(Borders::ALL).title(title));
