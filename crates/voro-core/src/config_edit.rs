@@ -17,12 +17,33 @@ use crate::agent::{VIEWER_PATH_PLACEHOLDER, is_builtin_viewer};
 use crate::error::{Error, Result};
 use crate::model::{Project, ReviewAction};
 
-/// Add a `[viewers.<name>]` table with the given command, refusing an empty
-/// name/command or a name that collides with an existing viewer. Existing
-/// content and comments in the file are preserved.
+/// The command a viewer gets when none is given: for a built-in name, exactly
+/// what that built-in runs, so overriding one starts from what it replaces;
+/// for anything else, the editor's own name handed the checkout —
+/// `<name> {path}` — which is what nearly every editor CLI wants and is the
+/// only part of the answer a new operator has no way to guess.
+///
+/// It is a *default*, not a rule: `code -n {path}`, a wrapper script, or a
+/// `git difftool` line are all still spellable by filling the command in.
+pub fn assumed_viewer_cmd(name: &str) -> String {
+    let name = name.trim();
+    match crate::agent::builtin_viewer_cmd(name) {
+        Some(cmd) => cmd.to_string(),
+        None => format!("{name} {VIEWER_PATH_PLACEHOLDER}"),
+    }
+}
+
+/// Add a `[viewers.<name>]` table, refusing an empty name or a name that
+/// collides with an existing viewer. An empty command is not a refusal but the
+/// common case: it becomes [`assumed_viewer_cmd`], so naming the editor is
+/// enough. Existing content and comments in the file are preserved.
 pub fn add_viewer(path: &Path, name: &str, cmd: &str) -> Result<()> {
     let name = name.trim();
-    let cmd = cmd.trim();
+    let assumed = assumed_viewer_cmd(name);
+    let cmd = match cmd.trim() {
+        "" => assumed.as_str(),
+        cmd => cmd,
+    };
     validate_viewer(name, cmd)?;
     let mut doc = load_doc(path)?;
     if viewer_exists(&doc, name) {
@@ -287,7 +308,7 @@ cmd = \"git -C {path} difftool -d {base}...{branch}\"  # inline note
     }
 
     #[test]
-    fn add_viewer_rejects_duplicates_and_empty_fields() {
+    fn add_viewer_rejects_duplicates_and_a_bad_name() {
         let dir = scratch("reject");
         let path = dir.join("voro.toml");
         std::fs::create_dir_all(&dir).unwrap();
@@ -295,9 +316,6 @@ cmd = \"git -C {path} difftool -d {base}...{branch}\"  # inline note
         add_viewer(&path, "zed", "zed {path}").unwrap();
         let dup = add_viewer(&path, "zed", "zed .").unwrap_err().to_string();
         assert!(dup.contains("already exists"), "{dup}");
-
-        let empty_cmd = add_viewer(&path, "emacs", "  ").unwrap_err().to_string();
-        assert!(empty_cmd.contains("command is required"), "{empty_cmd}");
 
         let empty_name = add_viewer(&path, "  ", "zed .").unwrap_err().to_string();
         assert!(empty_name.contains("name is required"), "{empty_name}");
@@ -424,6 +442,39 @@ cmd = \"git -C {path} difftool -d {base}...{branch}\"  # inline note
 
         let bad = set_default_viewer(&path, "ghost").unwrap_err().to_string();
         assert!(bad.contains("no viewer named 'ghost'"), "{bad}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Naming the editor is enough: the command a new operator has no way to
+    /// guess is assumed, and naming a built-in starts from what it replaces
+    /// rather than from a worse guess at the same thing (#405).
+    #[test]
+    fn a_viewer_added_with_no_command_gets_the_obvious_one() {
+        let dir = scratch("assumed");
+        let path = dir.join("voro.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(assumed_viewer_cmd("emacsclient"), "emacsclient {path}");
+        assert_eq!(assumed_viewer_cmd("code"), "code -n {path}");
+
+        add_viewer(&path, "emacsclient", "").unwrap();
+        add_viewer(&path, "code", "   ").unwrap();
+        let config = AgentsConfig::load(&path).unwrap();
+        assert_eq!(
+            config.viewer_cmd(Some("emacsclient")).unwrap(),
+            "emacsclient {path}"
+        );
+        // overriding a built-in with a blank command reproduces it, so the
+        // table is a starting point to edit rather than a downgrade
+        assert_eq!(config.viewer_cmd(Some("code")).unwrap(), "code -n {path}");
+
+        // a name is still required, and an edit still refuses a blank command:
+        // there the field is not empty but emptied
+        let no_name = add_viewer(&path, "  ", "").unwrap_err().to_string();
+        assert!(no_name.contains("name is required"), "{no_name}");
+        let blank_edit = edit_viewer(&path, "code", " ").unwrap_err().to_string();
+        assert!(blank_edit.contains("command is required"), "{blank_edit}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

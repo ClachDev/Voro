@@ -202,6 +202,12 @@ pub fn is_builtin_viewer(name: &str) -> bool {
     builtin_viewers().contains_key(name)
 }
 
+/// A built-in viewer's command, so an override can start from what it replaces
+/// rather than from an empty field.
+pub fn builtin_viewer_cmd(name: &str) -> Option<&'static str> {
+    builtin_viewers().get(name).map(|v| v.cmd.as_str())
+}
+
 /// Header prose for the skeleton `agent init` writes. [`starter_config`]
 /// appends the current built-ins (commented) and example stanzas after it.
 const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).

@@ -188,10 +188,12 @@ dispatch
   viewer list                     list effective viewers (built-in + user)
                                   with provenance; * marks the default used
                                   when nothing names one
-  viewer add <name> <cmd>         define a [viewers.NAME] entry in voro.toml
-                                  (comment-preserving); cmd may carry {path},
-                                  {branch}, {base} (e.g. 'zed {path}'). Naming
-                                  a built-in overrides it wholesale
+  viewer add <name> [cmd]         define a [viewers.NAME] entry in voro.toml
+                                  (comment-preserving). With no cmd it runs
+                                  '<name> {path}' — the built-in's own line if
+                                  NAME is one, which is how you override it.
+                                  A cmd may carry {path}, {branch}, {base}
+                                  (e.g. 'code -n {path}')
   viewer remove <name>            delete a viewer; refused while a project's
                                   review action still names it, and for a
                                   built-in, which is overridden rather than
@@ -457,8 +459,16 @@ enum AgentCmd {
 #[derive(Subcommand)]
 enum ViewerCmd {
     List,
-    Add { name: String, cmd: String },
-    Remove { name: String },
+    /// A command is optional: with none, the viewer runs
+    /// `voro_core::config_edit::assumed_viewer_cmd` — the built-in's own line
+    /// when the name is one, else `<name> {path}`.
+    Add {
+        name: String,
+        cmd: Option<String>,
+    },
+    Remove {
+        name: String,
+    },
 }
 
 #[derive(Args)]
@@ -2196,6 +2206,13 @@ fn viewer_verb(store: &mut Store, cmd: ViewerCmd, ctx: &DispatchCtx) -> Result<S
     let path = &ctx.agents_path;
     match cmd {
         ViewerCmd::Add { name, cmd } => {
+            // With no command, the viewer is its own name handed the checkout
+            // (or the built-in's line, overriding one) — resolved here as well
+            // as in the writer so the reply says what was actually recorded.
+            let cmd = match cmd {
+                Some(cmd) if !cmd.trim().is_empty() => cmd,
+                _ => voro_core::config_edit::assumed_viewer_cmd(&name),
+            };
             voro_core::config_edit::add_viewer(path, &name, &cmd).map_err(|e| e.to_string())?;
             let mut out = format!("viewer '{name}' added: {cmd}");
             if voro_core::config_edit::missing_path_placeholder(&cmd) {
@@ -2600,9 +2617,10 @@ mod tests {
         assert!(listed.contains("user override"), "{listed}");
         call(&mut s, &["viewer", "remove", "zed"]).unwrap();
 
-        // an empty command is refused
-        let e = call(&mut s, &["viewer", "add", "emacs", "   "]).unwrap_err();
-        assert!(e.contains("command is required"), "{e}");
+        // no command at all assumes the obvious one and says what it recorded
+        let out = call(&mut s, &["viewer", "add", "emacs"]).unwrap();
+        assert!(out.contains("emacs {path}"), "{out}");
+        call(&mut s, &["viewer", "remove", "emacs"]).unwrap();
 
         // a command with no {path} succeeds but warns
         let out = call(&mut s, &["viewer", "add", "difftool", "git difftool -d"]).unwrap();

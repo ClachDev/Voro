@@ -2812,6 +2812,13 @@ impl App {
         editing: bool,
         review_project: Option<i64>,
     ) {
+        // A blank command on an add is the common case, not a slip: it means
+        // the obvious line for that name (DESIGN.md §5). Resolved here as well
+        // as in the writer so the status line reports what was recorded.
+        let cmd = match (editing, cmd.trim().is_empty()) {
+            (false, true) => voro_core::config_edit::assumed_viewer_cmd(&name),
+            _ => cmd,
+        };
         let path = &self.dispatch_ctx.agents_path;
         let result = if editing {
             voro_core::config_edit::edit_viewer(path, &name, &cmd)
@@ -2833,7 +2840,9 @@ impl App {
         let mut msg = if editing {
             format!("viewer '{trimmed}' updated")
         } else {
-            format!("viewer '{trimmed}' added")
+            // Name what was written, since on a blank command the operator
+            // never typed it.
+            format!("viewer '{trimmed}' added: {}", cmd.trim())
         };
         if voro_core::config_edit::missing_path_placeholder(&cmd) {
             msg.push_str(" (no {path} — runs in the checkout dir)");
@@ -4190,9 +4199,13 @@ mod tests {
             "{status}"
         );
         assert!(status.contains("code/cursor/zed"), "{status}");
-        // the status line truncates at 110 columns (#406), so the action must
-        // survive ahead of the diagnosis
-        assert!(status.len() < 110, "{} chars: {status}", status.len());
+        // the status line wraps rather than truncating (§9), so the diagnosis
+        // is never lost — but the action is what the operator acts on, so it
+        // still comes first
+        assert!(
+            status.find("name one here").unwrap() < status.find("no built-in").unwrap(),
+            "{status}"
+        );
 
         // anything else opening can fail on is reported, not answered
         app.mode = Mode::Normal;
@@ -4201,6 +4214,42 @@ mod tests {
         )));
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(app.status.as_deref(), Some("no viewer named 'nope'"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Naming an editor is enough (#405): ⏎ through the command field records
+    /// `<name> {path}`, and a name that is a built-in's records that built-in's
+    /// own line, so an override starts from what it replaces.
+    #[test]
+    fn a_viewer_added_with_a_blank_command_gets_the_obvious_one() {
+        let (store, ctx, _project) = scratch_env("config-blank-cmd", None);
+        let path = ctx.agents_path.clone();
+        let mut app = App::new(store, ctx).unwrap();
+
+        key(&mut app, KeyCode::Char('4'));
+        key(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "emacsclient");
+        key(&mut app, KeyCode::Enter); // name -> command
+        key(&mut app, KeyCode::Enter); // submit with the command blank
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.config_viewers[row(&app, "emacsclient")].cmd,
+            "emacsclient {path}"
+        );
+        // the status names what was written, since it was never typed
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("emacsclient {path}"), "{status}");
+
+        // and overriding a built-in reproduces it rather than guessing at it
+        key(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "code");
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter);
+        let code = &app.config_viewers[row(&app, "code")];
+        assert_eq!(code.cmd, "code -n {path}");
+        assert_eq!(code.provenance, "user override");
+        assert!(code.editable);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

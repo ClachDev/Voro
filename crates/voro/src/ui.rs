@@ -435,13 +435,25 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             } else {
                 field("name", name, !*on_cmd)
             };
+            // What a blank command will be filled with, live as the name is
+            // typed: `<name> {path}` is the answer for nearly every editor CLI
+            // and the part a new operator cannot guess, so the form says it
+            // rather than leaving an empty field to be puzzled over. On an
+            // edit there is nothing to assume — the command is already there.
+            let hint = match (*editing, cmd.trim().is_empty(), name.trim().is_empty()) {
+                (false, true, false) => format!(
+                    "blank command runs: {}",
+                    voro_core::config_edit::assumed_viewer_cmd(name)
+                ),
+                (false, true, true) => {
+                    "name an editor on PATH; a blank command runs `<name> {path}`".to_string()
+                }
+                _ => "{path} = checkout/worktree · {branch} · {base}".to_string(),
+            };
             let para = Paragraph::new(vec![
                 name_line,
                 field("command", cmd, *on_cmd),
-                Line::from(Span::styled(
-                    "{path} = checkout/worktree · {branch} · {base}",
-                    Style::new().dim(),
-                )),
+                Line::from(Span::styled(hint, Style::new().dim())),
             ])
             .block(Block::default().borders(Borders::ALL).title(title));
             frame.render_widget(para, area);

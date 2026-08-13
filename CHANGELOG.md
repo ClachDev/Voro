@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spot rather than only complaining, and at the shell the failure asks you to
   register the viewer you already use (`voro viewer add <name> '<cmd>'`), with
   the probed built-ins named after the action — instead of reporting a config
-  file that may not exist as an invalid *agents* config.
+  file that may not exist as an invalid *agents* config. Naming the editor is
+  enough: the command is now optional in both the form and `voro viewer add`,
+  defaulting to `<name> {path}`, or to a built-in's own line when you name one
+  to override it, with the form showing what it will write as you type.
 - **A build from a `target/` directory opens a dev store, not your real one.** A
   `voro` run out of `target/debug` or `target/release` now uses
   `~/.local/share/voro/dev.db`, seeded on first run with a fixture board
