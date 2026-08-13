@@ -11,14 +11,14 @@
 //! log — and records it on the session row for later attach/resume.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voro_core::{
-    AgentsConfig, Launch, LaunchSpec, ResolvedAgent, ReviewAction, ReviewDiff, Store, TaskState,
+    AgentsConfig, Launch, LaunchSpec, ResolvedAgent, ReviewDiff, Store, TaskState,
     VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, render,
 };
 
@@ -208,13 +208,19 @@ The operator's note is what they want fixed. It is the brief; honour it:
 When the rewrite is ready, write it to a file outside the checkout and apply it
 with exactly this command:
 
-    voro set {task_id}{db} --body-file <path>
+    voro set {task_id}{db} --body-file <path> [--title \"...\"]
 
-That is the only change you may make. The task stays `proposed` so the operator
-re-triages the improved version, so do not change its state, priority, or
-dependencies — no `voro triage`, no `--priority`, no `--blocked-by`, no `voro
-add` or `voro propose` — and never modify Voro's database with raw SQL, which
-would bypass the state machine and event log. Rewrite the body and stop.
+Add `--title` when the note asks for a retitle or the rewrite leaves the
+current title inaccurate, and put it on that same command, because
+a title-only `voro set` replaces no body, so it concludes no round and would
+leave this one hanging.
+
+That one command is the only change you may make. The task stays `proposed` so
+the operator re-triages the improved version, and everything else stays as it
+is: do not change its state, priority, or dependencies — no `voro triage`, no
+`--priority`, no `--blocked-by`, no `voro add` or `voro propose` — and never
+modify Voro's database with raw SQL, which would bypass the state machine and
+event log. Rewrite the body and stop.
 ";
 
 /// The interactive refine (DESIGN.md §6): the planning harness pointed at a task
@@ -238,14 +244,20 @@ decisions already made, and give concrete acceptance criteria.
 When the operator confirms the rewrite, write the body to a file outside the
 checkout and apply it with:
 
-    voro set {task_id}{db} --body-file <path>
+    voro set {task_id}{db} --body-file <path> [--title \"...\"]
 
-That is the only change to make. The task stays `proposed` so the operator
-re-triages the improved version, so do not change its state, priority, or
-dependencies, and do not create a new task — this edits the one that exists. If
-the operator decides against changing anything, end the session without applying
-a body — that is a no-op, not a failure. Never modify Voro's database with raw
-SQL, which would bypass the state machine and event log.
+Add `--title` when the operator wants the task retitled or the rewrite leaves
+the current title inaccurate, and put it on that same command, because
+a title-only `voro set` replaces no body, so it concludes no round and would
+leave this one hanging.
+
+That one command is the only change to make. The task stays `proposed` so the
+operator re-triages the improved version, and everything else stays as it is:
+do not change its state, priority, or dependencies, and do not create a new
+task — this edits the one that exists. If the operator decides against changing
+anything, end the session without applying a body — that is a no-op, not a
+failure. Never modify Voro's database with raw SQL, which would bypass the state
+machine and event log.
 ";
 
 /// How often the session-ref capture re-polls the agent's `sessions` command
@@ -258,10 +270,13 @@ const REF_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SPAWN_CLOCK_SLACK_MS: i64 = 2000;
 
 /// The ` --db <path>` flag every rendered verb carries when the database in play
-/// is not the default one the CLI resolves to unaided — empty otherwise, since
-/// that is what the verbs already do (DESIGN.md §8).
+/// is not the operator's store — empty otherwise, since that is what a bare
+/// verb resolves to (DESIGN.md §8). The agent a dispatch launches runs the
+/// installed `voro` from `PATH`, so the comparison is against the production
+/// path (§5) rather than whichever store this binary defaults to: a dispatch
+/// from the dev store renders the flag and keeps the return path on it.
 fn db_flag(db_path: &Path) -> String {
-    if db_path == Store::default_db_path() {
+    if db_path == Store::production_db_path() {
         String::new()
     } else {
         format!(" --db {}", shell_quote(db_path))
@@ -868,11 +883,20 @@ pub fn refine(
     ))
 }
 
+/// How long [`send_message`] watches a spawned send before calling it started.
+const MESSAGE_GRACE: Duration = Duration::from_secs(2);
+
+/// How often that window is polled.
+const MESSAGE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How much of a failed send's log to look at for the line to quote back.
+const LOG_TAIL_BYTES: u64 = 4096;
+
 /// One line said into a session that already exists (DESIGN.md §8), assembled by
 /// the TUI's quick-message key. Unlike an [`Expansion`] this opens no session
-/// row and tracks no pid: it joins a conversation Voro already knows about
-/// rather than starting one, so there is no new identity to compose and nothing
-/// for the reconciler to observe.
+/// row: it joins a conversation Voro already knows about rather than starting
+/// one, so there is no new identity to compose — it updates the row that
+/// conversation already has (DESIGN.md §8).
 pub struct SessionMessage<'a> {
     /// The task whose session is being messaged — names the prompt and log
     /// files, and the launch-log line.
@@ -888,32 +912,143 @@ pub struct SessionMessage<'a> {
     pub cwd: String,
 }
 
-/// Fire a message into a task's agent session and return, leaving it to run
-/// (DESIGN.md §8). Fire-and-forget by design: the send is one turn appended to a
-/// transcript the operator watches elsewhere, so an agent-side refusal lands in
-/// the log rather than back in the UI, and nothing here waits for a reply.
-pub fn send_message(ctx: &DispatchCtx, msg: SessionMessage) -> Result<String, String> {
+/// A quick message whose send is under way: the spawn survived its grace window
+/// ([`send_message`]), so the caller may now record what it changed about the
+/// session and — for a rejection — apply the transition the message carries.
+/// The child is still held, so a caller whose recording fails can take the
+/// agent down with it ([`abandon`](Self::abandon)) rather than leaving it acting
+/// on a message no state reflects.
+pub struct SentMessage {
+    spawned: Spawned,
+    task_id: i64,
+    new_session_ref: Option<String>,
+}
+
+impl SentMessage {
+    /// The process carrying the turn. Unlike a dispatch's launcher pid this is
+    /// the send itself, so it is alive for as long as the agent is answering —
+    /// which is what keeps the reconciler off a task whose forked turn does not
+    /// appear in the agent's own listing (DESIGN.md §8).
+    pub fn pid(&self) -> i64 {
+        self.spawned.pid
+    }
+
+    /// The reference the session answers to from now on, when the agent's verb
+    /// forked rather than resuming in place.
+    pub fn new_session_ref(&self) -> Option<&str> {
+        self.new_session_ref.as_deref()
+    }
+
+    /// Let the send run: hand the child to the reaper and report it. From here
+    /// the turn is fire-and-forget — it is appended to a transcript the operator
+    /// watches elsewhere, so an agent-side refusal after this point lands in the
+    /// log rather than back in the UI.
+    pub fn confirm(self, ctx: &DispatchCtx) -> String {
+        let summary = format!(
+            "message sent to task {}'s session — log {}",
+            self.task_id,
+            self.spawned.log_path.display()
+        );
+        reap_expansion(self.spawned, ctx.launch_log_path());
+        summary
+    }
+
+    /// Kill the send's process group, for a caller whose store write failed
+    /// after the spawn: an agent must not go on acting on a message the
+    /// database does not record.
+    pub fn abandon(self) {
+        kill_expansion(self.spawned);
+    }
+}
+
+/// Fire a message into a task's agent session and wait just long enough to know
+/// it started (DESIGN.md §8). A headless send can be refused outright — a
+/// supervisor-held session, a stale reference — and that refusal exits in well
+/// under a second, so the spawn is given a grace window to fail in and an early
+/// non-zero exit is reported as a send that did not happen. What comes back is
+/// a [`SentMessage`] the caller records against the session before letting it
+/// run; the transition a rejection carries hangs off that, so nothing is
+/// committed against a message that never left.
+pub fn send_message(ctx: &DispatchCtx, msg: SessionMessage) -> Result<SentMessage, String> {
     if msg.message.trim().is_empty() {
         return Err("a message is required".into());
     }
     let label = format!("message-{}", msg.task_id);
     let prompt_path = write_prompt(ctx, &label, msg.message)?;
-    let command = voro_core::render_message(msg.template, msg.session_ref, &prompt_path);
-    let spawned = spawn_logged(
+    let rendered = voro_core::render_message(msg.template, msg.session_ref, &prompt_path);
+    let mut spawned = spawn_logged(
         ctx,
         label,
         &prompt_path,
-        &command,
+        &rendered.command,
         &msg.cwd,
         msg.session_ref.to_string(),
     )?;
-    let summary = format!(
-        "message sent to task {}'s session — log {}",
-        msg.task_id,
-        spawned.log_path.display()
-    );
-    reap_expansion(spawned, ctx.launch_log_path());
-    Ok(summary)
+    // An exit inside the window is only a failure if it failed: a verb that
+    // says its piece and returns cleanly has delivered the message.
+    if let Some(status) = wait_for_early_exit(&mut spawned.child, ctx.message_grace)
+        && !status.success()
+    {
+        append_launch_log(
+            &ctx.launch_log_path(),
+            &format!("{}: exited with {status}", spawned.label),
+        );
+        return Err(format!(
+            "the message was refused by '{}' ({status}){}",
+            msg.template
+                .split_whitespace()
+                .next()
+                .unwrap_or("the agent"),
+            log_tail_note(&spawned.log_path)
+        ));
+    }
+    Ok(SentMessage {
+        spawned,
+        task_id: msg.task_id,
+        new_session_ref: rendered.new_session_ref,
+    })
+}
+
+/// Poll a freshly spawned child for up to `grace`, returning its status if it
+/// exits in that window and `None` if it is still going (or could not be
+/// waited on, which is not evidence either way). A zero grace is a single look.
+fn wait_for_early_exit(child: &mut Child, grace: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(MESSAGE_POLL_INTERVAL.min(grace));
+    }
+}
+
+/// The last line a failed send wrote, for the status line — the agent's own
+/// account of why it refused, which is otherwise only in the log file. Empty
+/// when there is nothing to quote.
+fn log_tail_note(path: &Path) -> String {
+    let Ok(mut file) = File::open(path) else {
+        return String::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if file
+        .seek(SeekFrom::Start(len.saturating_sub(LOG_TAIL_BYTES)))
+        .is_err()
+    {
+        return String::new();
+    }
+    let mut tail = String::new();
+    if file.read_to_string(&mut tail).is_err() {
+        return String::new();
+    }
+    match tail.lines().rev().find(|l| !l.trim().is_empty()) {
+        Some(line) => format!(": {}", line.trim().chars().take(160).collect::<String>()),
+        None => String::new(),
+    }
 }
 
 /// Where dispatch finds its inputs and puts its artefacts. Built from the
@@ -931,6 +1066,11 @@ pub struct DispatchCtx {
     /// agent that defines a `sessions` verb, before giving up (the ref stays
     /// NULL and the summary says so). Zero means a single attempt.
     pub ref_capture_timeout: Duration,
+    /// How long a quick message's process gets to prove it started before the
+    /// send is treated as having landed (DESIGN.md §8). Long enough for a
+    /// refusal — which is immediate — to be caught, short enough that the TUI
+    /// does not visibly stall. Zero means a single look.
+    pub message_grace: Duration,
 }
 
 impl DispatchCtx {
@@ -947,6 +1087,7 @@ impl DispatchCtx {
             agents_path: AgentsConfig::default_path(),
             runtime_dir,
             ref_capture_timeout: Duration::from_secs(5),
+            message_grace: MESSAGE_GRACE,
         }
     }
 
@@ -1002,12 +1143,12 @@ pub fn dispatch(
 }
 
 /// Open a `review` (or `running`) task's diff in a viewer (DESIGN.md §11a): the
-/// viewer medium of the per-project review action (§8). A dispatched agent works
+/// only local-diff spelling (§8). A dispatched agent works
 /// in a throwaway worktree on the task's branch, so the diff lives there, not in
 /// the primary checkout — the viewer is run in that worktree when the task has a
 /// live one, falling back to the task's resolved repo when it has no branch or no worktree
 /// (§8). `viewer_override` names a `[viewers.<name>]` entry; `None` falls back to
-/// the project's review action or the config default. The viewer template gets
+/// the viewer the project names, or the config default. The viewer template gets
 /// `{path}` (the resolved dir), `{branch}` (the task's branch, empty when none),
 /// and `{base}` (the checkout's default branch) so it can express a diff range.
 /// Opening never touches task state, so there is no clean-tree guard (the diff
@@ -1030,13 +1171,9 @@ pub fn open(
     // second repo has its branch and worktree there (DESIGN.md §8).
     let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
 
-    // The project's review action may pin a named viewer even when open was
-    // invoked directly rather than through the resolved `pr` action.
-    let project_viewer = match &project.review_action {
-        ReviewAction::Viewer(Some(name)) => Some(name.clone()),
-        _ => None,
-    };
-    let viewer_name = viewer_override.map(str::to_string).or(project_viewer);
+    let viewer_name = viewer_override
+        .map(str::to_string)
+        .or_else(|| project.viewer.clone());
 
     let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     let viewer = config
@@ -1220,7 +1357,7 @@ fn spawn_session(
     // `## Feedback` section are all it has to answer.
     let rework = store
         .events_for(task_id)
-        .map(|events| voro_core::rework_report(&events).is_some())
+        .map(|events| voro_core::was_rejected(&events))
         .unwrap_or(false);
     let prompt = format!(
         "{}{body}",
@@ -1509,6 +1646,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         (store, ctx, project)
     }
@@ -1644,7 +1782,7 @@ mod tests {
         );
 
         // the default db is what the verbs resolve to unaided, so no flag
-        let default = render_preamble(62, &Store::default_db_path(), None, &[], false);
+        let default = render_preamble(62, &Store::production_db_path(), None, &[], false);
         assert!(default.contains("voro ask 62 --question"), "{default}");
         assert!(!default.contains("--db"), "{default}");
     }
@@ -1654,7 +1792,7 @@ mod tests {
         // no assigned branch: the agent is told to register the name it picks,
         // but branch-assignment wording and a completion `voro done --branch`
         // are absent, since no name is known.
-        let plain = render_preamble(62, &Store::default_db_path(), None, &[], false);
+        let plain = render_preamble(62, &Store::production_db_path(), None, &[], false);
         assert!(!plain.contains("git branch `"), "{plain}");
         assert!(plain.contains("voro set 62 --branch <name>"), "{plain}");
         assert!(!plain.contains("voro done 62 --branch"), "{plain}");
@@ -1672,7 +1810,7 @@ mod tests {
         // it at completion.
         let branched = render_preamble(
             62,
-            &Store::default_db_path(),
+            &Store::production_db_path(),
             Some("feat/parser"),
             &[],
             false,
@@ -1708,7 +1846,7 @@ mod tests {
         // because the harness names the branch itself, both cases spell out the
         // rename onto the branch Voro tracks.
         for (branch, name) in [(None, "<name>"), (Some("feat/parser"), "feat/parser")] {
-            let rendered = render_preamble(62, &Store::default_db_path(), branch, &[], false);
+            let rendered = render_preamble(62, &Store::production_db_path(), branch, &[], false);
             assert!(rendered.contains("`EnterWorktree` tool"), "{rendered}");
             assert!(
                 rendered.contains(&format!("git switch -c {name}")),
@@ -1732,7 +1870,7 @@ mod tests {
         // A task linked to a plan gets it handed over rather than having to
         // rediscover it from hints in the body (DESIGN.md §3/§8). The location
         // is absolute, since a linked doc may live in another checkout.
-        let db = Store::default_db_path();
+        let db = Store::production_db_path();
         let docs = [
             (
                 "Strategy 2026".to_string(),
@@ -1770,7 +1908,7 @@ mod tests {
     /// instruction, and a task nobody rejected carries none (DESIGN.md §8).
     #[test]
     fn preamble_tells_a_redispatched_rework_to_answer_the_feedback() {
-        let db = Store::default_db_path();
+        let db = Store::production_db_path();
         let reworking = render_preamble(62, &db, None, &[], true);
         assert!(
             reworking.contains("been through review once already"),
@@ -1792,7 +1930,7 @@ mod tests {
     fn the_rework_message_carries_the_feedback_and_the_instruction() {
         let message = rework_message(
             62,
-            &Store::default_db_path(),
+            &Store::production_db_path(),
             "  tests are missing, and the docs are stale  ",
         );
         assert!(
@@ -2094,6 +2232,7 @@ mod tests {
         // give the stub time to write the line before capture's single poll
         let ctx = DispatchCtx {
             ref_capture_timeout: Duration::from_secs(3),
+            message_grace: std::time::Duration::from_millis(300),
             ..ctx
         };
         let summary = dispatch(&mut store, &ctx, id, None).unwrap();
@@ -2387,6 +2526,16 @@ mod tests {
         assert_eq!(store.last_reviewed(id).unwrap().as_deref(), Some(&head[..]));
     }
 
+    /// A task reviewed with neither a PR nor a branch has no revision to read,
+    /// so the TUI starts no capture for it at all (DESIGN.md §8).
+    #[test]
+    fn a_task_with_no_pr_and_no_branch_has_nothing_to_capture() {
+        let (mut store, _ctx, project) = fixture("cat {prompt_file}");
+        let id = review_task(&mut store, &project);
+
+        assert_eq!(crate::pr::reviewed_source(&store, id), None);
+    }
+
     #[test]
     fn open_ignores_new_placeholders_a_template_does_not_use() {
         // A template that mentions neither {branch} nor {base} is substituted
@@ -2469,9 +2618,9 @@ mod tests {
 
     /// The two named-viewer selection paths (DESIGN.md §8/§11a): an explicit
     /// override picks its `[viewers.<name>]` entry over the default, and with
-    /// no override the project's `viewer:<name>` review action picks one.
+    /// no override the viewer the project names picks one.
     #[test]
-    fn open_picks_the_named_viewer_from_override_or_project_action() {
+    fn open_picks_the_named_viewer_from_override_or_project() {
         let (mut store, ctx, project) = fixture("cat {prompt_file}");
         std::fs::write(
             &ctx.agents_path,
@@ -2494,12 +2643,7 @@ mod tests {
         std::fs::remove_file(&marker).unwrap();
 
         let project_id = store.task(id).unwrap().project_id;
-        store
-            .set_review_action(
-                project_id,
-                &voro_core::ReviewAction::Viewer(Some("special".into())),
-            )
-            .unwrap();
+        store.set_viewer(project_id, Some("special")).unwrap();
         open(&mut store, &ctx, id, None).unwrap();
         for _ in 0..50 {
             if marker.exists() {
@@ -2625,14 +2769,16 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("what the parent actually did"), "{prompt}");
-        // the one write it is told to make, with the id and database literal
+        // the one write it is told to make, with the id and database literal,
+        // and the retitle that may ride along on it (task #391)
         assert!(
             prompt.contains(&format!(
-                "voro set {id} --db {} --body-file",
+                "voro set {id} --db {} --body-file <path> [--title",
                 shell_quote(&ctx.db_path)
             )),
             "{prompt}"
         );
+        assert!(prompt.contains("a title-only `voro set`"), "{prompt}");
         // and the writes it is told not to make
         assert!(
             prompt.contains("do not change its state, priority, or"),
@@ -2934,7 +3080,14 @@ mod tests {
         let prompt = std::fs::read_to_string(&prompt_path).unwrap();
         // the existing body is seeded, and the session ends in `set`, not `add`
         assert!(prompt.contains("make it better"), "{prompt}");
-        assert!(prompt.contains(&format!("voro set {id}")), "{prompt}");
+        assert!(
+            prompt.contains(&format!(
+                "voro set {id} --db {} --body-file <path> [--title",
+                shell_quote(&ctx.db_path)
+            )),
+            "{prompt}"
+        );
+        assert!(prompt.contains("a title-only `voro set`"), "{prompt}");
         assert!(!prompt.contains("voro add"), "{prompt}");
         assert!(prompt.contains("interactive"), "{prompt}");
 
@@ -3048,7 +3201,7 @@ mod tests {
 
     #[test]
     fn planning_prompt_renders_the_db_flag_only_for_a_non_default_database() {
-        let rendered = render_planning_prompt("proj", &Store::default_db_path());
+        let rendered = render_planning_prompt("proj", &Store::production_db_path());
         assert!(
             rendered.contains("voro add 'proj' \"<title>\" --body-file"),
             "{rendered}"

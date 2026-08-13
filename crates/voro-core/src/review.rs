@@ -1,8 +1,8 @@
-//! Re-review after a rejection (DESIGN.md §8): deciding how much of a task's
-//! diff the operator should be shown, and pairing a rework's completion summary
-//! with the feedback it answers. Pure of I/O — the `gh` and `git` calls that
-//! supply the revisions live in the `voro` crate — so every decision here is
-//! testable against canned strings.
+//! What a review is given against (DESIGN.md §8): the completion summary of
+//! the cycle in hand, with the feedback it answers when there is one, and how
+//! much of a task's diff the operator should be shown. Pure of I/O — the `gh`
+//! and `git` calls that supply the revisions live in the `voro` crate — so
+//! every decision here is testable against canned strings.
 
 use serde::Deserialize;
 
@@ -153,36 +153,43 @@ pub fn parse_pr_revisions(json: &str) -> PrRevisions {
     }
 }
 
-/// A rework cycle's report: the rejection feedback the operator gave, and the
-/// completion summary the agent came back with (DESIGN.md §8). The summary is
-/// `None` while the rework is still in flight.
+/// What a reviewer reads a task against (DESIGN.md §8): the completion summary
+/// the current cycle came back with, and — on a task that has been sent back —
+/// the rejection feedback that summary answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReworkReport {
-    pub feedback: String,
-    pub summary: Option<String>,
+pub struct CompletionReport {
+    pub summary: String,
+    pub feedback: Option<String>,
 }
 
-/// Pair a task's newest rejection feedback with the summary that answers it,
-/// read off its event log. `None` for a task no one has rejected — a first
-/// review has nothing to answer, so nothing is rendered against it. A summary
-/// logged *before* the feedback belongs to the cycle that was rejected, so only
-/// a later one counts as the response.
-pub fn rework_report(events: &[Event]) -> Option<ReworkReport> {
+/// Read a task's current completion report off its event log. `None` when the
+/// cycle in hand has reported nothing: a task that never completed, and a
+/// rework still in flight, whose newest summary belongs to the round that was
+/// rejected and so answers neither the feedback nor the operator's question of
+/// what changed this time.
+pub fn completion_report(events: &[Event]) -> Option<CompletionReport> {
     let last_feedback = events
         .iter()
         .rev()
-        .find(|e| e.kind == "feedback" && detail(e).is_some())?;
+        .find(|e| e.kind == "feedback" && detail(e).is_some());
+    let newer_than = last_feedback.map_or(i64::MIN, |e| e.id);
     let summary = events
         .iter()
         .rev()
-        .take_while(|e| e.id != last_feedback.id)
-        .find(|e| e.kind == "summary")
-        .and_then(detail)
-        .map(str::to_string);
-    Some(ReworkReport {
-        feedback: detail(last_feedback)?.to_string(),
-        summary,
+        .take_while(|e| e.id > newer_than)
+        .find_map(|e| if e.kind == "summary" { detail(e) } else { None })?;
+    Some(CompletionReport {
+        summary: summary.to_string(),
+        feedback: last_feedback.and_then(detail).map(str::to_string),
     })
+}
+
+/// Whether a task has been reviewed and sent back at some point — what makes a
+/// redispatch a rework rather than a first attempt (DESIGN.md §8).
+pub fn was_rejected(events: &[Event]) -> bool {
+    events
+        .iter()
+        .any(|e| e.kind == "feedback" && detail(e).is_some())
 }
 
 fn detail(event: &Event) -> Option<&str> {
@@ -289,10 +296,27 @@ mod tests {
         }
     }
 
+    /// The first review's case, and the one the card exists for: a summary with
+    /// no rejection behind it is still the report the operator reads.
     #[test]
-    fn a_task_nobody_rejected_has_no_rework_report() {
+    fn a_task_nobody_rejected_reports_its_summary_alone() {
         let events = vec![event(1, "summary", "did the thing")];
-        assert!(rework_report(&events).is_none());
+        let report = completion_report(&events).unwrap();
+        assert_eq!(report.summary, "did the thing");
+        assert!(report.feedback.is_none());
+        // the newest summary wins, as `set --summary` amending one intends
+        let events = vec![
+            event(1, "summary", "first draft"),
+            event(2, "summary", "amended"),
+        ];
+        assert_eq!(completion_report(&events).unwrap().summary, "amended");
+    }
+
+    #[test]
+    fn a_task_that_reported_nothing_has_no_report() {
+        assert!(completion_report(&[]).is_none());
+        assert!(completion_report(&[event(1, "dispatch", "claude")]).is_none());
+        assert!(completion_report(&[event(1, "summary", "  ")]).is_none());
     }
 
     #[test]
@@ -302,27 +326,24 @@ mod tests {
             event(2, "feedback", "tests missing"),
             event(3, "summary", "1. tests missing — added them"),
         ];
-        let report = rework_report(&events).unwrap();
-        assert_eq!(report.feedback, "tests missing");
-        assert_eq!(
-            report.summary.as_deref(),
-            Some("1. tests missing — added them")
-        );
+        let report = completion_report(&events).unwrap();
+        assert_eq!(report.feedback.as_deref(), Some("tests missing"));
+        assert_eq!(report.summary, "1. tests missing — added them");
     }
 
+    /// A rework in flight reports nothing rather than reporting the summary of
+    /// the round that was rejected, which describes work already judged.
     #[test]
-    fn a_rework_still_in_flight_reports_no_summary() {
+    fn a_rework_still_in_flight_has_no_report() {
         let events = vec![
             event(1, "summary", "first attempt"),
             event(2, "feedback", "tests missing"),
         ];
-        let report = rework_report(&events).unwrap();
-        assert_eq!(report.feedback, "tests missing");
-        assert!(report.summary.is_none());
+        assert!(completion_report(&events).is_none());
     }
 
-    /// A second rejection supersedes the first: the report answers the newest
-    /// feedback, and the summary that answered the previous round is not it.
+    /// A second rejection supersedes the first: the summary that answered the
+    /// previous round is not an answer to the newest feedback.
     #[test]
     fn a_second_rejection_supersedes_the_first() {
         let events = vec![
@@ -330,8 +351,16 @@ mod tests {
             event(2, "summary", "added tests"),
             event(3, "feedback", "and the docs"),
         ];
-        let report = rework_report(&events).unwrap();
-        assert_eq!(report.feedback, "and the docs");
-        assert!(report.summary.is_none());
+        assert!(completion_report(&events).is_none());
+    }
+
+    #[test]
+    fn a_rejection_anywhere_in_the_history_marks_a_rework() {
+        assert!(!was_rejected(&[event(1, "summary", "did the thing")]));
+        assert!(!was_rejected(&[event(1, "feedback", "   ")]));
+        assert!(was_rejected(&[
+            event(1, "feedback", "tests missing"),
+            event(2, "summary", "added tests"),
+        ]));
     }
 }

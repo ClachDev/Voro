@@ -2,14 +2,19 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::ui::Hit;
 use voro_core::{
-    Action, ActionRow, AgentsConfig, DepKind, DepRef, DigestRow, Event, LivenessSource, PrRef,
-    Priority, Project, Queue, QueueRow, RefineOutcome, ReviewAction, ReviewMedium, ReworkReport,
-    RunningRow, ScoreBreakdown, StateCounts, Store, Task, TaskState, Triage, WipGate, scheduler,
+    Action, ActionRow, AgentsConfig, CompletionReport, DepKind, DepRef, DigestRow, Event,
+    LivenessSource, PrRef, Priority, Project, Queue, QueueRow, RefineOutcome, RunningRow,
+    ScoreBreakdown, StateCounts, Store, Task, TaskState, Triage, WipGate, scheduler,
 };
 
 /// Lines `PgDn`/`PgUp` move the focus card in one press. A fixed step, since
 /// the key handler runs without the pane's geometry.
 const DETAIL_PAGE_STEP: i64 = 10;
+
+/// What an operator with no project registered is told, wherever they meet the
+/// fact: the empty cockpit's box and `n`'s refusal say the same thing in the
+/// same words, and in the keys README.md teaches.
+pub const NO_PROJECTS_HINT: &str = "no projects yet — press tab to Projects, then a to add one";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -27,14 +32,21 @@ pub enum DefaultKind {
     Viewer,
 }
 
-/// One option in the review-action picker (DESIGN.md §8/§11a). Beyond the real
-/// [`ReviewAction`] choices, the trailing `NewViewer` entry opens the add-viewer
-/// form and pins the project to the viewer it creates — first-time viewer setup
-/// without a detour through the Config screen.
+/// One option in the project's viewer picker (DESIGN.md §8/§11a). Beyond the
+/// viewers themselves — `None` for the config default, then each named one —
+/// the trailing `NewViewer` entry opens the add-viewer form and pins the
+/// project to the viewer it creates, first-time viewer setup without a detour
+/// through the Config screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReviewActionOption {
-    Action(ReviewAction),
+pub enum ViewerOption {
+    Viewer(Option<String>),
     NewViewer,
+}
+
+/// How a project's viewer choice reads on screen and at the shell: the name it
+/// pins, or the config default when it names none (DESIGN.md §8).
+pub fn viewer_label(viewer: Option<&str>) -> &str {
+    viewer.unwrap_or("default viewer")
 }
 
 /// An agent row on the Config screen (DESIGN.md §5): the effective set with
@@ -185,16 +197,16 @@ pub enum Mode {
         sel: usize,
         back: Option<u16>,
     },
-    /// Picking a project's review action on the projects screen (DESIGN.md
-    /// §8/§11a): auto, pr, the default viewer, each named viewer from
-    /// `voro.toml`, and a trailing "new viewer…" that opens the add-viewer form.
-    /// Loaded fresh so a just-added viewer shows up.
-    ReviewActionPicker {
+    /// Picking a project's viewer on the projects screen (DESIGN.md §8/§11a):
+    /// the default viewer, each named viewer from `voro.toml`, and a trailing
+    /// "new viewer…" that opens the add-viewer form. Loaded fresh so a
+    /// just-added viewer shows up.
+    ViewerPicker {
         project_id: i64,
-        options: Vec<ReviewActionOption>,
-        /// The project's action as stored, flagged in the list independently
-        /// of cursor position.
-        current: ReviewAction,
+        options: Vec<ViewerOption>,
+        /// The viewer the project names as stored, flagged in the list
+        /// independently of cursor position.
+        current: Option<String>,
         sel: usize,
     },
     /// The add/edit-viewer form on the Config screen (DESIGN.md §5): a name and
@@ -232,7 +244,7 @@ impl Mode {
             | Mode::Transition { sel, .. }
             | Mode::AgentPicker { sel, .. }
             | Mode::DocPicker { sel, .. }
-            | Mode::ReviewActionPicker { sel, .. }
+            | Mode::ViewerPicker { sel, .. }
             | Mode::DefaultPicker { sel, .. } => Some(*sel),
             _ => None,
         }
@@ -244,7 +256,7 @@ impl Mode {
             | Mode::Transition { sel, .. }
             | Mode::AgentPicker { sel, .. }
             | Mode::DocPicker { sel, .. }
-            | Mode::ReviewActionPicker { sel, .. }
+            | Mode::ViewerPicker { sel, .. }
             | Mode::DefaultPicker { sel, .. } => Some(sel),
             _ => None,
         }
@@ -291,6 +303,9 @@ pub struct AttachRequest {
 /// the line lands in, the template that puts it there, and the listing the
 /// liveness probe reads to be sure the session is between turns.
 struct MessageTarget {
+    /// The session row the send updates once it is confirmed — its process, and
+    /// its reference where the agent's verb forks (DESIGN.md §8).
+    session_id: i64,
     session_ref: String,
     template: String,
     sessions_cmd: Option<String>,
@@ -413,6 +428,11 @@ pub struct App {
     /// half-written done report a dispatched session left behind, which a PR
     /// cannot be opened from. Re-derived per refresh, never stored.
     pub incomplete_report: std::collections::HashSet<i64>,
+    /// Review tasks whose checkout has no git remote (DESIGN.md §8): there is
+    /// nowhere to open a pull request, so their rows advertise the local review
+    /// path instead of a `pr` that could only fail. Re-derived per refresh from
+    /// the checkouts themselves, one `git remote` per distinct repo.
+    pub local_review: std::collections::HashSet<i64>,
     /// Proposals whose last refine round rewrote the body (DESIGN.md §6): what
     /// renders the `↻ refined` marker, so the operator triages the improved
     /// version knowing it moved. Re-derived per refresh and cleared by triage
@@ -452,6 +472,30 @@ pub struct App {
     pub conflict_selected: Option<(i64, bool)>,
     /// The background thread and debounce clock behind `conflict_selected`.
     probe: crate::probe::ConflictProbe,
+    /// The background threads capturing the revisions rejections were made
+    /// against (DESIGN.md §8), drained by `poll_reviewed_capture`.
+    capture: crate::probe::ReviewedCapture,
+    /// Which in-flight sessions can be read for a usage cap: task id, the
+    /// session reference to read, and the agent's `logs` command. Resolved on
+    /// refresh, where the agents config is already loaded, so the tick that
+    /// starts a probe does no I/O of its own to decide what to probe.
+    cap_targets: Vec<(i64, String, String)>,
+    /// Which in-flight tasks are sitting on a usage cap right now, and when
+    /// each window reopens if the agent said (DESIGN.md §8). Purely a reading
+    /// of current session output — no column, no event, no state change — so it
+    /// clears itself once the operator continues the session and fresh output
+    /// displaces the cap message.
+    pub caps: std::collections::HashMap<i64, voro_core::CapReading>,
+    /// The background threads taking those readings, drained by
+    /// `poll_cap_probes`.
+    cap_probe: crate::probe::CapProbe,
+    /// The local wall clock as minutes past midnight, for deciding whether a
+    /// badged reset time has gone by. Refreshed on a slow cadence rather than
+    /// per frame: reading it costs a subprocess, and a badge that flips from
+    /// "waiting" to "window open" within half a minute is timely enough.
+    pub now_minutes: Option<u16>,
+    /// When `now_minutes` was last read.
+    clock_read_at: Option<std::time::Instant>,
 
     pub cockpit_rows: Vec<CockpitRow>,
     pub cockpit_sel: usize,
@@ -534,6 +578,7 @@ impl App {
             counts: StateCounts::default(),
             all: Vec::new(),
             incomplete_report: std::collections::HashSet::new(),
+            local_review: std::collections::HashSet::new(),
             refined: std::collections::HashSet::new(),
             refine_failed: std::collections::HashSet::new(),
             deps: std::collections::HashMap::new(),
@@ -543,6 +588,12 @@ impl App {
             last_sessions: std::collections::HashMap::new(),
             conflict_selected: None,
             probe: crate::probe::ConflictProbe::default(),
+            capture: crate::probe::ReviewedCapture::default(),
+            cap_targets: Vec::new(),
+            caps: std::collections::HashMap::new(),
+            cap_probe: crate::probe::CapProbe::default(),
+            now_minutes: None,
+            clock_read_at: None,
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
             tasks_sel: 0,
@@ -563,6 +614,18 @@ impl App {
             last_data_version: 0,
         };
         app.refresh()?;
+        // A database with nothing registered opens where the first step is
+        // (DESIGN.md §9): the cockpit has nothing to show and its `n` cannot
+        // proceed without a project. Startup only — `refresh` runs after every
+        // mutation and on every external-change poll, and the screen is the
+        // operator's after that.
+        if app.projects.is_empty() {
+            app.screen = Screen::Projects;
+            app.status = Some(
+                "welcome to voro — press a to add your first project, then n to create a task"
+                    .into(),
+            );
+        }
         app.last_data_version = app.store.data_version()?;
         Ok(app)
     }
@@ -653,6 +716,15 @@ impl App {
                     .then_some(r.task.id)
             })
             .collect();
+        let mut forges = crate::pr::ForgeMemo::default();
+        self.local_review = all
+            .iter()
+            .filter(|r| r.task.state == TaskState::Review && r.task.pr_url.is_none())
+            .filter_map(|r| {
+                let repo = self.store.repo_for_task(&r.task).ok()?;
+                (!forges.takes_pull_requests(&repo.path)).then_some(r.task.id)
+            })
+            .collect();
         let proposals = || all.iter().filter(|r| r.task.state == TaskState::Proposed);
         self.refined = proposals()
             .filter_map(|r| {
@@ -689,6 +761,7 @@ impl App {
         };
         self.costs = costs;
         self.queue = scheduler::queue(&candidates, &costs, gate);
+        self.cap_targets = self.resolve_cap_targets(config.as_ref().ok());
 
         self.cockpit_rows = self.build_cockpit_rows();
 
@@ -902,6 +975,133 @@ impl App {
         }
     }
 
+    /// Capture the revision a rejection was made against, off the event loop
+    /// (DESIGN.md §8). The keypress gains nothing by waiting for `gh`: the
+    /// value is read only when the rework comes back for re-review, minutes or
+    /// hours later, and rejecting has just moved the task to `running`, where
+    /// neither read path consults it. A task with neither a PR nor a branch has
+    /// nothing to read, so it starts nothing.
+    fn capture_reviewed(&mut self, task_id: i64) {
+        // The head is read a moment after the keypress rather than at it, so a
+        // rework commit pushed inside that window would be captured as reviewed
+        // and left out of the delta. `voro reject` on the CLI stays synchronous
+        // for anyone who wants the tight capture.
+        if let Some(source) = crate::pr::reviewed_source(&self.store, task_id) {
+            self.capture.start(task_id, source);
+        }
+    }
+
+    /// Which in-flight sessions can be asked whether they are sitting on a
+    /// usage cap (DESIGN.md §8). A target needs all three of a strip row with
+    /// work under way, an open session carrying the reference the agent knows
+    /// it by, and an agent defining a `logs` verb — so an agent without one
+    /// contributes no targets and is probed for nothing, which is how the whole
+    /// feature stays absent for `codex` rather than failing loudly on it.
+    fn resolve_cap_targets(&self, config: Option<&AgentsConfig>) -> Vec<(i64, String, String)> {
+        let Some(config) = config else {
+            return Vec::new();
+        };
+        self.running
+            .iter()
+            .filter(|r| matches!(r.task_state, TaskState::Running | TaskState::Refining))
+            .filter_map(|r| {
+                let session = self.last_sessions.get(&r.task_id)?;
+                if session.ended_at.is_some() {
+                    return None;
+                }
+                let session_ref = session.session_ref.clone()?;
+                let logs = config.agent(&session.agent)?.logs()?.to_string();
+                Some((r.task_id, session_ref, logs))
+            })
+            .collect()
+    }
+
+    /// Advance the usage-cap readings behind the running strip's badge
+    /// (DESIGN.md §8). Both halves are non-blocking: the `logs` verb runs on a
+    /// background thread, because replaying a session's screen takes the better
+    /// part of a second and the render path may never wait on that.
+    ///
+    /// A reading that comes back empty *removes* the badge rather than leaving
+    /// the last one standing, which is the whole of the self-clearing rule: the
+    /// operator continues a capped session, its next output no longer says
+    /// "limit reached", and the badge is gone on the following pass.
+    pub fn poll_cap_probes(&mut self) {
+        for (task_id, reading) in self.cap_probe.take_results() {
+            match reading {
+                Some(reading) => {
+                    self.caps.insert(task_id, reading);
+                }
+                None => {
+                    self.caps.remove(&task_id);
+                }
+            }
+        }
+
+        // A task that has left the strip — finished, stalled, redispatched —
+        // keeps neither a badge nor a debounce.
+        let live: std::collections::HashSet<i64> =
+            self.cap_targets.iter().map(|(id, _, _)| *id).collect();
+        self.caps.retain(|id, _| live.contains(id));
+        self.cap_probe.retain(&live);
+
+        let now = std::time::Instant::now();
+        let due: Vec<(i64, String, String)> = self
+            .cap_targets
+            .iter()
+            .filter(|(id, _, _)| self.cap_probe.due(*id, now))
+            .cloned()
+            .collect();
+        for (task_id, session_ref, logs) in due {
+            self.cap_probe.start(task_id, session_ref, logs, now);
+        }
+
+        self.refresh_clock(now);
+    }
+
+    /// Hand back a reading as though a background probe had produced it, so
+    /// the drain half can be tested without waiting out a real interval.
+    #[cfg(test)]
+    pub fn inject_cap_result(&mut self, task_id: i64, reading: Option<voro_core::CapReading>) {
+        self.cap_probe.inject_result(task_id, reading);
+    }
+
+    /// How many in-flight sessions can be read for a cap this pass.
+    #[cfg(test)]
+    pub fn cap_target_ids(&self) -> Vec<i64> {
+        self.cap_targets.iter().map(|(id, _, _)| *id).collect()
+    }
+
+    /// Keep the wall clock the reset badge is judged against roughly current,
+    /// without paying for it on frames where nothing reads it.
+    fn refresh_clock(&mut self, now: std::time::Instant) {
+        const CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+        if self.caps.is_empty() {
+            return;
+        }
+        if self
+            .clock_read_at
+            .is_some_and(|at| now.saturating_duration_since(at) < CLOCK_INTERVAL)
+        {
+            return;
+        }
+        self.clock_read_at = Some(now);
+        self.now_minutes = crate::session_probe::local_minutes();
+    }
+
+    /// Record every revision a background capture has finished (DESIGN.md §8).
+    /// Each belongs to the task it was captured for, not to the selection, so
+    /// nothing is discarded here. Errors are swallowed as the synchronous path
+    /// swallows them: an unrecorded revision costs a full diff on the
+    /// re-review, never a failed reject. Quitting before a capture lands loses
+    /// it the same way, which is why no refresh follows either — nothing
+    /// rendered reads the reviewed revision, which `pr` and `open` read on
+    /// demand.
+    pub fn poll_reviewed_capture(&mut self) {
+        for (task_id, sha) in self.capture.take_results() {
+            let _ = self.store.record_reviewed(task_id, &sha);
+        }
+    }
+
     pub fn move_selection(&mut self, delta: i64) {
         let (sel, len) = match self.screen {
             Screen::Cockpit => (&mut self.cockpit_sel, self.cockpit_rows.len()),
@@ -1040,8 +1240,9 @@ impl App {
         if self.report(result).is_some() {
             if rejected {
                 // The head the operator just judged, so the re-review can be
-                // narrowed to the rework (DESIGN.md §8).
-                crate::pr::record_reviewed(&mut self.store, task_id);
+                // narrowed to the rework (DESIGN.md §8) — captured off the loop,
+                // so the redraw does not wait on `gh`.
+                self.capture_reviewed(task_id);
             }
             let result = self.refresh();
             self.report(result);
@@ -1091,12 +1292,12 @@ impl App {
                 sel,
                 back,
             } => self.key_doc_picker(key, task_id, docs, sel, back),
-            Mode::ReviewActionPicker {
+            Mode::ViewerPicker {
                 project_id,
                 options,
                 current,
                 sel,
-            } => self.key_review_action_picker(key, project_id, options, current, sel),
+            } => self.key_viewer_picker(key, project_id, options, current, sel),
             Mode::ViewerForm {
                 name,
                 cmd,
@@ -1370,8 +1571,8 @@ impl App {
 
     /// The checkout a task's work lives in (DESIGN.md §8): its resolved repo's
     /// path. Every TUI action that needs a working directory for a task —
-    /// paging its log, attaching to its session, resolving its review medium
-    /// — comes here rather than reading a project path.
+    /// paging its log, attaching to its session, asking whether it can take a
+    /// pull request — comes here rather than reading a project path.
     fn task_checkout(&self, task_id: i64) -> voro_core::Result<String> {
         let task = self.store.task(task_id)?;
         Ok(self.store.repo_for_task(&task)?.path)
@@ -1380,6 +1581,18 @@ impl App {
     /// The repo a task names, as (name, path), or `None` when it runs in its
     /// project's default — the detail pane renders the line only when it says
     /// something the project row does not.
+    /// The verb a task's row advertises (DESIGN.md §3), degraded to the local
+    /// review path where the checkout has no remote to open a pull request on
+    /// (§8). Every rendered `next:` resolves through here so the advertisement
+    /// and the key that serves it cannot drift apart.
+    pub fn next_action(&self, task: &voro_core::Task) -> Option<voro_core::NextAction> {
+        let verb = task.next_action()?;
+        Some(match self.local_review.contains(&task.id) {
+            true => verb.without_pull_requests(),
+            false => verb,
+        })
+    }
+
     pub fn task_repo(&self, task: &voro_core::Task) -> Option<(String, String)> {
         task.repo_id?;
         let repo = self.store.repo_for_task(task).ok()?;
@@ -1406,6 +1619,38 @@ impl App {
     pub fn selected_can_hand_off(&self) -> bool {
         self.selected_task()
             .is_some_and(|t| t.state == TaskState::Review)
+    }
+
+    /// Whether the selection has work to look at locally — what gates the `o`
+    /// hint (DESIGN.md §9), and the same pair of states the key itself allows.
+    pub fn selected_has_a_diff(&self) -> bool {
+        self.selected_task()
+            .is_some_and(|t| matches!(t.state, TaskState::Review | TaskState::Running))
+    }
+
+    /// Whether the selection is the task `g` has a PR to show or create — what
+    /// gates that hint (DESIGN.md §9). The key stays bound in every state, for
+    /// jumping to a tracked PR and linking one; only the advertisement is
+    /// narrowed to the moment the PR is the review.
+    pub fn selected_is_in_review(&self) -> bool {
+        self.selected_task()
+            .is_some_and(|t| t.state == TaskState::Review)
+    }
+
+    /// Whether the selection still has a dispatch ahead of it, so the model
+    /// `!` picks would be used — what gates that hint (DESIGN.md §9). Deep is a
+    /// property of the *next* launch, so on a task whose work is done — under
+    /// review, handed off, or closed — the line stops offering a toggle that
+    /// changes nothing the operator is about to see. The key itself stays bound
+    /// in every state, as `g` does; only the advertisement is narrowed, which is
+    /// what makes room for the review keys beside it.
+    pub fn selected_can_go_deep(&self) -> bool {
+        self.selected_task().is_some_and(|t| {
+            !matches!(
+                t.state,
+                TaskState::Review | TaskState::Waiting | TaskState::Done | TaskState::Rejected
+            )
+        })
     }
 
     /// Whether the selection is somewhere dispatch can act from (DESIGN.md §8)
@@ -1439,7 +1684,7 @@ impl App {
     /// none.
     fn new_task(&mut self, flow: CreateFlow) {
         match self.projects.len() {
-            0 => self.status = Some("no projects yet — add one on the projects screen (3)".into()),
+            0 => self.status = Some(NO_PROJECTS_HINT.into()),
             1 => self.start_create(self.projects[0].id, flow),
             _ => self.mode = Mode::PickProject { sel: 0, flow },
         }
@@ -1802,6 +2047,7 @@ impl App {
             return None;
         };
         Some(MessageTarget {
+            session_id: session.id,
             session_ref,
             template: template.to_string(),
             sessions_cmd: agent.and_then(|a| a.sessions()).map(str::to_string),
@@ -1809,11 +2055,15 @@ impl App {
     }
 
     /// Send the collected line into the task's session (DESIGN.md §8). A
-    /// review or waiting task's message *is* its rejection: the transition runs
-    /// first, so the feedback is in the body and the event log before anything
-    /// is said, and a refused transition sends nothing. A `needs-input` task
-    /// transitions not at all — the answer lives in the transcript and the
-    /// agent's own `voro resume` moves it back to `running` (DESIGN.md §6).
+    /// review or waiting task's message *is* its rejection, and the send goes
+    /// first: a message that never left would otherwise leave the feedback in
+    /// the body, the task back in `running`, and the agent none the wiser —
+    /// which is exactly the state a redispatch cannot tell from a stall. So the
+    /// spawn is confirmed, then the session row and the transition commit
+    /// together, and a refused send leaves the task precisely where it was. A
+    /// `needs-input` task transitions not at all — the answer lives in the
+    /// transcript and the agent's own `voro resume` moves it back to `running`
+    /// (DESIGN.md §6).
     fn send_session_message(&mut self, task_id: i64, message: &str) {
         if message.trim().is_empty() {
             self.status = Some("a message is required".into());
@@ -1853,19 +2103,6 @@ impl App {
             }
         };
         let rejected = matches!(state, TaskState::Review | TaskState::Waiting);
-        if rejected
-            && let Err(e) = self
-                .store
-                .apply(task_id, Action::RejectWork(message.to_string()))
-        {
-            self.status = Some(format!("{e} — nothing was sent"));
-            return;
-        }
-        if rejected {
-            // What the operator just judged, so the re-review can be narrowed to
-            // the rework (DESIGN.md §8).
-            crate::pr::record_reviewed(&mut self.store, task_id);
-        }
         // A rejection reaches the session framed as one: the feedback, plus the
         // instruction to answer it point by point at `done` (DESIGN.md §8). An
         // ordinary message is said as written.
@@ -1881,13 +2118,47 @@ impl App {
                 cwd,
             },
         );
-        self.status = Some(match (sent, rejected) {
-            (Ok(summary), true) => format!("{summary} — task returned to running"),
-            (Ok(summary), false) => summary,
-            (Err(e), true) => format!(
-                "{e} — the feedback is recorded and the task is running, but nothing was sent"
-            ),
-            (Err(e), false) => e,
+        let sent = match sent {
+            Ok(sent) => sent,
+            Err(e) => {
+                self.status = Some(format!("{e} — task {task_id} is unchanged"));
+                return;
+            }
+        };
+        // The send is under way, so the session row follows it — the process
+        // now carrying the turn, and the reference the agent forked into where
+        // its verb does that — and the rejection commits behind it. A store
+        // failure here takes the agent down with it rather than leaving it
+        // working on feedback no state records.
+        let pid = sent.pid();
+        if let Err(e) =
+            self.store
+                .record_session_send(target.session_id, sent.new_session_ref(), pid)
+        {
+            sent.abandon();
+            self.status = Some(format!(
+                "recording the send failed ({e}); the spawned agent (pid {pid}) was killed"
+            ));
+            return;
+        }
+        if rejected {
+            if let Err(e) = self
+                .store
+                .apply(task_id, Action::RejectWork(message.to_string()))
+            {
+                sent.abandon();
+                self.status = Some(format!("{e}; the spawned agent (pid {pid}) was killed"));
+                return;
+            }
+            // What the operator just judged, so the re-review can be narrowed to
+            // the rework (DESIGN.md §8) — off the loop, so nothing waits on `gh`.
+            self.capture_reviewed(task_id);
+        }
+        let summary = sent.confirm(&self.dispatch_ctx);
+        self.status = Some(if rejected {
+            format!("{summary} — task returned to running")
+        } else {
+            summary
         });
         let refreshed = self.refresh();
         self.report(refreshed);
@@ -1906,12 +2177,11 @@ impl App {
         self.store.events_for(task_id).unwrap_or_default()
     }
 
-    /// The rework cycle a task is in, if any (DESIGN.md §8): the newest
-    /// rejection feedback and the summary answering it. `None` for a task
-    /// nobody has sent back, which is what keeps a first review's detail pane
-    /// exactly as it was.
-    pub fn rework_report(&self, task_id: i64) -> Option<ReworkReport> {
-        voro_core::rework_report(&self.store.events_for(task_id).ok()?)
+    /// What the selected task last reported (DESIGN.md §8): the completion
+    /// summary of the cycle in hand, and the rejection feedback it answers if
+    /// it is a rework. `None` for a task that has reported nothing.
+    pub fn completion_report(&self, task_id: i64) -> Option<CompletionReport> {
+        voro_core::completion_report(&self.store.events_for(task_id).ok()?)
     }
 
     /// The selected task's id and agent override, if it is `ready` or `stalled`
@@ -1970,16 +2240,17 @@ impl App {
         }
     }
 
-    /// The review key — the per-project "show me this task's diff" action
-    /// (DESIGN.md §8). With a tracked PR, jump to it in a browser (§11c). With
-    /// none: a `review` task resolves the project's review medium — GitHub opens
-    /// the create-PR confirmation modal, a viewer project opens the checkout —
-    /// and any other state falls back to the link-an-existing-PR prompt.
+    /// The GitHub key (DESIGN.md §8) — statically the PR medium, whatever the
+    /// project's review action says. With a tracked PR, jump to it in a browser
+    /// (§11c). With none, a `review` task opens the create-PR confirmation
+    /// modal, and any other state falls back to the link-an-existing-PR prompt.
+    /// A checkout GitHub cannot take refuses before the modal, naming `o` — the
+    /// local diff is the only thing left to look at.
     fn open_selected_pr(&mut self) {
         let Some(task) = self.selected_task() else {
             return;
         };
-        let (id, state, project_id) = (task.id, task.state, task.project_id);
+        let (id, state) = (task.id, task.state);
         let has_pr = task.pr_url.is_some();
         if has_pr {
             match crate::pr::open(&self.store, id) {
@@ -1995,30 +2266,12 @@ impl App {
             };
             return;
         }
-        let project = match self.store.project(project_id) {
-            Ok(project) => project,
-            Err(e) => {
-                self.status = Some(e.to_string());
-                return;
-            }
-        };
-        let checkout = match self.task_checkout(id) {
-            Ok(path) => path,
-            Err(e) => {
-                self.status = Some(e.to_string());
-                return;
-            }
-        };
-        if let ReviewMedium::Viewer(viewer) = crate::pr::resolve_medium(&project, &checkout) {
-            let result =
-                crate::dispatch::open(&mut self.store, &self.dispatch_ctx, id, viewer.as_deref());
-            match result {
-                Ok(summary) => self.status = Some(summary),
-                Err(e) => self.status = Some(e),
-            }
-            return;
-        }
-        match crate::pr::plan(&self.store, id) {
+        // The network-free preconditions first, so a task missing a branch or
+        // summary names that gap without a `gh` round-trip; then the medium,
+        // which has to answer before the modal rather than after it.
+        let planned = crate::pr::plan(&self.store, id)
+            .and_then(|plan| self.pr_checkout_is_github(id).map(|()| plan));
+        match planned {
             Ok(plan) => {
                 self.mode = Mode::ConfirmPr {
                     task_id: id,
@@ -2030,13 +2283,20 @@ impl App {
         }
     }
 
+    /// Whether the task's checkout can take a pull request at all, named in the
+    /// TUI's idiom so the refusal points at `o` (DESIGN.md §8).
+    fn pr_checkout_is_github(&self, task_id: i64) -> Result<(), String> {
+        let checkout = self.task_checkout(task_id).map_err(|e| e.to_string())?;
+        crate::pr::ensure_github_repo(&checkout, "`o`")
+    }
+
     /// Drive the create-PR confirmation modal (DESIGN.md §8). Enter (or `y`)
     /// runs the same `crate::pr::create` the CLI's `pr` calls and shows the new
     /// PR, then refreshes; esc (or `n`) cancels without touching anything.
     fn key_confirm_pr(&mut self, key: KeyEvent, task_id: i64, branch: String, title: String) {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let created = crate::pr::create(&mut self.store, task_id);
+                let created = crate::pr::create(&mut self.store, task_id, "`o`");
                 self.report_created_pr(task_id, created, crate::pr::open_url);
                 let result = self.refresh();
                 self.report(result);
@@ -2300,7 +2560,7 @@ impl App {
     /// The projects screen's local keys (DESIGN.md §9). `0`–`5` sets the
     /// selected project's weight; `r` opens the AddProject form pre-filled to
     /// rename/re-path, `a` opens it blank, `d` deletes behind the store's own
-    /// guard (only projects with no tasks), `v` picks the review action, `A`
+    /// guard (only projects with no tasks), `v` picks the viewer, `A`
     /// toggles archived (DESIGN.md §5). Movement and screen switching are
     /// handled by `key_normal`.
     fn key_projects(&mut self, key: KeyEvent) {
@@ -2344,8 +2604,8 @@ impl App {
             }
             KeyCode::Char('v') => {
                 if let Some(project) = self.projects.get(self.projects_sel) {
-                    let (id, current) = (project.id, project.review_action.clone());
-                    self.open_review_action_picker(id, current);
+                    let (id, current) = (project.id, project.viewer.clone());
+                    self.open_viewer_picker(id, current);
                 }
             }
             KeyCode::Char('A') => {
@@ -2365,11 +2625,11 @@ impl App {
         }
     }
 
-    /// Open the review-action picker for a project (DESIGN.md §8/§11a): auto,
-    /// pr, the default viewer, and each named viewer from `voro.toml`. The
-    /// config is loaded fresh so a just-added `[viewers.*]` table shows up;
-    /// the cursor starts on the project's current action.
-    fn open_review_action_picker(&mut self, project_id: i64, current: ReviewAction) {
+    /// Open the viewer picker for a project (DESIGN.md §8/§11a): the default
+    /// viewer, then each named viewer from `voro.toml`. The config is loaded
+    /// fresh so a just-added `[viewers.*]` table shows up; the cursor starts on
+    /// the viewer the project names.
+    fn open_viewer_picker(&mut self, project_id: i64, current: Option<String>) {
         let config = match AgentsConfig::load(&self.dispatch_ctx.agents_path) {
             Ok(config) => config,
             Err(e) => {
@@ -2377,25 +2637,21 @@ impl App {
                 return;
             }
         };
-        let mut options = vec![
-            ReviewActionOption::Action(ReviewAction::Auto),
-            ReviewActionOption::Action(ReviewAction::Pr),
-            ReviewActionOption::Action(ReviewAction::Viewer(None)),
-        ];
+        let mut options = vec![ViewerOption::Viewer(None)];
         options.extend(
             config
                 .viewer_names()
                 .into_iter()
-                .map(|name| ReviewActionOption::Action(ReviewAction::Viewer(Some(name)))),
+                .map(|name| ViewerOption::Viewer(Some(name))),
         );
         // The quick path (DESIGN.md §5): a trailing entry that opens the
         // add-viewer form and pins this project to the viewer it creates.
-        options.push(ReviewActionOption::NewViewer);
+        options.push(ViewerOption::NewViewer);
         let sel = options
             .iter()
-            .position(|o| matches!(o, ReviewActionOption::Action(a) if *a == current))
+            .position(|o| matches!(o, ViewerOption::Viewer(v) if *v == current))
             .unwrap_or(0);
-        self.mode = Mode::ReviewActionPicker {
+        self.mode = Mode::ViewerPicker {
             project_id,
             options,
             current,
@@ -2403,15 +2659,15 @@ impl App {
         };
     }
 
-    /// Drive the review-action picker: ⏎ stores the highlighted action via
-    /// `set_review_action` and refreshes so the projects row reflects it;
+    /// Drive the viewer picker: ⏎ stores the highlighted viewer via
+    /// `set_viewer` and refreshes so the projects row reflects it;
     /// esc cancels without touching anything.
-    fn key_review_action_picker(
+    fn key_viewer_picker(
         &mut self,
         key: KeyEvent,
         project_id: i64,
-        options: Vec<ReviewActionOption>,
-        current: ReviewAction,
+        options: Vec<ViewerOption>,
+        current: Option<String>,
         mut sel: usize,
     ) {
         match key.code {
@@ -2422,19 +2678,20 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => sel = sel.saturating_sub(1),
             KeyCode::Enter => {
                 match options.get(sel) {
-                    Some(ReviewActionOption::Action(action)) => {
-                        let action = action.clone();
+                    Some(ViewerOption::Viewer(viewer)) => {
+                        let viewer = viewer.clone();
                         let result = self
                             .store
-                            .set_review_action(project_id, &action)
+                            .set_viewer(project_id, viewer.as_deref())
                             .and_then(|_| self.refresh());
                         if self.report(result).is_some() {
-                            self.status = Some(format!("review action -> {action}"));
+                            self.status =
+                                Some(format!("viewer -> {}", viewer_label(viewer.as_deref())));
                         }
                     }
                     // Open the shared add-viewer form; on success it pins this
                     // project to the new viewer (DESIGN.md §5).
-                    Some(ReviewActionOption::NewViewer) => {
+                    Some(ViewerOption::NewViewer) => {
                         self.open_viewer_form(None, Some(project_id));
                     }
                     None => {}
@@ -2443,7 +2700,7 @@ impl App {
             }
             _ => {}
         }
-        self.mode = Mode::ReviewActionPicker {
+        self.mode = Mode::ViewerPicker {
             project_id,
             options,
             current,
@@ -2470,7 +2727,7 @@ impl App {
 
     /// Open the add/edit-viewer form. `existing` pre-fills it for an edit (name
     /// locked); `review_project` threads through the quick path so a viewer
-    /// created from the review-action picker becomes that project's action.
+    /// created from the viewer picker becomes that project's viewer.
     fn open_viewer_form(
         &mut self,
         existing: Option<(String, String)>,
@@ -2500,8 +2757,8 @@ impl App {
         }
     }
 
-    /// Delete the selected viewer, refusing when a project's review action still
-    /// names it (DESIGN.md §5) — the same refusal as `voro viewer remove`, with
+    /// Delete the selected viewer, refusing when a project still names it
+    /// (DESIGN.md §5) — the same refusal as `voro viewer remove`, with
     /// the offending projects named. Deleting the default clears `default_viewer`.
     fn delete_selected_viewer(&mut self) {
         let Some(viewer) = self.config_viewers.get(self.config_sel) else {
@@ -2514,7 +2771,7 @@ impl App {
         if !referencing.is_empty() {
             let names: Vec<&str> = referencing.iter().map(|p| p.name.as_str()).collect();
             self.status = Some(format!(
-                "'{name}' is the review action of {} — repoint it first (v on the projects screen)",
+                "'{name}' is the viewer of {} — repoint it first (v on the projects screen)",
                 names.join(", ")
             ));
             return;
@@ -2667,9 +2924,8 @@ impl App {
             msg.push_str(" (no {path} — runs in the checkout dir)");
         }
         if let Some(project_id) = review_project {
-            let action = voro_core::ReviewAction::Viewer(Some(trimmed.clone()));
-            match self.store.set_review_action(project_id, &action) {
-                Ok(_) => msg.push_str(" — set as this project's review action"),
+            match self.store.set_viewer(project_id, Some(&trimmed)) {
+                Ok(_) => msg.push_str(" — set as this project's viewer"),
                 Err(e) => msg = e.to_string(),
             }
         }
@@ -3111,6 +3367,56 @@ mod tests {
         App::new(store, dummy_ctx()).unwrap()
     }
 
+    /// A store with nothing in it at all — the first run Voro has to land well.
+    fn empty_app() -> App {
+        App::new(Store::open_in_memory().unwrap(), dummy_ctx()).unwrap()
+    }
+
+    /// The first run: with no project registered the cockpit has nothing to
+    /// show and its `n` cannot proceed, so the app opens where the first step
+    /// is (DESIGN.md §9), saying why.
+    #[test]
+    fn a_clean_database_opens_on_the_projects_screen() {
+        let app = empty_app();
+        assert_eq!(app.screen, Screen::Projects);
+        let status = app.status.clone().expect("the landing explains itself");
+        assert!(status.contains("press a"), "{status}");
+        assert!(status.contains('n'), "{status}");
+    }
+
+    #[test]
+    fn a_database_with_a_project_opens_on_the_cockpit() {
+        let app = app_with(&[]);
+        assert_eq!(app.screen, Screen::Cockpit);
+        assert_eq!(app.status, None);
+    }
+
+    /// The landing is decided once, at startup. `refresh` runs after every
+    /// mutation and on every external-change poll, so deciding there would yank
+    /// the operator to Projects mid-session — for instance on the cockpit of a
+    /// database whose last project they just deleted.
+    #[test]
+    fn refresh_leaves_the_screen_where_the_operator_put_it() {
+        let mut app = empty_app();
+        app.screen = Screen::Cockpit;
+        app.refresh().unwrap();
+        assert_eq!(app.screen, Screen::Cockpit);
+    }
+
+    /// `n` with no projects refuses in the keys README.md teaches — `tab` and
+    /// `a`, not a screen number.
+    #[test]
+    fn new_task_without_projects_points_at_tab_and_a() {
+        let mut app = empty_app();
+        app.screen = Screen::Cockpit;
+        for press in ['n', 'N'] {
+            app.status = None;
+            key(&mut app, KeyCode::Char(press));
+            assert_eq!(app.status.as_deref(), Some(NO_PROJECTS_HINT));
+            assert!(app.pending_editor.is_none());
+        }
+    }
+
     /// Enter on a needs-input inbox row resumes the task directly — the
     /// operator answered in the agent's own session, so there is no answer
     /// prompt (DESIGN.md §6/§8), just the `needs-input → running` transition.
@@ -3175,6 +3481,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         (store, ctx, project_path)
     }
@@ -3226,6 +3533,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         let project = store
             .create_project("demo", project_path.to_str().unwrap())
@@ -3944,6 +4252,9 @@ mod tests {
         let path = ctx.agents_path.clone();
         let mut app = App::new(store, ctx).unwrap();
 
+        // No project is registered, so the app opened on Projects, where the
+        // digits are weights; the jump below is a cockpit key.
+        app.screen = Screen::Cockpit;
         key(&mut app, KeyCode::Char('4'));
         assert_eq!(app.screen, Screen::Config);
         assert!(app.config_viewers.is_empty());
@@ -3999,19 +4310,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// Deleting a viewer a project's review action still names is refused on the
+    /// Deleting a viewer a project still names is refused on the
     /// Config screen too, naming the project (DESIGN.md §5).
     #[test]
     fn config_screen_refuses_to_delete_a_referenced_viewer() {
         let toml = "[viewers.zed]\ncmd = \"zed {path}\"\n";
         let (mut store, ctx, _project) = scratch_env("config-ref", Some(toml));
         let project = store.create_project("demo2", "/tmp/demo2").unwrap();
-        store
-            .set_review_action(
-                project.id,
-                &voro_core::ReviewAction::Viewer(Some("zed".into())),
-            )
-            .unwrap();
+        store.set_viewer(project.id, Some("zed")).unwrap();
         let path = ctx.agents_path.clone();
         let mut app = App::new(store, ctx).unwrap();
 
@@ -4035,11 +4341,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// The quick path (DESIGN.md §5): the projects screen's review-action picker
+    /// The quick path (DESIGN.md §5): the projects screen's viewer picker
     /// grows a "new viewer…" entry that opens the add-viewer form and, on
     /// success, pins the project to the viewer it created.
     #[test]
-    fn review_action_picker_new_viewer_creates_and_pins_it() {
+    fn viewer_picker_new_viewer_creates_and_pins_it() {
         let (mut store, ctx, project_path) = scratch_env("config-quickpath", None);
         let project = store
             .create_project("demo", project_path.to_str().unwrap())
@@ -4047,13 +4353,13 @@ mod tests {
         let path = ctx.agents_path.clone();
         let mut app = App::new(store, ctx).unwrap();
 
-        // onto the projects screen, open the review-action picker
+        // onto the projects screen, open the viewer picker
         key(&mut app, KeyCode::Char('3'));
         assert_eq!(app.screen, Screen::Projects);
         key(&mut app, KeyCode::Char('v'));
         let n = match &app.mode {
-            Mode::ReviewActionPicker { options, .. } => options.len(),
-            _ => panic!("expected the review-action picker to open"),
+            Mode::ViewerPicker { options, .. } => options.len(),
+            _ => panic!("expected the viewer picker to open"),
         };
         // the last option is "new viewer…"; move to it and select
         for _ in 0..n {
@@ -4083,8 +4389,8 @@ mod tests {
                 .contains(&"emacs".to_string())
         );
         assert_eq!(
-            app.store.project(project.id).unwrap().review_action,
-            voro_core::ReviewAction::Viewer(Some("emacs".into()))
+            app.store.project(project.id).unwrap().viewer.as_deref(),
+            Some("emacs")
         );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -4464,6 +4770,12 @@ mod tests {
     /// session verbs the stub agent defines, so a test can take one away. The
     /// stub lingers after printing its prompt, so a verb-less agent — whose
     /// liveness is the pid — keeps its task `running` through reconcile.
+    ///
+    /// The `message` verb lingers too: a send that exits non-zero inside its
+    /// grace window is a send that did not happen (task #390), so the stub has
+    /// to be a command that survives. It says what it is in a trailing comment,
+    /// which the launch log records verbatim — that is what the assertions
+    /// below read the rendered `{session}` out of.
     fn jump_in_env(verbs: &[&str], listing_json: &str) -> JumpIn {
         let (mut store, ctx, project_path) = scratch_env("jumpin", None);
         let listing = project_path.parent().unwrap().join("listing.json");
@@ -4472,7 +4784,10 @@ mod tests {
             ("sessions", format!("cat '{}'", listing.display())),
             ("attach", "agent attach {session}".into()),
             ("resume", "agent resume {session}".into()),
-            ("message", "agent message {session} {prompt_file}".into()),
+            (
+                "message",
+                "sleep 30 # agent message {session} {prompt_file}".into(),
+            ),
         ]
         .into_iter()
         .filter(|(verb, _)| verbs.contains(verb))
@@ -4517,6 +4832,142 @@ mod tests {
     /// Every session verb, the ordinary configuration.
     fn all_verbs() -> &'static [&'static str] {
         &["sessions", "attach", "resume", "message"]
+    }
+
+    // --- capped-but-alive sessions (task #415) ---
+
+    /// A project with one live dispatch whose agent's `logs` verb prints
+    /// `logs_output`, which is the whole of what the cap probe reads.
+    /// `define_logs` takes the verb away, for the degradation case.
+    fn cap_env(define_logs: bool, logs_output: &str) -> (App, i64, std::path::PathBuf) {
+        let (mut store, ctx, project_path) = scratch_env("caps", None);
+        let listing = project_path.parent().unwrap().join("listing.json");
+        // The session stays listed live, so reconcile-on-read leaves the task
+        // `running` and the strip keeps its row while the probe runs.
+        write_listing(
+            &listing,
+            &format!(
+                r#"[{{"sessionId": "ref-1", "state": "working", "pid": {}}}]"#,
+                std::process::id()
+            ),
+        );
+        let logs = if define_logs {
+            format!("logs = \"printf '%s' '{logs_output}' # {{session}}\"\n")
+        } else {
+            String::new()
+        };
+        std::fs::write(
+            &ctx.agents_path,
+            format!(
+                "default_agent = \"stub\"\n\n[agents.stub]\n\
+                 dispatch = \"cat {{prompt_file}} && sleep 30\"\n\
+                 sessions = \"cat '{}'\"\n{logs}",
+                listing.display()
+            ),
+        )
+        .unwrap();
+        let project = store
+            .create_project("demo", project_path.to_str().unwrap())
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: project.id,
+                repo_id: None,
+                title: "held work".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
+        let session_id = store.sessions_for(task.id).unwrap()[0].id;
+        store.set_session_ref(session_id, "ref-1").unwrap();
+        let mut app = App::new(store, ctx).unwrap();
+        app.refresh().unwrap();
+        (app, task.id, project_path)
+    }
+
+    /// Drive the probe until its reading lands, which is a background thread
+    /// running a subprocess and so not instant.
+    fn settle_cap(app: &mut App, task_id: i64, want: bool) {
+        for _ in 0..200 {
+            app.poll_cap_probes();
+            if app.caps.contains_key(&task_id) == want {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the cap reading never settled to {want}");
+    }
+
+    /// The headline case (DESIGN.md §8): a dispatch alive and sitting on a cap
+    /// is read as capped, with the reset time the agent named — and the task is
+    /// left exactly where it was, because the session is intact and will resume
+    /// on its own.
+    #[test]
+    fn a_live_capped_dispatch_is_read_with_its_reset_time() {
+        let (mut app, task_id, project_path) =
+            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+        assert_eq!(app.cap_target_ids(), vec![task_id]);
+
+        settle_cap(&mut app, task_id, true);
+        assert_eq!(
+            app.caps[&task_id].reset_label().as_deref(),
+            Some("21:50"),
+            "the reset time is read off the agent's own output"
+        );
+        assert_eq!(
+            app.store.task(task_id).unwrap().state,
+            TaskState::Running,
+            "a cap is a display fact, not a transition"
+        );
+        assert!(
+            app.store.sessions_for(task_id).unwrap()[0]
+                .ended_at
+                .is_none(),
+            "the session stays open"
+        );
+
+        // Continuing the session displaces the cap message; the next reading
+        // comes back empty and the badge goes with it.
+        app.inject_cap_result(task_id, None);
+        settle_cap(&mut app, task_id, false);
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// A working session is read and badged for nothing, so the probe running
+    /// at all costs an uncapped fleet no marks.
+    #[test]
+    fn a_live_healthy_dispatch_is_read_as_uncapped() {
+        let (mut app, task_id, project_path) = cap_env(true, "running the test suite");
+        for _ in 0..20 {
+            app.poll_cap_probes();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.caps.is_empty(), "{:?}", app.caps);
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// An agent defining no `logs` verb is probed for nothing at all — no
+    /// target, no subprocess, no badge, and no error either. This is the whole
+    /// of what `codex` sees of this feature.
+    #[test]
+    fn an_agent_without_the_verb_is_never_probed() {
+        let (mut app, _, project_path) = cap_env(false, "Session limit reached");
+        assert!(app.cap_target_ids().is_empty());
+        for _ in 0..5 {
+            app.poll_cap_probes();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.caps.is_empty(), "{:?}", app.caps);
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }
 
     /// `A` on a running task whose session is still listed queues the agent's
@@ -4881,7 +5332,8 @@ mod tests {
 
     /// A `needs-input` task transitions not at all — per DESIGN.md §6 the
     /// answer lives in the transcript, and the agent's own `voro resume` moves
-    /// the task back to `running`.
+    /// the task back to `running`. Its session row still follows the send, so
+    /// the answer's process is what the reconciler reads.
     #[test]
     fn message_on_a_needs_input_task_sends_without_transitioning() {
         let mut env = jump_in_env(&["attach", "resume", "message"], FINISHED_LISTING);
@@ -4898,6 +5350,107 @@ mod tests {
         assert_eq!(task.state, TaskState::NeedsInput);
         assert!(!task.body.contains("voro-core"), "{}", task.body);
         assert!(launches(&root).contains("agent message 'ref-1'"));
+        let session = app.store.sessions_for(task_id).unwrap().remove(0);
+        assert!(crate::session_probe::pid_is_alive(session.pid.unwrap()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Rewrite the stub agent's `message` verb — loaded fresh on every send, so
+    /// a test can change what a send *does* after the environment is built.
+    fn set_message_verb(env: &JumpIn, template: &str) {
+        let config = std::fs::read_to_string(&env.ctx.agents_path).unwrap();
+        let rewritten = config
+            .lines()
+            .map(|line| match line.starts_with("message = ") {
+                true => format!("message = \"{template}\"\n"),
+                false => format!("{line}\n"),
+            })
+            .collect::<String>();
+        std::fs::write(&env.ctx.agents_path, rewritten).unwrap();
+    }
+
+    /// The defect this ordering exists for (task #390): the send is what the
+    /// rejection hangs off, so a message the agent refuses — a supervisor-held
+    /// session, a stale reference — leaves the task in `review` with its body
+    /// untouched and the refusal on the status line. Recording feedback the
+    /// agent never received, and returning the task to `running` on the
+    /// strength of it, is the one outcome worse than not sending.
+    #[test]
+    fn a_refused_send_leaves_the_review_task_exactly_where_it_was() {
+        let mut env = jump_in_env(all_verbs(), FINISHED_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        set_message_verb(
+            &env,
+            "printf 'Session is currently running as a background agent' >&2; \
+             exit 1 # {session} {prompt_file}",
+        );
+        let (project_path, task_id) = (env.project_path.clone(), env.task_id);
+        let root = project_path.parent().unwrap().to_path_buf();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        send_message(&mut app, "the tests are missing");
+
+        let task = app.store.task(task_id).unwrap();
+        assert_eq!(task.state, TaskState::Review);
+        assert!(!task.body.contains("Feedback"), "{}", task.body);
+        assert!(
+            !task.body.contains("the tests are missing"),
+            "{}",
+            task.body
+        );
+        assert!(
+            !app.store
+                .events_for(task_id)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "feedback"),
+            "no rejection is logged for a message that never landed"
+        );
+        // the agent's own account of the refusal, out of the log and onto the
+        // status line
+        let status = app.status.as_deref().unwrap_or("").to_string();
+        assert!(status.contains("background agent"), "{status}");
+        assert!(status.contains("unchanged"), "{status}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A verb that forks rather than resuming in place: the session row follows
+    /// the fork, so the next message and the next jump-in address the
+    /// conversation where it actually continued — and the rejection lands as
+    /// usual behind the confirmed send.
+    #[test]
+    fn a_forking_send_moves_the_session_to_the_reference_it_opened() {
+        let mut env = jump_in_env(all_verbs(), FINISHED_LISTING);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        set_message_verb(
+            &env,
+            "sleep 30 # agent message {session} --session-id {new_session} {prompt_file}",
+        );
+        let (project_path, task_id) = (env.project_path.clone(), env.task_id);
+        let root = project_path.parent().unwrap().to_path_buf();
+
+        let mut app = App::new(env.store, env.ctx).unwrap();
+        app.toggle_screen();
+        send_message(&mut app, "the tests are missing");
+
+        let task = app.store.task(task_id).unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert!(task.body.contains("the tests are missing"), "{}", task.body);
+        let session = app.store.sessions_for(task_id).unwrap().remove(0);
+        let new_ref = session.session_ref.expect("a reference");
+        assert_ne!(new_ref, "ref-1", "the row followed the fork");
+        assert!(crate::session_probe::pid_is_alive(session.pid.unwrap()));
+        assert!(
+            launches(&root).contains(&format!("--session-id '{new_ref}'")),
+            "the recorded reference is the one the command was given"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4933,10 +5486,11 @@ mod tests {
     }
 
     /// The refusal's other half (task #376): a pid-less `blocked` zombie is
-    /// not a session still running, so the message goes headlessly — the
-    /// rejection lands first, then the send. The reconcile that follows finds
-    /// the same zombie and stalls the task, exactly as a `done` entry does
-    /// below, with the feedback already in the body for the redispatch.
+    /// not a session still running, so the message goes headlessly — and the
+    /// send that lands is what the task then rides on. The reconcile that
+    /// follows finds the same zombie in the listing but the send's own process
+    /// on the row, so the task stays `running` rather than being stalled out
+    /// from under the agent now answering (task #390).
     #[test]
     fn message_sends_into_a_zombie_session() {
         let mut env = jump_in_env(all_verbs(), ZOMBIE_LISTING);
@@ -4952,7 +5506,7 @@ mod tests {
 
         let task = app.store.task(task_id).unwrap();
         assert!(task.body.contains("the tests are missing"), "{}", task.body);
-        assert_eq!(task.state, TaskState::Stalled);
+        assert_eq!(task.state, TaskState::Running);
         assert!(launches(&root).contains("agent message 'ref-1'"));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -4987,14 +5541,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The reject edge's documented tail (DESIGN.md §8), inherited unchanged:
-    /// when the agent's listing still reports the session finished, the
-    /// reconcile that follows the transition stalls the task. The feedback is
-    /// in the body either way, so the redispatch that stalling offers carries
-    /// it — and the headless send that did land reports back on the stalled
-    /// session's behalf if it gets there first.
+    /// The reject edge's tail, corrected (task #390): a session the listing
+    /// reports finished used to be stalled by the very next reconcile, seconds
+    /// after the rejection was sent into it — the operator's feedback recorded,
+    /// the task queued for redispatch, and the agent that received it ignored.
+    /// The send's own process is now on the row, so the task rides `running`
+    /// for as long as the turn takes.
     #[test]
-    fn message_to_a_finished_session_leaves_the_reject_edge_to_reconcile() {
+    fn message_to_a_finished_session_keeps_the_task_running() {
         let mut env = jump_in_env(all_verbs(), FINISHED_LISTING);
         env.store
             .apply(env.task_id, Action::Complete(None))
@@ -5007,9 +5561,15 @@ mod tests {
         send_message(&mut app, "the tests are missing");
 
         let task = app.store.task(task_id).unwrap();
-        assert_eq!(task.state, TaskState::Stalled);
+        assert_eq!(task.state, TaskState::Running);
         assert!(task.body.contains("the tests are missing"), "{}", task.body);
         assert!(launches(&root).contains("agent message 'ref-1'"));
+        let session = app.store.sessions_for(task_id).unwrap().remove(0);
+        assert!(session.ended_at.is_none());
+        assert!(
+            crate::session_probe::pid_is_alive(session.pid.unwrap()),
+            "the row carries the send's own process, not the dispatch launcher"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5306,6 +5866,56 @@ mod tests {
         }
     }
 
+    /// `g` is statically the GitHub medium (DESIGN.md §8): on a review task
+    /// whose checkout cannot take a pull request it refuses on the status line
+    /// naming `o`, opens no confirmation, and does not fall back to the
+    /// project's viewer — which is what the viewer action here would have done
+    /// before the split.
+    #[test]
+    fn review_key_on_a_non_github_checkout_refuses_naming_the_viewer_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "voro-review-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut store = Store::open_in_memory().unwrap();
+        let project = store.create_project("demo", dir.to_str().unwrap()).unwrap();
+        store.set_viewer(project.id, Some("zed")).unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: project.id,
+                repo_id: None,
+                title: "reviewable".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        store.set_branch(task.id, Some("feat/thing")).unwrap();
+        store.apply(task.id, Action::Start).unwrap();
+        // PR-ready in every way but the checkout, so the refusal can only be
+        // about the medium — the plan's own gaps are checked first.
+        store
+            .apply(task.id, Action::Complete(Some("did it".into())))
+            .unwrap();
+
+        let mut app = App::new(store, dummy_ctx()).unwrap();
+        key(&mut app, KeyCode::Char('g'));
+
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(matches!(app.mode, Mode::Normal), "{status:?}");
+        assert!(status.contains("`o`"), "{status:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Typing a reference and submitting tracks it (canonicalised) on the task
     /// and closes the prompt, so the link shows without touching the CLI.
     #[test]
@@ -5462,6 +6072,7 @@ mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         app
     }
@@ -5580,6 +6191,21 @@ mod tests {
         app.poll_conflict_probe();
         assert_eq!(app.conflict_selected, None);
         assert_eq!(app.probe.in_flight(), None);
+    }
+
+    /// A captured revision reaches the store whatever is selected by the time
+    /// it lands (DESIGN.md §8) — the rejection that started it has already
+    /// moved its task on to `running`.
+    #[test]
+    fn a_captured_revision_is_recorded_against_its_task() {
+        let mut app = app_with(&[TaskState::Review, TaskState::Ready]);
+        let id = app.selected_task_id().unwrap();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        app.capture.inject_result(id, Some(sha));
+        app.move_selection(1);
+
+        app.poll_reviewed_capture();
+        assert_eq!(app.store.last_reviewed(id).unwrap(), Some(sha.to_string()));
     }
 
     /// Moving off the row drops its verdict, so nothing stale is rendered and

@@ -36,15 +36,61 @@ fn split_db(args: Vec<String>) -> (PathBuf, Vec<String>) {
             rest.push(arg);
         }
     }
-    let db = db
-        .or_else(|| std::env::var_os("VORO_DB").map(PathBuf::from))
-        .unwrap_or_else(Store::default_db_path);
+    let db = db.unwrap_or_else(resolved_db);
     (db, rest)
+}
+
+/// The database a run with no `--db` uses. `VORO_DB` supplies a default:
+/// dispatch exports it so a session's return path finds the store its
+/// dispatcher was on (DESIGN.md §8), so it is a value a process inherits
+/// rather than one it names. A build out of a `target/` directory takes no
+/// database from the environment — `--db` if given, the dev store otherwise
+/// (§5).
+fn resolved_db() -> PathBuf {
+    let inherited = std::env::var_os("VORO_DB").map(PathBuf::from);
+    match inherited {
+        Some(path) if !Store::is_dev_build() => path,
+        Some(path) => {
+            eprintln!(
+                "voro: this build runs from a target/ directory, so it is ignoring the inherited \
+                 VORO_DB ({}) and using {} instead. Pass --db explicitly to override.",
+                path.display(),
+                Store::dev_db_path().display()
+            );
+            Store::dev_db_path()
+        }
+        None => Store::default_db_path(),
+    }
+}
+
+/// Report a startup failure the way the CLI verbs report theirs: the error's
+/// own message, on stderr. Returning it from `main` would print the derived
+/// `Debug` form instead, which buries the sentence the operator has to read.
+fn or_exit<T>(result: voro_core::Result<T>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("voro: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (path, verb_args) = split_db(std::env::args().skip(1).collect());
-    let mut store = Store::open(&path)?;
+    let mut store = or_exit(Store::open(&path));
+    // The dev store carries its fixture from first use (DESIGN.md §5); empty,
+    // it renders as a blank board indistinguishable from a broken query.
+    if path == Store::dev_db_path() && or_exit(voro_core::seed::is_empty(&store)) {
+        let summary = or_exit(voro_core::seed::seed(&mut store));
+        eprintln!(
+            "voro: seeded the dev store at {} with {} projects and {} tasks — \
+             `voro seed --force` rebuilds it.",
+            path.display(),
+            summary.projects,
+            summary.tasks
+        );
+    }
     let ctx = dispatch::DispatchCtx::from_db_path(&path);
 
     if !verb_args.is_empty() {
@@ -90,6 +136,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // probe once the selection has rested. Both halves are non-blocking, so
         // the `gh` call never stalls the loop and scrolling spawns nothing.
         app.poll_conflict_probe();
+        // Record the revisions rejections were made against, once the `gh` call
+        // a rejection started has answered (DESIGN.md §8). A tick or two behind
+        // the keypress, which is soon enough: nothing reads the revision until
+        // the rework comes back.
+        app.poll_reviewed_capture();
+        // Advance the usage-cap readings behind the running strip's badge
+        // (DESIGN.md §8). A capped `--bg` session never dies, so nothing else
+        // would ever notice it; the `logs` verb that reads it is slow, so it
+        // runs on a background thread and lands a tick or two later.
+        app.poll_cap_probes();
         if let Some(request) = app.pending_editor.take() {
             // $EDITOR owns the terminal for the duration; tear the TUI down
             // around it rather than fighting over raw mode.

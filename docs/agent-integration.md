@@ -77,7 +77,8 @@ dispatch   = "claude --bg --name \"{session_name}\" --permission-mode auto --mod
 sessions   = "claude agents --json"
 attach     = "claude attach {session}"
 resume     = "claude --resume {session}"
-message    = "claude -p --resume {session} \"$(cat {prompt_file})\""
+message    = "claude -p --resume {session} --fork-session --session-id {new_session} \"$(cat {prompt_file})\""
+logs       = "claude logs \"$(printf %.8s {session})\" 2>/dev/null | tail -c 20000"
 plan       = "claude --name \"{session_name}\" --permission-mode auto --model {model} \"$(cat {prompt_file})\""
 model      = "opus"
 model_deep = "fable"
@@ -118,13 +119,44 @@ resume   = "codex resume {session}"
 - `message` says one thing into a session *headlessly*: it takes both
   `{session}` and `{prompt_file}`, appends the file's contents to that session's
   transcript as the next turn, and returns without owning the terminal. It is
-  the only session verb Voro backgrounds, and it is fire-and-forget — Voro reads
-  no reply, so an agent-side refusal lands in the launch's log rather than in
-  the UI. The built-in above is `resume` plus `-p`, and that near-duplication is
-  deliberate: a verb is an opaque per-agent contract, which is what lets an
-  agent define a subset of the verbs and degrade one at a time. `codex` names no
-  `message`, so the quick-message key reports that on the status line and the
-  jump-in still works.
+  the only session verb Voro backgrounds. Voro watches the spawned command for
+  about two seconds and treats an exit with a non-zero status in that window as
+  a message that was never delivered: nothing is transitioned, the task stays
+  where it was, and the command's last log line is quoted on the status line. A
+  send still running past the window — or one that finished cleanly inside it —
+  has landed, and from there it is fire-and-forget: Voro reads no reply, so
+  anything the agent says afterwards is in the launch's log rather than the UI.
+  A rejection's `review → running` transition (DESIGN.md §6) hangs off that
+  confirmation, so feedback is never recorded against a message the agent
+  refused. `codex` names no `message`, so the quick-message key reports that on
+  the status line and the jump-in still works.
+- `message` may also carry `{new_session}`, replaced with a fresh v4 UUID Voro
+  generates for the send. Use it when your agent's sessions cannot be resumed
+  headlessly but can be *forked*: the built-in `claude` message verb is
+  `--resume` plus `--fork-session --session-id {new_session}`, because a
+  `claude --bg` session keeps a supervisor process after finishing its turn and
+  that supervisor refuses a plain `--resume` while it lives. The fork continues
+  the same conversation under the reference Voro named, and Voro records that
+  reference on the session row once the send is confirmed — so later messages,
+  the jump-in keys, and reconciliation all follow the conversation to where it
+  continued. A `message` template without the placeholder resumes in place and
+  keeps the reference it had. `{new_session}` is refused on every other verb:
+  it names the session a send opens, and nothing else opens one.
+- `logs` prints a session's recent output, taking `{session}` alone. Voro reads
+  it for exactly one thing: whether that session is sitting on a **usage cap**
+  (DESIGN.md §8). A cap does not kill a backgrounded session — the supervisor
+  stays alive and waits for the window to reset — so without this a capped
+  dispatch rides the running strip looking healthy for hours; with it, the row
+  is badged `⚠ capped ↻21:50`. The same reading tells a capped death from an
+  ordinary one, which the launch log cannot do for a `--bg` launch whose
+  launcher exits at birth having logged only its backgrounding banner.
+  Everything about it is best-effort: the output may be a terminal capture
+  (escape sequences are stripped before matching), the exit status is not
+  consulted, and an agent that defines no `logs` is probed for nothing and
+  badged for nothing — `codex` names none. Tail the output in the template, as
+  the built-in does; Voro reads whatever it prints. Note the built-in's
+  truncation: `claude logs` keys on the *job* id, the first eight characters of
+  the session id, so `{session}` is trimmed rather than passed whole.
 - `plan` runs an interactive *foreground* session for the TUI's agent-assisted
   task creation (DESIGN.md §8): `{prompt_file}` holds the planning brief, and
   the command owns the terminal until the conversation ends, so it must not
@@ -192,7 +224,11 @@ leaves dead sessions at `blocked` forever) would otherwise read as a fleet of
 running agents. A session that drops out, finishes, or zombies there without
 calling `voro done`/`ask` stalls its task, exactly as pid-death does for plain
 agents (DESIGN.md §8). When liveness is unknowable (no ref, listing failed) the
-session is left alone.
+session is left alone. The row's own pid is still read in one direction, for
+every agent: a pid that is *alive* proves the session is, whatever the listing
+says. That is what a quick message leaves behind — the process carrying its turn
+— and a forked send never appears in the listing at all, so without this rule
+the next reconcile would stall a task whose agent is mid-answer.
 
 **Jump-in.** In the TUI, `A` on a running task runs the agent's `attach` command
 with the TUI suspended — the real session, full control, including answering
@@ -211,11 +247,15 @@ standing. It applies to the three states whose session is open and between turns
 session that redispatch, not a headless resume, is the honest answer for. Voro
 probes liveness first and refuses a session still running, since that one wants
 the terminal. On a `review` or `waiting` task the message *is* a
-reject-with-feedback: the transition runs first, so the feedback is appended to
-the body and logged before anything is said, and a refused transition sends
-nothing. On a `needs-input` task nothing transitions — the answer lives in the
-transcript, and the agent's own `voro resume` moves the task back (DESIGN.md
-§6).
+reject-with-feedback: the send goes first and the transition follows it, so
+feedback is appended to the body and logged only once the message is known to
+have started, and a send the agent refuses leaves the task untouched. On a
+`needs-input` task nothing transitions — the answer lives in the transcript, and
+the agent's own `voro resume` moves the task back (DESIGN.md §6). Either way the
+session row follows the send: it records the process now carrying the turn, so
+reconciliation leaves the task `running` while the agent answers, and — for a
+verb that forks (`{new_session}`) — the reference the conversation continued
+under.
 
 The same jump-in resolves a **stale review branch**. A task can sit in `review`
 while other work merges, leaving its branch in conflict with the moved base

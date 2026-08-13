@@ -360,107 +360,17 @@ impl fmt::Display for RefineOutcome {
     }
 }
 
-/// A project's review medium (DESIGN.md §8/§11a): which of the two media the
-/// unified `pr` action uses to get a review task's diff in front of the
-/// operator. Stored on the project (`projects.review_action`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum ReviewAction {
-    /// Resolve at use: GitHub when the checkout is a GitHub repo, otherwise
-    /// the configured viewer. Stored as NULL — the unconfigured default.
-    #[default]
-    Auto,
-    /// Always the GitHub PR flow (jump to the tracked PR, or push and create).
-    Pr,
-    /// Always a local viewer from `voro.toml`: the named `[viewers.<name>]`
-    /// when one is given, otherwise the default viewer.
-    Viewer(Option<String>),
-}
-
-impl ReviewAction {
-    /// Parse the stored/CLI form: `auto`, `pr`, `viewer`, or `viewer:<name>`.
-    pub fn parse(s: &str) -> Result<ReviewAction> {
-        match s {
-            "auto" => Ok(ReviewAction::Auto),
-            "pr" => Ok(ReviewAction::Pr),
-            "viewer" => Ok(ReviewAction::Viewer(None)),
-            other => match other.strip_prefix("viewer:") {
-                Some(name) if !name.trim().is_empty() => {
-                    Ok(ReviewAction::Viewer(Some(name.trim().to_string())))
-                }
-                _ => Err(Error::Invalid(format!(
-                    "unknown review action '{s}' — expected auto, pr, viewer, or viewer:<name>"
-                ))),
-            },
-        }
-    }
-
-    /// Resolve the medium once the checkout's GitHub-ness is known. Only `Auto`
-    /// consults the probe's answer.
-    pub fn resolve(&self, on_github: bool) -> ReviewMedium {
-        match self {
-            ReviewAction::Auto if on_github => ReviewMedium::GithubPr,
-            ReviewAction::Auto => ReviewMedium::Viewer(None),
-            ReviewAction::Pr => ReviewMedium::GithubPr,
-            ReviewAction::Viewer(name) => ReviewMedium::Viewer(name.clone()),
-        }
-    }
-
-    /// Whether resolving this action needs the GitHub probe at all, so
-    /// callers can skip the `gh` shell-out when the medium is pinned.
-    pub fn needs_probe(&self) -> bool {
-        matches!(self, ReviewAction::Auto)
-    }
-}
-
-impl fmt::Display for ReviewAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ReviewAction::Auto => f.pad("auto"),
-            ReviewAction::Pr => f.pad("pr"),
-            ReviewAction::Viewer(None) => f.pad("viewer"),
-            ReviewAction::Viewer(Some(name)) => f.pad(&format!("viewer:{name}")),
-        }
-    }
-}
-
-impl FromSql for ReviewAction {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        match value {
-            ValueRef::Null => Ok(ReviewAction::Auto),
-            _ => ReviewAction::parse(value.as_str()?).map_err(|e| FromSqlError::Other(Box::new(e))),
-        }
-    }
-}
-
-impl ToSql for ReviewAction {
-    /// `Auto` writes NULL — absence of configuration — so the column stays
-    /// empty until the operator pins a medium.
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        match self {
-            ReviewAction::Auto => Ok(rusqlite::types::Null.into()),
-            other => Ok(other.to_string().into()),
-        }
-    }
-}
-
-/// The concrete medium a [`ReviewAction`] resolves to: the single "show me
-/// this task's diff" action, per project (DESIGN.md §8).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReviewMedium {
-    /// Jump to / create the GitHub PR.
-    GithubPr,
-    /// Run a `voro.toml` viewer on the checkout; `Some` names a
-    /// `[viewers.<name>]` entry, `None` is the default viewer.
-    Viewer(Option<String>),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub id: i64,
     pub name: String,
     pub weight: i64,
-    /// How `pr` shows this project's review diffs (DESIGN.md §8/§11a).
-    pub review_action: ReviewAction,
+    /// The `voro.toml` viewer this project's local diffs open in (DESIGN.md
+    /// §8/§11a): a `[viewers.<name>]` name, or `None` for the default viewer.
+    /// The review keys are static — `g`/`pr` are always the GitHub PR flow,
+    /// `o`/`open` always a local viewer — so this picks no medium, only the
+    /// viewer `o`/`open` resolve for this project.
+    pub viewer: Option<String>,
     /// Retired (DESIGN.md §5): the project and all its tasks leave the cockpit
     /// — queue, stats, running strip — until unarchived. Tasks freeze in
     /// whatever state they hold; only the projects screen still shows the
@@ -578,6 +488,10 @@ pub enum NextAction {
     Pr,
     /// A review task whose PR is open: review it there.
     ReviewPr,
+    /// A review task in a checkout no pull request can be opened from: read the
+    /// diff in a local viewer. Never derived from state alone — a caller that
+    /// knows the checkout degrades [`NextAction::Pr`] to it.
+    Open,
     /// A ready human-only task: only the human can execute it.
     Do,
     /// A stalled task: its dispatch died, restart it with the prior
@@ -594,9 +508,23 @@ impl NextAction {
             NextAction::Answer => "answer",
             NextAction::Pr => "pr",
             NextAction::ReviewPr => "review PR",
+            NextAction::Open => "open",
             NextAction::Do => "do",
             NextAction::Redispatch => "redispatch",
             NextAction::Dispatch => "dispatch",
+        }
+    }
+
+    /// The same verb in a checkout that cannot take a pull request (DESIGN.md
+    /// §8): `pr` there is a recommendation that can only fail, so it degrades
+    /// to the local review path the operator does have. Every other verb is
+    /// forge-independent and passes through. Pure — whether a given checkout
+    /// can take a pull request is decided in the `voro` crate, which owns the
+    /// git and `gh` seams, and handed here.
+    pub fn without_pull_requests(self) -> NextAction {
+        match self {
+            NextAction::Pr => NextAction::Open,
+            other => other,
         }
     }
 }
@@ -796,44 +724,46 @@ mod tests {
         );
     }
 
+    /// The one verb that depends on the checkout rather than the task: where no
+    /// pull request can be opened, `pr` reads as the local review path instead
+    /// (DESIGN.md §8). Every other verb is forge-independent and holds still.
+    #[test]
+    fn without_pull_requests_degrades_pr_and_nothing_else() {
+        assert_eq!(NextAction::Pr.without_pull_requests(), NextAction::Open);
+        for verb in [
+            NextAction::Triage,
+            NextAction::Answer,
+            NextAction::ReviewPr,
+            NextAction::Open,
+            NextAction::Do,
+            NextAction::Redispatch,
+            NextAction::Dispatch,
+        ] {
+            assert_eq!(verb.without_pull_requests(), verb, "{verb}");
+        }
+    }
+
+    /// `open` is never derived from state — a checkout that cannot take a pull
+    /// request is what produces it, and the derivation stays pure.
+    #[test]
+    fn open_is_not_derived_from_state() {
+        for state in TaskState::ALL {
+            for pr_url in [None, Some("https://x")] {
+                for human in [false, true] {
+                    assert_ne!(
+                        task_in(state, pr_url, human).next_action(),
+                        Some(NextAction::Open),
+                        "{state} pr_url={pr_url:?} human={human}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn next_action_display_honors_width() {
         assert_eq!(format!("{:10}", NextAction::Do), "do        ");
         assert_eq!(format!("{:10}", NextAction::ReviewPr), "review PR ");
         assert_eq!(format!("{:10}", NextAction::Redispatch), "redispatch");
-    }
-
-    #[test]
-    fn review_action_parses_and_displays_every_form() {
-        for (text, action) in [
-            ("auto", ReviewAction::Auto),
-            ("pr", ReviewAction::Pr),
-            ("viewer", ReviewAction::Viewer(None)),
-            ("viewer:zed", ReviewAction::Viewer(Some("zed".into()))),
-        ] {
-            assert_eq!(ReviewAction::parse(text).unwrap(), action, "{text}");
-            assert_eq!(action.to_string(), text);
-        }
-        assert!(ReviewAction::parse("github").is_err());
-        assert!(ReviewAction::parse("viewer:").is_err());
-        assert!(ReviewAction::parse("viewer:  ").is_err());
-    }
-
-    #[test]
-    fn review_action_resolves_the_medium() {
-        assert_eq!(ReviewAction::Auto.resolve(true), ReviewMedium::GithubPr);
-        assert_eq!(
-            ReviewAction::Auto.resolve(false),
-            ReviewMedium::Viewer(None)
-        );
-        assert!(ReviewAction::Auto.needs_probe());
-
-        assert_eq!(ReviewAction::Pr.resolve(false), ReviewMedium::GithubPr);
-        assert!(!ReviewAction::Pr.needs_probe());
-        assert_eq!(
-            ReviewAction::Viewer(Some("zed".into())).resolve(true),
-            ReviewMedium::Viewer(Some("zed".into()))
-        );
-        assert!(!ReviewAction::Viewer(None).needs_probe());
     }
 }

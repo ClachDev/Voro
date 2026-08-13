@@ -4,6 +4,7 @@
 //! `docs/DESIGN.md`.
 
 mod agent;
+mod cap;
 pub mod config_edit;
 mod error;
 mod import;
@@ -11,27 +12,29 @@ mod model;
 mod pr;
 mod review;
 pub mod scheduler;
+pub mod seed;
 mod store;
 mod template;
 mod transition;
 
 pub use agent::{
-    AgentSessionEntry, AgentTemplate, AgentsConfig, Launch, LaunchSpec, PROMPT_FILE_PLACEHOLDER,
-    Provenance, ResolvedAgent, SESSION_NAME_PLACEHOLDER, SESSION_PLACEHOLDER, SessionLiveness,
-    TASK_ID_PLACEHOLDER, VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER,
-    VIEWER_PATH_PLACEHOLDER, ViewerTemplate, parse_sessions_json, render_message,
+    AgentSessionEntry, AgentTemplate, AgentsConfig, Launch, LaunchSpec, NEW_SESSION_PLACEHOLDER,
+    PROMPT_FILE_PLACEHOLDER, Provenance, RenderedMessage, ResolvedAgent, SESSION_NAME_PLACEHOLDER,
+    SESSION_PLACEHOLDER, SessionLiveness, TASK_ID_PLACEHOLDER, VIEWER_BASE_PLACEHOLDER,
+    VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, ViewerTemplate, parse_sessions_json,
+    render_message, render_session,
 };
+pub use cap::{CAP_SIGNATURES, CapReading, read_cap, strip_ansi};
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};
 pub use model::{
     Dep, DepKind, DepRef, Doc, Event, LivenessSource, NextAction, Priority, Project, RefineOutcome,
-    Repo, ReviewAction, ReviewMedium, RunningRow, Session, SessionOutcome, Task, TaskState,
-    location_is_url,
+    Repo, RunningRow, Session, SessionOutcome, Task, TaskState, location_is_url,
 };
 pub use pr::{Mergeability, PrPlan, PrRef, format_review_feedback, parse_mergeable, plan_pr};
 pub use review::{
-    PrRevisions, REVIEWED_EVENT, ReviewDiff, ReworkReport, parse_pr_revisions, plan_review_diff,
-    rework_report,
+    CompletionReport, PrRevisions, REVIEWED_EVENT, ReviewDiff, completion_report,
+    parse_pr_revisions, plan_review_diff, was_rejected,
 };
 pub use scheduler::{
     ActionRow, AttentionCosts, Candidate, DigestRow, EffectiveScore, Queue, QueueRow,

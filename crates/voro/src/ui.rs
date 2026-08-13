@@ -5,11 +5,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use voro_core::{
-    ActionRow, DepKind, DepRef, DigestRow, EffectiveScore, Event, QueueRow, ReworkReport,
-    ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
+    ActionRow, CapReading, CompletionReport, DepKind, DepRef, DigestRow, EffectiveScore, Event,
+    QueueRow, ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
 };
 
-use crate::app::{App, CockpitRow, Mode, ReviewActionOption, Screen, TaskRow};
+use crate::app::{App, CockpitRow, Mode, Screen, TaskRow, ViewerOption, viewer_label};
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
@@ -369,7 +369,7 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             frame.render_stateful_widget(list, area, &mut state);
             hits.push_list(area, state.offset(), count, Hit::PickerOption);
         }
-        Mode::ReviewActionPicker {
+        Mode::ViewerPicker {
             options,
             current,
             sel,
@@ -378,11 +378,13 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             let items: Vec<ListItem> = options
                 .iter()
                 .map(|o| match o {
-                    ReviewActionOption::Action(a) if a == current => {
-                        ListItem::new(format!("{a}  (current)"))
+                    ViewerOption::Viewer(v) if v == current => {
+                        ListItem::new(format!("{}  (current)", viewer_label(v.as_deref())))
                     }
-                    ReviewActionOption::Action(a) => ListItem::new(a.to_string()),
-                    ReviewActionOption::NewViewer => ListItem::new(Line::from(Span::styled(
+                    ViewerOption::Viewer(v) => {
+                        ListItem::new(viewer_label(v.as_deref()).to_string())
+                    }
+                    ViewerOption::NewViewer => ListItem::new(Line::from(Span::styled(
                         "new viewer…",
                         Style::new().fg(Color::Blue),
                     ))),
@@ -396,7 +398,7 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title("Review action — ⏎ set, esc cancel"),
+                        .title("Viewer — ⏎ set, esc cancel"),
                 )
                 .highlight_style(SELECTED);
             frame.render_stateful_widget(list, area, &mut state);
@@ -568,14 +570,14 @@ fn draw_cockpit(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     let running_height = if app.running.is_empty() {
         0
     } else {
-        (app.running.len() as u16 + 2).clamp(3, 6)
+        (app.running.len() as u16 + 2).clamp(3, 10)
     };
     let [header, queue, detail, running, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(queue_height),
         Constraint::Min(5),
         Constraint::Length(running_height),
-        Constraint::Length(1),
+        Constraint::Length(status_height(app, frame.area())),
     ])
     .areas(frame.area());
 
@@ -717,6 +719,35 @@ fn strip_pr_span() -> Span<'static> {
     Span::styled("  PR", Style::new().fg(Color::Magenta))
 }
 
+/// The usage-cap badge on a running strip row (DESIGN.md §8): this session is
+/// alive but held at a cap, doing nothing until the window reopens.
+///
+/// Yellow rather than red, and no state change behind it, because nothing has
+/// gone wrong — the session is intact and will pick up where it left off. It is
+/// the *absence* of this badge on a stuck row that used to mislead: capped work
+/// sat on the strip with a climbing elapsed time and no way to tell it from work
+/// in progress.
+///
+/// Three shapes, in decreasing order of what Voro managed to learn. With a
+/// parsed reset time still ahead, `⚠ capped ↻21:50` — the operator can decide
+/// whether to wait. Past that time the window is open and the session is merely
+/// waiting to be nudged, which is a different situation and a different thing
+/// to do about it, so it says so. With no time parsed at all, the bare badge:
+/// the cap is the part worth knowing, and suppressing it for want of a
+/// timestamp would trade the whole signal for a detail.
+fn capped_span(reading: &CapReading, now_minutes: Option<u16>) -> Span<'static> {
+    let past = now_minutes.is_some_and(|now| reading.reset_passed(now));
+    let text = match (reading.reset_label(), past) {
+        (_, true) => "  ⚠ capped · reset passed".to_string(),
+        (Some(at), false) => format!("  ⚠ capped ↻{at}"),
+        (None, false) => "  ⚠ capped".to_string(),
+    };
+    Span::styled(
+        text,
+        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )
+}
+
 /// The stale-branch marker (DESIGN.md §8): a review task whose tracked PR
 /// reports a merge conflict, probed on demand for the selected task. Purely
 /// informational — it flags that the branch needs resolving before it can
@@ -726,6 +757,26 @@ fn conflict_span() -> Span<'static> {
         "  [branch conflicts]",
         Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
     )
+}
+
+/// A queue row's state cell, coloured by what the state asks of the operator.
+/// Only the states that are stuck on them take a colour: `needs-input` cyan,
+/// the hue the agent already speaks in throughout the TUI (the question suffix,
+/// `↻ refined`, `⟳ refining`); `review` green, matching the branch and repo
+/// lines in the detail pane, since a git artifact is what there is to look at;
+/// `stalled` red, matching the failed-session line. `ready` stays plain so an
+/// uncoloured queue reads as nothing waiting on the operator, and `proposed`
+/// stays dim with the rest of its row. No bold — that is reserved for the row
+/// markers, which sit above the state cell in the hierarchy.
+fn state_span(state: TaskState) -> Span<'static> {
+    let style = match state {
+        TaskState::NeedsInput => Style::new().fg(Color::Cyan),
+        TaskState::Review => Style::new().fg(Color::Green),
+        TaskState::Stalled => Style::new().fg(Color::Red),
+        TaskState::Proposed => Style::new().dim(),
+        _ => Style::new(),
+    };
+    Span::styled(format!("{:11}", state.as_str()), style)
 }
 
 /// The human-only flag (task #100) rendered as a row marker. A property of the
@@ -849,15 +900,48 @@ fn doc_picker_row(app: &App, task_id: i64, doc: &voro_core::Doc) -> Line<'static
 /// A review row's next action rendered as a browser suffix (DESIGN.md §3). The
 /// browser shows state in its own column, so only `review` — whose verb reads
 /// the tracked PR, not the state alone — earns the suffix.
-fn review_next_span(task: &voro_core::Task) -> Option<Span<'static>> {
+fn review_next_span(app: &App, task: &voro_core::Task) -> Option<Span<'static>> {
     if task.state != voro_core::TaskState::Review {
         return None;
     }
-    let verb = task.next_action()?;
+    let verb = app.next_action(task)?;
     Some(Span::styled(
         format!("  next: {verb}"),
         Style::new().fg(Color::Blue),
     ))
+}
+
+/// What the agent reported (DESIGN.md §8): the completion summary of the cycle
+/// in hand, rendered above the body — the body is the instruction that has
+/// already been carried out, the summary is the account of carrying it out, and
+/// the account is what a verdict is given against. It is the only such account
+/// a project with no PR and no configured viewer has, so the card cannot leave
+/// it to `voro show`. On a rework it is headed by the feedback it answers,
+/// which is the other half of making a re-review proportional to the fix — the
+/// operator reads *what the agent says it changed* here and the diff since the
+/// rejected revision beside it.
+fn completion_lines(report: &CompletionReport) -> Vec<Line<'static>> {
+    let heading = match report.feedback {
+        Some(_) => "response to the review feedback:",
+        None => "completion summary:",
+    };
+    let mut lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            heading,
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    // One `Line` per source line, as the question block does: ratatui does not
+    // break lines inside a `Span`, so a point-by-point summary rendered as one
+    // span would collapse into a single paragraph and lose its structure.
+    lines.extend(
+        report
+            .summary
+            .lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), Style::new().fg(Color::Cyan)))),
+    );
+    lines
 }
 
 /// A task's newest session, rendered for the attention states (tasks #73/#110).
@@ -866,35 +950,6 @@ fn review_next_span(task: &voro_core::Task) -> Option<Span<'static>> {
 /// end time. An open one shows agent and start time. Both end on the log path
 /// the `l` key pages. States where the session is history rather than context
 /// (`done`, `rejected`, a redispatch-ready task) render nothing.
-/// The response to a rejection (DESIGN.md §8): the summary the rework came back
-/// with, rendered against the feedback it answers. This is the other half of
-/// making a re-review proportional to the fix — the operator reads *what the
-/// agent says it changed* here, and the diff since the rejected revision beside
-/// it, instead of rediscovering both from the whole PR. Only a task that has
-/// been sent back renders it; a first review's summary is the PR body and is
-/// read there.
-fn rework_lines(report: &ReworkReport) -> Vec<Line<'static>> {
-    let Some(summary) = &report.summary else {
-        return Vec::new();
-    };
-    let mut lines = vec![
-        Line::default(),
-        Line::from(Span::styled(
-            "response to the review feedback:",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )),
-    ];
-    // One `Line` per source line, as the question block does: ratatui does not
-    // break lines inside a `Span`, so a point-by-point summary rendered as one
-    // span would collapse into a single paragraph and lose its structure.
-    lines.extend(
-        summary
-            .lines()
-            .map(|line| Line::from(Span::styled(line.to_string(), Style::new().fg(Color::Cyan)))),
-    );
-    lines
-}
-
 fn session_lines(session: &Session, state: TaskState) -> Vec<Line<'static>> {
     if !matches!(
         state,
@@ -967,15 +1022,9 @@ fn action_row_line(app: &App, row: &ActionRow, indent: &str) -> Line<'static> {
     };
     let mut spans = vec![
         score,
-        Span::styled(
-            format!(
-                "{indent}{} {:11} {}",
-                task_ref(c.task.id),
-                c.task.state.as_str(),
-                c.task.priority,
-            ),
-            style,
-        ),
+        Span::styled(format!("{indent}{} ", task_ref(c.task.id)), style),
+        state_span(c.task.state),
+        Span::styled(format!(" {}", c.task.priority), style),
         deep_marker(c.task.deep),
         Span::styled(format!(" {}: {}", c.project_name, c.task.title), style),
     ];
@@ -1101,7 +1150,14 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     });
     if empty {
         let inner = area.inner(ratatui::layout::Margin::new(1, 1));
-        frame.render_widget(Paragraph::new("nothing to do — press n").dim(), inner);
+        // With nothing registered, `n` has nothing to create a task against, so
+        // the empty box points at registration instead (DESIGN.md §9).
+        let hint = if app.projects.is_empty() {
+            crate::app::NO_PROJECTS_HINT
+        } else {
+            "nothing to do — press n"
+        };
+        frame.render_widget(Paragraph::new(hint).dim(), inner);
     }
 }
 
@@ -1236,9 +1292,10 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         // A review task with a branch and no summary: `pr` would fail, so say
         // what is needed rather than the optimistic "next: pr".
         lines.push(Line::from(incomplete_report_span()));
-    } else if let Some(verb) = task.next_action() {
+    } else if let Some(verb) = app.next_action(task) {
         let hint = match verb {
             voro_core::NextAction::Pr => "  (g opens one from the summary)",
+            voro_core::NextAction::Open => "  (o shows the diff in a viewer)",
             _ => "",
         };
         lines.push(Line::from(Span::styled(
@@ -1271,8 +1328,13 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     {
         lines.extend(score_lines(&b, app.effective_score(task, b.total)));
     }
-    if let Some(report) = app.rework_report(task.id) {
-        lines.extend(rework_lines(&report));
+    // Only where the report is the thing being acted on: a task under review,
+    // or handed off for someone else to review (DESIGN.md §8). Once a verdict
+    // has been given the summary is history, and the card is read for the body.
+    if matches!(task.state, TaskState::Review | TaskState::Waiting)
+        && let Some(report) = app.completion_report(task.id)
+    {
+        lines.extend(completion_lines(&report));
     }
     lines.push(Line::default());
     lines.extend(crate::markdown::body_lines(&task.body));
@@ -1353,6 +1415,9 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                     spans.push(strip_pr_span());
                 }
             }
+            if let Some(reading) = app.caps.get(&r.task_id) {
+                spans.push(capped_span(reading, app.now_minutes));
+            }
             // A hand-off has nothing left to be live: the work is with someone
             // else, so a closed session is the expected shape, not an orphan.
             if r.session_id.is_none() && !waiting {
@@ -1389,8 +1454,11 @@ fn format_elapsed(secs: i64) -> String {
 }
 
 fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
-    let [list_area, status] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+    let [list_area, status] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(status_height(app, frame.area())),
+    ])
+    .areas(frame.area());
 
     let items: Vec<ListItem> = app
         .all
@@ -1429,24 +1497,38 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             }
             if app.incomplete_report.contains(&r.task.id) {
                 spans.push(incomplete_report_span());
-            } else if let Some(span) = review_next_span(&r.task) {
+            } else if let Some(span) = review_next_span(app, &r.task) {
                 spans.push(span);
             }
             spans.extend(blocker_spans(r));
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let mut state = ListState::default().with_selected(if app.all.is_empty() {
-        None
-    } else {
-        Some(app.tasks_sel)
-    });
+    let empty = items.is_empty();
+    let mut state =
+        ListState::default().with_selected(if empty { None } else { Some(app.tasks_sel) });
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("All tasks"))
         .highlight_style(SELECTED);
     frame.render_stateful_widget(list, list_area, &mut state);
     hits.push_list(list_area, state.offset(), app.all.len(), Hit::TaskRow);
+    if empty {
+        let inner = list_area.inner(ratatui::layout::Margin::new(1, 1));
+        frame.render_widget(Paragraph::new(tasks_empty_message(app)).dim(), inner);
+    }
     draw_status(frame, app, status);
+}
+
+/// What an empty task browser says. The two cases need different advice: with no
+/// project registered `n` cannot create anything, so the message points at the
+/// projects screen in the same words the `n` key itself uses; otherwise `n` is
+/// the way in.
+fn tasks_empty_message(app: &App) -> &'static str {
+    if app.projects.is_empty() {
+        "no projects yet — add one on the projects screen (3)"
+    } else {
+        "no tasks yet — press n to add one"
+    }
 }
 
 /// The dependency section of a detail view (task #103), both directions, one
@@ -1499,13 +1581,16 @@ fn blocker_spans(row: &TaskRow) -> Vec<Span<'static>> {
 }
 
 /// The projects screen (DESIGN.md §9): one row per project — weight, name,
-/// path, open task count, and the review action when one is pinned (§8). The
+/// path, open task count, and the viewer when the project names one (§8). The
 /// open count is the project's non-terminal tasks, from the loaded task list.
 /// An archived project stays on this screen, dim and tagged, so it can be
 /// found and unarchived (§5).
 fn draw_projects(frame: &mut Frame, app: &App, hits: &mut HitMap) {
-    let [list_area, status] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+    let [list_area, status] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(status_height(app, frame.area())),
+    ])
+    .areas(frame.area());
 
     let items: Vec<ListItem> = app
         .projects
@@ -1521,9 +1606,9 @@ fn draw_projects(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             } else {
                 Style::new()
             };
-            let action = match &p.review_action {
-                voro_core::ReviewAction::Auto => String::new(),
-                other => format!("  [{other}]"),
+            let viewer = match &p.viewer {
+                Some(name) => format!("  [viewer:{name}]"),
+                None => String::new(),
             };
             let archived = if p.archived { "  [archived]" } else { "" };
             // The path column shows the default repo, so a single-repo project
@@ -1534,7 +1619,7 @@ fn draw_projects(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             };
             ListItem::new(Line::from(Span::styled(
                 format!(
-                    "{:>2}  {:14} {:28} {} open{extra}{action}{archived}",
+                    "{:>2}  {:14} {:28} {} open{extra}{viewer}{archived}",
                     p.weight,
                     p.name,
                     app.project_path(p.id),
@@ -1572,8 +1657,11 @@ fn draw_projects(frame: &mut Frame, app: &App, hits: &mut HitMap) {
 /// viewers, with the legacy anonymous `[viewer]` shown read-only beneath them. A
 /// file that failed to parse is surfaced here rather than rendering empty.
 fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
-    let [main, status] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+    let [main, status] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(status_height(app, frame.area())),
+    ])
+    .areas(frame.area());
 
     if let Some(err) = &app.config_error {
         let para = Paragraph::new(vec![
@@ -1704,11 +1792,52 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     draw_status(frame, app, status);
 }
 
+/// How many lines the status region needs at this frame size (DESIGN.md §9).
+/// The key line is always one; a message takes as many as it wraps to, up to
+/// half the screen — a message Voro cannot fit in half a terminal is past the
+/// point where growing the region further helps.
+fn status_height(app: &App, area: Rect) -> u16 {
+    let Some(msg) = &app.status else {
+        return 1;
+    };
+    let needed = wrap_status(msg, area.width).len() as u16;
+    needed.clamp(1, (area.height / 2).max(1))
+}
+
+/// Greedy word wrap for the status line. Voro's errors end with the actionable
+/// half — the key to press instead — so truncating them at the pane width hides
+/// exactly the part worth reading (DESIGN.md §9). Wrapping here rather than
+/// through `Wrap` keeps the drawn line count knowable before the layout is
+/// split, so the region can be sized to the message. A word wider than the pane
+/// gets its own line and truncates there, having nowhere else to go.
+fn wrap_status(msg: &str, width: u16) -> Vec<String> {
+    let width = width.max(1) as usize;
+    let mut lines = Vec::new();
+    for paragraph in msg.split('\n') {
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let fits = Span::raw(current.as_str()).width() + 1 + Span::raw(word).width() <= width;
+            if !current.is_empty() && !fits {
+                lines.push(std::mem::take(&mut current));
+            }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        lines.push(current);
+    }
+    lines
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     // A red status message overrides the key line, as before.
     if let Some(msg) = &app.status {
-        let line = Line::from(Span::styled(msg.clone(), Style::new().fg(Color::Red)));
-        frame.render_widget(line, area);
+        let lines: Vec<Line> = wrap_status(msg, area.width)
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, Style::new().fg(Color::Red))))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), area);
         return;
     }
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -1738,7 +1867,6 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
     // glyph renders as the bold key and the verb as the dim label.
     let enter = app.enter_hint().and_then(|h| h.split_once(' '));
     let enter = ("⏎", enter.map_or("act", |(_, verb)| verb), enter.is_some());
-    let selected = app.selected_task_id().is_some();
     match app.screen {
         Screen::Cockpit => vec![
             enter,
@@ -1746,8 +1874,10 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
             ("r/R", "refine", selection_is_refinable(app)),
             ("C", "cancel refine", app.selected_is_refining()),
             ("s", "state", true),
-            ("!", "deep", selected),
+            ("!", "deep", app.selected_can_go_deep()),
             ("w", "wait", app.selected_can_hand_off()),
+            ("o", "open", app.selected_has_a_diff()),
+            ("g", "PR", app.selected_is_in_review()),
             ("a/A", "message", app.selected_can_message()),
             ("n/N", "new", true),
             ("e", "edit", true),
@@ -1758,10 +1888,12 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
         Screen::Tasks => vec![
             enter,
             ("w", "wait", app.selected_can_hand_off()),
+            ("o", "open", app.selected_has_a_diff()),
+            ("g", "PR", app.selected_is_in_review()),
             ("r/R", "refine", selection_is_refinable(app)),
             ("C", "cancel refine", app.selected_is_refining()),
             ("s", "state", true),
-            ("!", "deep", true),
+            ("!", "deep", app.selected_can_go_deep()),
             ("a/A", "message", app.selected_can_message()),
             ("n/N", "new", true),
             ("e", "edit", true),
@@ -1778,7 +1910,7 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
             ("a", "add", true),
             ("A", "archive", true),
             ("d", "delete", true),
-            ("v", "review action", true),
+            ("v", "viewer", true),
             ("?", "keys", true),
             ("tab", "config", true),
             ("q", "quit", true),
@@ -1888,8 +2020,8 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                 ("C", "cancel a refine in flight"),
                 ("x", "fold the score decomposition into the card"),
                 ("h", "fold the task's history into the card"),
-                ("o", "open the diff in a viewer"),
-                ("g", "open the tracked PR"),
+                ("o", "open the local diff in a viewer"),
+                ("g", "open the PR on GitHub"),
             ]);
             actions.extend(pairs(MESSAGE_KEYS));
             actions.extend([
@@ -1923,8 +2055,8 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                 ("!", "toggle deep — the agent's strongest model"),
                 ("c", "link and unlink documents"),
                 ("C", "cancel a refine in flight"),
-                ("o", "open the diff in a viewer"),
-                ("g", "open the tracked PR"),
+                ("o", "open the local diff in a viewer"),
+                ("g", "open the PR on GitHub"),
             ]);
             actions.extend(pairs(MESSAGE_KEYS));
             actions.extend([
@@ -1956,7 +2088,7 @@ fn key_map(screen: Screen) -> Vec<KeySection> {
                     ("a", "add a project"),
                     ("A", "archive or unarchive the project"),
                     ("d", "delete the project — only when it is empty"),
-                    ("v", "pick the project's review action"),
+                    ("v", "pick the project's viewer"),
                 ],
             ),
             (
@@ -2084,6 +2216,233 @@ mod tests {
     use super::*;
     use voro_core::{LivenessSource, Priority, Task, TaskState};
 
+    /// The refusal `g` gives on a checkout `gh` cannot address (DESIGN.md §8) —
+    /// the shape every wrapping test here cares about: long, and closing on the
+    /// key to press instead.
+    const GH_REFUSAL: &str = "/home/michael/Projects/demoproj is not a GitHub repository, \
+         so there is no pull request to open — use `o` to see this task's diff in a viewer";
+
+    /// Every screen's status region, read back as one whitespace-normalised
+    /// string, so a message that wrapped across rows reads as itself again.
+    fn screen_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        rows.join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// An app showing `status`, over `queued` ready tasks and `running`
+    /// dispatched ones — the two counts are what decide how much of the cockpit
+    /// the queue and the running strip claim.
+    fn app_with_status(status: &str, queued: usize, running: usize) -> crate::app::App {
+        use voro_core::{NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let mut task = |title: String| {
+            store
+                .create_task(NewTask {
+                    project_id: p.id,
+                    repo_id: None,
+                    title,
+                    body: String::new(),
+                    priority: Priority::P2,
+                    state: TaskState::Ready,
+                    agent: None,
+                    human: false,
+                    deep: false,
+                })
+                .unwrap()
+                .id
+        };
+        for i in 0..queued {
+            task(format!("queued {i}"));
+        }
+        let live: Vec<i64> = (0..running).map(|i| task(format!("live {i}"))).collect();
+        for id in live {
+            store
+                .record_dispatch(id, "claude", None, LivenessSource::Listing, None)
+                .unwrap();
+        }
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = crate::app::App::new(store, ctx).unwrap();
+        app.status = Some(status.into());
+        app
+    }
+
+    /// An empty cockpit says what the next press actually is: with nothing
+    /// registered `n` cannot create anything, so the box points at Projects.
+    #[test]
+    fn an_empty_cockpit_points_at_projects_until_one_exists() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::Store;
+
+        let render = |app: &crate::app::App| {
+            let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw(f, app);
+                })
+                .unwrap();
+            screen_text(&terminal)
+        };
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut bare = crate::app::App::new(Store::open_in_memory().unwrap(), ctx).unwrap();
+        bare.screen = crate::app::Screen::Cockpit;
+        bare.status = None;
+        let text = render(&bare);
+        assert!(text.contains(crate::app::NO_PROJECTS_HINT), "{text}");
+
+        let mut registered = app_with_status("", 0, 0);
+        registered.status = None;
+        let text = render(&registered);
+        assert!(text.contains("nothing to do — press n"), "{text}");
+    }
+
+    #[test]
+    fn wrap_status_breaks_on_words_and_keeps_every_one() {
+        let lines = wrap_status(GH_REFUSAL, 40);
+        assert!(lines.len() > 1, "{lines:?}");
+        for line in &lines {
+            assert!(
+                line.chars().count() <= 40,
+                "{line:?} is wider than the pane"
+            );
+        }
+        assert_eq!(
+            lines.join(" ").split_whitespace().collect::<Vec<_>>(),
+            GH_REFUSAL.split_whitespace().collect::<Vec<_>>(),
+        );
+    }
+
+    /// A word with nowhere to break — a long path — takes its own line rather
+    /// than pushing the rest of the message off the pane.
+    #[test]
+    fn wrap_status_gives_an_overlong_word_its_own_line() {
+        let lines = wrap_status("at /a/very/long/path/that/exceeds/the/pane use `o`", 12);
+        assert_eq!(
+            lines,
+            vec!["at", "/a/very/long/path/that/exceeds/the/pane", "use `o`"]
+        );
+    }
+
+    /// The bug this fixes: at an ordinary terminal width the closing half of an
+    /// error — the part naming what to press instead — was cut off. The cockpit
+    /// now grows its status region to fit the whole message.
+    #[test]
+    fn cockpit_status_wraps_instead_of_truncating() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let app = app_with_status(GH_REFUSAL, 1, 0);
+        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+
+        let normalised = GH_REFUSAL.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            screen_text(&terminal).contains(&normalised),
+            "the whole message should be on screen, got:\n{}",
+            screen_text(&terminal)
+        );
+    }
+
+    /// A cockpit whose queue and running strip are both at their tallest still
+    /// shows the message whole — three times the length of the longest real
+    /// one, on a narrow screen — the panes above it giving up the rows.
+    #[test]
+    fn a_crowded_cockpit_still_shows_the_whole_message() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let long = format!("{GH_REFUSAL} {GH_REFUSAL} {GH_REFUSAL}");
+        let app = app_with_status(&long, 20, 12);
+        let mut terminal = Terminal::new(TestBackend::new(70, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+
+        let normalised = long.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            screen_text(&terminal).contains(&normalised),
+            "the whole message should survive a full cockpit, got:\n{}",
+            screen_text(&terminal)
+        );
+    }
+
+    /// The same holds on every other screen, since each splits its own layout.
+    #[test]
+    fn every_screen_wraps_a_long_status() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+        let normalised = GH_REFUSAL.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (key, screen) in [
+            ('2', Screen::Tasks),
+            ('3', Screen::Projects),
+            ('4', Screen::Config),
+        ] {
+            let mut app = app_with_status(GH_REFUSAL, 1, 0);
+            app.on_key(KeyEvent::from(KeyCode::Char(key)));
+            assert_eq!(app.screen, screen);
+            // Switching screens is free to clear the message; re-arm it.
+            app.status = Some(GH_REFUSAL.into());
+
+            let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw(f, &app);
+                })
+                .unwrap();
+            assert!(
+                screen_text(&terminal).contains(&normalised),
+                "{screen:?} truncated the message:\n{}",
+                screen_text(&terminal)
+            );
+        }
+    }
+
+    /// A short message and the key line still occupy one row, so the panes keep
+    /// the space they had whenever there is nothing long to say.
+    #[test]
+    fn status_region_stays_one_line_for_short_messages() {
+        let area = Rect::new(0, 0, 110, 24);
+        let mut app = app_with_status("task 9 has no session on record", 1, 0);
+        assert_eq!(status_height(&app, area), 1);
+        app.status = None;
+        assert_eq!(status_height(&app, area), 1);
+    }
+
+    /// The region grows only to half the screen: a terminal too small to hold
+    /// the message is better served by keeping its lists than by burying them.
+    #[test]
+    fn status_region_stops_at_half_the_screen() {
+        let app = app_with_status(&GH_REFUSAL.repeat(20), 1, 0);
+        assert_eq!(status_height(&app, Rect::new(0, 0, 40, 24)), 12);
+        assert_eq!(status_height(&app, Rect::new(0, 0, 40, 3)), 1);
+    }
+
     /// End-to-end: the Config screen renders the read-only agents (with the
     /// default marked) over the editable named viewers, drawn through the real
     /// screen draw path (DESIGN.md §5).
@@ -2113,8 +2472,12 @@ mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         let mut app = App::new(store, ctx).unwrap();
+        // No project is registered, so the app opened on Projects, where the
+        // digits are weights; the jump below is a cockpit key.
+        app.screen = Screen::Cockpit;
         app.on_key(KeyEvent::from(KeyCode::Char('4')));
         assert_eq!(app.screen, Screen::Config);
 
@@ -2212,6 +2575,53 @@ mod tests {
         assert!(!open.style.add_modifier.contains(Modifier::DIM));
     }
 
+    /// An empty browser explains itself rather than drawing a blank box, and
+    /// distinguishes its two cases: nothing can be created until a project
+    /// exists, so only a store that has one points at `n`.
+    #[test]
+    fn browser_render_explains_an_empty_list() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::Store;
+
+        let render = |store: Store| -> String {
+            let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                "/nonexistent/voro.db",
+            ));
+            let mut app = App::new(store, ctx).unwrap();
+            // The screen `App::new` opens on depends on whether the store has a
+            // project (DESIGN.md §9), so the browser is selected outright rather
+            // than counted to from the default.
+            app.screen = crate::app::Screen::Tasks;
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            terminal
+                .draw(|f| draw_tasks(f, &app, &mut HitMap::default()))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        let bare = render(Store::open_in_memory().unwrap());
+        assert!(
+            bare.contains("no projects yet — add one on the projects screen (3)"),
+            "empty browser with no projects did not point at the projects screen: {bare}"
+        );
+
+        let mut store = Store::open_in_memory().unwrap();
+        store.create_project("voro", "/tmp/voro").unwrap();
+        let no_tasks = render(store);
+        assert!(
+            no_tasks.contains("no tasks yet — press n to add one"),
+            "empty browser with a project did not point at n: {no_tasks}"
+        );
+    }
+
     /// End-to-end: a real store with a parked task blocked by one open and one
     /// closed task, rendered through the actual browser draw path, must show the
     /// suffix naming both blockers.
@@ -2269,6 +2679,83 @@ mod tests {
             rendered.contains(&format!("blocked by #{}, #{}", open.id, closed.id)),
             "browser did not annotate the parked row with its blockers: {rendered}"
         );
+    }
+
+    /// The detail card advertises what the project can actually do (DESIGN.md
+    /// §8): in a checkout with no remote, `g` has nowhere to open a pull
+    /// request, so the card names the local viewer and the key that reaches it.
+    #[test]
+    fn the_detail_card_advertises_the_local_path_without_a_remote() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::process::{Command, Stdio};
+        use voro_core::{Action, NewTask, Store};
+
+        let project = std::env::temp_dir().join(format!(
+            "voro-ui-remoteless-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["init", "-q"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store
+            .create_project("voro", project.to_str().unwrap())
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "the finished work".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap()
+            .id;
+        store
+            .record_dispatch(task, "claude", None, LivenessSource::Listing, None)
+            .unwrap();
+        store
+            .apply(task, Action::Complete(Some("did it".into())))
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let app = App::new(store, ctx).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal
+            .draw(|f| draw_cockpit(f, &app, &mut HitMap::default()))
+            .unwrap();
+        let out: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(out.contains("next: open"), "{out}");
+        assert!(out.contains("(o shows the diff in a viewer)"), "{out}");
+        assert!(!out.contains("next: pr"), "{out}");
+
+        std::fs::remove_dir_all(&project).ok();
     }
 
     /// End-to-end through the real cockpit draw (DESIGN.md §9): a hand-off
@@ -2382,6 +2869,198 @@ mod tests {
             column(&strip[waiting_at], "dependency bump"),
             "the strip's title column moved between row kinds:\n{out}"
         );
+    }
+
+    /// The badge a capped-but-alive dispatch earns (DESIGN.md §8), end to end
+    /// through the real cockpit draw. The session is `running` throughout and
+    /// stays that way: a cap is a display fact about a session that will resume
+    /// on its own, not a death to be redispatched, so nothing here touches the
+    /// state machine.
+    #[test]
+    fn a_capped_session_is_badged_on_the_strip() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{CapReading, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "the held one".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap()
+            .id;
+        store
+            .record_dispatch(task, "claude", None, LivenessSource::Listing, None)
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+
+        // The detail pane names the selected task too, so read the strip's own
+        // rows: everything below its block header.
+        let row = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            terminal
+                .draw(|f| draw_cockpit(f, app, &mut HitMap::default()))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let lines: Vec<String> = buffer
+                .content()
+                .chunks(buffer.area().width as usize)
+                .map(|r| r.iter().map(|c| c.symbol()).collect())
+                .collect();
+            let at = lines
+                .iter()
+                .position(|l| l.contains("Running"))
+                .unwrap_or_else(|| panic!("no running strip was drawn:\n{}", lines.join("\n")));
+            lines[at + 1..]
+                .iter()
+                .find(|l| l.contains("the held one"))
+                .unwrap_or_else(|| {
+                    panic!("the dispatch is not on the strip:\n{}", lines.join("\n"))
+                })
+                .clone()
+        };
+
+        // No reading, no badge: an ordinary dispatch is unmarked.
+        assert!(!row(&app).contains("capped"), "{}", row(&app));
+
+        // A cap whose window is still an hour out names when it reopens.
+        app.caps.insert(
+            task,
+            CapReading {
+                reset_minutes: Some(21 * 60 + 50),
+            },
+        );
+        app.now_minutes = Some(20 * 60 + 50);
+        let line = row(&app);
+        assert!(line.contains("⚠ capped"), "{line}");
+        assert!(line.contains("↻21:50"), "{line}");
+        assert!(!line.contains("reset passed"), "{line}");
+        assert_eq!(
+            app.store.task(task).unwrap().state,
+            TaskState::Running,
+            "badging a cap must not move the task"
+        );
+
+        // Past that time the window is open and the session is only waiting to
+        // be nudged — a different situation, said differently.
+        app.now_minutes = Some(22 * 60);
+        let line = row(&app);
+        assert!(line.contains("⚠ capped · reset passed"), "{line}");
+
+        // A cap the agent named no time for still badges: the time is the
+        // optional half, and withholding the badge for want of it would trade
+        // the signal for a detail.
+        app.caps.insert(task, CapReading::default());
+        let line = row(&app);
+        assert!(line.contains("⚠ capped"), "{line}");
+        assert!(!line.contains('↻'), "{line}");
+        assert!(!line.contains("reset passed"), "{line}");
+
+        // And the badge clears itself once the reading goes away, which is what
+        // continuing the session does on the next pass.
+        app.caps.remove(&task);
+        assert!(!row(&app).contains("capped"), "{}", row(&app));
+    }
+
+    /// A full slate of in-flight work — the dispatch cap's worth of running
+    /// sessions plus the hand-offs that do not count against it — fits on the
+    /// strip at once rather than being cut off behind a scroll.
+    #[test]
+    fn a_full_slate_of_in_flight_work_all_shows_on_the_strip() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let mut task = |title: &str| {
+            store
+                .create_task(NewTask {
+                    project_id: p.id,
+                    repo_id: None,
+                    title: title.into(),
+                    body: String::new(),
+                    priority: Priority::P2,
+                    state: TaskState::Ready,
+                    agent: None,
+                    human: false,
+                    deep: false,
+                })
+                .unwrap()
+                .id
+        };
+        let running: Vec<(i64, String)> = (1..=6)
+            .map(|n| {
+                let title = format!("under way {n}");
+                (task(&title), title)
+            })
+            .collect();
+        let handed_off: Vec<(i64, String)> = (1..=2)
+            .map(|n| {
+                let title = format!("handed off {n}");
+                (task(&title), title)
+            })
+            .collect();
+
+        for (id, _) in &running {
+            store
+                .record_dispatch(*id, "claude", None, LivenessSource::Listing, None)
+                .unwrap();
+        }
+        for (id, _) in &handed_off {
+            store
+                .record_dispatch(*id, "claude", None, LivenessSource::Listing, None)
+                .unwrap();
+            store.apply(*id, Action::Complete(None)).unwrap();
+            store.apply(*id, Action::HandOff).unwrap();
+        }
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let app = App::new(store, ctx).unwrap();
+        assert_eq!(app.running.len(), 8, "the fixture must fill the strip");
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        terminal
+            .draw(|f| draw_cockpit(f, &app, &mut HitMap::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let lines: Vec<String> = buffer
+            .content()
+            .chunks(buffer.area().width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect();
+        let out = lines.join("\n");
+
+        // The detail pane names the selected task too, so read the strip's own
+        // rows: everything below its block header.
+        let strip = lines
+            .iter()
+            .position(|l| l.contains("Running"))
+            .map(|i| &lines[i + 1..])
+            .unwrap_or_else(|| panic!("no running strip was drawn:\n{out}"));
+        for (_, title) in running.iter().chain(handed_off.iter()) {
+            assert!(
+                strip.iter().any(|l| l.contains(title.as_str())),
+                "{title} did not fit on the strip:\n{out}"
+            );
+        }
     }
 
     /// End-to-end through the real cockpit draw (DESIGN.md §6/§9): a refine
@@ -2514,6 +3193,40 @@ mod tests {
             .collect();
         assert!(out.contains("⚠ refine failed"), "{out}");
         assert!(!out.contains("↻ refined"), "{out}");
+    }
+
+    /// The queue's state cell is coloured only where the state is stuck on the
+    /// operator, and never bold — the row markers own that weight.
+    #[test]
+    fn state_cell_colours_only_the_states_stuck_on_the_operator() {
+        let cases = [
+            (TaskState::NeedsInput, Some(Color::Cyan)),
+            (TaskState::Review, Some(Color::Green)),
+            (TaskState::Stalled, Some(Color::Red)),
+            (TaskState::Ready, None),
+            (TaskState::Proposed, None),
+        ];
+        for (state, fg) in cases {
+            let span = state_span(state);
+            assert_eq!(span.style.fg, fg, "{}", state.as_str());
+            assert!(
+                !span.style.add_modifier.contains(Modifier::BOLD),
+                "{}",
+                state.as_str()
+            );
+        }
+        assert!(
+            state_span(TaskState::Proposed)
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            !state_span(TaskState::Ready)
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
     }
 
     /// End-to-end: a human-only task carries the `[human]` marker on its queue
@@ -3530,6 +4243,94 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("Bravo option")), "{rows:?}");
     }
 
+    /// A review card leads with the agent's account of what it did, above the
+    /// body it was given (task #407) — on a first review, where there is no
+    /// rejection behind it, and on a rework, where the feedback heads it.
+    #[test]
+    fn review_card_shows_the_completion_summary_above_the_body() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        store.set_weight(p.id, 3).unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "greet the reader".into(),
+                body: "acceptance: the greeting renders".into(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        store.apply(task.id, Action::Start).unwrap();
+        store
+            .apply(
+                task.id,
+                Action::Complete(Some("README.md: +2 lines\nmain.rs: untouched".into())),
+            )
+            .unwrap();
+
+        let width: u16 = 100;
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        let rows = |app: &App, terminal: &mut Terminal<TestBackend>| -> Vec<String> {
+            terminal
+                .draw(|f| {
+                    draw(f, app);
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(width as usize)
+                .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+                .collect()
+        };
+        let row_of = |rows: &[String], needle: &str| -> Option<usize> {
+            rows.iter().position(|r| r.contains(needle))
+        };
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let mut app = App::new(store, ctx).unwrap();
+        let first = rows(&app, &mut terminal);
+        let heading = row_of(&first, "completion summary:").unwrap_or_else(|| panic!("{first:?}"));
+        // Each summary line on its own row, as the question block renders.
+        assert!(row_of(&first, "README.md: +2 lines").is_some(), "{first:?}");
+        let last = row_of(&first, "main.rs: untouched").unwrap_or_else(|| panic!("{first:?}"));
+        let body = row_of(&first, "acceptance: the greeting renders")
+            .unwrap_or_else(|| panic!("{first:?}"));
+        assert!(heading < last && last < body, "{first:?}");
+
+        // Sent back and completed again: the same block, headed by the feedback
+        // the new summary answers rather than by the neutral title.
+        app.store
+            .apply(task.id, Action::RejectWork("tests missing".into()))
+            .unwrap();
+        app.store
+            .apply(task.id, Action::Complete(Some("added the tests".into())))
+            .unwrap();
+        app.refresh().unwrap();
+        let second = rows(&app, &mut terminal);
+        assert!(
+            row_of(&second, "response to the review feedback:").is_some(),
+            "{second:?}"
+        );
+        assert!(row_of(&second, "added the tests").is_some(), "{second:?}");
+        assert!(
+            row_of(&second, "completion summary:").is_none(),
+            "{second:?}"
+        );
+    }
+
     /// The cockpit key line only advertises the selection-only actions while a
     /// task is selected — with an empty queue there is nothing for them to act
     /// on, so they drop out.
@@ -3544,8 +4345,10 @@ mod tests {
             ))
         };
 
-        let empty = App::new(Store::open_in_memory().unwrap(), ctx()).unwrap();
-        assert_eq!(empty.screen, Screen::Cockpit);
+        let mut empty = App::new(Store::open_in_memory().unwrap(), ctx()).unwrap();
+        // A project-less database opens on Projects (DESIGN.md §9); the cockpit
+        // this test is about is the one reached by tabbing back to it.
+        empty.screen = Screen::Cockpit;
         assert!(empty.selected_task_id().is_none());
         let labels: Vec<&str> = key_hints(&empty).iter().map(|(_, l)| *l).collect();
         for dropped in ["dispatch", "deep"] {
@@ -3582,11 +4385,80 @@ mod tests {
         }
     }
 
-    /// A lowercase/uppercase pair of one action takes a single slot keyed on
-    /// the pair, and the line stays short enough to scan: ten slots or fewer on
-    /// every row of a queue holding one of each kind (DESIGN.md §9).
+    /// The review cluster's gating (DESIGN.md §9): `o` is advertised wherever
+    /// there is a diff to look at — `review` and `running` — `g` only on
+    /// `review`, where the PR is the review, and `!` nowhere past dispatch. A
+    /// `ready` row, which has none of the three states, shows the mirror image.
     #[test]
-    fn the_key_line_pairs_its_slots_and_stays_at_ten() {
+    fn the_key_line_advertises_the_review_keys_only_where_they_act() {
+        use crate::app::App;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let task = |title: &str| NewTask {
+            project_id: p.id,
+            repo_id: None,
+            title: title.into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state: TaskState::Ready,
+            agent: None,
+            human: false,
+            deep: false,
+        };
+        store.create_task(task("ready to go")).unwrap();
+        let running = store.create_task(task("under way")).unwrap();
+        store.apply(running.id, Action::Start).unwrap();
+        let reviewed = store.create_task(task("in review")).unwrap();
+        store.apply(reviewed.id, Action::Start).unwrap();
+        store.apply(reviewed.id, Action::Complete(None)).unwrap();
+
+        let mut app = App::new(
+            store,
+            crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                "/nonexistent/voro.db",
+            )),
+        )
+        .unwrap();
+        app.screen = Screen::Tasks;
+
+        let keys_for = |app: &mut App, title: &str| {
+            app.tasks_sel = app
+                .all
+                .iter()
+                .position(|row| row.task.title == title)
+                .unwrap_or_else(|| panic!("no {title:?} row"));
+            key_hints(app)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>()
+        };
+
+        let ready = keys_for(&mut app, "ready to go");
+        assert!(!ready.contains(&"o"), "{ready:?}");
+        assert!(!ready.contains(&"g"), "{ready:?}");
+        assert!(ready.contains(&"!"), "{ready:?}");
+
+        let running = keys_for(&mut app, "under way");
+        assert!(running.contains(&"o"), "{running:?}");
+        assert!(!running.contains(&"g"), "{running:?}");
+        assert!(running.contains(&"!"), "{running:?}");
+
+        let review = keys_for(&mut app, "in review");
+        assert!(review.contains(&"o"), "{review:?}");
+        assert!(review.contains(&"g"), "{review:?}");
+        assert!(!review.contains(&"!"), "{review:?}");
+    }
+
+    /// A lowercase/uppercase pair of one action takes a single slot keyed on
+    /// the pair, and the line stays short enough to scan: eleven slots or fewer
+    /// on every row of a queue holding one of each kind (DESIGN.md §9). Eleven
+    /// rather than ten because a `review` row carries the whole review cluster
+    /// — `⏎`, `w`, `o`, `g` — the one moment all four are live options; `!`
+    /// dropping off that row is what keeps even eleven reachable.
+    #[test]
+    fn the_key_line_pairs_its_slots_and_stays_at_eleven() {
         use crate::app::App;
         use ratatui::crossterm::event::{KeyCode, KeyEvent};
         use voro_core::{Action, NewTask, Store};
@@ -3679,7 +4551,7 @@ mod tests {
                 }
                 let keys: Vec<&str> = key_hints(&app).iter().map(|(k, _)| *k).collect();
                 assert!(
-                    keys.len() <= 10,
+                    keys.len() <= 11,
                     "{screen:?} row {i} shows {} slots: {keys:?}",
                     keys.len()
                 );
@@ -3707,7 +4579,7 @@ mod tests {
                     "{screen:?} row {i}: {keys:?}"
                 );
                 // The refine keys and the cancel are mutually exclusive by
-                // state, which is what keeps the line within its ten slots.
+                // state, which is what keeps the line within its eleven slots.
                 assert!(
                     !(keys.contains(&"r/R") && keys.contains(&"C")),
                     "{screen:?} row {i}: {keys:?}"
@@ -4236,6 +5108,7 @@ mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         let mut app = crate::app::App::new(store, ctx).unwrap();
         let mut terminal = TestTerminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();

@@ -9,13 +9,14 @@ use std::fmt::Write as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use voro_core::{
-    Action, AgentsConfig, DepKind, Doc, Event, NewTask, PrRef, Priority, Project, QueueRow,
-    RefineOutcome, Repo, ReviewAction, ReviewMedium, Store, Task, TaskEdit, TaskState, Triage,
-    WipGate, scheduler,
+    Action, AgentsConfig, DepKind, Doc, Event, NewTask, NextAction, PrRef, Priority, Project,
+    QueueRow, RefineOutcome, Repo, Store, Task, TaskEdit, TaskState, Triage, WipGate, scheduler,
 };
 
+use crate::app::viewer_label;
 use crate::dispatch::{self, DispatchCtx};
 use crate::import;
+use crate::pr::ForgeMemo;
 
 const HELP: &str = "\
 voro — prioritised attention across projects
@@ -37,12 +38,11 @@ projects
   project delete <project>        delete a project with no tasks — park it
                                   (weight 0) or archive it instead to retire
                                   one that has any
-  project action <project> <auto|pr|viewer[:NAME]>
-                                  set how `pr` shows the project's review
-                                  diffs: auto (GitHub when the checkout is a
-                                  GitHub repo, else the viewer), pr always,
-                                  or a viewer from voro.toml (viewer:NAME
-                                  picks a [viewers.NAME] entry)
+  project viewer <project> [NAME] set which viewer `open` shows the project's
+                                  local diffs in: NAME picks a [viewers.NAME]
+                                  entry from voro.toml, and naming none leaves
+                                  the default viewer (`pr` is always GitHub, so
+                                  the medium is not a project setting)
   weight <project> <0-5>          set a project's weight (0 parks it)
 
 repos                             a project allocates attention; its repos
@@ -160,6 +160,11 @@ tasks
                                   parked projects
   explain <task-id>               score decomposition, and the divisor the
                                   inbox ranks it by
+  seed [--force]                  fill the dev store with fixture data — a
+                                  board covering every task state. A build run
+                                  from a target/ directory seeds it by itself
+                                  on first run; --force rebuilds it. Refused
+                                  against your real store
   import <project> [--repo NAME] [--gh-repo owner/name]
                                   import open GitHub issues as proposed
                                   tasks via `gh issue list`; idempotent.
@@ -183,20 +188,20 @@ dispatch
   viewer add <name> <cmd>         define a [viewers.NAME] entry in voro.toml
                                   (comment-preserving); cmd may carry {path},
                                   {branch}, {base} (e.g. 'zed {path}')
-  viewer remove <name>            delete a viewer; refused while a project's
-                                  review action still names it
+  viewer remove <name>            delete a viewer; refused while a project
+                                  still names it
   open <task-id>                  open a review/running task's checkout in a
-                                  voro.toml viewer to see its diff — the
-                                  explicit spelling of pr's viewer medium;
-                                  reports what to configure if none is set
-  pr <task-id> [--yes]            show the task's diff via the project's
-                                  review action (`project action`). GitHub:
-                                  jump to the tracked PR in a browser, or push
-                                  the review task's branch and open a ready PR
+                                  voro.toml viewer to see its diff — the only
+                                  local-diff spelling, and the one `project
+                                  viewer` names a viewer for; reports what to
+                                  configure if none is set
+  pr <task-id> [--yes]            show the task's diff on GitHub, always: jump
+                                  to the tracked PR in a browser, or push the
+                                  review task's branch and open a ready PR
                                   from its summary, recording the URL (--yes
                                   skips the confirm; track an existing PR with
-                                  `set --pr`). Viewer: open the checkout in
-                                  the configured viewer, like `open`
+                                  `set --pr`). A checkout GitHub cannot take
+                                  errors pointing at `open`
 
 transitions
   triage <task-id> <parked|ready|reject|refine>
@@ -291,6 +296,12 @@ enum Verb {
     Inbox,
     Next,
     Stats,
+    /// Fill the dev store with fixture data.
+    Seed {
+        /// Discard what is there and rebuild it.
+        #[arg(long)]
+        force: bool,
+    },
     Explain {
         task_id: i64,
     },
@@ -360,14 +371,32 @@ enum Verb {
 
 #[derive(Subcommand)]
 enum ProjectCmd {
-    Add { name: String, path: String },
+    Add {
+        name: String,
+        path: String,
+    },
     List,
-    Rename { project: String, name: String },
-    Path { project: String, path: String },
-    Archive { project: String },
-    Unarchive { project: String },
-    Delete { project: String },
-    Action { project: String, action: String },
+    Rename {
+        project: String,
+        name: String,
+    },
+    Path {
+        project: String,
+        path: String,
+    },
+    Archive {
+        project: String,
+    },
+    Unarchive {
+        project: String,
+    },
+    Delete {
+        project: String,
+    },
+    Viewer {
+        project: String,
+        name: Option<String>,
+    },
 }
 
 /// The checkouts under a project (DESIGN.md §3/§5). A project always has at
@@ -663,6 +692,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Inbox => inbox_verb(store, ctx),
         Verb::Next => next_verb(store),
         Verb::Stats => stats_verb(store),
+        Verb::Seed { force } => seed_verb(store, ctx, force),
         Verb::Explain { task_id } => explain_verb(store, task_id, ctx),
         Verb::Agent { cmd } => agent_verb(cmd, ctx),
         Verb::Dispatch { task_id, agent } => {
@@ -670,7 +700,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         }
         Verb::Open { task_id } => dispatch::open(store, ctx, task_id, None),
         Verb::Viewer { cmd } => viewer_verb(store, cmd, ctx),
-        Verb::Pr { task_id, yes } => pr_verb(store, task_id, yes, ctx),
+        Verb::Pr { task_id, yes } => pr_verb(store, task_id, yes),
         Verb::Reject(args) => reject_verb(store, args),
         Verb::Done(args) => done_verb(store, args),
         Verb::Import(args) => import_verb(store, args),
@@ -872,9 +902,9 @@ fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
         ProjectCmd::List => {
             let mut out = String::new();
             for p in store.projects().map_err(|e| e.to_string())? {
-                let action = match &p.review_action {
-                    ReviewAction::Auto => String::new(),
-                    other => format!("  [{other}]"),
+                let viewer = match &p.viewer {
+                    Some(name) => format!("  [viewer:{name}]"),
+                    None => String::new(),
                 };
                 let archived = if p.archived { "  [archived]" } else { "" };
                 // The path column stays the default repo's, so a single-repo
@@ -891,7 +921,7 @@ fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
                 };
                 writeln!(
                     out,
-                    "{:3}  w{}  {}  {}{extra}{action}{archived}",
+                    "{:3}  w{}  {}  {}{extra}{viewer}{archived}",
                     p.id, p.weight, p.name, path
                 )
                 .unwrap();
@@ -946,15 +976,16 @@ fn project_verb(store: &mut Store, cmd: ProjectCmd) -> Result<String, String> {
                 .map_err(|e| e.to_string())?;
             Ok(format!("project {} '{}' deleted", project.id, project.name))
         }
-        ProjectCmd::Action { project, action } => {
+        ProjectCmd::Viewer { project, name } => {
             let project = resolve_project(store, &project)?;
-            let action = ReviewAction::parse(&action).map_err(|e| e.to_string())?;
             let p = store
-                .set_review_action(project.id, &action)
+                .set_viewer(project.id, name.as_deref())
                 .map_err(|e| e.to_string())?;
             Ok(format!(
-                "{} review action {} -> {}",
-                p.name, project.review_action, p.review_action
+                "{} viewer: {} -> {}",
+                p.name,
+                viewer_label(project.viewer.as_deref()),
+                viewer_label(p.viewer.as_deref())
             ))
         }
     }
@@ -1556,28 +1587,29 @@ fn doc_link_echo(docs: &[Doc]) -> String {
     format!("docs: {}", listed.join(", "))
 }
 
-/// `pr <task-id> [--yes]` (DESIGN.md §8/§11c): the per-project "show me this
-/// task's diff" action. With a tracked PR, open it in a browser. Without one,
-/// resolve the project's review medium: GitHub creates the PR from the review
-/// task's done-time state (asserting PR-readiness, confirming unless `--yes`),
-/// a viewer project opens the checkout, as `open` does.
-fn pr_verb(store: &mut Store, id: i64, yes: bool, ctx: &DispatchCtx) -> Result<String, String> {
+/// `pr <task-id> [--yes]` (DESIGN.md §8/§11c): the GitHub half of "show me this
+/// task's diff", whatever viewer the project names. With a tracked PR,
+/// open it in a browser. Without one, create the PR from the review task's
+/// done-time state — asserting PR-readiness, confirming unless `--yes`. A
+/// checkout that cannot take a PR errors pointing at `voro open`, which is the
+/// only local-diff spelling.
+fn pr_verb(store: &mut Store, id: i64, yes: bool) -> Result<String, String> {
     let task = store.task(id).map_err(|e| e.to_string())?;
     if task.pr_url.is_some() {
         return crate::pr::open(store, id);
     }
-    let project = store.project(task.project_id).map_err(|e| e.to_string())?;
-    let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
-    if let ReviewMedium::Viewer(viewer) = crate::pr::resolve_medium(&project, &repo.path) {
-        return dispatch::open(store, ctx, id, viewer.as_deref());
-    }
     // Assert PR-ready and learn the branch before prompting, so a task missing
     // state, branch, or summary fails naming the gap rather than at the prompt.
     let plan = crate::pr::plan(store, id)?;
+    let local_diff = format!("`voro open {id}`");
+    // Then the medium, before the prompt rather than after it: nothing is worth
+    // confirming on a checkout GitHub cannot take.
+    let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
+    crate::pr::ensure_github_repo(&repo.path, &local_diff)?;
     if !yes && !confirm(&format!("push `{}` and open a PR for #{id}?", plan.branch))? {
         return Ok(format!("cancelled — no PR opened for #{id}"));
     }
-    crate::pr::create(store, id).map(|url| format!("opened {url} for task {id}"))
+    crate::pr::create(store, id, &local_diff).map(|url| format!("opened {url} for task {id}"))
 }
 
 /// Ask a yes/no question on the terminal, defaulting to no (DESIGN.md §8). A
@@ -1650,7 +1682,7 @@ fn done_verb(store: &mut Store, args: DoneArgs) -> Result<String, String> {
         write!(out, " (branch {})", name.trim()).unwrap();
     }
     // A code-producing task's complete report carries both a branch and a
-    // summary whatever the review medium, so warn (never fail) about whichever
+    // summary whichever key reviews it, so warn (never fail) about whichever
     // is absent — this note is ephemeral and costs the operator nothing, so it
     // stays symmetric where the durable flag only marks a branch without a
     // summary (DESIGN.md §8). A human task lands straight in `done` with no
@@ -1721,6 +1753,7 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
         writeln!(out, "branch: {branch}").unwrap();
     }
     if let Some(verb) = task.next_action() {
+        let verb = advertised(store, &mut ForgeMemo::default(), &task, verb);
         writeln!(out, "next: {verb}").unwrap();
     }
     if store
@@ -1767,14 +1800,18 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
         )
         .unwrap();
     }
-    // The response to a rejection (DESIGN.md §8), the CLI's mirror of the
-    // detail pane's block: the summary the rework came back with, read beside
-    // the feedback it answers rather than dug out of the event log.
-    if let Some(report) =
-        voro_core::rework_report(&store.events_for(id).map_err(|e| e.to_string())?)
-        && let Some(summary) = report.summary
+    // What the agent reported (DESIGN.md §8), the CLI's mirror of the detail
+    // pane's block: the completion summary of the cycle in hand, headed on a
+    // rework by the feedback it answers, rather than dug out of the event log.
+    if matches!(task.state, TaskState::Review | TaskState::Waiting)
+        && let Some(report) =
+            voro_core::completion_report(&store.events_for(id).map_err(|e| e.to_string())?)
     {
-        writeln!(out, "response to the review feedback:\n{summary}").unwrap();
+        let heading = match report.feedback {
+            Some(_) => "response to the review feedback:",
+            None => "completion summary:",
+        };
+        writeln!(out, "{heading}\n{}", report.summary).unwrap();
     }
     // The plans this task implements (DESIGN.md §3), resolved to where they
     // actually are — the same absolute location dispatch hands the agent.
@@ -1842,6 +1879,7 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
         None => None,
     };
     let projects = store.projects().map_err(|e| e.to_string())?;
+    let mut forges = ForgeMemo::default();
     let mut out = String::new();
     for task in store.tasks().map_err(|e| e.to_string())? {
         if state_filter.is_some_and(|s| task.state != s)
@@ -1859,7 +1897,7 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
             .unwrap_or("?");
         let incomplete = incomplete_report_suffix(store, task.id);
         let suffix = if incomplete.is_empty() {
-            review_next_suffix(&task)
+            review_next_suffix(store, &mut forges, &task)
         } else {
             incomplete.to_string()
         };
@@ -1878,12 +1916,28 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
 /// A review row's next action as a browser suffix (DESIGN.md §3). The list
 /// shows state in its own column, so only `review` — whose verb reads the
 /// tracked PR, not the state alone — earns the suffix.
-fn review_next_suffix(task: &Task) -> String {
+fn review_next_suffix(store: &Store, forges: &mut ForgeMemo, task: &Task) -> String {
     if task.state != TaskState::Review {
         return String::new();
     }
-    task.next_action()
-        .map_or_else(String::new, |verb| format!("  next: {verb}"))
+    task.next_action().map_or_else(String::new, |verb| {
+        format!("  next: {}", advertised(store, forges, task, verb))
+    })
+}
+
+/// The verb a row advertises (DESIGN.md §3): the derived one, except that `pr`
+/// degrades to the local review path in a checkout with no remote to open a
+/// pull request on (§8) — a recommendation that could only fail is worse than
+/// none. A checkout that cannot be resolved keeps the derived verb, so nothing
+/// but a definite answer moves a row.
+fn advertised(store: &Store, forges: &mut ForgeMemo, task: &Task, verb: NextAction) -> NextAction {
+    if verb != NextAction::Pr {
+        return verb;
+    }
+    match store.repo_for_task(task) {
+        Ok(repo) if !forges.takes_pull_requests(&repo.path) => verb.without_pull_requests(),
+        _ => verb,
+    }
 }
 
 fn inbox_verb(store: &mut Store, ctx: &DispatchCtx) -> Result<String, String> {
@@ -1894,6 +1948,7 @@ fn inbox_verb(store: &mut Store, ctx: &DispatchCtx) -> Result<String, String> {
         max_running: config.max_running(),
     };
     let queue = scheduler::queue(&candidates, &config.costs(), gate);
+    let mut forges = ForgeMemo::default();
     let mut out = String::new();
     // The capacity line stands in for the dispatch rows the gate suppressed,
     // so an inbox with no startable work still says why (DESIGN.md §7).
@@ -1956,7 +2011,7 @@ fn inbox_verb(store: &mut Store, ctx: &DispatchCtx) -> Result<String, String> {
                     "{:5.1}  #{} {:10} {} {}: {}",
                     row.effective,
                     c.task.id,
-                    row.action.as_str(),
+                    advertised(store, &mut forges, &c.task, row.action),
                     c.task.priority,
                     c.project_name,
                     c.task.title
@@ -1987,6 +2042,37 @@ fn plural(n: usize, noun: &str) -> String {
 
 /// Task counts by state (DESIGN.md §12) as a scriptable readout, excluding
 /// parked projects so the numbers match the queue and header.
+/// Fixture data, for the dev store only (DESIGN.md §5). The refusal is on the
+/// database in play, not on how the binary was built, so no combination of
+/// flags and environment seeds over the operator's board.
+fn seed_verb(store: &mut Store, ctx: &DispatchCtx, force: bool) -> Result<String, String> {
+    if ctx.db_path == Store::production_db_path() {
+        return Err(format!(
+            "refusing to seed {} — that is your real store, not the dev one. A build run from \
+             a target/ directory seeds {} by itself on first run.",
+            Store::production_db_path().display(),
+            Store::dev_db_path().display()
+        ));
+    }
+    let empty = voro_core::seed::is_empty(store).map_err(|e| e.to_string())?;
+    if !empty {
+        if !force {
+            return Err(format!(
+                "{} already has projects — pass --force to discard them and rebuild the fixture",
+                ctx.db_path.display()
+            ));
+        }
+        store.truncate_all().map_err(|e| e.to_string())?;
+    }
+    let summary = voro_core::seed::seed(store).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "seeded {} with {} projects and {} tasks",
+        ctx.db_path.display(),
+        summary.projects,
+        summary.tasks
+    ))
+}
+
 fn stats_verb(store: &mut Store) -> Result<String, String> {
     let c = store.state_counts().map_err(|e| e.to_string())?;
     let mut out = String::new();
@@ -2029,8 +2115,8 @@ fn next_verb(store: &mut Store) -> Result<String, String> {
 }
 
 /// `  [incomplete report]` when a `review` task carries a branch and no summary
-/// (DESIGN.md §8), else empty. Deliberately does not resolve the review medium,
-/// since `auto` resolution probes `gh` and this renders per line.
+/// (DESIGN.md §8), else empty. Read from task and event state alone — nothing
+/// here touches `gh`, since this renders per line.
 fn incomplete_report_suffix(store: &Store, task_id: i64) -> &'static str {
     if store.incomplete_report_flag(task_id).unwrap_or(false) {
         "  [incomplete report]"
@@ -2116,7 +2202,7 @@ fn explain_verb(store: &mut Store, id: i64, ctx: &DispatchCtx) -> Result<String,
 /// `viewer list/add/remove` (DESIGN.md §8/§11a): read and edit the viewers
 /// `voro.toml` defines. `add`/`remove` route through the same comment-preserving
 /// write helper the TUI Config screen uses; `remove` needs the store to refuse
-/// deleting a viewer a project's review action still names.
+/// deleting a viewer a project still names.
 fn viewer_verb(store: &mut Store, cmd: ViewerCmd, ctx: &DispatchCtx) -> Result<String, String> {
     let path = &ctx.agents_path;
     match cmd {
@@ -2137,8 +2223,8 @@ fn viewer_verb(store: &mut Store, cmd: ViewerCmd, ctx: &DispatchCtx) -> Result<S
             if !referencing.is_empty() {
                 let names: Vec<&str> = referencing.iter().map(|p| p.name.as_str()).collect();
                 return Err(format!(
-                    "viewer '{name}' is the review action of {} — repoint {} with `voro project \
-                     action <project> <auto|pr|viewer:NAME>` before removing it",
+                    "viewer '{name}' is the viewer of {} — repoint {} with `voro project \
+                     viewer <project> [NAME]` before removing it",
                     names.join(", "),
                     if referencing.len() == 1 { "it" } else { "them" }
                 ));
@@ -2450,6 +2536,7 @@ mod tests {
             agents_path: agents_path.clone(),
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         let mut s = store();
         let call = |s: &mut Store, args: &[&str]| {
@@ -2495,6 +2582,7 @@ mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         let mut s = store();
         let call = |s: &mut Store, args: &[&str]| {
@@ -2522,14 +2610,14 @@ mod tests {
         let out = call(&mut s, &["viewer", "add", "difftool", "git difftool -d"]).unwrap();
         assert!(out.contains("{path}"), "{out}");
 
-        // a project pinned to viewer:zed blocks its removal, naming the project
+        // a project naming zed blocks its removal, naming the project
         call(&mut s, &["project", "add", "demo", "/tmp/demo"]).unwrap();
-        call(&mut s, &["project", "action", "demo", "viewer:zed"]).unwrap();
+        call(&mut s, &["project", "viewer", "demo", "zed"]).unwrap();
         let e = call(&mut s, &["viewer", "remove", "zed"]).unwrap_err();
-        assert!(e.contains("demo") && e.contains("review action"), "{e}");
+        assert!(e.contains("demo") && e.contains("is the viewer of"), "{e}");
 
         // repoint the project, then removal succeeds and list loses it
-        call(&mut s, &["project", "action", "demo", "auto"]).unwrap();
+        call(&mut s, &["project", "viewer", "demo"]).unwrap();
         let out = call(&mut s, &["viewer", "remove", "zed"]).unwrap();
         assert!(out.contains("removed"), "{out}");
         let listed = call(&mut s, &["viewer", "list"]).unwrap();
@@ -3145,6 +3233,41 @@ mod tests {
         assert!(out.contains("review PR"), "{out}");
     }
 
+    /// `show` prints the completion summary of the cycle awaiting a verdict —
+    /// on a first review as well as a rework (task #407) — and stops once the
+    /// verdict has been given, when the summary is history.
+    #[test]
+    fn show_prints_the_completion_summary_under_review() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "A task", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["done", "1", "--summary", "README.md: +2 lines"]);
+        let out = ok(&mut s, &["show", "1"]);
+        assert!(
+            out.contains("completion summary:\nREADME.md: +2 lines"),
+            "{out}"
+        );
+
+        // Handed off, the verdict is still pending, so the report still shows.
+        ok(&mut s, &["wait", "1"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("README.md: +2 lines"));
+
+        // Sent back: the rejected round's summary is not an answer to the
+        // feedback, so nothing shows until the rework reports.
+        ok(&mut s, &["reject", "1", "tests missing"]);
+        assert!(!ok(&mut s, &["show", "1"]).contains("completion summary:"));
+        ok(&mut s, &["done", "1", "--summary", "added the tests"]);
+        let out = ok(&mut s, &["show", "1"]);
+        assert!(
+            out.contains("response to the review feedback:\nadded the tests"),
+            "{out}"
+        );
+
+        ok(&mut s, &["accept", "1"]);
+        assert!(!ok(&mut s, &["show", "1"]).contains("summary:"));
+    }
+
     /// `show` names the next action in its header whenever the task derives
     /// one, and drops the line on states that ask nothing of the human.
     #[test]
@@ -3194,6 +3317,65 @@ mod tests {
         ok(&mut s, &["set", &complete.to_string(), "--pr", "acme/w#1"]);
         let out = ok(&mut s, &["list"]);
         assert!(out.contains("next: review PR"), "{out}");
+    }
+
+    /// A checkout with no remote has nowhere to open a pull request, so every
+    /// surface that advertises a verb names the local review path instead of a
+    /// `pr` that could only fail (DESIGN.md §8). Adding a remote puts `pr`
+    /// back, and a tracked PR is untouched either way.
+    #[test]
+    fn a_review_row_in_a_remoteless_checkout_advertises_open() {
+        use std::process::{Command, Stdio};
+
+        let project = std::env::temp_dir().join(format!(
+            "voro-cli-remoteless-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+
+        let mut s = store();
+        ok(
+            &mut s,
+            &["project", "add", "demo", project.to_str().unwrap()],
+        );
+        let id = review_task(&mut s, Some("feat/thing"), Some("did it"));
+
+        let show = ok(&mut s, &["show", &id.to_string()]);
+        assert!(show.contains("next: open"), "{show}");
+        let list = ok(&mut s, &["list"]);
+        assert!(list.contains("next: open"), "{list}");
+        let inbox = ok(&mut s, &["inbox"]);
+        assert!(inbox.contains(&format!("#{id} open ")), "{inbox}");
+
+        // A tracked PR outranks the checkout: the diff already lives there.
+        ok(&mut s, &["set", &id.to_string(), "--pr", "acme/w#1"]);
+        let show = ok(&mut s, &["show", &id.to_string()]);
+        assert!(show.contains("next: review PR"), "{show}");
+
+        ok(&mut s, &["set", &id.to_string(), "--no-pr"]);
+        git(&["remote", "add", "origin", "https://github.com/acme/w.git"]);
+        let show = ok(&mut s, &["show", &id.to_string()]);
+        assert!(show.contains("next: pr"), "{show}");
+        let inbox = ok(&mut s, &["inbox"]);
+        assert!(inbox.contains(&format!("#{id} pr ")), "{inbox}");
+
+        std::fs::remove_dir_all(&project).ok();
     }
 
     #[test]
@@ -3992,20 +4174,12 @@ mod tests {
         id
     }
 
-    /// Pin the demo project's review action to `pr`, so these tests exercise
-    /// the GitHub create path deterministically — under `auto` a non-GitHub
-    /// temp path would resolve to the viewer medium instead (DESIGN.md §8).
-    fn pin_pr_action(s: &mut Store) {
-        ok(s, &["project", "action", "demo", "pr"]);
-    }
-
     /// `pr` on a task that is not in `review` fails naming the state gap, before
     /// touching git or `gh` — the validation runs first.
     #[test]
     fn pr_create_requires_the_review_state() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        pin_pr_action(&mut s);
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
         let e = err(&mut s, &["pr", "1", "--yes"]);
         assert!(e.contains("review"), "{e}");
@@ -4016,7 +4190,6 @@ mod tests {
     fn pr_create_requires_a_branch() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        pin_pr_action(&mut s);
         let id = review_task(&mut s, None, Some("did it"));
         let e = err(&mut s, &["pr", &id.to_string(), "--yes"]);
         assert!(e.contains("branch"), "{e}");
@@ -4028,7 +4201,6 @@ mod tests {
     fn pr_create_requires_a_summary() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        pin_pr_action(&mut s);
         let id = review_task(&mut s, Some("feat/thing"), None);
         let e = err(&mut s, &["pr", &id.to_string(), "--yes"]);
         assert!(e.contains("summary"), "{e}");
@@ -4042,7 +4214,7 @@ mod tests {
         assert!(out.contains("--summary-file"), "{out}");
     }
 
-    // --- the folded review action (DESIGN.md §8/§11a) ---
+    // --- the project's viewer, and the static `pr` (DESIGN.md §8/§11a) ---
 
     /// A DispatchCtx whose voro.toml is the given text, isolated under a temp
     /// root — the CLI-test face of the dispatch fixtures, for verbs that read
@@ -4065,6 +4237,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         }
     }
 
@@ -4073,25 +4246,27 @@ mod tests {
     }
 
     #[test]
-    fn project_action_sets_shows_and_rejects() {
+    fn project_viewer_sets_clears_and_shows() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        let out = ok(&mut s, &["project", "action", "demo", "viewer:zed"]);
-        assert!(out.contains("auto -> viewer:zed"), "{out}");
+        let out = ok(&mut s, &["project", "viewer", "demo", "zed"]);
+        assert!(out.contains("default viewer -> zed"), "{out}");
         assert!(
             ok(&mut s, &["project", "list"]).contains("[viewer:zed]"),
-            "list must show a pinned action"
+            "list must show the viewer a project names"
         );
 
-        ok(&mut s, &["project", "action", "demo", "auto"]);
+        // naming no viewer clears it back to the default, which earns no marker
+        let out = ok(&mut s, &["project", "viewer", "demo"]);
+        assert!(out.contains("zed -> default viewer"), "{out}");
         assert!(
             !ok(&mut s, &["project", "list"]).contains("[viewer"),
-            "auto is the default and earns no marker"
+            "the default viewer earns no marker"
         );
 
-        let e = err(&mut s, &["project", "action", "demo", "github"]);
-        assert!(e.contains("auto, pr, viewer"), "{e}");
-        assert!(ok(&mut s, &["help"]).contains("project action"), "help");
+        let e = err(&mut s, &["project", "viewer", "nope", "zed"]);
+        assert!(e.contains("nope"), "{e}");
+        assert!(ok(&mut s, &["help"]).contains("project viewer"), "help");
     }
 
     #[test]
@@ -4117,11 +4292,12 @@ mod tests {
         assert!(ok(&mut s, &["help"]).contains("viewer list"), "help");
     }
 
-    /// The fold itself: `pr` on a project whose review action names a viewer
-    /// runs that viewer on the checkout — no branch, summary, or GitHub repo
-    /// required — instead of erroring at the forge seam (DESIGN.md §8).
+    /// `pr` is statically the GitHub medium (DESIGN.md §8): on a checkout that
+    /// cannot take a pull request it errors pointing at `voro open`, and the
+    /// viewer the project names does not redirect it. The
+    /// viewer would leave a marker behind, so its absence is the assertion.
     #[test]
-    fn pr_on_a_viewer_project_opens_the_viewer() {
+    fn pr_on_a_non_github_checkout_errors_pointing_at_open() {
         let mut s = store();
         let ctx = ctx_with_toml("[viewers.marker]\ncmd = \"touch {path}/opened.marker\"\n");
         let project_dir = ctx.db_path.parent().unwrap().join("project");
@@ -4131,21 +4307,18 @@ mod tests {
             &mut s,
             &["project", "add", "demo", project_dir.to_str().unwrap()],
         );
-        ok(&mut s, &["project", "action", "demo", "viewer:marker"]);
-        // a review task with neither branch nor summary — the viewer medium
-        // must not demand PR-readiness
-        let id = review_task(&mut s, None, None);
+        ok(&mut s, &["project", "viewer", "demo", "marker"]);
+        // PR-ready in every way but the checkout, so the refusal can only be
+        // about the medium.
+        let id = review_task(&mut s, Some("feat/thing"), Some("did it"));
 
-        let out = run_with(&mut s, &["pr", &id.to_string()], &ctx).unwrap();
-        assert!(out.contains("opened task"), "{out}");
-        let marker = project_dir.join("opened.marker");
-        for _ in 0..50 {
-            if marker.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(marker.exists(), "pr must have run the project's viewer");
+        let e = run_with(&mut s, &["pr", &id.to_string(), "--yes"], &ctx).unwrap_err();
+        assert!(e.contains("voro open"), "{e}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !project_dir.join("opened.marker").exists(),
+            "pr must not fall back to the project's viewer"
+        );
     }
 
     // --- done summary-file and PR-readiness warnings (DESIGN.md §8) ---
@@ -4201,7 +4374,7 @@ mod tests {
     fn done_warning_promises_no_pr_failure_on_a_viewer_project() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
-        ok(&mut s, &["project", "action", "demo", "viewer:zed"]);
+        ok(&mut s, &["project", "viewer", "demo", "zed"]);
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
         ok(&mut s, &["start", "1"]);
         let out = ok(&mut s, &["done", "1", "--branch", "feat/x"]);
@@ -4539,6 +4712,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         ok(
             &mut store,
@@ -4618,6 +4792,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
         };
         (store, ctx, project)
     }

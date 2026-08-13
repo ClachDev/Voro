@@ -20,7 +20,9 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use voro_core::{AgentSessionEntry, SessionLiveness, parse_sessions_json};
+use voro_core::{
+    AgentSessionEntry, CapReading, SessionLiveness, parse_sessions_json, read_cap, render_session,
+};
 
 /// Run an agent's `sessions` command and parse its listing, in a given
 /// directory where the caller has one to scope it to (dispatch matches a fresh
@@ -72,6 +74,47 @@ pub fn pid_is_alive(pid: i64) -> bool {
         .args(["-0", &pid.to_string()])
         .output()
         .is_ok_and(|out| out.status.success())
+}
+
+/// Run an agent's `logs` command for one session and read the result as a cap
+/// reading (DESIGN.md §8). `None` means "nothing says this session is capped",
+/// which is also what a command that would not run answers: the verb is
+/// best-effort throughout, and an agent that cannot produce output for a
+/// session is one Voro badges nothing for.
+///
+/// Exit status is deliberately not consulted. The built-in `claude` spelling
+/// exits zero on a job it cannot find, printing a not-found line, and an agent
+/// that exits non-zero while still having printed the tail is no less readable;
+/// the only question either way is whether a cap signature is in the text.
+pub fn read_session_cap(logs_cmd: &str, session_ref: &str) -> Option<CapReading> {
+    let rendered = render_session(logs_cmd, session_ref);
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&rendered)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    read_cap(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The local wall clock as minutes past midnight, which is what a bare reset
+/// time in an agent's output is compared against ([`CapReading::reset_passed`]).
+///
+/// Read from `date` because the agent renders that time in the operator's own
+/// timezone and the standard library offers no local time — a dependency for
+/// one clock reading would cost more than the subprocess, which runs only when
+/// a badge with a time is actually on screen. An unreadable clock answers
+/// `None`, and the badge simply shows the time without judging it.
+pub fn local_minutes() -> Option<u16> {
+    let output = Command::new("date")
+        .arg("+%H:%M")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    let stamp = String::from_utf8_lossy(&output.stdout);
+    let (hour, minute) = stamp.trim().split_once(':')?;
+    let (hour, minute): (u16, u16) = (hour.parse().ok()?, minute.parse().ok()?);
+    (hour < 24 && minute < 60).then_some(hour * 60 + minute)
 }
 
 /// Whether a session is still running, for a caller holding no listing of its
@@ -152,6 +195,50 @@ mod tests {
         assert!(!pid_is_alive(0));
         assert!(!pid_is_alive(-1));
         assert!(pid_is_alive(std::process::id() as i64));
+    }
+
+    /// The `logs` verb end to end: the reference is bound and shell-quoted,
+    /// the output is classified, and the reset time comes back parsed.
+    #[test]
+    fn a_capped_session_reads_as_capped_through_the_logs_verb() {
+        let reading = read_session_cap(
+            "printf 'Session limit reached · Retrying in 5m (9:50pm)' # {session}",
+            "uuid-1",
+        )
+        .expect("a cap");
+        assert_eq!(reading.reset_label().as_deref(), Some("21:50"));
+
+        // The reference reaches the command as itself, so a session can be
+        // singled out by it rather than the template being merely decorative.
+        assert_eq!(
+            read_session_cap("printf %s {session}", "session limit reached"),
+            Some(voro_core::CapReading::default())
+        );
+    }
+
+    /// A session that is working, and the ways the verb itself can come to
+    /// nothing, all read the same: no cap. The built-in `claude` spelling exits
+    /// zero on a job it cannot find, so a not-found line must be as unremarkable
+    /// as a command that would not run at all.
+    #[test]
+    fn a_healthy_or_unreadable_session_reads_as_uncapped() {
+        for cmd in [
+            "printf 'Running tests… {session}'",
+            "printf \"Couldn't read logs for {session} — job not found\"",
+            "printf 'No job matching {session}.'",
+            "false # {session}",
+            "exit 127 # {session}",
+        ] {
+            assert_eq!(read_session_cap(cmd, "uuid-1"), None, "{cmd}");
+        }
+    }
+
+    /// The wall clock the reset badge is judged against is a real reading, in
+    /// range — the badge is wrong in both directions if this is not.
+    #[test]
+    fn the_local_clock_reads_within_the_day() {
+        let minutes = local_minutes().expect("a local clock");
+        assert!(minutes < 24 * 60, "{minutes}");
     }
 
     /// The three ways liveness is unknowable, each answering `None` rather

@@ -11,15 +11,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Capped sessions are visible instead of silently stuck.** A usage cap does
+  not kill a backgrounded agent — the supervisor stays alive and waits for the
+  window to reset — so capped work used to ride the running strip looking
+  healthy for hours. Its row is now badged `⚠ capped ↻21:50`, with the reset
+  time where the agent named one and `⚠ capped · reset passed` once that time
+  has gone by. The task stays `running` and the session stays open: nothing is
+  dead and nothing needs redispatching. The badge clears itself once the
+  session is continued. Agents declare the capability with a new optional
+  `logs` verb (`{session}`), built in for `claude`; an agent without one, such
+  as `codex`, is probed for nothing and behaves exactly as before.
+- **A build from a `target/` directory opens a dev store, not your real one.** A
+  `voro` run out of `target/debug` or `target/release` now uses
+  `~/.local/share/voro/dev.db`, seeded on first run with a fixture board
+  covering every task state, both live and dead sessions, each dependency kind,
+  a multi-repo project and an archived one. `voro seed --force` rebuilds it;
+  seeding the operator's store is refused. Such a build also takes no database
+  from the environment: dispatch exports `VORO_DB` so a session's return path
+  finds the store its dispatcher was on, which put the operator's database in
+  the environment of every agent working in a worktree, and a `cargo run` there
+  inherited it. An explicit `--db` is still honoured. This chooses a default
+  and bounds nothing — `cargo install --path` builds a working checkout into an
+  ordinary install location, where it counts as installed — so what protects
+  the schema is the journal and the version check below.
+- **The store records which migrations it is made of.** A `schema_migrations`
+  journal keeps each applied migration's SQL alongside the build that applied
+  it, and every open checks it against the migrations the running binary
+  carries. `user_version` is a counter, so it cannot distinguish two branches
+  that each add a migration 17 — the binary carrying the other 17 applies
+  nothing, refuses nothing, and dies at the first query on a missing column.
+  That case is now refused up front, naming the migration, the build that
+  applied it, and the snapshot to restore. Migrations applied before the
+  journal existed are recorded as unverifiable rather than assumed. One new
+  rule follows: an applied migration is immutable, and editing one is reported
+  as a divergence.
+- **Two further guards on opening a store.** A database whose schema is ahead of
+  the running binary is refused with an error naming the way out, instead of
+  silently skipping the migration and failing later as a missing column; and
+  any open that is about to migrate first copies the file to `backups/` beside
+  it, so a migration that renames or drops a column stays recoverable.
+  Startup failures now print their message rather than a `Debug` dump.
 - **Quick-message a task's session**: `a` in the TUI collects one line and sends
   it straight into the task's recorded agent session, headlessly, without
   suspending the cockpit — for a `needs-input`, `review`, or `waiting` task
   whose session is between turns. On a review or waiting task the message *is*
-  the rejection: the feedback is appended to the body and logged before
-  anything is sent. The interactive jump-in moves from `a` to `A`. Agents
-  declare the capability with a new optional `message` verb (`{session}` plus
-  `{prompt_file}`), built in for `claude`; an agent without one, such as
-  `codex`, reports so on the status line and keeps its jump-in.
+  the rejection: the send goes first and the feedback is appended to the body
+  and logged behind it, so a message the agent refuses leaves the task
+  untouched rather than recording feedback nobody received. The interactive
+  jump-in moves from `a` to `A`. Agents declare the capability with a new
+  optional `message` verb (`{session}` plus `{prompt_file}`, and the optional
+  `{new_session}` for an agent that can only be joined by forking — which is
+  how the built-in `claude` verb reaches a session its supervisor still holds),
+  built in for `claude`; an agent without one, such as `codex`, reports so on
+  the status line and keeps its jump-in.
 - `voro set <id> --unlink <kind>:<other-id>` drops a single dependency edge —
   `related:7`, `discovered-from:4`, `blocks:9` — named as `voro show` lists it.
   A pair of tasks carrying two edges keeps the one not named, so an edge
@@ -64,6 +108,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The review card shows the agent's completion summary.** A task in `review`
+  or `waiting` renders what the agent reported at `done` — its account of what
+  changed and how it was verified — above the task body, in the TUI detail pane
+  and in `voro show`. It was previously rendered only on a task that had been
+  rejected once, which left a first review with no account of the work anywhere
+  but `voro show`'s event log — and no PR or configured viewer to fall back on,
+  on the fresh install where that matters most. A rework's block is unchanged
+  but for its heading, and shows nothing while the rework is still in flight.
+- The per-project review action is now what it does: a viewer name. Since the
+  review keys split — `pr` always GitHub, `open` always a local viewer — the
+  setting decided only which `[viewers.<name>]` table a project's local diffs
+  open in, so `projects.review_action` becomes `projects.viewer` and holds that
+  name or nothing. Existing databases convert in place: `viewer:<name>` keeps
+  its name, and `auto`, `pr`, and a bare `viewer` — three spellings of "name no
+  viewer" — all become the default viewer. `voro project action <p>
+  <auto|pr|viewer[:NAME]>` is now `voro project viewer <p> [NAME]`, naming no
+  viewer to fall back to the default, and the projects screen's `v` picker
+  offers the default and each named viewer instead of two entries that did
+  nothing distinguishable.
 - The cockpit key line advertises `d/D dispatch` only on a `ready` or `stalled`
   row, where dispatch can actually act, rather than on any selection — which
   also makes room for the new `a/A message` slot within the line's ten.
@@ -99,6 +162,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Two errors a first-time user is likeliest to meet now say what to do about
+  them. An editor that will not run reports the variable and the command it
+  came from rather than a bare exit code — `could not run $EDITOR
+  (definitely-not-an-editor): not found` in place of `editor exited with exit
+  status: 127` — and a missing `gh` is named as the GitHub CLI, with where to
+  install it, instead of an `os error 2` that reads as if the checkout were
+  missing.
+- A review task in a project with nowhere to push no longer advertises `next:
+  pr`, an action that could only fail there. Where the task's checkout has no
+  git remote, every surface that names a next action — the cockpit detail card,
+  the browser and `voro list` suffixes, `voro show`, and the `voro inbox` verb
+  column — now reads `next: open` and points at `o` rather than `g`. The keys
+  themselves are unchanged: `g`/`pr` is still always GitHub and still refuses a
+  checkout `gh` cannot address, and `o`/`open` is still always the local viewer.
+  The advertisement rides a rendered row, so it asks git alone whether the
+  checkout has any remote, network-free and memoised per checkout, rather than
+  paying `pr`'s `gh` round-trip; a checkout whose remote is not GitHub reads as
+  before and is refused at press time.
+- A backgrounded session that dies on a usage cap is recorded `capped` rather
+  than `failed`. The classification read Voro's own launch log, which for a
+  `--bg` launch holds nothing but the backgrounding banner — the launcher exits
+  at birth — so it could essentially never fire; it now reads the session's own
+  output through the agent's `logs` verb, keeping the log tail as the fallback
+  for agents defining none. The phrases it matches also cover what agents
+  actually write: a five-hour cap is worded "Session limit reached" and a weekly
+  one "Weekly limit reached", neither of which contains "usage limit", "rate
+  limit" or "quota exceeded", so the previous list matched almost no real cap.
+  Warnings short of a cap ("approaching", "80% of your", "not your") are
+  excluded, so the marker still never fires on a healthy session.
 - A headless `voro refine` is no longer marked `⚠ refine failed` seconds after
   it starts. The round runs the agent's own `dispatch` template, so under a
   `claude --bg`-style launcher the pid Voro recorded belonged to a launcher that

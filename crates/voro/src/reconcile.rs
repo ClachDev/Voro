@@ -19,8 +19,8 @@
 //! its listing taken once per pass and cached here across the sessions sharing
 //! an agent. This is the only correct source for supervisor-owned launches
 //! (`claude --bg`), whose spawned pid is a launcher that exits at birth: the pid
-//! the session row holds would declare every such session dead, so it is never
-//! consulted for them, and undeterminable liveness (no ref, listing failed) is
+//! the session row holds can never declare such a session dead, and
+//! undeterminable liveness (no ref, listing failed) is
 //! left alone rather than guessed. The pid a listing *entry* carries is a
 //! different pid — the supervisor's — and it is authoritative where present,
 //! which is what stops a listing that keeps dead sessions at `blocked` forever
@@ -28,14 +28,34 @@
 //! child Voro owns, or any launch by an agent with no `sessions` verb — keeps
 //! the spawned-pid check.
 //!
+//! The row's own pid is still read in one direction, whichever source owns the
+//! session: a pid that is *alive* proves the session is (task #390). A quick
+//! message replaces that pid with the process carrying its turn, and where the
+//! agent had to fork to be joined at all, that turn is a `-p` run the agent's
+//! listing never shows — so the listing would report the session gone while the
+//! message it was just sent is still being worked on. A dead pid still proves
+//! nothing under a supervisor-owned launch and falls back to the listing.
+//!
 //! A refine round is read by the flavour it was launched as, which is the point
-//! of recording it: the headless flavour renders the agent's own `dispatch`
-//! template, so under a `--bg` launcher its recorded pid lies exactly as a
-//! dispatch's does, and it is listing-authoritative whether or not its ref
+//! of recording the source: the headless flavour renders the agent's own
+//! `dispatch` template, so under a `--bg` launcher its recorded pid lies exactly
+//! as a dispatch's does, and it is listing-authoritative whether or not its ref
 //! capture happened to succeed. The interactive flavour is the genuinely-own-pid
 //! case — a foreground `plan` child, no ref by construction — and says so on its
 //! row, so a Voro that dies mid-conversation still leaves a round another window
 //! can finish.
+//!
+//! Whether a *dead* session died capped is read from the same per-agent verb
+//! set, through an optional `logs` (task #415). Voro's own launch log — the
+//! only channel there used to be — cannot answer for a supervisor-owned launch:
+//! the launcher exits at birth having written nothing but the backgrounding
+//! banner, so the scan could essentially never report `capped` for a `--bg`
+//! dispatch, whatever killed it. An agent that can print a session's recent
+//! output is asked for it instead, and the log tail stays the fallback for
+//! agents that cannot. The *live* half of the same reading — a session held at
+//! a cap without dying, which is what a cap actually does to a `--bg` dispatch
+//! — is not taken here at all: it is slow enough to need its own off-loop
+//! runner ([`crate::probe::CapProbe`]), and it changes nothing in the database.
 //!
 //! There is no daemon watching for process exit. Reconciliation runs on read:
 //! `App::refresh` and every CLI verb call [`reconcile_live_sessions`] before
@@ -46,18 +66,16 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use voro_core::{AgentSessionEntry, AgentsConfig, LivenessSource, Result, Store, TaskState};
+use voro_core::{
+    AgentSessionEntry, AgentsConfig, LivenessSource, Result, Store, TaskState, read_cap,
+};
 
-use crate::session_probe::{listing_says_live, pid_is_alive, run_sessions_command};
+use crate::session_probe::{
+    listing_says_live, pid_is_alive, read_session_cap, run_sessions_command,
+};
 
 /// How much of a session's log tail to scan for a usage-cap signature.
 const LOG_TAIL_BYTES: u64 = 4096;
-
-/// Phrases that plausibly mean "usage cap", checked case-insensitively
-/// against the log tail. Deliberately narrow (DESIGN.md §8): not a general log
-/// parser — anything it misses is reported `failed` rather than misattributed
-/// as `capped`.
-const CAP_SIGNATURES: [&str; 3] = ["usage limit", "rate limit", "quota exceeded"];
 
 /// Reconcile every session still marked live, per its task's state (DESIGN.md
 /// §8). The probe-or-not decision is made here; [`Store::reconcile_session`]
@@ -115,14 +133,38 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
                     })
             }
         };
+        // A recorded process that is still there proves the session is live
+        // whatever the listing says: a quick message forks a `-p` turn that
+        // never appears in `claude agents`, so listing-absence alone must not
+        // finalise the session under it (DESIGN.md §8). The check is
+        // directional — a dead pid proves nothing, since a dispatch's pid is a
+        // launcher that exits at birth, and falls back to the listing verdict.
+        let alive = match alive {
+            Some(false) if session.pid.is_some_and(pid_is_alive) => Some(true),
+            verdict => verdict,
+        };
         let Some(alive) = alive else { continue };
         if alive {
             continue;
         }
-        let likely_capped = session
-            .log_path
-            .as_deref()
-            .is_some_and(log_tail_looks_capped);
+        // Classify the death from the session's *own* output where the agent
+        // can produce it (DESIGN.md §8). Voro's launch log is the wrong place
+        // to ask for a supervisor-owned launch: the launcher exits at birth
+        // having written only the backgrounding banner, so scanning it could
+        // essentially never report `capped` for a `--bg` dispatch however the
+        // session actually died. It stays the fallback for agents defining no
+        // `logs` verb, where it is the only text there is.
+        let logs_cmd = config
+            .as_ref()
+            .and_then(|c| c.agent(&session.agent))
+            .and_then(|a| a.logs());
+        let likely_capped = match logs_cmd.zip(session.session_ref.as_deref()) {
+            Some((cmd, session_ref)) => read_session_cap(cmd, session_ref).is_some(),
+            None => session
+                .log_path
+                .as_deref()
+                .is_some_and(log_tail_looks_capped),
+        };
         if store
             .reconcile_session(session.id, false, likely_capped)?
             .is_some()
@@ -133,8 +175,9 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
     Ok(finalised)
 }
 
-/// Best-effort usage-cap detector (DESIGN.md §8): scan the log tail for the
-/// phrases in [`CAP_SIGNATURES`].
+/// Best-effort usage-cap detector for an agent with no `logs` verb (DESIGN.md
+/// §8): read the launch log's tail and put it through the same classifier the
+/// session-output path uses, so both channels agree on what a cap looks like.
 fn log_tail_looks_capped(path: &str) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
@@ -144,12 +187,11 @@ fn log_tail_looks_capped(path: &str) -> bool {
     if file.seek(SeekFrom::Start(start)).is_err() {
         return false;
     }
-    let mut tail = String::new();
-    if file.read_to_string(&mut tail).is_err() {
+    let mut tail = Vec::new();
+    if file.read_to_end(&mut tail).is_err() {
         return false;
     }
-    let tail = tail.to_lowercase();
-    CAP_SIGNATURES.iter().any(|sig| tail.contains(sig))
+    read_cap(&String::from_utf8_lossy(&tail)).is_some()
 }
 
 #[cfg(test)]
@@ -471,11 +513,14 @@ mod tests {
         ] {
             let (agents_path, dir) = sessions_fixture(name, listing);
             let (mut s, task_id) = running_task();
+            // The launcher pid of a `--bg` dispatch, dead as it always is by
+            // now, so the listing is what decides (a *live* pid would override
+            // it — see `a_live_pid_outlives_its_absence_from_the_listing`).
             let session = s
                 .create_session(
                     task_id,
                     "claude",
-                    Some(std::process::id() as i64),
+                    Some(dead_pid()),
                     LivenessSource::Listing,
                     None,
                 )
@@ -514,7 +559,7 @@ mod tests {
             .create_session(
                 task_id,
                 "claude",
-                Some(std::process::id() as i64),
+                Some(dead_pid()),
                 LivenessSource::Listing,
                 None,
             )
@@ -549,6 +594,28 @@ mod tests {
             .create_session(task_id, "claude", None, LivenessSource::Listing, None)
             .unwrap();
         s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert!(s.session(session.id).unwrap().ended_at.is_none());
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The quick-message case (task #390): a forked `-p` turn does not appear
+    /// in the agent's listing at all, so the ref the session now carries reads
+    /// as gone — while the process answering the message is right there on the
+    /// row. A live pid outranks the listing, or the send the operator just made
+    /// would stall the task under the agent working on it.
+    #[test]
+    fn a_live_pid_outlives_its_absence_from_the_listing() {
+        let (agents_path, dir) = sessions_fixture("message-fork", "[]");
+        let (mut s, task_id) = running_task();
+        let session = s
+            .create_session(task_id, "claude", None, LivenessSource::Listing, None)
+            .unwrap();
+        s.record_session_send(session.id, Some("forked-uuid"), std::process::id() as i64)
+            .unwrap();
 
         assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
         assert!(s.session(session.id).unwrap().ended_at.is_none());
@@ -615,6 +682,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- capped deaths read the session's own output (task #415) ---
+
+    /// A `voro.toml` whose `claude` agent lists no sessions and prints
+    /// `logs_output` for any session, plus the log file path a launch would
+    /// have written, so a test can set the two channels against each other.
+    fn logs_fixture(name: &str, logs_output: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("voro-reconcile-logs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let agents_path = dir.join("voro.toml");
+        std::fs::write(
+            &agents_path,
+            format!(
+                "default_agent = \"claude\"\n\n[agents.claude]\n\
+                 dispatch = \"cat {{prompt_file}}\"\n\
+                 logs = \"printf '%s' '{logs_output}' # {{session}}\"\n"
+            ),
+        )
+        .unwrap();
+        let log = dir.join("launch.log");
+        (agents_path, log, dir)
+    }
+
+    /// The whole point of the `logs` verb on the dead path (DESIGN.md §8): a
+    /// `--bg` launch's own log holds nothing but the backgrounding banner, so
+    /// the session that died capped is only legible in the agent's own record
+    /// of it. Before this, the scan read the banner, found nothing, and reported
+    /// every capped bg dispatch as a plain failure.
+    #[test]
+    fn a_dead_session_is_classified_capped_from_its_own_output() {
+        let (agents_path, log, dir) = logs_fixture("capped", "Session limit reached");
+        std::fs::write(&log, "[voro] launched in background, pid 1234\n").unwrap();
+        let (mut s, task_id) = running_task();
+        let session = s
+            .create_session(
+                task_id,
+                "claude",
+                Some(dead_pid()),
+                LivenessSource::Pid,
+                Some(log.to_str().unwrap()),
+            )
+            .unwrap();
+        s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 1);
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
+        assert_eq!(
+            s.session(session.id).unwrap().outcome,
+            Some(SessionOutcome::Capped)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half: a session whose output says nothing about a cap is a
+    /// plain failure, and the verb's answer overrides the launch log rather
+    /// than being ORed with it — a banner that happened to contain the phrase
+    /// cannot re-label a death the agent itself accounts for otherwise.
+    #[test]
+    fn a_dead_session_the_verb_calls_healthy_is_a_plain_failure() {
+        let (agents_path, log, dir) = logs_fixture("failed", "compiling... done.");
+        std::fs::write(&log, "hit the usage limit\n").unwrap();
+        let (mut s, task_id) = running_task();
+        let session = s
+            .create_session(
+                task_id,
+                "claude",
+                Some(dead_pid()),
+                LivenessSource::Pid,
+                Some(log.to_str().unwrap()),
+            )
+            .unwrap();
+        s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 1);
+        assert_eq!(
+            s.session(session.id).unwrap().outcome,
+            Some(SessionOutcome::Failed)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An agent defining no `logs` verb is reconciled exactly as before, from
+    /// the launch log — and now catches the wordings the original three
+    /// signatures missed, since both channels share one classifier.
+    #[test]
+    fn a_verbless_agent_still_classifies_from_the_launch_log() {
+        let (mut s, task_id) = running_task();
+        let dead = dead_pid();
+        let log = std::env::temp_dir().join(format!(
+            "voro-reconcile-verbless-{}-{dead}.log",
+            std::process::id()
+        ));
+        std::fs::write(&log, "Session limit reached · resets 9pm").unwrap();
+
+        let session = s
+            .create_session(
+                task_id,
+                "manual",
+                Some(dead),
+                LivenessSource::Pid,
+                Some(log.to_str().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 1);
+        assert_eq!(
+            s.session(session.id).unwrap().outcome,
+            Some(SessionOutcome::Capped)
+        );
+        let _ = std::fs::remove_file(&log);
+    }
+
     // --- refine rounds read the source they recorded (tasks #379, #387) ---
 
     /// The refine-side twin of
@@ -643,15 +824,12 @@ mod tests {
     }
 
     /// The other half: a round genuinely gone from the listing is still caught
-    /// and still marked, however alive the pid on the row looks.
+    /// and still marked, the launcher pid on its row proving nothing either way.
     #[test]
     fn a_refine_round_gone_from_the_listing_is_marked_failed() {
         let (agents_path, dir) = sessions_fixture("refine-gone", "[]");
-        let (mut s, task_id, session_id) = refining_task(
-            "claude",
-            Some(std::process::id() as i64),
-            LivenessSource::Listing,
-        );
+        let (mut s, task_id, session_id) =
+            refining_task("claude", Some(dead_pid()), LivenessSource::Listing);
         s.set_session_ref(session_id, "refine-uuid").unwrap();
 
         assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 1);

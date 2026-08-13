@@ -8,8 +8,8 @@
 use std::process::{Command, Stdio};
 
 use voro_core::{
-    Mergeability, PrPlan, PrRef, PrRevisions, Project, ReviewDiff, ReviewMedium, Store,
-    format_review_feedback, parse_mergeable, parse_pr_revisions, plan_pr, plan_review_diff,
+    Mergeability, PrPlan, PrRef, PrRevisions, ReviewDiff, Store, format_review_feedback,
+    parse_mergeable, parse_pr_revisions, plan_pr, plan_review_diff,
 };
 
 /// Resolve a task's tracked PR, erroring with a fix-it hint when none is set.
@@ -95,26 +95,89 @@ pub fn local_review_diff(store: &Store, task_id: i64, repo_path: &str, branch: &
     )
 }
 
-/// Record the revision the operator has just reviewed and sent back (DESIGN.md
-/// §8), so the next look at this task is narrowed to the rework. Best-effort by
-/// design: a tracked PR's head is what was actually reviewed, a task without one
-/// falls back to the local tip of its branch, and neither being readable simply
-/// leaves the re-review showing the full diff.
-pub fn record_reviewed(store: &mut Store, task_id: i64) {
-    let Ok(task) = store.task(task_id) else {
-        return;
+/// Where the revision an operator has just reviewed can be read from: the
+/// task's tracked PR, and the local tip of its branch as the fallback. Holds
+/// owned strings and no `Store` handle, so it can move into the background
+/// thread that resolves it (`crate::probe`, DESIGN.md §8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewedSource {
+    pr_url: Option<String>,
+    /// The checkout the branch lives in, and the branch — a task dispatched
+    /// into a second repo has its branch there, not in the project's own.
+    branch: Option<(String, String)>,
+}
+
+#[cfg(test)]
+impl ReviewedSource {
+    /// A source with nothing to read, which resolves to `None` without running
+    /// a subprocess — enough to exercise the runner around it without `gh`.
+    pub fn empty() -> Self {
+        ReviewedSource {
+            pr_url: None,
+            branch: None,
+        }
+    }
+}
+
+/// The store half of a reviewed-revision capture (DESIGN.md §8): a few cheap
+/// SQLite reads, so it runs on the TUI event loop. `None` when the task has
+/// neither a tracked PR nor a branch in a resolvable checkout, which is the
+/// case that starts no capture at all.
+pub fn reviewed_source(store: &Store, task_id: i64) -> Option<ReviewedSource> {
+    let task = store.task(task_id).ok()?;
+    let branch = task.branch.as_deref().and_then(|branch| {
+        let repo = store.repo_for_task(&task).ok()?;
+        Some((repo.path, branch.to_string()))
+    });
+    let source = ReviewedSource {
+        pr_url: task.pr_url,
+        branch,
     };
-    let from_pr = task
+    (source.pr_url.is_some() || source.branch.is_some()).then_some(source)
+}
+
+/// The subprocess half of the capture (DESIGN.md §8), which is why it takes a
+/// [`ReviewedSource`] rather than a task: the TUI runs it off the event loop,
+/// where no `Store` is in reach. A tracked PR's head is what was actually
+/// reviewed, a task without one falls back to the local tip of its branch, and
+/// neither being readable yields `None` — an unreadable revision costs a full
+/// diff next time, never a failed reject.
+pub fn resolve_reviewed(source: &ReviewedSource) -> Option<String> {
+    let from_pr = source
         .pr_url
         .as_deref()
         .and_then(|url| PrRef::parse(url).ok())
-        .and_then(|pr| pr_revisions(&pr).head);
-    let sha = from_pr.or_else(|| {
-        let branch = task.branch.as_deref()?;
-        let repo = store.repo_for_task(&task).ok()?;
-        rev_parse(&repo.path, branch)
-    });
-    if let Some(sha) = sha {
+        .and_then(|pr| pr_head(&pr));
+    from_pr.or_else(|| {
+        let (repo_path, branch) = source.branch.as_ref()?;
+        rev_parse(repo_path, branch)
+    })
+}
+
+/// A PR's head revision (`gh pr view --json headRefOid`). The capture wants the
+/// head alone; the commit list [`pr_revisions`] also fetches answers a
+/// reachability question only the read path puts.
+fn pr_head(pr: &PrRef) -> Option<String> {
+    let output = Command::new("gh")
+        .args(["pr", "view", &pr.url, "--json", "headRefOid"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_pr_revisions(&String::from_utf8_lossy(&output.stdout)).head
+}
+
+/// Record the revision the operator has just reviewed and sent back (DESIGN.md
+/// §8), so the next look at this task is narrowed to the rework. Blocking, which
+/// is what a one-shot CLI verb should be; the TUI runs the same two halves
+/// either side of its event loop instead (`crate::probe::ReviewedCapture`).
+pub fn record_reviewed(store: &mut Store, task_id: i64) {
+    let Some(source) = reviewed_source(store, task_id) else {
+        return;
+    };
+    if let Some(sha) = resolve_reviewed(&source) {
         let _ = store.record_reviewed(task_id, &sha);
     }
 }
@@ -161,7 +224,7 @@ pub fn open_url(url: &str) -> Result<String, String> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("cannot run `gh` to open the PR: {e}"))?;
+        .map_err(|e| gh_unavailable(&e, "to open the PR"))?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -200,13 +263,15 @@ pub fn plan(store: &Store, task_id: i64) -> Result<PrPlan, String> {
 /// the dispatched agent still cannot publish. Only called when no PR is
 /// tracked; a tracked one jumps to [`open`] instead. Returns the canonical URL
 /// so a caller can chain into [`open_url`] without re-reading the task.
-pub fn create(store: &mut Store, task_id: i64) -> Result<String, String> {
+/// `local_diff` is the caller's spelling of the local-diff key, for the
+/// non-GitHub error in [`ensure_github_repo`].
+pub fn create(store: &mut Store, task_id: i64, local_diff: &str) -> Result<String, String> {
     let plan = plan(store, task_id)?;
     let task = store.task(task_id).map_err(|e| e.to_string())?;
     // The task's own checkout: a task dispatched into a second repo has its
     // branch there, so that is where the push and `gh pr create` must run.
     let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
-    let url = open_pr_on_github(&repo.path, &plan)?;
+    let url = open_pr_on_github(&repo.path, &plan, local_diff)?;
     // Canonicalise before storing, so the tracked URL matches what `set --pr`
     // would record and a later jump-to-PR is addressable.
     let pr = PrRef::parse(&url)
@@ -254,59 +319,97 @@ pub fn conflict_status_url(url: &str) -> Mergeability {
     }
 }
 
-/// Resolve a project's review medium (DESIGN.md §8). The decision is
-/// `ReviewAction::resolve` in `voro-core`; this seam supplies the one input it
-/// cannot compute — whether the checkout is a GitHub repo `gh` can address —
-/// and only when the action is `auto`, so pinned media never pay for the probe.
-/// The action stays per-project; the probe runs against `checkout`, the task's
-/// resolved repo, so a multi-repo project answers per task (DESIGN.md §8).
-pub fn resolve_medium(project: &Project, checkout: &str) -> ReviewMedium {
-    let on_github = project.review_action.needs_probe() && is_github_repo(checkout);
-    project.review_action.resolve(on_github)
-}
-
-/// The probe behind the `auto` review action: whether `gh` can address the
-/// checkout as a GitHub repository. A missing or unauthenticated `gh` reads
-/// as "not GitHub" — the viewer is then the only workable medium — while the
-/// explicit `pr` action still reports the failure via [`ensure_github_repo`].
-fn is_github_repo(repo_path: &str) -> bool {
-    Command::new("gh")
-        .args(["repo", "view", "--json", "nameWithOwner"])
-        .current_dir(repo_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 /// The forge-specific half of [`create`] (DESIGN.md §8): push the branch and
 /// open a ready PR against the repo's default branch, returning the PR URL. A
-/// non-GitHub checkout gets a clear error pointing at the viewer medium.
-fn open_pr_on_github(repo_path: &str, plan: &PrPlan) -> Result<String, String> {
-    ensure_github_repo(repo_path)?;
+/// non-GitHub checkout gets a clear error pointing at the local-diff key.
+fn open_pr_on_github(repo_path: &str, plan: &PrPlan, local_diff: &str) -> Result<String, String> {
+    ensure_github_repo(repo_path, local_diff)?;
     push_branch(repo_path, &plan.branch)?;
     gh_pr_create(repo_path, plan)
 }
 
-/// Refuse a non-GitHub checkout before pushing anything, pointing at the
-/// viewer medium instead — reached when a project's review action is pinned
-/// to `pr` (or resolves there) but the checkout cannot take one (DESIGN.md §8).
-fn ensure_github_repo(repo_path: &str) -> Result<(), String> {
+/// Refuse a checkout `gh` cannot address as a GitHub repository, before
+/// anything is confirmed or pushed (DESIGN.md §8). The GitHub flow is what
+/// `g`/`pr` statically mean, so the fix is the other key rather than a project
+/// setting: `local_diff` names it in the caller's own idiom — `o` in the TUI,
+/// `voro open <id>` at the shell. A missing or unauthenticated `gh` reads as
+/// "not GitHub", which is the same dead end from the operator's side.
+pub fn ensure_github_repo(repo_path: &str, local_diff: &str) -> Result<(), String> {
     let output = Command::new("gh")
         .args(["repo", "view", "--json", "nameWithOwner"])
         .current_dir(repo_path)
         .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot run `gh` in {repo_path}: {e}"))?;
-    if output.status.success() {
-        return Ok(());
+        .output();
+    match output {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(_) => Err(format!(
+            "{repo_path} is not a GitHub repository, so there is no pull request to open — \
+             use {local_diff} to see this task's diff in a viewer"
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "{GH_MISSING}, or use {local_diff} to see this task's diff in a viewer"
+        )),
+        Err(e) => Err(format!(
+            "cannot run `gh` in {repo_path} ({e}), so no pull request can be reached — \
+             use {local_diff} to see this task's diff in a viewer"
+        )),
     }
-    Err(format!(
-        "{repo_path} is not a GitHub repository, so `pr` cannot open a pull request there; \
-         use `voro open <task-id>` to see its diff in a viewer, or point the project at one \
-         with `voro project action <project> viewer`"
-    ))
+}
+
+/// What a missing `gh` should say. Printed raw, its `No such file or directory
+/// (os error 2)` reads as if the *checkout* were missing, and names neither the
+/// tool nor the fix.
+const GH_MISSING: &str = "`gh` (the GitHub CLI) is not installed — install it from cli.github.com";
+
+/// How a failure to *spawn* `gh` should read, given what the call was for. A
+/// missing binary is the likeliest cause by a wide margin and is the one an
+/// OS error explains worst, so it gets [`GH_MISSING`].
+pub fn gh_unavailable(e: &std::io::Error, purpose: &str) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        GH_MISSING.to_string()
+    } else {
+        format!("cannot run `gh` {purpose}: {e}")
+    }
+}
+
+/// Whether a checkout could take a pull request at all, decided from its git
+/// remotes alone (DESIGN.md §8): a repository with nowhere to push has no forge
+/// to open one on, whichever forge that would have been. This is what the
+/// advertised next action is derived through, so unlike [`ensure_github_repo`]
+/// — the press-time guard, which asks `gh` the sharper question and pays a
+/// round-trip for it — it must stay network-free and cheap enough to run behind
+/// a rendered row. The two answers can differ in exactly one direction: a
+/// checkout with a remote that is not GitHub still advertises `pr` and is
+/// refused at press time, which is the same dead end as before rather than a
+/// new one. Anything git cannot answer reads as "yes", leaving the row as it
+/// was.
+pub fn takes_pull_requests(repo_path: &str) -> bool {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("remote")
+        .stdin(Stdio::null())
+        .output();
+    match output {
+        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        _ => true,
+    }
+}
+
+/// [`takes_pull_requests`] memoised by checkout path, so a screen or a `list`
+/// pays one `git remote` per distinct repo rather than one per row.
+#[derive(Default)]
+pub struct ForgeMemo(std::collections::HashMap<String, bool>);
+
+impl ForgeMemo {
+    pub fn takes_pull_requests(&mut self, repo_path: &str) -> bool {
+        if let Some(&known) = self.0.get(repo_path) {
+            return known;
+        }
+        let answer = takes_pull_requests(repo_path);
+        self.0.insert(repo_path.to_string(), answer);
+        answer
+    }
 }
 
 /// Push the task's branch to `origin` so `gh pr create --head` can find it. The
@@ -347,7 +450,7 @@ fn gh_pr_create(repo_path: &str, plan: &PrPlan) -> Result<String, String> {
         .current_dir(repo_path)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("cannot run `gh pr create`: {e}"))?;
+        .map_err(|e| gh_unavailable(&e, "to create the pull request"))?;
     if !output.status.success() {
         return Err(format!(
             "`gh pr create` failed: {}",
@@ -380,7 +483,7 @@ fn gh_api(pr: &PrRef, path: &str) -> Result<String, String> {
     }
     let output = cmd
         .output()
-        .map_err(|e| format!("failed to run `gh api {path}`: {e}"))?;
+        .map_err(|e| gh_unavailable(&e, &format!("to fetch {path}")))?;
     if !output.status.success() {
         return Err(format!(
             "`gh api {path}` failed: {}",
@@ -388,4 +491,29 @@ fn gh_api(pr: &PrRef, path: &str) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    /// The cause an OS error explains worst — `gh` simply not being installed,
+    /// which prints as a missing file and so reads as a missing checkout.
+    #[test]
+    fn a_missing_gh_names_the_tool_and_the_fix() {
+        let message = gh_unavailable(&Error::from(ErrorKind::NotFound), "to open the PR");
+        assert!(message.contains("GitHub CLI"), "{message}");
+        assert!(message.contains("cli.github.com"), "{message}");
+        assert!(!message.contains("os error"), "{message}");
+    }
+
+    /// Anything else is unguessable, so it keeps the raw cause and says what
+    /// the call was for.
+    #[test]
+    fn another_spawn_failure_keeps_its_cause() {
+        let message = gh_unavailable(&Error::from(ErrorKind::PermissionDenied), "to open the PR");
+        assert!(message.contains("to open the PR"), "{message}");
+        assert!(message.contains("permission denied"), "{message}");
+    }
 }
