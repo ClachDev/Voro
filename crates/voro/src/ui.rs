@@ -436,36 +436,28 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             } else {
                 field("name", name, !*on_cmd)
             };
-            // The command writes itself from the name until the operator
-            // writes one (§5), so the hint says which of those is happening:
-            // an empty form asks for the name it needs, a following command
-            // says it is following and how to take it over, and a written one
-            // gets the placeholder legend it is being written with.
-            let hint = match (*cmd_tracks_name, name.trim().is_empty()) {
-                (true, true) => "name an editor on PATH — the command writes itself",
-                (true, false) => "command follows the name — type here to write your own",
-                (false, _) => "{path} = checkout/worktree · {branch} · {base}",
-            };
-            // A command the form wrote is dim until it is taken over, so what
-            // was typed and what was filled in never look alike.
-            let cmd_style = match (*cmd_tracks_name, *on_cmd) {
-                (true, false) => Style::new().dim(),
-                _ => Style::new(),
-            };
+            // A command the form wrote is dim, focused or not, so that what was
+            // typed and what was filled in never look alike. That is the whole
+            // announcement: the line below stays the placeholder legend, which
+            // is the part of this form nobody can infer.
+            let mut cmd_style = Style::new();
+            if *on_cmd {
+                cmd_style = cmd_style.add_modifier(Modifier::REVERSED);
+            }
+            if *cmd_tracks_name {
+                cmd_style = cmd_style.dim();
+            }
             let cmd_line = Line::from(vec![
                 Span::raw("command: "),
-                Span::styled(
-                    format!("{cmd}▏"),
-                    match *on_cmd {
-                        true => Style::new().add_modifier(Modifier::REVERSED),
-                        false => cmd_style,
-                    },
-                ),
+                Span::styled(format!("{cmd}▏"), cmd_style),
             ]);
             let para = Paragraph::new(vec![
                 name_line,
                 cmd_line,
-                Line::from(Span::styled(hint, Style::new().dim())),
+                Line::from(Span::styled(
+                    "{path} = checkout/worktree · {branch} · {base}",
+                    Style::new().dim(),
+                )),
             ])
             .block(Block::default().borders(Borders::ALL).title(title));
             frame.render_widget(para, area);
