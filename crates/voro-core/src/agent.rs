@@ -18,6 +18,7 @@ use std::sync::LazyLock;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+use crate::model::LivenessSource;
 use crate::scheduler::{AttentionCosts, DEFAULT_MAX_RUNNING};
 use crate::template::{render, shell_quote};
 
@@ -798,6 +799,24 @@ impl ResolvedAgent {
             self.model.as_deref()
         };
         render_launch(&self.dispatch, spec, model)
+    }
+
+    /// Which liveness source a session launched through this agent's
+    /// `dispatch` template must be read by (DESIGN.md §8), recorded on the
+    /// session row at launch. An agent defining a `sessions` verb is one whose
+    /// launch may hand the work to a supervisor — `claude --bg` does — leaving
+    /// Voro holding a launcher pid that dies at birth, so its listing is the
+    /// only source that can answer. An agent without the verb has no listing to
+    /// consult, and its spawned pid is all there is.
+    ///
+    /// This is the *headless* launch's answer, which the interactive `plan`
+    /// verb does not share: that one is a foreground child Voro owns, so its
+    /// caller records [`LivenessSource::Pid`] itself.
+    pub fn dispatch_liveness_source(&self) -> LivenessSource {
+        match self.sessions {
+            Some(_) => LivenessSource::Listing,
+            None => LivenessSource::Pid,
+        }
     }
 
     /// The plan template rendered the same way, when the agent defines the
@@ -2454,6 +2473,37 @@ mod tests {
             })
             .unwrap(),
             "run -i --name voro-plan-mote '/tmp/p.md'"
+        );
+    }
+
+    /// What a headless launch records on its session row (DESIGN.md §8, task
+    /// #387): an agent with a `sessions` verb may hand the work to a supervisor,
+    /// so its listing is the authority; one without has only the pid Voro
+    /// spawned.
+    #[test]
+    fn a_sessions_verb_makes_a_launch_listing_authoritative() {
+        let text = r#"
+            [agents.supervised]
+            dispatch = "run --bg {prompt_file}"
+            sessions = "run sessions --json"
+
+            [agents.plain]
+            dispatch = "run {prompt_file}"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        assert_eq!(
+            config
+                .resolve(Some("supervised"))
+                .unwrap()
+                .dispatch_liveness_source(),
+            LivenessSource::Listing
+        );
+        assert_eq!(
+            config
+                .resolve(Some("plain"))
+                .unwrap()
+                .dispatch_liveness_source(),
+            LivenessSource::Pid
         );
     }
 

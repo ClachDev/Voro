@@ -2,9 +2,9 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::ui::Hit;
 use voro_core::{
-    Action, ActionRow, AgentsConfig, CompletionReport, DepKind, DepRef, DigestRow, Event, PrRef,
-    Priority, Project, Queue, QueueRow, RefineOutcome, RunningRow, ScoreBreakdown, StateCounts,
-    Store, Task, TaskState, Triage, WipGate, scheduler,
+    Action, ActionRow, AgentsConfig, CompletionReport, DepKind, DepRef, DigestRow, Event,
+    LivenessSource, PrRef, Priority, Project, Queue, QueueRow, RefineOutcome, RunningRow,
+    ScoreBreakdown, StateCounts, Store, Task, TaskState, Triage, WipGate, scheduler,
 };
 
 /// Lines `PgDn`/`PgUp` move the focus card in one press. A fixed step, since
@@ -1780,10 +1780,18 @@ impl App {
     /// since pulling the terminal out from under a conversation the operator is
     /// already in would be the worse failure.
     pub fn open_refine_round(&mut self, refine: &crate::dispatch::RefineLaunch, pid: i64) {
-        if let Err(e) =
-            self.store
-                .record_refine_launch(refine.task_id, "", &refine.agent, Some(pid), None)
-        {
+        // The interactive round is the own-pid case (DESIGN.md §8): a
+        // foreground `plan` child Voro spawned, so the pid recorded here is the
+        // round itself and reconciliation must read it rather than a listing
+        // this session never appears in.
+        if let Err(e) = self.store.record_refine_launch(
+            refine.task_id,
+            "",
+            &refine.agent,
+            Some(pid),
+            LivenessSource::Pid,
+            None,
+        ) {
             self.status = Some(format!("refine of task {} unrecorded: {e}", refine.task_id));
         }
     }
@@ -3259,7 +3267,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voro_core::{NewTask, Priority};
+    use voro_core::{LivenessSource, NewTask, Priority};
 
     fn key(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::from(code));
@@ -3318,7 +3326,7 @@ mod tests {
                 // jump-in keys read off the strip row.
                 TaskState::Waiting => {
                     store
-                        .record_dispatch(task.id, "claude", None, None)
+                        .record_dispatch(task.id, "claude", None, LivenessSource::Pid, None)
                         .unwrap();
                     store.apply(task.id, Action::Complete(None)).unwrap();
                     store.apply(task.id, Action::HandOff).unwrap();
@@ -3327,7 +3335,13 @@ mod tests {
                 // stalls the task (DESIGN.md §8).
                 TaskState::Stalled => {
                     let (_, session) = store
-                        .record_dispatch(task.id, "claude", Some(1), Some("/tmp/demo/s.log"))
+                        .record_dispatch(
+                            task.id,
+                            "claude",
+                            Some(1),
+                            LivenessSource::Pid,
+                            Some("/tmp/demo/s.log"),
+                        )
                         .unwrap();
                     store.reconcile_session(session.id, false, false).unwrap();
                 }
@@ -3342,6 +3356,7 @@ mod tests {
                             "thin body",
                             "claude",
                             None,
+                            LivenessSource::Pid,
                             Some("/tmp/demo/refine.log"),
                         )
                         .unwrap();
@@ -5693,7 +5708,13 @@ mod tests {
             })
             .unwrap();
         store
-            .record_dispatch(task.id, "claude", Some(1), Some("/tmp/demo/open.log"))
+            .record_dispatch(
+                task.id,
+                "claude",
+                Some(1),
+                LivenessSource::Pid,
+                Some("/tmp/demo/open.log"),
+            )
             .unwrap();
         store.apply(task.id, Action::Ask("A or B?".into())).unwrap();
 
@@ -5744,7 +5765,7 @@ mod tests {
             })
             .unwrap();
         let (_, session) = store
-            .record_dispatch(task.id, "claude", Some(1), None)
+            .record_dispatch(task.id, "claude", Some(1), LivenessSource::Pid, None)
             .unwrap();
         store.reconcile_session(session.id, false, false).unwrap();
 

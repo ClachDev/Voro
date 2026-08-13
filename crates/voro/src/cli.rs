@@ -2390,6 +2390,7 @@ fn task_line(task: &Task, project: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use voro_core::LivenessSource;
 
     fn store() -> Store {
         Store::open_in_memory().unwrap()
@@ -2813,8 +2814,15 @@ mod tests {
         ok(&mut s, &["add", "demo", "An idea"]);
         assert!(!ok(&mut s, &["inbox"]).contains("refined"));
 
-        s.record_refine_launch(1, "name the files it touches", "claude", None, None)
-            .unwrap();
+        s.record_refine_launch(
+            1,
+            "name the files it touches",
+            "claude",
+            None,
+            LivenessSource::Pid,
+            None,
+        )
+        .unwrap();
         // Mid-round the proposal is out of the queue entirely, and nothing
         // claims a rewrite that has not landed.
         assert!(!ok(&mut s, &["inbox"]).contains("awaiting triage"));
@@ -2849,8 +2857,15 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "An idea"]);
-        s.record_refine_launch(1, "name the files", "claude", None, None)
-            .unwrap();
+        s.record_refine_launch(
+            1,
+            "name the files",
+            "claude",
+            None,
+            LivenessSource::Pid,
+            None,
+        )
+        .unwrap();
         s.conclude_refine(1, RefineOutcome::Failed).unwrap();
 
         assert!(ok(&mut s, &["inbox"]).contains("⚠ 1 refine failed"));
@@ -2860,7 +2875,7 @@ mod tests {
         assert!(!out.contains("↻ refined"), "{out}");
 
         // A quit that concluded nothing is a no-op, not a failure: no marker.
-        s.record_refine_launch(1, "again", "claude", None, None)
+        s.record_refine_launch(1, "again", "claude", None, LivenessSource::Pid, None)
             .unwrap();
         s.conclude_refine(1, RefineOutcome::Cancelled).unwrap();
         assert!(!ok(&mut s, &["list"]).contains("refine failed"));
@@ -2878,8 +2893,15 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "An idea", "--body", "thin"]);
-        s.record_refine_launch(1, "make it dispatchable", "claude", None, None)
-            .unwrap();
+        s.record_refine_launch(
+            1,
+            "make it dispatchable",
+            "claude",
+            None,
+            LivenessSource::Pid,
+            None,
+        )
+        .unwrap();
         let session = s.sessions_for(1).unwrap()[0].id;
 
         let path = std::env::temp_dir().join(format!("voro-refine-{}.md", std::process::id()));
@@ -2905,8 +2927,15 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "An idea", "--body", "thin"]);
-        s.record_refine_launch(1, "make it dispatchable", "claude", None, None)
-            .unwrap();
+        s.record_refine_launch(
+            1,
+            "make it dispatchable",
+            "claude",
+            None,
+            LivenessSource::Pid,
+            None,
+        )
+        .unwrap();
 
         ok(&mut s, &["set", "1", "--priority", "1"]);
         assert_eq!(s.task(1).unwrap().state, TaskState::Refining);
@@ -2925,8 +2954,15 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "An idea", "--body", "thin"]);
-        s.record_refine_launch(1, "make it dispatchable", "claude", None, None)
-            .unwrap();
+        s.record_refine_launch(
+            1,
+            "make it dispatchable",
+            "claude",
+            None,
+            LivenessSource::Pid,
+            None,
+        )
+        .unwrap();
         s.conclude_refine(1, RefineOutcome::Failed).unwrap();
         assert!(s.refine_failed_flag(1).unwrap());
 
@@ -2956,7 +2992,7 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "An idea"]);
-        s.record_refine_launch(1, "thin body", "claude", None, None)
+        s.record_refine_launch(1, "thin body", "claude", None, LivenessSource::Pid, None)
             .unwrap();
 
         for verdict in ["ready", "parked", "reject"] {
@@ -4044,7 +4080,9 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
-        let (_, session) = s.record_dispatch(1, "claude", None, None).unwrap();
+        let (_, session) = s
+            .record_dispatch(1, "claude", None, LivenessSource::Pid, None)
+            .unwrap();
         s.reconcile_session(session.id, false, false).unwrap();
         assert_eq!(s.task(1).unwrap().state, TaskState::Stalled);
 

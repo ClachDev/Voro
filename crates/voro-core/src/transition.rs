@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use rusqlite::{Connection, params};
 
 use crate::error::{Error, Result};
-use crate::model::{RefineOutcome, Session, SessionOutcome, Task, TaskState};
+use crate::model::{LivenessSource, RefineOutcome, Session, SessionOutcome, Task, TaskState};
 use crate::store::{
     Store, close_open_session, get_session, get_task, insert_session, log_event,
     set_session_outcome,
@@ -149,19 +149,22 @@ impl Store {
     /// Dispatch's atomic write (DESIGN.md §8): move the task `ready → running`
     /// (or `stalled → running`) and open its session in one transaction, so a
     /// running task always has a session and a session always has a running
-    /// task. Spawning the process is the caller's job, before this commits.
+    /// task. Spawning the process is the caller's job, before this commits, and
+    /// so is naming its `liveness_source` (DESIGN.md §8): only the code that
+    /// launched knows whether the pid it holds is the work or a launcher.
     pub fn record_dispatch(
         &mut self,
         task_id: i64,
         agent: &str,
         pid: Option<i64>,
+        liveness_source: LivenessSource,
         log_path: Option<&str>,
     ) -> Result<(Task, Session)> {
         let tx = self.conn.transaction()?;
         reject_human_dispatch(&tx, task_id)?;
         reject_archived_dispatch(&tx, task_id)?;
         apply_action(&tx, task_id, Action::Start)?;
-        let session_id = insert_session(&tx, task_id, agent, pid, log_path)?;
+        let session_id = insert_session(&tx, task_id, agent, pid, liveness_source, log_path)?;
         tx.commit()?;
         Ok((self.task(task_id)?, self.session(session_id)?))
     }
@@ -174,7 +177,9 @@ impl Store {
     /// which is what sends the rewritten body back through triage. The
     /// note rides the transition; the empty string is the interactive flavour,
     /// which is a conversation rather than a brief. Spawning the process is the
-    /// caller's job, before this commits.
+    /// caller's job, before this commits, and the flavour it spawned rides in as
+    /// `liveness_source`: the headless round inherits the `dispatch` template's
+    /// source, the interactive one is the foreground child's own pid.
     ///
     /// [`record_dispatch`]: Store::record_dispatch
     pub fn record_refine_launch(
@@ -183,11 +188,12 @@ impl Store {
         note: &str,
         agent: &str,
         pid: Option<i64>,
+        liveness_source: LivenessSource,
         log_path: Option<&str>,
     ) -> Result<(Task, Session)> {
         let tx = self.conn.transaction()?;
         apply_action(&tx, task_id, Action::Refine(note.to_string()))?;
-        let session_id = insert_session(&tx, task_id, agent, pid, log_path)?;
+        let session_id = insert_session(&tx, task_id, agent, pid, liveness_source, log_path)?;
         tx.commit()?;
         Ok((self.task(task_id)?, self.session(session_id)?))
     }
@@ -729,8 +735,15 @@ mod tests {
             Proposed | Parked | Ready => create(s, project_id, state),
             Refining => {
                 let id = create(s, project_id, Proposed);
-                s.record_refine_launch(id, "thin body", "claude", Some(1), None)
-                    .unwrap();
+                s.record_refine_launch(
+                    id,
+                    "thin body",
+                    "claude",
+                    Some(1),
+                    LivenessSource::Pid,
+                    None,
+                )
+                .unwrap();
                 id
             }
             Running => {
@@ -755,7 +768,9 @@ mod tests {
             }
             Stalled => {
                 let id = create(s, project_id, Ready);
-                let (_, session) = s.record_dispatch(id, "claude", Some(1), None).unwrap();
+                let (_, session) = s
+                    .record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+                    .unwrap();
                 s.reconcile_session(session.id, false, false).unwrap();
                 id
             }
@@ -900,7 +915,7 @@ mod tests {
                 let id = create(&mut s, p, TaskState::Ready);
 
                 let (task, session) = s
-                    .record_refine_launch(id, note, "claude", Some(4242), None)
+                    .record_refine_launch(id, note, "claude", Some(4242), LivenessSource::Pid, None)
                     .unwrap();
                 assert_eq!(task.state, TaskState::Refining);
                 assert_eq!(session.task_id, id);
@@ -928,8 +943,15 @@ mod tests {
                 ] {
                     let (mut s, p) = store_with_project();
                     let id = create(&mut s, p, from);
-                    s.record_refine_launch(id, "thin body", "claude", Some(1), None)
-                        .unwrap();
+                    s.record_refine_launch(
+                        id,
+                        "thin body",
+                        "claude",
+                        Some(1),
+                        LivenessSource::Pid,
+                        None,
+                    )
+                    .unwrap();
 
                     let task = s.conclude_refine(id, outcome).unwrap();
                     assert_eq!(task.state, TaskState::Proposed, "{from} + {outcome:?}");
@@ -967,8 +989,15 @@ mod tests {
             let id = create(&mut s, p, TaskState::Ready);
             assert!(crate::scheduler::focus(&s.candidates().unwrap()).is_some());
 
-            s.record_refine_launch(id, "thin body", "claude", Some(1), None)
-                .unwrap();
+            s.record_refine_launch(
+                id,
+                "thin body",
+                "claude",
+                Some(1),
+                LivenessSource::Pid,
+                None,
+            )
+            .unwrap();
             let candidates = s.candidates().unwrap();
             assert!(
                 !candidates.iter().any(|c| c.task.id == id),
@@ -1047,7 +1076,9 @@ mod tests {
             let (mut s, p) = store_with_project();
             let id = create_human(&mut s, p, TaskState::Ready);
 
-            let err = s.record_dispatch(id, "claude", Some(1), None).unwrap_err();
+            let err = s
+                .record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+                .unwrap_err();
             assert!(
                 matches!(err, Error::HumanTask { id: e, .. } if e == id),
                 "expected a human-only refusal, got {err}"
@@ -1078,7 +1109,9 @@ mod tests {
             let (mut s, p) = store_with_project();
             let id = create_human(&mut s, p, TaskState::Ready);
             s.apply(id, Action::Start).unwrap();
-            let stray = s.create_session(id, "claude", Some(1), None).unwrap();
+            let stray = s
+                .create_session(id, "claude", Some(1), LivenessSource::Pid, None)
+                .unwrap();
 
             s.apply(id, Action::Complete(None)).unwrap();
             let closed = s.session(stray.id).unwrap();
@@ -1563,7 +1596,13 @@ mod tests {
         let (mut s, p) = store_with_project();
         let id = create(&mut s, p, TaskState::Ready);
         let (task, session) = s
-            .record_dispatch(id, "claude", Some(4321), Some("/var/log/26.log"))
+            .record_dispatch(
+                id,
+                "claude",
+                Some(4321),
+                LivenessSource::Pid,
+                Some("/var/log/26.log"),
+            )
             .unwrap();
         assert_eq!(task.state, TaskState::Running);
         assert_eq!(session.task_id, id);
@@ -1579,7 +1618,7 @@ mod tests {
         let (mut s, p) = store_with_project();
         let id = create(&mut s, p, TaskState::Proposed);
         assert!(matches!(
-            s.record_dispatch(id, "claude", None, None),
+            s.record_dispatch(id, "claude", None, LivenessSource::Pid, None),
             Err(Error::InvalidTransition { .. })
         ));
         // the failed transaction must leave neither state change nor session
@@ -1596,7 +1635,7 @@ mod tests {
         s.set_archived(p, true).unwrap();
 
         let err = s
-            .record_dispatch(ready, "claude", Some(1), None)
+            .record_dispatch(ready, "claude", Some(1), LivenessSource::Pid, None)
             .unwrap_err();
         assert!(matches!(err, Error::ProjectArchived { .. }), "{err}");
         assert_eq!(s.task(ready).unwrap().state, TaskState::Ready);
@@ -1604,7 +1643,10 @@ mod tests {
 
         // unarchiving reopens the door
         s.set_archived(p, false).unwrap();
-        assert!(s.record_dispatch(ready, "claude", Some(1), None).is_ok());
+        assert!(
+            s.record_dispatch(ready, "claude", Some(1), LivenessSource::Pid, None)
+                .is_ok()
+        );
     }
 
     // --- session lifecycle: one open session, closed by terminal transitions ---
@@ -1617,7 +1659,7 @@ mod tests {
         // `completed` when the review is accepted.
         let accepted = create(&mut s, p, TaskState::Ready);
         let sess = s
-            .record_dispatch(accepted, "claude", Some(1), None)
+            .record_dispatch(accepted, "claude", Some(1), LivenessSource::Pid, None)
             .unwrap()
             .1;
         s.apply(accepted, Action::Complete(None)).unwrap();
@@ -1633,7 +1675,7 @@ mod tests {
         // Abort: running -> ready closes the session `aborted`.
         let aborted = create(&mut s, p, TaskState::Ready);
         let sess = s
-            .record_dispatch(aborted, "claude", Some(1), None)
+            .record_dispatch(aborted, "claude", Some(1), LivenessSource::Pid, None)
             .unwrap()
             .1;
         s.apply(aborted, Action::Abort).unwrap();
@@ -1645,7 +1687,7 @@ mod tests {
         // Abandon (from review) closes the session `aborted` too.
         let abandoned = create(&mut s, p, TaskState::Ready);
         let sess = s
-            .record_dispatch(abandoned, "claude", Some(1), None)
+            .record_dispatch(abandoned, "claude", Some(1), LivenessSource::Pid, None)
             .unwrap()
             .1;
         s.apply(abandoned, Action::Complete(None)).unwrap();
@@ -1663,7 +1705,10 @@ mod tests {
         // session and `resume` only moves the state (DESIGN.md §6/§8).
         let (mut s, p) = store_with_project();
         let id = create(&mut s, p, TaskState::Ready);
-        let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+        let sess = s
+            .record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+            .unwrap()
+            .1;
 
         s.apply(id, Action::Ask("A or B?".into())).unwrap();
         assert!(s.session(sess.id).unwrap().ended_at.is_none());
@@ -1682,7 +1727,10 @@ mod tests {
         // session — the ref survives until the task actually closes (DESIGN.md §8).
         let (mut s, p) = store_with_project();
         let id = create(&mut s, p, TaskState::Ready);
-        let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+        let sess = s
+            .record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+            .unwrap()
+            .1;
         s.set_session_ref(sess.id, "ref-1").unwrap();
         s.apply(id, Action::Complete(None)).unwrap();
         s.apply(id, Action::RejectWork("redo the tests".into()))
@@ -1706,7 +1754,10 @@ mod tests {
             // once the work becomes the operator's move again.
             let (mut s, p) = store_with_project();
             let id = create(&mut s, p, TaskState::Ready);
-            let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+            let sess = s
+                .record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+                .unwrap()
+                .1;
             s.apply(id, Action::Complete(None)).unwrap();
 
             let task = s.apply(id, Action::HandOff).unwrap();
@@ -1747,7 +1798,10 @@ mod tests {
             // it does straight from review (DESIGN.md §8).
             let (mut s, p) = store_with_project();
             let id = create(&mut s, p, TaskState::Ready);
-            let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+            let sess = s
+                .record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+                .unwrap()
+                .1;
             s.apply(id, Action::Complete(None)).unwrap();
             s.apply(id, Action::HandOff).unwrap();
 
@@ -1763,7 +1817,10 @@ mod tests {
         fn abandon_from_waiting_closes_the_session_aborted() {
             let (mut s, p) = store_with_project();
             let id = create(&mut s, p, TaskState::Ready);
-            let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+            let sess = s
+                .record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+                .unwrap()
+                .1;
             s.apply(id, Action::Complete(None)).unwrap();
             s.apply(id, Action::HandOff).unwrap();
 
@@ -1779,7 +1836,10 @@ mod tests {
         fn reclaim_pulls_the_work_back_to_review_keeping_the_session() {
             let (mut s, p) = store_with_project();
             let id = create(&mut s, p, TaskState::Ready);
-            let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+            let sess = s
+                .record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+                .unwrap()
+                .1;
             s.apply(id, Action::Complete(None)).unwrap();
             s.apply(id, Action::HandOff).unwrap();
 
@@ -1796,7 +1856,10 @@ mod tests {
             // agent session.
             let (mut s, p) = store_with_project();
             let id = create(&mut s, p, TaskState::Ready);
-            let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+            let sess = s
+                .record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+                .unwrap()
+                .1;
             s.set_session_ref(sess.id, "ref-1").unwrap();
             s.apply(id, Action::Complete(None)).unwrap();
             s.apply(id, Action::HandOff).unwrap();
@@ -1819,7 +1882,10 @@ mod tests {
             // process liveness — nothing to reconcile (DESIGN.md §8).
             let (mut s, p) = store_with_project();
             let id = create(&mut s, p, TaskState::Ready);
-            let sess = s.record_dispatch(id, "claude", Some(1), None).unwrap().1;
+            let sess = s
+                .record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+                .unwrap()
+                .1;
             s.apply(id, Action::Complete(None)).unwrap();
             s.apply(id, Action::HandOff).unwrap();
 
@@ -1839,7 +1905,8 @@ mod tests {
         // supersede cannot leave two open rows on one task.
         let (mut s, p) = store_with_project();
         let id = create(&mut s, p, TaskState::Ready);
-        s.record_dispatch(id, "claude", Some(1), None).unwrap();
+        s.record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+            .unwrap();
         let second = s.conn.execute(
             "INSERT INTO sessions (task_id, agent, started_at) VALUES (?1, 'x', datetime('now'))",
             [id],
@@ -1867,7 +1934,13 @@ mod tests {
         fn dispatch(s: &mut Store, p: i64) -> (i64, i64) {
             let task_id = create(s, p, TaskState::Ready);
             let (_, session) = s
-                .record_dispatch(task_id, "claude", Some(4242), Some("/var/log/s.log"))
+                .record_dispatch(
+                    task_id,
+                    "claude",
+                    Some(4242),
+                    LivenessSource::Pid,
+                    Some("/var/log/s.log"),
+                )
                 .unwrap();
             (task_id, session.id)
         }
@@ -1922,7 +1995,14 @@ mod tests {
             let (mut s, p) = store_with_project();
             let task_id = create(&mut s, p, TaskState::Proposed);
             let (_, session) = s
-                .record_refine_launch(task_id, "thin body", "claude", Some(4242), None)
+                .record_refine_launch(
+                    task_id,
+                    "thin body",
+                    "claude",
+                    Some(4242),
+                    LivenessSource::Pid,
+                    None,
+                )
                 .unwrap();
 
             // a live agent is left alone: the rewrite may still land
@@ -1982,7 +2062,13 @@ mod tests {
             assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
 
             let (task, session) = s
-                .record_dispatch(task_id, "codex", Some(4343), Some("/var/log/s2.log"))
+                .record_dispatch(
+                    task_id,
+                    "codex",
+                    Some(4343),
+                    LivenessSource::Pid,
+                    Some("/var/log/s2.log"),
+                )
                 .unwrap();
             assert_eq!(task.state, TaskState::Running);
             assert_eq!(session.agent, "codex");
@@ -2173,7 +2259,13 @@ mod tests {
             assert!(s.session(older_session).unwrap().ended_at.is_some());
 
             let newer_session = s
-                .record_dispatch(task_id, "claude", Some(4343), Some("/var/log/s2.log"))
+                .record_dispatch(
+                    task_id,
+                    "claude",
+                    Some(4343),
+                    LivenessSource::Pid,
+                    Some("/var/log/s2.log"),
+                )
                 .unwrap()
                 .1
                 .id;

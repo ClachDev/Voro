@@ -5,8 +5,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    Dep, DepKind, DepRef, Doc, Event, Priority, Project, RefineOutcome, Repo, RunningRow, Session,
-    SessionOutcome, Task, TaskState, location_is_url,
+    Dep, DepKind, DepRef, Doc, Event, LivenessSource, Priority, Project, RefineOutcome, Repo,
+    RunningRow, Session, SessionOutcome, Task, TaskState, location_is_url,
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -28,6 +28,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0016_add_refining_state.sql"),
     include_str!("../migrations/0017_schema_migrations.sql"),
     include_str!("../migrations/0018_project_viewer.sql"),
+    include_str!("../migrations/0019_session_liveness_source.sql"),
 ];
 
 /// Whether a path lies inside a Cargo build directory — a `target` component
@@ -1489,14 +1490,17 @@ impl Store {
 
     /// Open a session for a running task, stamping `started_at`. `ended_at` and
     /// `outcome` stay NULL until [`end_session`](Store::end_session).
+    /// `liveness_source` is which source reconciliation must read the session by
+    /// (DESIGN.md §8), which only the caller that spawned the process knows.
     pub fn create_session(
         &mut self,
         task_id: i64,
         agent: &str,
         pid: Option<i64>,
+        liveness_source: LivenessSource,
         log_path: Option<&str>,
     ) -> Result<Session> {
-        let id = insert_session(&self.conn, task_id, agent, pid, log_path)?;
+        let id = insert_session(&self.conn, task_id, agent, pid, liveness_source, log_path)?;
         self.session(id)
     }
 
@@ -1770,8 +1774,7 @@ pub(crate) fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     })
 }
 
-pub(crate) const SESSION_COLUMNS: &str =
-    "id, task_id, agent, pid, session_ref, log_path, started_at, ended_at, outcome";
+pub(crate) const SESSION_COLUMNS: &str = "id, task_id, agent, pid, session_ref, liveness_source, log_path, started_at, ended_at, outcome";
 
 pub(crate) fn get_session(conn: &Connection, id: i64) -> Result<Option<Session>> {
     Ok(conn
@@ -1790,10 +1793,11 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         agent: row.get(2)?,
         pid: row.get(3)?,
         session_ref: row.get(4)?,
-        log_path: row.get(5)?,
-        started_at: row.get(6)?,
-        ended_at: row.get(7)?,
-        outcome: row.get(8)?,
+        liveness_source: row.get(5)?,
+        log_path: row.get(6)?,
+        started_at: row.get(7)?,
+        ended_at: row.get(8)?,
+        outcome: row.get(9)?,
     })
 }
 
@@ -1860,13 +1864,14 @@ pub(crate) fn insert_session(
     task_id: i64,
     agent: &str,
     pid: Option<i64>,
+    liveness_source: LivenessSource,
     log_path: Option<&str>,
 ) -> Result<i64> {
     close_open_session(conn, task_id, SessionOutcome::Aborted)?;
     conn.execute(
-        "INSERT INTO sessions (task_id, agent, pid, log_path, started_at)
-         VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-        params![task_id, agent, pid, log_path],
+        "INSERT INTO sessions (task_id, agent, pid, liveness_source, log_path, started_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+        params![task_id, agent, pid, liveness_source, log_path],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -2505,7 +2510,9 @@ mod tests {
                     s.apply(t.id, Action::Ask("A or B?".into())).unwrap();
                 }
                 TaskState::Stalled => {
-                    let (_, session) = s.record_dispatch(t.id, "claude", Some(1), None).unwrap();
+                    let (_, session) = s
+                        .record_dispatch(t.id, "claude", Some(1), LivenessSource::Pid, None)
+                        .unwrap();
                     s.reconcile_session(session.id, false, false).unwrap();
                 }
                 _ => {
@@ -2529,7 +2536,8 @@ mod tests {
 
         let (mut s, p) = human_fixture();
         let t = s.create_task(new_with(p, None, false)).unwrap();
-        s.record_dispatch(t.id, "claude", Some(1), None).unwrap();
+        s.record_dispatch(t.id, "claude", Some(1), LivenessSource::Pid, None)
+            .unwrap();
 
         let err = s.update_task(t.id, edit_of(&t, None, true)).unwrap_err();
         assert!(matches!(err, Error::HumanTask { id, .. } if id == t.id));
@@ -2958,8 +2966,15 @@ mod tests {
             Proposed | Parked | Ready => create(s, state),
             Refining => {
                 let id = create(s, Proposed);
-                s.record_refine_launch(id, "thin body", "claude", Some(1), None)
-                    .unwrap();
+                s.record_refine_launch(
+                    id,
+                    "thin body",
+                    "claude",
+                    Some(1),
+                    LivenessSource::Pid,
+                    None,
+                )
+                .unwrap();
                 id
             }
             Running => {
@@ -2984,7 +2999,9 @@ mod tests {
             }
             Stalled => {
                 let id = create(s, Ready);
-                let (_, session) = s.record_dispatch(id, "claude", Some(1), None).unwrap();
+                let (_, session) = s
+                    .record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+                    .unwrap();
                 s.reconcile_session(session.id, false, false).unwrap();
                 id
             }
@@ -3779,6 +3796,7 @@ mod tests {
                 "  name the files it touches  ",
                 "claude",
                 Some(4321),
+                LivenessSource::Pid,
                 Some("/var/log/refine.log"),
             )
             .unwrap();
@@ -3806,7 +3824,7 @@ mod tests {
     fn a_note_less_refine_launch_logs_no_note() {
         let mut s = Store::open_in_memory().unwrap();
         let t = proposal(&mut s, "refine me");
-        s.record_refine_launch(t.id, "", "claude", Some(1), None)
+        s.record_refine_launch(t.id, "", "claude", Some(1), LivenessSource::Pid, None)
             .unwrap();
         assert_eq!(s.latest_refine_note(t.id).unwrap(), None);
         assert_eq!(s.task(t.id).unwrap().state, TaskState::Refining);
@@ -3827,7 +3845,7 @@ mod tests {
             (RefineOutcome::Cancelled, false, false),
             (RefineOutcome::Applied, true, false),
         ] {
-            s.record_refine_launch(t.id, "note", "claude", Some(1), None)
+            s.record_refine_launch(t.id, "note", "claude", Some(1), LivenessSource::Pid, None)
                 .unwrap();
             let after = s.conclude_refine(t.id, outcome).unwrap();
             assert_eq!(after.state, TaskState::Proposed, "{outcome}");
@@ -3849,7 +3867,7 @@ mod tests {
     fn a_late_rewrite_corrects_a_failed_round_to_applied() {
         let mut s = Store::open_in_memory().unwrap();
         let t = proposal(&mut s, "refine me");
-        s.record_refine_launch(t.id, "note", "claude", Some(1), None)
+        s.record_refine_launch(t.id, "note", "claude", Some(1), LivenessSource::Pid, None)
             .unwrap();
         s.conclude_refine(t.id, RefineOutcome::Failed).unwrap();
         assert!(s.refine_failed_flag(t.id).unwrap());
@@ -3881,7 +3899,7 @@ mod tests {
         for outcome in [RefineOutcome::Applied, RefineOutcome::Cancelled] {
             let mut s = Store::open_in_memory().unwrap();
             let t = proposal(&mut s, "refine me");
-            s.record_refine_launch(t.id, "note", "claude", Some(1), None)
+            s.record_refine_launch(t.id, "note", "claude", Some(1), LivenessSource::Pid, None)
                 .unwrap();
             s.conclude_refine(t.id, outcome).unwrap();
 
@@ -3895,7 +3913,7 @@ mod tests {
         assert!(!s.correct_late_refine(t.id).unwrap());
         assert_eq!(s.latest_refine_outcome(t.id).unwrap(), None);
 
-        s.record_refine_launch(t.id, "note", "claude", Some(1), None)
+        s.record_refine_launch(t.id, "note", "claude", Some(1), LivenessSource::Pid, None)
             .unwrap();
         s.conclude_refine(t.id, RefineOutcome::Failed).unwrap();
         s.apply(t.id, Action::Triage(Triage::Ready)).unwrap();
@@ -3918,7 +3936,7 @@ mod tests {
             let mut s = Store::open_in_memory().unwrap();
             let t = proposal(&mut s, "refine me");
             let (_, session) = s
-                .record_refine_launch(t.id, "note", "claude", Some(1), None)
+                .record_refine_launch(t.id, "note", "claude", Some(1), LivenessSource::Pid, None)
                 .unwrap();
 
             s.conclude_refine(t.id, outcome).unwrap();
@@ -3943,7 +3961,7 @@ mod tests {
 
         s.apply(t.id, Action::Triage(Triage::Parked)).unwrap();
         assert!(matches!(
-            s.record_refine_launch(t.id, "too late", "claude", None, None),
+            s.record_refine_launch(t.id, "too late", "claude", None, LivenessSource::Pid, None),
             Err(Error::InvalidTransition { .. })
         ));
         // The refused launch wrote nothing — no session, no state change.
@@ -3982,7 +4000,13 @@ mod tests {
         let task_id = task_fixture(&mut s);
 
         let opened = s
-            .create_session(task_id, "claude", Some(4321), Some("/var/log/s.log"))
+            .create_session(
+                task_id,
+                "claude",
+                Some(4321),
+                LivenessSource::Pid,
+                Some("/var/log/s.log"),
+            )
             .unwrap();
         assert_eq!(opened.task_id, task_id);
         assert_eq!(opened.agent, "claude");
@@ -4009,11 +4033,23 @@ mod tests {
         let sessionless = task_fixture(&mut s);
 
         let first = s
-            .create_session(with_history, "claude", None, Some("/var/log/first.log"))
+            .create_session(
+                with_history,
+                "claude",
+                None,
+                LivenessSource::Pid,
+                Some("/var/log/first.log"),
+            )
             .unwrap();
         s.end_session(first.id, SessionOutcome::Failed).unwrap();
         let second = s
-            .create_session(with_history, "codex", None, Some("/var/log/second.log"))
+            .create_session(
+                with_history,
+                "codex",
+                None,
+                LivenessSource::Pid,
+                Some("/var/log/second.log"),
+            )
             .unwrap();
 
         let latest = s.latest_sessions().unwrap();
@@ -4030,7 +4066,9 @@ mod tests {
     fn session_optional_fields_are_null() {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
-        let opened = s.create_session(task_id, "codex", None, None).unwrap();
+        let opened = s
+            .create_session(task_id, "codex", None, LivenessSource::Pid, None)
+            .unwrap();
         assert!(opened.pid.is_none());
         assert!(opened.session_ref.is_none());
         assert!(opened.log_path.is_none());
@@ -4040,7 +4078,9 @@ mod tests {
     fn set_session_ref_records_and_rejects_unknown_ids() {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
-        let opened = s.create_session(task_id, "claude", None, None).unwrap();
+        let opened = s
+            .create_session(task_id, "claude", None, LivenessSource::Pid, None)
+            .unwrap();
         assert!(opened.session_ref.is_none());
 
         let updated = s
@@ -4058,6 +4098,151 @@ mod tests {
         ));
     }
 
+    /// Each launch records which source reconciliation must read it by
+    /// (DESIGN.md §8, task #387), and it survives the round trip: a headless
+    /// launch under a supervisor is listing-authoritative, an interactive round
+    /// is not, and neither is inferred from anything else on the row.
+    #[test]
+    fn a_session_records_the_liveness_source_it_was_launched_with() {
+        let mut s = Store::open_in_memory().unwrap();
+        let task_id = task_fixture(&mut s);
+        let listing = s
+            .create_session(task_id, "claude", Some(1), LivenessSource::Listing, None)
+            .unwrap();
+        assert_eq!(listing.liveness_source, LivenessSource::Listing);
+        assert_eq!(
+            s.session(listing.id).unwrap().liveness_source,
+            LivenessSource::Listing
+        );
+
+        let pid = s
+            .create_session(task_id, "manual", Some(1), LivenessSource::Pid, None)
+            .unwrap();
+        assert_eq!(pid.liveness_source, LivenessSource::Pid);
+        assert_eq!(
+            s.live_sessions().unwrap()[0].liveness_source,
+            pid.liveness_source
+        );
+
+        // A ref captured later says nothing about the source: that was decided
+        // at launch, which is the whole point of recording it.
+        s.set_session_ref(pid.id, "uuid").unwrap();
+        assert_eq!(
+            s.session(pid.id).unwrap().liveness_source,
+            LivenessSource::Pid
+        );
+    }
+
+    /// The dispatch and refine transactions carry the flavour through to the
+    /// row they open, so the reconciler reads what the launcher spawned.
+    #[test]
+    fn dispatch_and_refine_launches_carry_their_liveness_source() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("proj", "/tmp/proj").unwrap();
+        let ready = s
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "run me".into(),
+                body: String::new(),
+                priority: Priority::P1,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        let (_, dispatched) = s
+            .record_dispatch(ready.id, "claude", Some(1), LivenessSource::Listing, None)
+            .unwrap();
+        assert_eq!(dispatched.liveness_source, LivenessSource::Listing);
+
+        let proposal = s
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "sloppy".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Proposed,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        let (_, headless) = s
+            .record_refine_launch(
+                proposal.id,
+                "name the files",
+                "claude",
+                Some(2),
+                LivenessSource::Listing,
+                None,
+            )
+            .unwrap();
+        assert_eq!(headless.liveness_source, LivenessSource::Listing);
+
+        s.conclude_refine(proposal.id, RefineOutcome::Cancelled)
+            .unwrap();
+        let (_, interactive) = s
+            .record_refine_launch(
+                proposal.id,
+                "",
+                "claude",
+                Some(3),
+                LivenessSource::Pid,
+                None,
+            )
+            .unwrap();
+        assert_eq!(interactive.liveness_source, LivenessSource::Pid);
+    }
+
+    /// A database from before migration 0017 must open with every existing
+    /// session listing-authoritative — what a dispatch of an agent with a
+    /// `sessions` verb already was, and the direction that leaves a session
+    /// alone rather than finalising a live one — and the CHECK must reject a
+    /// source that is neither.
+    #[test]
+    fn migration_0017_defaults_existing_sessions_to_the_listing() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..16] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 16).unwrap();
+        conn.execute("INSERT INTO projects (name) VALUES ('p')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO repos (project_id, name, path, is_default)
+             VALUES (1, 'p', '/tmp/p', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (project_id, title, state, state_since, created_at)
+             VALUES (1, 'dispatched', 'running', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (task_id, agent, pid, started_at)
+             VALUES (1, 'claude', 4242, datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let store = Store::from_connection(conn).unwrap();
+        assert_eq!(
+            store.session(1).unwrap().liveness_source,
+            LivenessSource::Listing
+        );
+
+        let junk = store.conn.execute(
+            "UPDATE sessions SET liveness_source = 'guess' WHERE id = 1",
+            [],
+        );
+        assert!(junk.is_err(), "the CHECK must reject an unknown source");
+    }
+
     /// A confirmed send moves the session's process to the one carrying the
     /// turn, and follows the fork when the agent opened a new reference — but a
     /// send that resumed in place must not blank the reference it already had.
@@ -4066,7 +4251,7 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
         let opened = s
-            .create_session(task_id, "claude", Some(1234), None)
+            .create_session(task_id, "claude", Some(1234), LivenessSource::Pid, None)
             .unwrap();
         s.set_session_ref(opened.id, "first-ref").unwrap();
 
@@ -4100,8 +4285,12 @@ mod tests {
     fn sessions_for_returns_newest_first() {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
-        let first = s.create_session(task_id, "claude", None, None).unwrap();
-        let second = s.create_session(task_id, "claude", None, None).unwrap();
+        let first = s
+            .create_session(task_id, "claude", None, LivenessSource::Pid, None)
+            .unwrap();
+        let second = s
+            .create_session(task_id, "claude", None, LivenessSource::Pid, None)
+            .unwrap();
 
         let sessions = s.sessions_for(task_id).unwrap();
         assert_eq!(
@@ -4114,8 +4303,12 @@ mod tests {
     fn live_sessions_excludes_ended() {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
-        let done = s.create_session(task_id, "claude", None, None).unwrap();
-        let live = s.create_session(task_id, "claude", None, None).unwrap();
+        let done = s
+            .create_session(task_id, "claude", None, LivenessSource::Pid, None)
+            .unwrap();
+        let live = s
+            .create_session(task_id, "claude", None, LivenessSource::Pid, None)
+            .unwrap();
         s.end_session(done.id, SessionOutcome::Failed).unwrap();
 
         let ids = s.live_sessions().unwrap();
@@ -4126,7 +4319,9 @@ mod tests {
     fn running_rows_join_current_task_fields() {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
-        let session = s.create_session(task_id, "claude", None, None).unwrap();
+        let session = s
+            .create_session(task_id, "claude", None, LivenessSource::Pid, None)
+            .unwrap();
 
         let rows = s.running_rows().unwrap();
         assert_eq!(rows.len(), 1);
@@ -4142,8 +4337,12 @@ mod tests {
     fn running_rows_exclude_ended_sessions_and_order_newest_first() {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
-        let done = s.create_session(task_id, "claude", None, None).unwrap();
-        let live = s.create_session(task_id, "codex", None, None).unwrap();
+        let done = s
+            .create_session(task_id, "claude", None, LivenessSource::Pid, None)
+            .unwrap();
+        let live = s
+            .create_session(task_id, "codex", None, LivenessSource::Pid, None)
+            .unwrap();
         s.end_session(done.id, SessionOutcome::Completed).unwrap();
 
         let rows = s.running_rows().unwrap();
@@ -4158,7 +4357,9 @@ mod tests {
     fn running_rows_compute_elapsed_from_started_at() {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
-        let session = s.create_session(task_id, "claude", None, None).unwrap();
+        let session = s
+            .create_session(task_id, "claude", None, LivenessSource::Pid, None)
+            .unwrap();
         s.conn
             .execute(
                 "UPDATE sessions SET started_at = datetime('now', '-90 seconds') WHERE id = ?1",
@@ -4210,7 +4411,9 @@ mod tests {
     fn running_rows_include_task_whose_sessions_all_ended() {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
-        let done = s.create_session(task_id, "claude", None, None).unwrap();
+        let done = s
+            .create_session(task_id, "claude", None, LivenessSource::Pid, None)
+            .unwrap();
         s.end_session(done.id, SessionOutcome::Failed).unwrap();
 
         let rows = s.running_rows().unwrap();
@@ -4225,7 +4428,9 @@ mod tests {
     fn running_rows_order_live_sessions_before_session_less_tasks() {
         let mut s = Store::open_in_memory().unwrap();
         let live_task = task_fixture(&mut s);
-        let session = s.create_session(live_task, "claude", None, None).unwrap();
+        let session = s
+            .create_session(live_task, "claude", None, LivenessSource::Pid, None)
+            .unwrap();
         let orphan_task = task_fixture(&mut s);
 
         let rows = s.running_rows().unwrap();
@@ -4244,7 +4449,14 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         let t = proposal(&mut s, "refine me");
         let (_, session) = s
-            .record_refine_launch(t.id, "thin body", "claude", Some(1), None)
+            .record_refine_launch(
+                t.id,
+                "thin body",
+                "claude",
+                Some(1),
+                LivenessSource::Pid,
+                None,
+            )
             .unwrap();
 
         let rows = s.running_rows().unwrap();
@@ -4280,7 +4492,9 @@ mod tests {
             })
             .unwrap()
             .id;
-        let (_, opened) = s.record_dispatch(id, "claude", Some(1), None).unwrap();
+        let (_, opened) = s
+            .record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+            .unwrap();
         s.apply(id, Action::Complete(None)).unwrap();
         s.apply(id, Action::HandOff).unwrap();
         s.set_pr(id, Some("https://github.com/o/r/pull/7")).unwrap();
@@ -4369,24 +4583,27 @@ mod tests {
 
         // review keeps its session open, yet must not appear in the strip
         let review = s.create_task(new("review")).unwrap().id;
-        s.record_dispatch(review, "claude", Some(1), None).unwrap();
+        s.record_dispatch(review, "claude", Some(1), LivenessSource::Pid, None)
+            .unwrap();
         s.apply(review, Action::Complete(None)).unwrap();
         assert!(s.sessions_for(review).unwrap()[0].ended_at.is_none());
 
         // done and rejected have their sessions closed by the transition
         let done = s.create_task(new("done")).unwrap().id;
-        s.record_dispatch(done, "claude", Some(2), None).unwrap();
+        s.record_dispatch(done, "claude", Some(2), LivenessSource::Pid, None)
+            .unwrap();
         s.apply(done, Action::Complete(None)).unwrap();
         s.apply(done, Action::Accept).unwrap();
 
         let rejected = s.create_task(new("rejected")).unwrap().id;
-        s.record_dispatch(rejected, "claude", Some(3), None)
+        s.record_dispatch(rejected, "claude", Some(3), LivenessSource::Pid, None)
             .unwrap();
         s.apply(rejected, Action::Abort).unwrap();
         s.apply(rejected, Action::Abandon).unwrap();
 
         let running = s.create_task(new("running")).unwrap().id;
-        s.record_dispatch(running, "claude", Some(4), None).unwrap();
+        s.record_dispatch(running, "claude", Some(4), LivenessSource::Pid, None)
+            .unwrap();
 
         let rows = s.running_rows().unwrap();
         assert_eq!(rows.len(), 1);
@@ -4399,7 +4616,8 @@ mod tests {
     fn running_rows_ignore_a_stale_open_session_on_a_closed_task() {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
-        s.create_session(task_id, "claude", Some(1), None).unwrap();
+        s.create_session(task_id, "claude", Some(1), LivenessSource::Pid, None)
+            .unwrap();
         s.conn
             .execute("UPDATE tasks SET state = 'done' WHERE id = ?1", [task_id])
             .unwrap();
@@ -4411,7 +4629,9 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         let task_id = task_fixture(&mut s);
         for outcome in SessionOutcome::ALL {
-            let opened = s.create_session(task_id, "claude", None, None).unwrap();
+            let opened = s
+                .create_session(task_id, "claude", None, LivenessSource::Pid, None)
+                .unwrap();
             let ended = s.end_session(opened.id, outcome).unwrap();
             assert_eq!(ended.outcome, Some(outcome));
         }

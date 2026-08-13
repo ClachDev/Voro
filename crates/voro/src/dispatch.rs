@@ -829,15 +829,16 @@ pub fn refine(
     let log_path = spawned.log_path.clone();
     let session_name = spawned.session_name.clone();
 
-    // Recorded after the spawn, exactly as dispatch records its session, so the
-    // pid the reconciler probes is the real one; a round that could not be
-    // recorded takes its agent down with it rather than rewriting a body no
-    // window knows is being rewritten.
+    // Recorded after the spawn, exactly as dispatch records its session — and
+    // with the same liveness source, since the round runs that same template; a
+    // round that could not be recorded takes its agent down with it rather than
+    // rewriting a body no window knows is being rewritten.
     let recorded = store.record_refine_launch(
         task_id,
         note,
         &agent.name,
         Some(pid),
+        agent.dispatch_liveness_source(),
         Some(log_path.to_string_lossy().as_ref()),
     );
     let session = match recorded {
@@ -1403,6 +1404,7 @@ fn spawn_session(
         task_id,
         &agent.name,
         Some(pid),
+        agent.dispatch_liveness_source(),
         Some(log_path.to_string_lossy().as_ref()),
     );
     let (task, session) = match recorded {
@@ -1608,7 +1610,7 @@ fn default_base_branch(repo_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voro_core::{NewTask, Priority};
+    use voro_core::{LivenessSource, NewTask, Priority};
 
     /// A scratch database, a freshly-`git init`ed clean project, and an
     /// `voro.toml` whose one agent is a stub command that just reads the
@@ -1714,9 +1716,12 @@ mod tests {
         let log = session.log_path.as_deref().unwrap();
         assert!(Path::new(log).exists(), "log file {log} should exist");
 
-        // no sessions verb, so no capture was attempted and none is reported
+        // no sessions verb, so no capture was attempted and none is reported —
+        // and with no listing to consult, the spawned pid is what the session
+        // records for reconciliation to read it by (DESIGN.md §8)
         assert!(session.session_ref.is_none());
         assert!(!summary.contains("ref"), "{summary}");
+        assert_eq!(session.liveness_source, LivenessSource::Pid);
 
         // the prompt carries the task title and body
         let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
@@ -2840,15 +2845,16 @@ mod tests {
 
         let summary = refine(&mut store, &ctx, id, "name the files").unwrap();
         assert!(summary.contains("ref refine-uuid"), "{summary}");
-        assert_eq!(
-            store.sessions_for(id).unwrap()[0].session_ref.as_deref(),
-            Some("refine-uuid")
-        );
+        let session = &store.sessions_for(id).unwrap()[0];
+        assert_eq!(session.session_ref.as_deref(), Some("refine-uuid"));
+        assert_eq!(session.liveness_source, LivenessSource::Listing);
         assert_eq!(store.task(id).unwrap().state, TaskState::Refining);
     }
 
     /// Capture is best-effort here as it is for a dispatch: a listing that
-    /// matches nothing leaves the ref NULL, says so, and the round runs on.
+    /// matches nothing leaves the ref NULL, says so, and the round runs on —
+    /// still recorded listing-authoritative (task #387), which is what leaves
+    /// reconcile with nothing to probe rather than a launcher pid to misread.
     #[test]
     fn refine_survives_a_ref_it_cannot_capture() {
         let (mut store, ctx, project) = fixture_toml(
@@ -2859,7 +2865,9 @@ mod tests {
 
         let summary = refine(&mut store, &ctx, id, "name the files").unwrap();
         assert!(summary.contains("session ref not captured"), "{summary}");
-        assert!(store.sessions_for(id).unwrap()[0].session_ref.is_none());
+        let session = &store.sessions_for(id).unwrap()[0];
+        assert!(session.session_ref.is_none());
+        assert_eq!(session.liveness_source, LivenessSource::Listing);
         assert_eq!(store.task(id).unwrap().state, TaskState::Refining);
     }
 
@@ -3134,7 +3142,7 @@ mod tests {
         );
         let id = proposal(&mut store, &project, false);
         store
-            .record_refine_launch(id, "first round", "stub", None, None)
+            .record_refine_launch(id, "first round", "stub", None, LivenessSource::Pid, None)
             .unwrap();
 
         let err = refine(&mut store, &ctx, id, "second round").unwrap_err();

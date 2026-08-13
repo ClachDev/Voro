@@ -9,7 +9,7 @@
 //! one by hand when a dev build needs to exercise dispatch.
 
 use crate::error::Result;
-use crate::model::{DepKind, Priority, SessionOutcome, TaskState};
+use crate::model::{DepKind, LivenessSource, Priority, SessionOutcome, TaskState};
 use crate::store::{NewTask, Store};
 use crate::transition::{Action, Triage};
 
@@ -70,7 +70,13 @@ pub fn seed(store: &mut Store) -> Result<SeedSummary> {
     // Fixture sessions record no pid: reconcile-on-read finalises a live
     // session whose process is gone, and an absent pid reads as liveness
     // unknown, which leaves the row standing.
-    store.create_session(running.id, "claude", None, Some("/tmp/voro-dev/import.log"))?;
+    store.create_session(
+        running.id,
+        "claude",
+        None,
+        LivenessSource::Listing,
+        Some("/tmp/voro-dev/import.log"),
+    )?;
     age(store, running.id, "-40 minutes")?;
     tasks += 1;
 
@@ -82,7 +88,8 @@ pub fn seed(store: &mut Store) -> Result<SeedSummary> {
         Priority::P2,
     )?;
     store.apply(asked.id, Action::Start)?;
-    let asked_session = store.create_session(asked.id, "claude", None, None)?;
+    let asked_session =
+        store.create_session(asked.id, "claude", None, LivenessSource::Listing, None)?;
     store.apply(
         asked.id,
         Action::Ask("Should the strip keep showing waiting rows once they have a PR?".into()),
@@ -100,8 +107,13 @@ pub fn seed(store: &mut Store) -> Result<SeedSummary> {
     )?;
     store.apply(review.id, Action::Start)?;
     store.set_branch(review.id, Some("split-review-keys"))?;
-    let review_session =
-        store.create_session(review.id, "claude", None, Some("/tmp/voro-dev/keys.log"))?;
+    let review_session = store.create_session(
+        review.id,
+        "claude",
+        None,
+        LivenessSource::Listing,
+        Some("/tmp/voro-dev/keys.log"),
+    )?;
     store.apply(
         review.id,
         Action::Complete(Some(
@@ -144,6 +156,7 @@ pub fn seed(store: &mut Store) -> Result<SeedSummary> {
         stalled.id,
         "claude",
         Some(0),
+        LivenessSource::Listing,
         Some("/tmp/voro-dev/backfill.log"),
     )?;
     store.reconcile_session(dead.id, false, false)?;
@@ -189,7 +202,7 @@ pub fn seed(store: &mut Store) -> Result<SeedSummary> {
         refining.id,
         Action::Refine("Narrow this to a decision with a threshold, not an open question.".into()),
     )?;
-    store.create_session(refining.id, "claude", None, None)?;
+    store.create_session(refining.id, "claude", None, LivenessSource::Listing, None)?;
     tasks += 1;
 
     let parked = ready_task(

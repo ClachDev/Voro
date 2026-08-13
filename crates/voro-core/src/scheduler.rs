@@ -473,7 +473,7 @@ pub struct StateCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::TaskState;
+    use crate::model::{LivenessSource, TaskState};
     use crate::store::NewTask;
 
     #[test]
@@ -661,7 +661,9 @@ mod tests {
     }
 
     fn to_stalled(s: &mut Store, id: i64) {
-        let (_, session) = s.record_dispatch(id, "claude", Some(1), None).unwrap();
+        let (_, session) = s
+            .record_dispatch(id, "claude", Some(1), LivenessSource::Pid, None)
+            .unwrap();
         s.reconcile_session(session.id, false, false).unwrap();
     }
 
@@ -1098,8 +1100,15 @@ mod tests {
         let mut s = setup();
         let p = add_project(&mut s, "p", 5);
         let refining = add_proposed(&mut s, p, "being rewritten", Priority::P0);
-        s.record_refine_launch(refining, "thin body", "claude", Some(1), None)
-            .unwrap();
+        s.record_refine_launch(
+            refining,
+            "thin body",
+            "claude",
+            Some(1),
+            LivenessSource::Pid,
+            None,
+        )
+        .unwrap();
         let ready = add_task(&mut s, p, "startable", Priority::P3);
 
         let candidates = s.candidates().unwrap();

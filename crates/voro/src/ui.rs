@@ -2214,7 +2214,7 @@ pub fn popup_area(frame: &mut Frame, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voro_core::{Priority, Task, TaskState};
+    use voro_core::{LivenessSource, Priority, Task, TaskState};
 
     /// The refusal `g` gives on a checkout `gh` cannot address (DESIGN.md §8) —
     /// the shape every wrapping test here cares about: long, and closing on the
@@ -2269,7 +2269,9 @@ mod tests {
         }
         let live: Vec<i64> = (0..running).map(|i| task(format!("live {i}"))).collect();
         for id in live {
-            store.record_dispatch(id, "claude", None, None).unwrap();
+            store
+                .record_dispatch(id, "claude", None, LivenessSource::Listing, None)
+                .unwrap();
         }
         let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
@@ -2727,7 +2729,9 @@ mod tests {
             })
             .unwrap()
             .id;
-        store.record_dispatch(task, "claude", None, None).unwrap();
+        store
+            .record_dispatch(task, "claude", None, LivenessSource::Listing, None)
+            .unwrap();
         store
             .apply(task, Action::Complete(Some("did it".into())))
             .unwrap();
@@ -2794,7 +2798,7 @@ mod tests {
         store.apply(closed_dependent, Action::Abandon).unwrap();
 
         store
-            .record_dispatch(handed_off, "claude", None, None)
+            .record_dispatch(handed_off, "claude", None, LivenessSource::Pid, None)
             .unwrap();
         store.apply(handed_off, Action::Complete(None)).unwrap();
         store.apply(handed_off, Action::HandOff).unwrap();
@@ -2802,7 +2806,7 @@ mod tests {
             .set_pr(handed_off, Some("https://github.com/o/r/pull/9"))
             .unwrap();
         store
-            .record_dispatch(under_way, "claude", None, None)
+            .record_dispatch(under_way, "claude", None, LivenessSource::Pid, None)
             .unwrap();
 
         let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
@@ -2895,7 +2899,9 @@ mod tests {
             })
             .unwrap()
             .id;
-        store.record_dispatch(task, "claude", None, None).unwrap();
+        store
+            .record_dispatch(task, "claude", None, LivenessSource::Listing, None)
+            .unwrap();
 
         let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
@@ -3012,10 +3018,14 @@ mod tests {
             .collect();
 
         for (id, _) in &running {
-            store.record_dispatch(*id, "claude", None, None).unwrap();
+            store
+                .record_dispatch(*id, "claude", None, LivenessSource::Listing, None)
+                .unwrap();
         }
         for (id, _) in &handed_off {
-            store.record_dispatch(*id, "claude", None, None).unwrap();
+            store
+                .record_dispatch(*id, "claude", None, LivenessSource::Listing, None)
+                .unwrap();
             store.apply(*id, Action::Complete(None)).unwrap();
             store.apply(*id, Action::HandOff).unwrap();
         }
@@ -3080,7 +3090,14 @@ mod tests {
             })
             .unwrap();
         store
-            .record_refine_launch(task.id, "name the files", "claude", None, None)
+            .record_refine_launch(
+                task.id,
+                "name the files",
+                "claude",
+                None,
+                LivenessSource::Pid,
+                None,
+            )
             .unwrap();
 
         let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
@@ -3144,7 +3161,14 @@ mod tests {
             })
             .unwrap();
         store
-            .record_refine_launch(task.id, "name the files", "claude", None, None)
+            .record_refine_launch(
+                task.id,
+                "name the files",
+                "claude",
+                None,
+                LivenessSource::Pid,
+                None,
+            )
             .unwrap();
         store
             .conclude_refine(task.id, RefineOutcome::Failed)
@@ -3663,7 +3687,7 @@ mod tests {
             .create_task(new("died", TaskState::Ready, false))
             .unwrap();
         let (_, session) = store
-            .record_dispatch(redispatch.id, "claude", Some(1), None)
+            .record_dispatch(redispatch.id, "claude", Some(1), LivenessSource::Pid, None)
             .unwrap();
         store.reconcile_session(session.id, false, false).unwrap();
         let do_ = store
@@ -4028,7 +4052,13 @@ mod tests {
                 })
                 .unwrap();
             let (_, session) = store
-                .record_dispatch(task.id, "claude", Some(1), Some("/tmp/voro/s.log"))
+                .record_dispatch(
+                    task.id,
+                    "claude",
+                    Some(1),
+                    LivenessSource::Pid,
+                    Some("/tmp/voro/s.log"),
+                )
                 .unwrap();
             store.reconcile_session(session.id, false, capped).unwrap();
             App::new(store, ctx()).unwrap()
@@ -4110,7 +4140,13 @@ mod tests {
             })
             .unwrap();
         store
-            .record_dispatch(task.id, "claude", Some(1), Some("/tmp/voro/open.log"))
+            .record_dispatch(
+                task.id,
+                "claude",
+                Some(1),
+                LivenessSource::Pid,
+                Some("/tmp/voro/open.log"),
+            )
             .unwrap();
         store.apply(task.id, Action::Ask("A or B?".into())).unwrap();
 
@@ -4164,7 +4200,13 @@ mod tests {
             })
             .unwrap();
         store
-            .record_dispatch(task.id, "claude", Some(1), Some("/tmp/voro/open.log"))
+            .record_dispatch(
+                task.id,
+                "claude",
+                Some(1),
+                LivenessSource::Pid,
+                Some("/tmp/voro/open.log"),
+            )
             .unwrap();
         store
             .apply(
@@ -4449,7 +4491,7 @@ mod tests {
             .create_task(task("in review", TaskState::Ready))
             .unwrap();
         store
-            .record_dispatch(reviewed.id, "claude", None, None)
+            .record_dispatch(reviewed.id, "claude", None, LivenessSource::Pid, None)
             .unwrap();
         store.apply(reviewed.id, Action::Complete(None)).unwrap();
         // ...and a refine in flight for the cancel slot, which rides the strip
@@ -4458,7 +4500,14 @@ mod tests {
             .create_task(task("being rewritten", TaskState::Proposed))
             .unwrap();
         store
-            .record_refine_launch(refining.id, "thin body", "claude", None, None)
+            .record_refine_launch(
+                refining.id,
+                "thin body",
+                "claude",
+                None,
+                LivenessSource::Pid,
+                None,
+            )
             .unwrap();
         let mut app = App::new(
             store,
@@ -4929,7 +4978,7 @@ mod tests {
         let third = ready_task(&mut store, p.id, "third");
         let live = ready_task(&mut store, p.id, "in flight");
         store
-            .record_dispatch(live.id, "claude", None, None)
+            .record_dispatch(live.id, "claude", None, LivenessSource::Pid, None)
             .unwrap();
 
         let mut app = test_app(store);
