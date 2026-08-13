@@ -1769,14 +1769,18 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
         )
         .unwrap();
     }
-    // The response to a rejection (DESIGN.md §8), the CLI's mirror of the
-    // detail pane's block: the summary the rework came back with, read beside
-    // the feedback it answers rather than dug out of the event log.
-    if let Some(report) =
-        voro_core::rework_report(&store.events_for(id).map_err(|e| e.to_string())?)
-        && let Some(summary) = report.summary
+    // What the agent reported (DESIGN.md §8), the CLI's mirror of the detail
+    // pane's block: the completion summary of the cycle in hand, headed on a
+    // rework by the feedback it answers, rather than dug out of the event log.
+    if matches!(task.state, TaskState::Review | TaskState::Waiting)
+        && let Some(report) =
+            voro_core::completion_report(&store.events_for(id).map_err(|e| e.to_string())?)
     {
-        writeln!(out, "response to the review feedback:\n{summary}").unwrap();
+        let heading = match report.feedback {
+            Some(_) => "response to the review feedback:",
+            None => "completion summary:",
+        };
+        writeln!(out, "{heading}\n{}", report.summary).unwrap();
     }
     // The plans this task implements (DESIGN.md §3), resolved to where they
     // actually are — the same absolute location dispatch hands the agent.
@@ -3109,6 +3113,41 @@ mod tests {
         ok(&mut s, &["set", &id.to_string(), "--pr", "acme/widget#42"]);
         let out = ok(&mut s, &["inbox"]);
         assert!(out.contains("review PR"), "{out}");
+    }
+
+    /// `show` prints the completion summary of the cycle awaiting a verdict —
+    /// on a first review as well as a rework (task #407) — and stops once the
+    /// verdict has been given, when the summary is history.
+    #[test]
+    fn show_prints_the_completion_summary_under_review() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "A task", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["done", "1", "--summary", "README.md: +2 lines"]);
+        let out = ok(&mut s, &["show", "1"]);
+        assert!(
+            out.contains("completion summary:\nREADME.md: +2 lines"),
+            "{out}"
+        );
+
+        // Handed off, the verdict is still pending, so the report still shows.
+        ok(&mut s, &["wait", "1"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("README.md: +2 lines"));
+
+        // Sent back: the rejected round's summary is not an answer to the
+        // feedback, so nothing shows until the rework reports.
+        ok(&mut s, &["reject", "1", "tests missing"]);
+        assert!(!ok(&mut s, &["show", "1"]).contains("completion summary:"));
+        ok(&mut s, &["done", "1", "--summary", "added the tests"]);
+        let out = ok(&mut s, &["show", "1"]);
+        assert!(
+            out.contains("response to the review feedback:\nadded the tests"),
+            "{out}"
+        );
+
+        ok(&mut s, &["accept", "1"]);
+        assert!(!ok(&mut s, &["show", "1"]).contains("summary:"));
     }
 
     /// `show` names the next action in its header whenever the task derives

@@ -2,8 +2,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::ui::Hit;
 use voro_core::{
-    Action, ActionRow, AgentsConfig, DepKind, DepRef, DigestRow, Event, PrRef, Priority, Project,
-    Queue, QueueRow, RefineOutcome, ReviewAction, ReworkReport, RunningRow, ScoreBreakdown,
+    Action, ActionRow, AgentsConfig, CompletionReport, DepKind, DepRef, DigestRow, Event, PrRef,
+    Priority, Project, Queue, QueueRow, RefineOutcome, ReviewAction, RunningRow, ScoreBreakdown,
     StateCounts, Store, Task, TaskState, Triage, WipGate, scheduler,
 };
 
@@ -1966,12 +1966,11 @@ impl App {
         self.store.events_for(task_id).unwrap_or_default()
     }
 
-    /// The rework cycle a task is in, if any (DESIGN.md §8): the newest
-    /// rejection feedback and the summary answering it. `None` for a task
-    /// nobody has sent back, which is what keeps a first review's detail pane
-    /// exactly as it was.
-    pub fn rework_report(&self, task_id: i64) -> Option<ReworkReport> {
-        voro_core::rework_report(&self.store.events_for(task_id).ok()?)
+    /// What the selected task last reported (DESIGN.md §8): the completion
+    /// summary of the cycle in hand, and the rejection feedback it answers if
+    /// it is a rework. `None` for a task that has reported nothing.
+    pub fn completion_report(&self, task_id: i64) -> Option<CompletionReport> {
+        voro_core::completion_report(&self.store.events_for(task_id).ok()?)
     }
 
     /// The selected task's id and agent override, if it is `ready` or `stalled`

@@ -1228,7 +1228,7 @@ fn spawn_session(
     // `## Feedback` section are all it has to answer.
     let rework = store
         .events_for(task_id)
-        .map(|events| voro_core::rework_report(&events).is_some())
+        .map(|events| voro_core::was_rejected(&events))
         .unwrap_or(false);
     let prompt = format!(
         "{}{body}",

@@ -64,6 +64,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The review card shows the agent's completion summary.** A task in `review`
+  or `waiting` renders what the agent reported at `done` — its account of what
+  changed and how it was verified — above the task body, in the TUI detail pane
+  and in `voro show`. It was previously rendered only on a task that had been
+  rejected once, which left a first review with no account of the work anywhere
+  but `voro show`'s event log — and no PR or configured viewer to fall back on,
+  on the fresh install where that matters most. A rework's block is unchanged
+  but for its heading, and shows nothing while the rework is still in flight.
 - The cockpit key line advertises `d/D dispatch` only on a `ready` or `stalled`
   row, where dispatch can actually act, rather than on any selection — which
   also makes room for the new `a/A message` slot within the line's ten.
