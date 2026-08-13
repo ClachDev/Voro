@@ -2554,8 +2554,10 @@ mod tests {
                 "/nonexistent/voro.db",
             ));
             let mut app = App::new(store, ctx).unwrap();
-            app.toggle_screen();
-            assert_eq!(app.screen, crate::app::Screen::Tasks);
+            // The screen `App::new` opens on depends on whether the store has a
+            // project (DESIGN.md §9), so the browser is selected outright rather
+            // than counted to from the default.
+            app.screen = crate::app::Screen::Tasks;
             let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
             terminal
                 .draw(|f| draw_tasks(f, &app, &mut HitMap::default()))
