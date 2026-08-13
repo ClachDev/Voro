@@ -165,9 +165,12 @@ cmd = \"cursor -n {path}\"
 cmd = \"zed {path}\"
 ";
 
-/// The order the built-in viewers are probed against PATH when nothing
-/// user-configured resolves: the first one installed wins (DESIGN.md §11a).
-const DEFAULT_VIEWER_PROBE_ORDER: [&str; 3] = ["code", "cursor", "zed"];
+/// The built-in viewers by name, in the order they are probed against PATH
+/// when nothing user-configured resolves: the first one installed wins
+/// (DESIGN.md §11a). Public because the messages that say what was looked for
+/// are written where the failure is surfaced, and none of them should spell
+/// the list again.
+pub const BUILTIN_VIEWER_NAMES: [&str; 3] = ["code", "cursor", "zed"];
 
 /// The parsed built-in viewers, layered under a user file the same way
 /// [`builtin_agents`] is. A malformed built-in is a bug here, not a user config
@@ -181,7 +184,7 @@ fn builtin_viewers() -> &'static BTreeMap<String, ViewerTemplate> {
                 "built-in viewer '{name}' has a command"
             );
         }
-        for name in DEFAULT_VIEWER_PROBE_ORDER {
+        for name in BUILTIN_VIEWER_NAMES {
             assert!(
                 raw.viewers.contains_key(name),
                 "probe order names a built-in viewer, not '{name}'"
@@ -197,15 +200,6 @@ fn builtin_viewers() -> &'static BTreeMap<String, ViewerTemplate> {
 /// viewer that isn't there.
 pub fn is_builtin_viewer(name: &str) -> bool {
     builtin_viewers().contains_key(name)
-}
-
-/// `a, b or c` — the built-in list as an error message reads it out.
-fn join_or(names: &[&str]) -> String {
-    match names {
-        [] => String::new(),
-        [only] => (*only).to_string(),
-        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
-    }
 }
 
 /// Header prose for the skeleton `agent init` writes. [`starter_config`]
@@ -797,9 +791,7 @@ fn binary_on_path(name: &str) -> bool {
 /// binary name — a user table overriding one keeps that name, so an override
 /// changes what runs, not whether the probe finds it.
 fn probed_builtin_viewer(probe: &dyn Fn(&str) -> bool) -> Option<&'static str> {
-    DEFAULT_VIEWER_PROBE_ORDER
-        .into_iter()
-        .find(|name| probe(name))
+    BUILTIN_VIEWER_NAMES.into_iter().find(|name| probe(name))
 }
 
 /// The agent a task will be dispatched with: the task's own override if it
@@ -1167,8 +1159,7 @@ impl AgentsConfig {
                         probed_builtin_viewer(probe).and_then(|name| self.named_viewer(name).ok())
                     })
                     .ok_or_else(|| Error::NoViewer {
-                        probed: join_or(&DEFAULT_VIEWER_PROBE_ORDER),
-                        path: self.path.clone(),
+                        probed: BUILTIN_VIEWER_NAMES.join("/"),
                     }),
             },
         }
@@ -2043,9 +2034,11 @@ mod tests {
         assert_eq!(parse_sessions_json("[]").unwrap(), vec![]);
     }
 
-    /// Nothing installed, nothing configured: the failure leads with what to
-    /// do, names the built-ins it looked for, and never calls the config file
-    /// invalid — it may not even exist (#405).
+    /// Nothing installed, nothing configured: the failure asks for the one
+    /// thing the operator can act on — register the viewer they already use —
+    /// and only then says what was probed. It never tells them to install an
+    /// editor, and never calls the config file invalid: it may not even exist
+    /// (#405).
     #[test]
     fn viewer_resolution_errors_with_guidance_when_nothing_resolves() {
         let message = config()
@@ -2053,12 +2046,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            message.starts_with("no viewer found — install"),
+            message.starts_with("no viewer set up — run `voro viewer add"),
             "{message}"
         );
-        assert!(message.contains("code, cursor or zed"), "{message}");
-        assert!(message.contains("voro viewer add"), "{message}");
-        assert!(message.contains("/tmp/voro.toml"), "{message}");
+        assert!(message.contains("'zed {path}'"), "{message}");
+        // the probed built-ins are diagnosis, so they come after the action
+        let (action, diagnosis) = message.split_once("; ").unwrap();
+        assert!(diagnosis.contains("code/cursor/zed"), "{message}");
+        assert!(!action.contains("install"), "{message}");
         assert!(!message.contains("invalid"), "{message}");
         assert!(config().viewer_names().is_empty());
         assert_eq!(config().default_viewer_name_with(&none_installed), None);
@@ -2232,7 +2227,7 @@ mod tests {
             .viewer_cmd_with(None, &none_installed)
             .unwrap_err()
             .to_string();
-        assert!(message.contains("no viewer found"), "{message}");
+        assert!(message.contains("no viewer set up"), "{message}");
     }
 
     #[test]

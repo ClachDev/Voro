@@ -18,9 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list` and the Config screen now show the built-ins beside your own with each
   one's provenance, starring whichever the next `open` will run. A built-in is
   overridden rather than edited or deleted, and both surfaces say so. When
-  nothing resolves at all, the failure leads with what to do (install one, or
-  `voro viewer add <name> '<cmd>'`) instead of reporting a config file that may
-  not exist as an invalid *agents* config.
+  nothing resolves at all, `o` in the TUI raises the add-viewer form on the
+  spot rather than only complaining, and at the shell the failure asks you to
+  register the viewer you already use (`voro viewer add <name> '<cmd>'`), with
+  the probed built-ins named after the action — instead of reporting a config
+  file that may not exist as an invalid *agents* config.
 - **A build from a `target/` directory opens a dev store, not your real one.** A
   `voro` run out of `target/debug` or `target/release` now uses
   `~/.local/share/voro/dev.db`, seeded on first run with a fixture board

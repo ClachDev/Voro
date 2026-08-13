@@ -686,7 +686,9 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Dispatch { task_id, agent } => {
             dispatch::dispatch(store, ctx, task_id, agent.as_deref())
         }
-        Verb::Open { task_id } => dispatch::open(store, ctx, task_id, None),
+        Verb::Open { task_id } => {
+            dispatch::open(store, ctx, task_id, None).map_err(|e| e.to_string())
+        }
         Verb::Viewer { cmd } => viewer_verb(store, cmd, ctx),
         Verb::Pr { task_id, yes } => pr_verb(store, task_id, yes),
         Verb::Reject(args) => reject_verb(store, args),
@@ -2252,8 +2254,9 @@ fn viewer_verb(store: &mut Store, cmd: ViewerCmd, ctx: &DispatchCtx) -> Result<S
             if default.is_none() && config.anonymous_viewer_cmd().is_none() {
                 writeln!(
                     out,
-                    "no viewer resolves — install one of the built-ins, or run \
-                     `voro viewer add <name> '<cmd>'` to define your own"
+                    "no viewer set up — run `voro viewer add <name> '<cmd>'`, e.g. \
+                     `voro viewer add zed 'zed {{path}}'`; none of the built-in {} are on PATH",
+                    voro_core::BUILTIN_VIEWER_NAMES.join("/")
                 )
                 .unwrap();
             }

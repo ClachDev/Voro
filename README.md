@@ -108,9 +108,10 @@ agent's completion summary — what it says it changed and how it verified.
 Press `o` to open its checkout in a viewer, or `g` to open its pull request
 (creating it when the project reviews through GitHub). The viewer needs no
 setup: Voro ships with `code`, `cursor` and `zed` built in and opens the first
-one on your PATH. With the account and the diff in front of you, press `enter`
-(`⏎ review`) to accept or reject the work; rejecting with a note re-dispatches
-the agent to address it.
+one on your PATH; if none of them is there, `o` opens a small form to name the
+editor you do use instead. With the account and the diff in front of you, press
+`enter` (`⏎ review`) to accept or reject the work; rejecting with a note
+re-dispatches the agent to address it.
 
 Other keys worth knowing on a selected task: `s` change state, `x` the score
 breakdown, `h` its history, `e` edit, `l` the session log, and `q` to quit.

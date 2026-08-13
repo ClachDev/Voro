@@ -2088,7 +2088,7 @@ impl App {
     /// Open the selected task's checkout in a configured viewer (DESIGN.md
     /// §11a): the explicit viewer key, reaching the local diff even on a GitHub
     /// project. Only `review`/`running` tasks have a diff worth opening; anything
-    /// else, or a missing viewer, reports via the status line.
+    /// else reports via the status line.
     fn open_selected_in_viewer(&mut self) {
         let (id, state) = match self.selected_task() {
             Some(task) => (task.id, task.state),
@@ -2100,9 +2100,32 @@ impl App {
             ));
             return;
         }
-        match crate::dispatch::open(&mut self.store, &self.dispatch_ctx, id, None) {
+        let result = crate::dispatch::open(&mut self.store, &self.dispatch_ctx, id, None);
+        self.report_open(result);
+    }
+
+    /// What `o` does with what opening returned. No viewer set up at all is
+    /// *answered* rather than reported: the add-viewer form opens on the spot
+    /// (DESIGN.md §5), because the operator pressing `o` is one name and
+    /// command away from what they asked for, and sending them to the Config
+    /// screen to type the same two fields is a detour. Saving does not then
+    /// open the task — `o` again does — so the key never does two things at
+    /// once. Every other failure only reports, as before.
+    ///
+    /// Split from the keypress because the branch cannot otherwise be tested:
+    /// which arm runs depends on the developer's PATH, and a test that got it
+    /// wrong would launch a real editor.
+    fn report_open(&mut self, result: Result<String, crate::dispatch::OpenFailure>) {
+        match result {
             Ok(summary) => self.status = Some(summary),
-            Err(e) => self.status = Some(e),
+            Err(crate::dispatch::OpenFailure::NoViewer(_)) => {
+                self.status = Some(format!(
+                    "no viewer set up — name one here to open this task (no built-in {} on PATH)",
+                    voro_core::BUILTIN_VIEWER_NAMES.join("/")
+                ));
+                self.open_viewer_form(None, None);
+            }
+            Err(e) => self.status = Some(e.to_string()),
         }
     }
 
@@ -4141,6 +4164,45 @@ mod tests {
             .iter()
             .position(|v| v.name == name)
             .unwrap_or_else(|| panic!("no viewer row named {name}"))
+    }
+
+    /// `o` with no viewer set up anywhere raises the add-viewer form rather
+    /// than only complaining (#405), and says why on the status line; every
+    /// other way opening can fail still just reports. Driven through
+    /// `report_open` rather than the key, since which arm a real keypress
+    /// takes depends on what the developer has installed.
+    #[test]
+    fn no_viewer_at_all_raises_the_add_viewer_form() {
+        let (store, ctx, _project) = scratch_env("open-no-viewer", None);
+        let path = ctx.agents_path.clone();
+        let mut app = App::new(store, ctx).unwrap();
+
+        app.report_open(Err(crate::dispatch::OpenFailure::NoViewer(
+            "no viewer set up — run `voro viewer add …`".into(),
+        )));
+        assert!(
+            matches!(app.mode, Mode::ViewerForm { editing: false, .. }),
+            "expected the add-viewer form to open"
+        );
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.starts_with("no viewer set up — name one here"),
+            "{status}"
+        );
+        assert!(status.contains("code/cursor/zed"), "{status}");
+        // the status line truncates at 110 columns (#406), so the action must
+        // survive ahead of the diagnosis
+        assert!(status.len() < 110, "{} chars: {status}", status.len());
+
+        // anything else opening can fail on is reported, not answered
+        app.mode = Mode::Normal;
+        app.report_open(Err(crate::dispatch::OpenFailure::Failed(
+            "no viewer named 'nope'".into(),
+        )));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status.as_deref(), Some("no viewer named 'nope'"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// The Config screen (DESIGN.md §5): add, edit, set-default, and delete a

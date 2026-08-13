@@ -1141,6 +1141,35 @@ pub fn dispatch(
     spawn_session(store, ctx, task_id, agent_override)
 }
 
+/// Why [`open`] could not show a diff, at the one granularity its callers act
+/// on differently: no viewer set up at all is answerable — the TUI raises the
+/// add-viewer form on it, since the operator is one name and command away from
+/// the thing they pressed `o` for — while everything else is only reportable.
+/// Both render the same text, so a caller that just prints keeps doing so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenFailure {
+    /// No user table and no built-in on PATH resolved (`voro-core`'s
+    /// `NoViewer`), carrying the shell-facing wording for callers that print.
+    NoViewer(String),
+    /// Any other refusal: wrong state, unreadable repo, unknown viewer name,
+    /// a viewer that would not spawn.
+    Failed(String),
+}
+
+impl From<String> for OpenFailure {
+    fn from(message: String) -> Self {
+        OpenFailure::Failed(message)
+    }
+}
+
+impl std::fmt::Display for OpenFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenFailure::NoViewer(message) | OpenFailure::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
 /// Open a `review` (or `running`) task's diff in a viewer (DESIGN.md §11a): the
 /// viewer medium of the per-project review action (§8). A dispatched agent works
 /// in a throwaway worktree on the task's branch, so the diff lives there, not in
@@ -1157,13 +1186,14 @@ pub fn open(
     ctx: &DispatchCtx,
     task_id: i64,
     viewer_override: Option<&str>,
-) -> Result<String, String> {
+) -> Result<String, OpenFailure> {
     let task = store.task(task_id).map_err(|e| e.to_string())?;
     if !matches!(task.state, TaskState::Review | TaskState::Running) {
         return Err(format!(
             "only review or running tasks can be opened in a viewer; task {task_id} is {}",
             task.state
-        ));
+        )
+        .into());
     }
     let project = store.project(task.project_id).map_err(|e| e.to_string())?;
     // The task's own repo, not the project default: a task dispatched into a
@@ -1176,9 +1206,16 @@ pub fn open(
     let viewer_name = viewer_override.map(str::to_string).or(project_viewer);
 
     let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
-    let viewer = config
-        .viewer_cmd(viewer_name.as_deref())
-        .map_err(|e| e.to_string())?;
+    // Nothing resolving at all is the one failure a caller can *answer* rather
+    // than just report — the TUI raises its add-viewer form on it — so it is
+    // told apart from every other way opening can fail (#405).
+    let viewer = match config.viewer_cmd(viewer_name.as_deref()) {
+        Ok(cmd) => cmd,
+        Err(e @ voro_core::Error::NoViewer { .. }) => {
+            return Err(OpenFailure::NoViewer(e.to_string()));
+        }
+        Err(e) => return Err(e.to_string().into()),
+    };
 
     // Run the viewer in the task's worktree when it has one — that is where the
     // dispatched agent's diff lives — otherwise the primary checkout.
@@ -2603,6 +2640,10 @@ mod tests {
         let id = review_task(&mut store, &project);
 
         let err = open(&mut store, &ctx, id, Some("nope")).unwrap_err();
+        // a name that resolves to nothing is only reportable, so it stays a
+        // plain failure rather than the answerable no-viewer-at-all one
+        assert!(matches!(err, OpenFailure::Failed(_)), "{err}");
+        let err = err.to_string();
         assert!(err.starts_with("no viewer named 'nope' — run"), "{err}");
         assert!(err.contains(ctx.agents_path.to_str().unwrap()), "{err}");
         assert!(!err.contains("invalid"), "{err}");
@@ -2613,7 +2654,7 @@ mod tests {
         let (mut store, ctx, project) = fixture("cat {prompt_file}");
         let id = ready_task(&mut store, &project); // still ready
 
-        let err = open(&mut store, &ctx, id, None).unwrap_err();
+        let err = open(&mut store, &ctx, id, None).unwrap_err().to_string();
         assert!(err.contains("review or running"), "{err}");
     }
 
@@ -2680,7 +2721,9 @@ mod tests {
         .unwrap();
         let id = review_task(&mut store, &project);
 
-        let err = open(&mut store, &ctx, id, Some("emacs")).unwrap_err();
+        let err = open(&mut store, &ctx, id, Some("emacs"))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("emacs"), "{err}");
         assert!(err.contains("zed"), "{err}");
     }
