@@ -152,6 +152,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The project picker offers only projects that can take the work, weightiest
+  first.** It used to list every project alphabetically, archived ones included
+  — and an archived project refuses new tasks, so picking one could only fail,
+  which in the `$EDITOR` and planning flows it did only after you had written
+  the task out. Archived projects are now dropped from the picker entirely
+  (unarchiving stays where it was, on the projects screen), and the rest are
+  ordered by the weight you set every morning, each row showing it, so the
+  project you are actually working on is the one under the cursor. A parked
+  project is still offered and simply sorts last. One live project beside
+  archived ones now skips the picker and creates straight into it, and with
+  every project archived `n`/`N` say so instead of raising an empty list.
 - **The key line stops offering `o` and `g` on a review task with nothing to
   show.** A task whose whole product is its summary — an investigation, a
   triage, an audit — reaches `review` having never made a branch, and both keys

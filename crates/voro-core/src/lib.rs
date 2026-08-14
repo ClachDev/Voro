@@ -30,6 +30,7 @@ pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body}
 pub use model::{
     Dep, DepKind, DepRef, Doc, Event, LivenessSource, NextAction, Priority, Project, RefineOutcome,
     Repo, RunningRow, Session, SessionOutcome, Task, TaskState, location_is_url,
+    projects_for_new_task,
 };
 pub use pr::{Mergeability, PrPlan, PrRef, format_review_feedback, parse_mergeable, plan_pr};
 pub use review::{

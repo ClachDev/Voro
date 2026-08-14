@@ -140,14 +140,17 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             frame.render_widget(para, area);
         }
         Mode::PickProject { sel, flow } => {
+            // Weight first, then name, as the projects screen lists them
+            // — the order is weightiest-first (DESIGN.md §9), which reads as
+            // arbitrary unless the number it sorts on is on the row.
             let items: Vec<ListItem> = app
-                .projects
+                .creatable_projects()
                 .iter()
-                .map(|p| ListItem::new(p.name.clone()))
+                .map(|p| ListItem::new(format!("{:>2}  {}", p.weight, p.name)))
                 .collect();
             let count = items.len();
             let height = items.len() as u16 + 2;
-            let area = popup_area(frame, 44, height.max(3));
+            let area = popup_area(frame, 48, height.max(3));
             let mut state = ListState::default().with_selected(Some(*sel));
             let title = match flow {
                 crate::app::CreateFlow::Quick => "Project to propose a task in",
@@ -2412,6 +2415,38 @@ mod tests {
             .unwrap();
         let text = screen_text(&terminal);
         assert!(text.contains("nothing to do — press n"), "{text}");
+    }
+
+    /// The picker carries the weight it sorts on, so weightiest-first reads as
+    /// an order rather than a shuffle, and an archived project — which could
+    /// not take the task anyway (DESIGN.md §5) — is not on it at all.
+    #[test]
+    fn the_project_picker_shows_weights_and_hides_the_archived() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with_status("", 0, 0);
+        let heavy = app.store.create_project("zeta", "/tmp/zeta").unwrap();
+        app.store.set_weight(heavy.id, 4).unwrap();
+        let retired = app.store.create_project("retired", "/tmp/retired").unwrap();
+        app.store.set_weight(retired.id, 5).unwrap();
+        app.store.set_archived(retired.id, true).unwrap();
+        app.refresh().unwrap();
+        app.mode = crate::app::Mode::PickProject {
+            sel: 0,
+            flow: crate::app::CreateFlow::Quick,
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        let text = screen_text(&terminal);
+        assert!(text.contains("4 zeta"), "{text}");
+        assert!(text.contains("3 voro"), "{text}");
+        assert!(!text.contains("retired"), "{text}");
     }
 
     /// The key map may not advertise a jump the gate would refuse (DESIGN.md

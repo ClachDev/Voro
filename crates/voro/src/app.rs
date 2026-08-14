@@ -4,7 +4,8 @@ use crate::ui::Hit;
 use voro_core::{
     Action, ActionRow, AgentsConfig, CompletionReport, DepKind, DepRef, DigestRow, Event,
     LivenessSource, PrRef, Priority, Project, Queue, QueueRow, RefineOutcome, RunningRow,
-    ScoreBreakdown, StateCounts, Store, Task, TaskState, Triage, WipGate, scheduler,
+    ScoreBreakdown, StateCounts, Store, Task, TaskState, Triage, WipGate, projects_for_new_task,
+    scheduler,
 };
 
 /// Lines `PgDn`/`PgUp` move the focus card in one press. A fixed step, since
@@ -15,6 +16,12 @@ const DETAIL_PAGE_STEP: i64 = 10;
 /// The gate (DESIGN.md §9) keeps the operator on the two screens `n` is not
 /// bound on, so this is a defensive path rather than one they can reach.
 pub const NO_PROJECTS_HINT: &str = "no projects yet — press tab to Projects, then a to add one";
+
+/// `n`'s refusal when every registered project is archived. An archived project
+/// refuses new work (DESIGN.md §5), so there is nothing to pick; unarchiving is
+/// the projects screen's job, which is where this points.
+pub const ALL_PROJECTS_ARCHIVED_HINT: &str =
+    "every project is archived — press tab to Projects, then A to unarchive one";
 
 /// How a gated screen jump refuses (DESIGN.md §9). It names `alt-3` rather than
 /// `tab` because the jump is the shortest route from either screen the gate
@@ -1840,14 +1847,24 @@ impl App {
             .is_some_and(|t| t.state == TaskState::Refining)
     }
 
-    /// Begin creating a task in one of the two flows (DESIGN.md §9): straight
-    /// into it when there is exactly one project, via the project picker when
-    /// there are several, and a pointer to the projects screen when there are
-    /// none.
+    /// The projects the create flows offer, in the order they offer them
+    /// (DESIGN.md §9) — unarchived only, weightiest first. Both the picker's
+    /// key handler and its draw arm index this, so `sel` means the same thing
+    /// to each.
+    pub fn creatable_projects(&self) -> Vec<&Project> {
+        projects_for_new_task(&self.projects)
+    }
+
+    /// Begin creating a task in one of the three flows (DESIGN.md §9): straight
+    /// into it when exactly one project can take work, via the project picker
+    /// when several can, and a pointer to the projects screen when none can —
+    /// because none is registered, or because every one of them is archived.
     fn new_task(&mut self, flow: CreateFlow) {
-        match self.projects.len() {
-            0 => self.status = Some(NO_PROJECTS_HINT.into()),
-            1 => self.start_create(self.projects[0].id, flow),
+        let offered: Vec<i64> = self.creatable_projects().iter().map(|p| p.id).collect();
+        match offered.len() {
+            0 if self.projects.is_empty() => self.status = Some(NO_PROJECTS_HINT.into()),
+            0 => self.status = Some(ALL_PROJECTS_ARCHIVED_HINT.into()),
+            1 => self.start_create(offered[0], flow),
             _ => self.mode = Mode::PickProject { sel: 0, flow },
         }
     }
@@ -3538,12 +3555,12 @@ impl App {
         match key.code {
             KeyCode::Esc => return,
             KeyCode::Char('j') | KeyCode::Down => {
-                sel = (sel + 1).min(self.projects.len().saturating_sub(1));
+                sel = (sel + 1).min(self.creatable_projects().len().saturating_sub(1));
             }
             KeyCode::Char('k') | KeyCode::Up => sel = sel.saturating_sub(1),
             KeyCode::Enter => {
-                if let Some(project) = self.projects.get(sel) {
-                    self.start_create(project.id, flow);
+                if let Some(project_id) = self.creatable_projects().get(sel).map(|p| p.id) {
+                    self.start_create(project_id, flow);
                 }
                 return;
             }
@@ -7409,6 +7426,86 @@ mod tests {
             _ => panic!("⏎ in the picker should open the quick-create modal"),
         }
         assert!(written_prompts(&app).is_empty(), "nothing spawns yet");
+    }
+
+    /// An archived project cannot take a new task at all (DESIGN.md §5), so it
+    /// is not a candidate: with one live project beside three archived ones
+    /// there is nothing to pick between, and `n` opens the create flow on the
+    /// live one rather than a picker whose other rows can only fail.
+    #[test]
+    fn create_skips_the_picker_when_only_one_project_is_unarchived() {
+        let mut app = app_with_stub_dispatch();
+        let live = app.projects[0].id;
+        for name in ["retired-a", "retired-b", "retired-c"] {
+            let p = app
+                .store
+                .create_project(name, &format!("/tmp/{name}"))
+                .unwrap();
+            app.store.set_archived(p.id, true).unwrap();
+        }
+        app.refresh().unwrap();
+        assert_eq!(app.projects.len(), 4);
+
+        key(&mut app, KeyCode::Char('n'));
+        match &app.mode {
+            Mode::QuickCreate { project_id, .. } => assert_eq!(*project_id, live),
+            _ => panic!("n should open the quick-create modal"),
+        }
+    }
+
+    /// With every project archived there is no project to create in, and no
+    /// picker to open over none. It refuses the way the neighbouring keys do —
+    /// a no-op with an explanation, pointing at the screen that unarchives.
+    #[test]
+    fn create_with_every_project_archived_explains_itself() {
+        let mut app = app_with_stub_dispatch();
+        let only = app.projects[0].id;
+        app.store.set_archived(only, true).unwrap();
+        app.refresh().unwrap();
+
+        for press in ['n', 'N'] {
+            app.status = None;
+            key(&mut app, KeyCode::Char(press));
+            assert!(matches!(app.mode, Mode::Normal), "no picker opens");
+            assert_eq!(app.status.as_deref(), Some(ALL_PROJECTS_ARCHIVED_HINT));
+            assert!(app.pending_editor.is_none());
+            assert!(app.pending_plan.is_none());
+        }
+    }
+
+    /// The picker offers what can take work in the order the operator ranked it
+    /// — weight descending, name ascending inside a weight (DESIGN.md §9) — so
+    /// ⏎ on a row starts the create flow on the project *that* order puts
+    /// there, not the one alphabetical order would have.
+    #[test]
+    fn picker_rows_follow_weight_then_name() {
+        let mut app = app_with_stub_dispatch();
+        let demo = app.projects[0].id;
+        app.store.set_weight(demo, 1).unwrap();
+        let heavy = app.store.create_project("zeta", "/tmp/zeta").unwrap();
+        app.store.set_weight(heavy.id, 4).unwrap();
+        let parked = app.store.create_project("alpha", "/tmp/alpha").unwrap();
+        app.store.set_weight(parked.id, 0).unwrap();
+        let hidden = app.store.create_project("beta", "/tmp/beta").unwrap();
+        app.store.set_weight(hidden.id, 5).unwrap();
+        app.store.set_archived(hidden.id, true).unwrap();
+        app.refresh().unwrap();
+
+        // zeta (4), demo (1), alpha (0) — beta is archived and absent despite
+        // outweighing all three.
+        for (row, expected) in [(0, heavy.id), (1, demo), (2, parked.id)] {
+            key(&mut app, KeyCode::Char('n'));
+            assert!(matches!(app.mode, Mode::PickProject { sel: 0, .. }));
+            for _ in 0..row {
+                key(&mut app, KeyCode::Char('j'));
+            }
+            key(&mut app, KeyCode::Enter);
+            match &app.mode {
+                Mode::QuickCreate { project_id, .. } => assert_eq!(*project_id, expected, "{row}"),
+                _ => panic!("row {row} should open the modal"),
+            }
+            key(&mut app, KeyCode::Esc);
+        }
     }
 
     /// `ctrl-n` keeps the manual `$EDITOR` form, the only path that sets state,
