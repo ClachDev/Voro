@@ -1913,6 +1913,22 @@ mod tests {
         panic!("{path} stayed empty");
     }
 
+    /// Poll a marker file a detached command writes until its content lands,
+    /// and return it trimmed. A shell's `>` creates the file when the command
+    /// starts and fills it a moment later, so waiting on existence alone can
+    /// read the marker back empty.
+    fn marker_text(path: &Path) -> String {
+        for _ in 0..50 {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && !text.trim().is_empty()
+            {
+                return text.trim().to_string();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("{} was never written", path.display());
+    }
+
     fn ready_task(store: &mut Store, project_path: &Path) -> i64 {
         let p = store
             .create_project("proj", project_path.to_str().unwrap())
@@ -2283,17 +2299,7 @@ mod tests {
 
         dispatch(&mut store, &ctx, id, None).unwrap();
 
-        let marker = project.join("marker.txt");
-        for _ in 0..50 {
-            if marker.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(
-            std::fs::read_to_string(&marker).unwrap().trim(),
-            id.to_string()
-        );
+        assert_eq!(marker_text(&project.join("marker.txt")), id.to_string());
     }
 
     #[test]
@@ -2687,29 +2693,7 @@ mod tests {
         open(&mut store, &ctx, id, None).unwrap();
 
         // {path} resolved to the worktree, {base}...{branch} to `main...feat`.
-        let range = wt.join("range.txt");
-        for _ in 0..50 {
-            if range.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(
-            std::fs::read_to_string(&range).unwrap().trim(),
-            "main...feat"
-        );
-    }
-
-    /// Wait for a detached viewer to have written its marker file, and return
-    /// what it wrote.
-    fn viewer_output(path: &Path) -> String {
-        for _ in 0..50 {
-            if path.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        std::fs::read_to_string(path).unwrap().trim().to_string()
+        assert_eq!(marker_text(&wt.join("range.txt")), "main...feat");
     }
 
     /// A checkout with a viewer template spelling a diff range, a worktree on
@@ -2763,7 +2747,7 @@ mod tests {
             "the summary must say what it narrowed to: {summary}"
         );
         assert_eq!(
-            viewer_output(&wt.join("range.txt")),
+            marker_text(&wt.join("range.txt")),
             format!("{reviewed}...feat")
         );
     }
@@ -2776,7 +2760,7 @@ mod tests {
 
         let summary = open(&mut store, &ctx, id, None).unwrap();
         assert!(!summary.contains("review"), "{summary}");
-        assert_eq!(viewer_output(&wt.join("range.txt")), "main...feat");
+        assert_eq!(marker_text(&wt.join("range.txt")), "main...feat");
     }
 
     /// The force-push case: the recorded revision is no longer on the branch,
@@ -2794,7 +2778,7 @@ mod tests {
             summary.contains("no longer on the branch"),
             "the fallback must explain itself: {summary}"
         );
-        assert_eq!(viewer_output(&wt.join("range.txt")), "main...feat");
+        assert_eq!(marker_text(&wt.join("range.txt")), "main...feat");
     }
 
     /// Recording is what a reject does, and a task with a branch but no PR
@@ -2847,14 +2831,7 @@ mod tests {
 
         open(&mut store, &ctx, id, None).unwrap();
 
-        let plain = project.join("plain.txt");
-        for _ in 0..50 {
-            if plain.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(std::fs::read_to_string(&plain).unwrap().trim(), "plain");
+        assert_eq!(marker_text(&project.join("plain.txt")), "plain");
     }
 
     #[test]
@@ -3579,14 +3556,7 @@ mod tests {
             .unwrap()
             .id;
         dispatch(store, ctx, id, None).unwrap();
-        let marker = project.join(format!("model-{id}.txt"));
-        for _ in 0..50 {
-            if marker.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        std::fs::read_to_string(&marker).unwrap().trim().to_string()
+        marker_text(&project.join(format!("model-{id}.txt")))
     }
 
     #[test]
