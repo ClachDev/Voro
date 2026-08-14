@@ -186,63 +186,28 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             frame.render_stateful_widget(list, area, &mut state);
             hits.push_list(area, state.offset(), count, Hit::PickerOption);
         }
-        Mode::Prompt { kind, buffer, .. } => {
-            // The buffer is usually one line, but a RejectWork prompt can be
-            // pre-filled with a PR's multi-line review comments (DESIGN.md
-            // §11c), so render every line and grow the box to fit.
-            let mut lines: Vec<Line> = buffer
-                .split('\n')
-                .map(|l| Line::from(l.to_string()))
-                .collect();
-            match lines.last_mut() {
-                Some(last) => last.spans.push(Span::raw("▏")),
-                None => lines.push(Line::from("▏")),
-            }
-            let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!("{} — ⏎ to submit, esc to cancel", kind.title())),
-            );
-            // Typed text never contains a newline (⏎ submits), so the box has
-            // to be sized from the *wrapped* line count at the popup's inner
-            // width — counting `\n`s would leave a one-row box with the tail of
-            // a long note wrapped out of sight. `line_count` counts both, and
-            // includes the block's two border rows.
-            let width = 72.min(frame.area().width);
-            let rendered_rows = para.line_count(width.saturating_sub(2)) as u16;
-            let area = popup_area(frame, width, rendered_rows.clamp(3, 20));
-            // Past the clamp the box stops growing, so scroll to the end of the
-            // text: the cursor lives there, and the tail is what is being typed.
-            let overflow = rendered_rows
-                .saturating_sub(2)
-                .saturating_sub(area.height.saturating_sub(2));
-            frame.render_widget(para.scroll((overflow, 0)), area);
-        }
-        Mode::LinkPr { buffer, .. } => {
-            let area = popup_area(frame, 72, 3);
-            let line = Line::from(vec![Span::raw(buffer.as_str()), Span::raw("▏")]);
-            let para = Paragraph::new(line).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Link PR (URL or owner/repo#n) — ⏎ to submit, esc to cancel"),
-            );
-            frame.render_widget(para, area);
-        }
+        Mode::Prompt { kind, buffer, .. } => draw_text_entry_popup(
+            frame,
+            format!("{} — ⏎ to submit, esc to cancel", kind.title()),
+            buffer,
+        ),
+        Mode::LinkPr { buffer, .. } => draw_text_entry_popup(
+            frame,
+            "Link PR (URL or owner/repo#n) — ⏎ to submit, esc to cancel".to_string(),
+            buffer,
+        ),
         Mode::QuickCreate { project_id, buffer } => {
-            let area = popup_area(frame, 72, 3);
-            let line = Line::from(vec![Span::raw(buffer.as_str()), Span::raw("▏")]);
             let project = app
                 .projects
                 .iter()
                 .find(|p| p.id == *project_id)
                 .map(|p| p.name.as_str())
                 .unwrap_or("the project");
-            let para = Paragraph::new(line).wrap(Wrap { trim: false }).block(
-                Block::default().borders(Borders::ALL).title(format!(
-                    "New task in {project} — ⏎ to propose, esc to cancel"
-                )),
-            );
-            frame.render_widget(para, area);
+            draw_text_entry_popup(
+                frame,
+                format!("New task in {project} — ⏎ to propose, esc to cancel"),
+                buffer,
+            )
         }
         Mode::ConfirmPr {
             task_id,
@@ -2322,6 +2287,43 @@ pub fn popup_area(frame: &mut Frame, width: u16, height: u16) -> Rect {
     };
     frame.render_widget(Clear, rect);
     rect
+}
+
+/// A bordered popup holding one typed buffer, with the cursor at its end. The
+/// box grows with the wrapped text and, past the clamp, scrolls to the tail.
+fn draw_text_entry_popup(frame: &mut Frame, title: String, buffer: &str) {
+    const WIDTH: u16 = 72;
+    const MIN_ROWS: u16 = 3;
+    const MAX_ROWS: u16 = 20;
+
+    // The buffer is usually one line, but a RejectWork prompt can be pre-filled
+    // with a PR's multi-line review comments (DESIGN.md §11c), so render every
+    // line and grow the box to fit.
+    let mut lines: Vec<Line> = buffer
+        .split('\n')
+        .map(|l| Line::from(l.to_string()))
+        .collect();
+    match lines.last_mut() {
+        Some(last) => last.spans.push(Span::raw("▏")),
+        None => lines.push(Line::from("▏")),
+    }
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title(title));
+    // Typed text never contains a newline (⏎ submits), so the box has to be
+    // sized from the *wrapped* line count at the popup's inner width —
+    // counting `\n`s would leave a one-row box with the tail of a long note
+    // wrapped out of sight. `line_count` counts both, and includes the block's
+    // two border rows.
+    let width = WIDTH.min(frame.area().width);
+    let rendered_rows = para.line_count(width.saturating_sub(2)) as u16;
+    let area = popup_area(frame, width, rendered_rows.clamp(MIN_ROWS, MAX_ROWS));
+    // Past the clamp the box stops growing, so scroll to the end of the text:
+    // the cursor lives there, and the tail is what is being typed.
+    let overflow = rendered_rows
+        .saturating_sub(2)
+        .saturating_sub(area.height.saturating_sub(2));
+    frame.render_widget(para.scroll((overflow, 0)), area);
 }
 
 #[cfg(test)]
@@ -5818,24 +5820,81 @@ mod tests {
         );
     }
 
-    /// Draws a `Mode::Prompt` over an otherwise empty app and returns the
-    /// terminal's cells as one string.
+    /// The quick-create popup shares the prompt's box, so a long intent wraps
+    /// and the popup grows to fit it rather than clipping at three rows.
+    #[test]
+    fn quick_create_popup_grows_with_wrapped_text() {
+        let buffer = format!("HEADMARK {}TAILMARK", "padding ".repeat(12));
+        let rendered = render_quick_create(&buffer);
+        assert!(
+            rendered.contains("HEADMARK"),
+            "the start of a wrapped intent stays visible: {rendered}"
+        );
+        assert!(
+            rendered.contains("TAILMARK▏"),
+            "the tail and the cursor stay visible: {rendered}"
+        );
+    }
+
+    /// And past the clamp it scrolls to the tail, as the prompt does.
+    #[test]
+    fn quick_create_popup_scrolls_to_the_tail_when_it_overflows() {
+        let buffer = format!("HEADMARK {}TAILMARK", "padding ".repeat(200));
+        let rendered = render_quick_create(&buffer);
+        assert!(
+            rendered.contains("TAILMARK▏"),
+            "the tail and the cursor stay visible: {rendered}"
+        );
+        assert!(
+            !rendered.contains("HEADMARK"),
+            "the head scrolls out of the clamped box: {rendered}"
+        );
+    }
+
+    /// Draws a `Mode::Prompt` over an otherwise empty app.
     fn render_prompt(buffer: &str) -> String {
-        use crate::app::{App, Mode, PromptKind};
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
+        use crate::app::{Mode, PromptKind};
         use voro_core::Store;
 
-        let store = Store::open_in_memory().unwrap();
+        render_modal(
+            Store::open_in_memory().unwrap(),
+            Mode::Prompt {
+                task_id: 1,
+                kind: PromptKind::RefineNote,
+                buffer: buffer.to_string(),
+            },
+        )
+    }
+
+    /// Draws a `Mode::QuickCreate` over an app whose store holds the project the
+    /// popup's title names.
+    fn render_quick_create(buffer: &str) -> String {
+        use crate::app::Mode;
+        use voro_core::Store;
+
+        let mut store = Store::open_in_memory().unwrap();
+        let project = store.create_project("voro", "/tmp/voro").unwrap();
+        render_modal(
+            store,
+            Mode::QuickCreate {
+                project_id: project.id,
+                buffer: buffer.to_string(),
+            },
+        )
+    }
+
+    /// Draws a modal over the given store and returns the terminal's cells as
+    /// one string.
+    fn render_modal(store: voro_core::Store, mode: crate::app::Mode) -> String {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
         let ctx = crate::dispatch::DispatchCtx::from_db_path(std::path::Path::new(
             "/nonexistent/voro.db",
         ));
         let mut app = App::new(store, ctx).unwrap();
-        app.mode = Mode::Prompt {
-            task_id: 1,
-            kind: PromptKind::RefineNote,
-            buffer: buffer.to_string(),
-        };
+        app.mode = mode;
 
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
         terminal
