@@ -484,10 +484,15 @@ pub enum NextAction {
     Triage,
     /// A question is waiting; answering it unblocks the work.
     Answer,
-    /// A review task with no tracked PR: open one from its done-time summary.
+    /// A review task with a branch and no tracked PR: open one from its
+    /// done-time summary.
     Pr,
     /// A review task whose PR is open: review it there.
     ReviewPr,
+    /// A review task with nothing to push — an investigation, a triage, an
+    /// audit whose whole product is its completion summary: read the report
+    /// and close it out.
+    Accept,
     /// A review task in a checkout no pull request can be opened from: read the
     /// diff in a local viewer. Never derived from state alone — a caller that
     /// knows the checkout degrades [`NextAction::Pr`] to it.
@@ -508,6 +513,7 @@ impl NextAction {
             NextAction::Answer => "answer",
             NextAction::Pr => "pr",
             NextAction::ReviewPr => "review PR",
+            NextAction::Accept => "accept",
             NextAction::Open => "open",
             NextAction::Do => "do",
             NextAction::Redispatch => "redispatch",
@@ -536,18 +542,37 @@ impl fmt::Display for NextAction {
 }
 
 impl Task {
+    /// The branch this task's work lives on, blank treated as absent — the one
+    /// reading of the column both the next-action derivation and
+    /// [`plan_pr`](crate::plan_pr) use, so a task advertised as PR-able is
+    /// exactly one `pr` accepts.
+    pub fn branch_name(&self) -> Option<&str> {
+        self.branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+    }
+
     /// The single next-action derivation (DESIGN.md §3): what the human does
     /// next, from state × fields. `None` for states that ask nothing of the
     /// human — `running` and `refining` belong to the running strip,
     /// `parked`/`done`/`rejected` wait on nothing. `stalled` always means a dead
     /// agent dispatch, since dispatch refuses human tasks. `waiting` is handed
     /// off to an external party (DESIGN.md §6) and asks nothing of the operator.
+    ///
+    /// `review` is the one arm that reads past the state (DESIGN.md §6): a
+    /// tracked PR asks to be reviewed, a recorded branch asks for one to be
+    /// opened, and a task carrying neither produced no code at all — its
+    /// summary is the whole deliverable — so the move is *accept*. The summary
+    /// itself is not consulted: it lives in the event log rather than on this
+    /// row, and a task with nothing to push has no other move regardless.
     pub fn next_action(&self) -> Option<NextAction> {
         match self.state {
             TaskState::Proposed => Some(NextAction::Triage),
             TaskState::NeedsInput => Some(NextAction::Answer),
             TaskState::Review if self.pr_url.is_some() => Some(NextAction::ReviewPr),
-            TaskState::Review => Some(NextAction::Pr),
+            TaskState::Review if self.branch_name().is_some() => Some(NextAction::Pr),
+            TaskState::Review => Some(NextAction::Accept),
             TaskState::Stalled => Some(NextAction::Redispatch),
             TaskState::Ready if self.human => Some(NextAction::Do),
             TaskState::Ready => Some(NextAction::Dispatch),
@@ -654,6 +679,15 @@ mod tests {
     }
 
     fn task_in(state: TaskState, pr_url: Option<&str>, human: bool) -> Task {
+        task_with(state, pr_url, human, None)
+    }
+
+    fn task_with(
+        state: TaskState,
+        pr_url: Option<&str>,
+        human: bool,
+        branch: Option<&str>,
+    ) -> Task {
         Task {
             id: 1,
             project_id: 1,
@@ -665,7 +699,7 @@ mod tests {
             agent: None,
             question: None,
             pr_url: pr_url.map(str::to_string),
-            branch: None,
+            branch: branch.map(str::to_string),
             state_since: "2026-01-01T00:00:00Z".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             closed_at: None,
@@ -679,7 +713,8 @@ mod tests {
         for (state, pr_url, human, expected) in [
             (TaskState::Proposed, None, false, Some(NextAction::Triage)),
             (TaskState::NeedsInput, None, false, Some(NextAction::Answer)),
-            (TaskState::Review, None, false, Some(NextAction::Pr)),
+            // no branch: nothing to push, so the report is the deliverable
+            (TaskState::Review, None, false, Some(NextAction::Accept)),
             (
                 TaskState::Review,
                 Some("https://github.com/o/r/pull/1"),
@@ -704,6 +739,55 @@ mod tests {
                 task_in(state, pr_url, human).next_action(),
                 expected,
                 "{state} pr_url={pr_url:?} human={human}"
+            );
+        }
+    }
+
+    /// The `review` arm reads two further columns (DESIGN.md §6). A task with a
+    /// branch has code to push and asks for `pr`; one with none produced only
+    /// its summary — an investigation, an audit — and asks to be accepted,
+    /// since `pr` on it could only refuse.
+    #[test]
+    fn the_review_verb_follows_the_branch() {
+        assert_eq!(
+            task_with(TaskState::Review, None, false, Some("feat/x")).next_action(),
+            Some(NextAction::Pr)
+        );
+        assert_eq!(
+            task_with(TaskState::Review, None, false, None).next_action(),
+            Some(NextAction::Accept)
+        );
+        // a blank branch is no branch, exactly as `plan_pr` reads it
+        for blank in ["", "   "] {
+            assert_eq!(
+                task_with(TaskState::Review, None, false, Some(blank)).next_action(),
+                Some(NextAction::Accept),
+                "{blank:?}"
+            );
+        }
+    }
+
+    /// A tracked PR outranks both: there is a diff open to read, however the
+    /// branch column reads.
+    #[test]
+    fn a_tracked_pr_outranks_the_branch() {
+        for branch in [None, Some("feat/x")] {
+            assert_eq!(
+                task_with(TaskState::Review, Some("https://x"), false, branch).next_action(),
+                Some(NextAction::ReviewPr),
+                "{branch:?}"
+            );
+        }
+    }
+
+    /// Only `review` reads the branch — no other state's verb moves with it.
+    #[test]
+    fn the_branch_moves_no_other_verb() {
+        for state in TaskState::ALL.iter().filter(|s| **s != TaskState::Review) {
+            assert_eq!(
+                task_with(*state, None, false, Some("feat/x")).next_action(),
+                task_in(*state, None, false).next_action(),
+                "{state}"
             );
         }
     }
@@ -734,6 +818,7 @@ mod tests {
             NextAction::Triage,
             NextAction::Answer,
             NextAction::ReviewPr,
+            NextAction::Accept,
             NextAction::Open,
             NextAction::Do,
             NextAction::Redispatch,

@@ -269,7 +269,10 @@ pub struct PrPlan {
 /// assemble the [`PrPlan`] (DESIGN.md §8): a `review` task carrying both a branch
 /// (the work to push) and a completion summary (the PR body; the caller supplies
 /// the latest). Each gap fails naming what is missing — state, branch, or
-/// summary. Pure of I/O.
+/// summary. The branch gap is the one no advertised verb leads to: a review task
+/// without one asks for *accept* rather than *pr* (DESIGN.md §6), so this
+/// refusal is reached only by an operator naming `pr` on it directly. Pure of
+/// I/O.
 pub fn plan_pr(task: &Task, latest_summary: Option<&str>) -> Result<PrPlan> {
     if task.state != TaskState::Review {
         return Err(Error::Invalid(format!(
@@ -277,18 +280,13 @@ pub fn plan_pr(task: &Task, latest_summary: Option<&str>) -> Result<PrPlan> {
             task.id, task.state
         )));
     }
-    let branch = task
-        .branch
-        .as_deref()
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-        .ok_or_else(|| {
-            Error::Invalid(format!(
-                "task {} has no branch to push — record one with `voro done --branch` or \
-                 `voro set --branch`",
-                task.id
-            ))
-        })?;
+    let branch = task.branch_name().ok_or_else(|| {
+        Error::Invalid(format!(
+            "task {} has no branch to push — record one with `voro done --branch` or \
+             `voro set --branch`",
+            task.id
+        ))
+    })?;
     let body = latest_summary
         .map(str::trim)
         .filter(|s| !s.is_empty())

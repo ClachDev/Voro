@@ -765,9 +765,12 @@ impl App {
             })
             .collect();
         let mut forges = crate::pr::ForgeMemo::default();
+        // Only the rows that actually advertise `pr` ask the forge question, so
+        // a review task with nothing to push — it advertises `accept`
+        // (DESIGN.md §6) — costs no `git remote`.
         self.local_review = all
             .iter()
-            .filter(|r| r.task.state == TaskState::Review && r.task.pr_url.is_none())
+            .filter(|r| r.task.next_action() == Some(voro_core::NextAction::Pr))
             .filter_map(|r| {
                 let repo = self.store.repo_for_task(&r.task).ok()?;
                 (!forges.takes_pull_requests(&repo.path)).then_some(r.task.id)
