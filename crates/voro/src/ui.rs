@@ -729,12 +729,21 @@ fn strip_pr_span() -> Span<'static> {
 /// to do about it, so it says so. With no time parsed at all, the bare badge:
 /// the cap is the part worth knowing, and suppressing it for want of a
 /// timestamp would trade the whole signal for a detail.
+///
+/// A fourth says the session is retrying it (§8), which is the one shape that
+/// wants *nothing* done about it: the turn is still running and will carry on
+/// by itself. It still badges rather than reading as healthy, because a
+/// session sitting on a retry is as idle-looking on the strip as a capped one
+/// and the operator deserves the reason — but it says which, so `u` passing it
+/// over reads as the right answer instead of a missed row.
 fn capped_span(reading: &CapReading, now_minutes: Option<u16>) -> Span<'static> {
     let past = now_minutes.is_some_and(|now| reading.reset_passed(now));
-    let text = match (reading.reset_label(), past) {
-        (_, true) => "  ⚠ capped · reset passed".to_string(),
-        (Some(at), false) => format!("  ⚠ capped ↻{at}"),
-        (None, false) => "  ⚠ capped".to_string(),
+    let text = match (reading.reset_label(), past, reading.retrying) {
+        (Some(at), _, true) => format!("  ⚠ capped · retrying ↻{at}"),
+        (None, _, true) => "  ⚠ capped · retrying".to_string(),
+        (_, true, false) => "  ⚠ capped · reset passed".to_string(),
+        (Some(at), false, false) => format!("  ⚠ capped ↻{at}"),
+        (None, false, false) => "  ⚠ capped".to_string(),
     };
     Span::styled(
         text,
@@ -3325,6 +3334,7 @@ mod tests {
             task,
             CapReading {
                 reset_minutes: Some(21 * 60 + 50),
+                retrying: false,
             },
         );
         app.now_minutes = Some(20 * 60 + 50);
@@ -3351,6 +3361,22 @@ mod tests {
         let line = row(&app);
         assert!(line.contains("⚠ capped"), "{line}");
         assert!(!line.contains('↻'), "{line}");
+        assert!(!line.contains("reset passed"), "{line}");
+
+        // A session retrying the rejected request says so, and never says its
+        // reset has passed however long ago the named time went by: it is
+        // mid-turn, so the time is when its own request goes out rather than
+        // when the operator should step in.
+        app.caps.insert(
+            task,
+            CapReading {
+                reset_minutes: Some(21 * 60 + 50),
+                retrying: true,
+            },
+        );
+        app.now_minutes = Some(22 * 60);
+        let line = row(&app);
+        assert!(line.contains("⚠ capped · retrying ↻21:50"), "{line}");
         assert!(!line.contains("reset passed"), "{line}");
 
         // And the badge clears itself once the reading goes away, which is what

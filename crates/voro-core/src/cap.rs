@@ -23,6 +23,15 @@
 //! disbelieve the badge. That asymmetry is why [`NOT_CAP_QUALIFIERS`] exists —
 //! the agent says "approaching" and "not your usage limit" in text that
 //! otherwise matches, and both mean the session is working fine.
+//!
+//! A matched cap is then read for one thing beyond its reset time: whether the
+//! agent is *retrying* the rejected request ([`CapReading::retrying`]). A
+//! usage cap never is — Claude Code declines to retry one at all (§8) — but a
+//! plain rate limit is retried, and the agent labels that retry with the API's
+//! own wording, which contains "rate limit". So the text that says a session
+//! is held and the text that says it is mid-turn differ by the retry phrase
+//! alone, and everything else about the two is identical: `blocked` in the
+//! listing, supervisor alive, cap phrase on screen.
 
 /// Phrases that mean "held at a usage cap", checked case-insensitively.
 ///
@@ -65,8 +74,16 @@ const NOT_CAP_QUALIFIERS: [&str; 4] = ["approaching", "% of your", "not your", "
 /// speak past a warning that had since replaced it.
 const MENTION_PREFIXES: [&str; 2] = ["/upgrade", "increase your"];
 
+/// Phrases that mean the agent is *retrying* the request the cap rejected
+/// rather than having ended its turn on it. Read in the same window as the
+/// reset time, since the agent renders both on one line with the retry half
+/// after the label: `Session limit reached · Retrying in 5m (9:50pm) ·
+/// attempt 2/10`.
+const RETRYING: [&str; 1] = ["retrying in"];
+
 /// How much text after a matched signature is read for the reset time that
-/// goes on the badge.
+/// goes on the badge, and for the retry wording that says the turn is still
+/// running.
 const WINDOW: usize = 200;
 
 /// How much text before a matched signature is read for the qualifiers that
@@ -86,6 +103,24 @@ pub struct CapReading {
     /// named a time. Best-effort by design: an unparsed time badges without
     /// one rather than suppressing the badge.
     pub reset_minutes: Option<u16>,
+    /// Whether the agent said it is retrying the rejected request rather than
+    /// having ended its turn on it.
+    ///
+    /// This is the one capped shape a nudge must not touch. The session is
+    /// mid-turn: it holds the request itself and will resume when the retry
+    /// lands, so stopping it to send *continue* kills a turn that needed no
+    /// help — and the sweep stops its target unconditionally (§8), so there is
+    /// nothing else between a misread and a killed turn. Both shapes otherwise
+    /// read identically: `blocked` in the agent's listing, supervisor alive,
+    /// the same cap phrase in the output.
+    ///
+    /// The risk this guards is not that a *cap* retries — Claude Code refuses
+    /// to retry a usage-limit rejection at all (§8) — but that a retry reads
+    /// as a cap. A rate limit that carries no usage-limit headers is retried,
+    /// and the agent labels that retry with the API's own message, which says
+    /// "rate limit" in it: a signature this module matches, riding a session
+    /// that is working perfectly well.
+    pub retrying: bool,
 }
 
 impl CapReading {
@@ -96,7 +131,10 @@ impl CapReading {
     }
 
     /// Whether the named reset has already gone by, given the local wall clock
-    /// as minutes past midnight.
+    /// as minutes past midnight — and so whether this session is waiting on a
+    /// human rather than on the clock. A retrying session is never either: it
+    /// is waiting on its own request, and its reset time is when that request
+    /// goes out, not when someone should intervene.
     ///
     /// The agent names a bare clock time — `9:50pm`, no date — so the occurrence
     /// meant is the one *nearest* now, in either direction. Taking the next one
@@ -106,6 +144,9 @@ impl CapReading {
     /// day is the widest a bare clock time can be read unambiguously, and a cap
     /// window the operator is watching is never further off than that.
     pub fn reset_passed(&self, now_minutes: u16) -> bool {
+        if self.retrying {
+            return false;
+        }
         let Some(reset) = self.reset_minutes else {
             return false;
         };
@@ -131,6 +172,7 @@ pub fn read_cap(tail: &str) -> Option<CapReading> {
     let after = &text[at..ceil_boundary(&text, (at + signature.len() + WINDOW).min(text.len()))];
     Some(CapReading {
         reset_minutes: parse_clock(after),
+        retrying: RETRYING.iter().any(|p| after.contains(p)),
     })
 }
 
@@ -274,14 +316,24 @@ fn ceil_boundary(text: &str, mut at: usize) -> usize {
 mod tests {
     use super::*;
 
-    /// The wording every `--bg` dispatch of the built-in `claude` hits first,
-    /// and the one the original three signatures all missed: a five-hour cap
+    /// The wording the original three signatures all missed: a five-hour cap
     /// says "Session limit reached" and nothing about usage, rates or quotas.
+    ///
+    /// The retry half is *binary-derived*, assembled from the agent's own
+    /// template rather than seen on a session — and taking it for an
+    /// observation is what sent a reviewer looking for a cap that retries.
+    /// What the template shows is real enough: the agent renders exactly this
+    /// line for a retried rate limit, reset time in parentheses and attempt
+    /// counter behind it. What it does not show is a cap reaching it, because
+    /// a usage limit is not among the errors the agent retries (§8). So the
+    /// string stands as the shape [`CapReading::retrying`] must recognise, and
+    /// stands for nothing about whether a *cap* wears it.
     #[test]
     fn a_five_hour_cap_reads_as_capped() {
         let reading = read_cap("Session limit reached · Retrying in 5m (9:50pm) · attempt 2/10")
             .expect("a cap");
         assert_eq!(reading.reset_label().as_deref(), Some("21:50"));
+        assert!(reading.retrying);
     }
 
     /// The wording an actual five-hour cap turned out to use, captured from
@@ -300,6 +352,44 @@ mod tests {
         )
         .expect("a cap");
         assert_eq!(reading.reset_label().as_deref(), Some("18:40"));
+        // The half that matters for the sweep: the real thing names no retry,
+        // so the turn is over and the session is waiting on a human.
+        assert!(!reading.retrying);
+    }
+
+    /// A retry the operator's sessions really do hit, captured from a `--bg`
+    /// session on 2026-08-13 while a sibling sat at the cap above. It is the
+    /// live proof that a backgrounded session reaches the retry banner — and
+    /// that the banner alone is not a cap: an overload names no limit, so
+    /// nothing here matches and no badge is owed.
+    #[test]
+    fn an_overload_retry_is_not_a_cap() {
+        assert_eq!(
+            read_cap(
+                "529 Overloaded · Retrying in 3s · attempt 3/10\n\
+                 If it persists, check https://status.claude.com."
+            ),
+            None
+        );
+    }
+
+    /// The case [`CapReading::retrying`] is built for: a rate limit the agent
+    /// *does* retry, labelled with the API's own wording. It matches on "rate
+    /// limit" like any cap, it badges like any cap — and the session behind it
+    /// is mid-turn, so the sweep must let it alone.
+    #[test]
+    fn a_retried_rate_limit_reads_as_retrying() {
+        let reading = read_cap(
+            "429 Number of requests has exceeded your rate limit · Retrying in 30s · attempt 3/10",
+        )
+        .expect("a cap");
+        assert!(reading.retrying);
+        // And it is never due a nudge, whatever the clock says, because the
+        // time it names is when its own request goes out.
+        let timed = read_cap("Session limit reached · Retrying in 5m (9:50pm) · attempt 2/10")
+            .expect("a cap");
+        assert_eq!(timed.reset_minutes, Some(21 * 60 + 50));
+        assert!(!timed.reset_passed(22 * 60 + 50));
     }
 
     /// The real warning short of that cap, captured from a session that went on
@@ -442,6 +532,7 @@ mod tests {
     fn a_reset_is_passed_by_nearest_occurrence() {
         let at = |m| CapReading {
             reset_minutes: Some(m),
+            retrying: false,
         };
         // 21:50 reset, read at 20:50 — an hour to go.
         assert!(!at(1310).reset_passed(1250));
