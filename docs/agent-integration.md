@@ -31,7 +31,8 @@ points, run the matching command — Voro surfaces it in the operator's queue:
 
     voro ask "$VORO_TASK_ID" --question "Schema A or B? Trade-offs: ..."
     voro resume "$VORO_TASK_ID"
-    voro done "$VORO_TASK_ID" --branch "$(git rev-parse --abbrev-ref HEAD)" --summary "Implemented X, tests pass"
+    voro done "$VORO_TASK_ID" --branch "$(git rev-parse --abbrev-ref HEAD)" \
+        --summary "<what changed and why, then how you verified it — a PR description>"
     voro propose <project> "Follow-up title" --from "$VORO_TASK_ID" --body-file plan.md
 
 - `ask` when you are blocked on a human decision and cannot proceed.
@@ -40,13 +41,14 @@ points, run the matching command — Voro surfaces it in the operator's queue:
   already in this transcript.
 - `done` when the work is complete and ready for review. Record **both** flags on
   the one call: `--branch` is the git branch your work landed on and `--summary`
-  is a PR-ready account of what changed, why, and how you verified it — on a
-  GitHub-reviewed project `voro pr` opens the pull request straight from them
-  and needs both, on any project the summary is the review context, and a `done`
-  that supplies only one leaves the task flagged `[incomplete report]`. Omit both only
-  for a task that produced no code (planning, triage). If the task named an
-  intended branch, you were told which one in the dispatch preamble — create or
-  check it out yourself.
+  is the pull request's description — what changed and why, then how you
+  verified it, written as a PR body rather than a status line. On a
+  GitHub-reviewed project `voro pr` opens the pull request with that summary as
+  its body and needs both, on any project the summary is the review context, and
+  a `done` that supplies only one leaves the task flagged `[incomplete report]`.
+  Omit both only for a task that produced no code (planning, triage). If the
+  task named an intended branch, you were told which one in the dispatch
+  preamble — create or check it out yourself.
 - `propose` to record follow-up work you noticed; `--from "$VORO_TASK_ID"` links
   it back to this task (`voro` reads no environment on its own — pass the id, as
   every verb here does).

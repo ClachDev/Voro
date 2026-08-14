@@ -48,11 +48,12 @@ the operator answers right here in this session — so when your question has be
 answered, run `voro resume {task_id}` before continuing, to move the task back to
 running (Voro records no answer text; the exchange is already in this transcript).
 The `--from {task_id}` on `propose` links each follow-up discovered-from this
-task; drop it for a proposal that stands on its own. Finish
-with your work committed on a branch and a PR-ready `--summary` on `done` — what
-changed, why, and how you verified it — since `voro pr` opens the pull request
-straight from that summary. Never modify the database with raw SQL, which would
-bypass the state machine and event log.{branch}{docs}{rework}
+task; drop it for a proposal that stands on its own. Finish with your work
+committed on a branch and a `--summary` on `done`: that summary is the pull
+request's description — `voro pr` opens the PR with it as the body — so write it
+as one, a short account of what changed and why followed by how you verified it,
+not a status line. Never modify the database with raw SQL, which would bypass
+the state machine and event log.{branch}{docs}{rework}
 
 ---
 
@@ -63,11 +64,12 @@ bypass the state machine and event log.{branch}{docs}{rework}
 /// narrowed to the diff since the rejected revision, so the summary is what
 /// carries the operator from each of their points to the change that answers
 /// it; without it they are back to rediscovering the rework from the diff.
-const REWORK_SUMMARY_SENTENCE: &str = "Report with `voro done {task_id}{db} --summary \"...\"` whose summary answers that \
-     feedback point by point — one item per point, saying what you changed or \
-     why you did not. The operator re-reviews only the diff since the revision \
-     they rejected, so that summary is what connects your changes to their \
-     points.";
+const REWORK_SUMMARY_SENTENCE: &str = "Report with `voro done {task_id}{db} --summary \"...\"`. That summary is the \
+     pull request's description, so write it as one — a PR body that answers \
+     that feedback point by point, one item per point, saying what you changed \
+     or why you did not. The operator re-reviews only the diff since the \
+     revision they rejected, so that summary is what connects your changes to \
+     their points.";
 
 /// The `{rework}` block for a task that has already been through review and was
 /// sent back (DESIGN.md §8). It rides the preamble because a redispatch is the
@@ -2328,12 +2330,32 @@ mod tests {
         );
         assert!(reworking.contains("point by point"), "{reworking}");
         assert!(
+            reworking.contains("pull request's description"),
+            "a rework summary is a PR body too: {reworking}"
+        );
+        assert!(
             reworking.contains("voro done 62 --summary"),
             "the instruction must be copy-pasteable: {reworking}"
         );
 
         let first = render_preamble(62, &db, None, &[], false);
         assert!(!first.contains("point by point"), "{first}");
+    }
+
+    /// Every dispatched prompt says what shape a completion summary takes: it
+    /// is the pull request's description, since `voro pr` opens the PR with it
+    /// as the body (DESIGN.md §8).
+    #[test]
+    fn preamble_says_the_summary_is_the_pr_description() {
+        let plain = render_preamble(62, &Store::production_db_path(), None, &[], false);
+        // The template is hand-wrapped, so match the prose rather than where
+        // the lines happen to break.
+        let flowed = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flowed.contains("that summary is the pull request's description"),
+            "{plain}"
+        );
+        assert!(flowed.contains("not a status line"), "{plain}");
     }
 
     /// The rejection as the live session hears it: the operator's points
@@ -2354,6 +2376,10 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("point by point"), "{message}");
+        assert!(
+            message.contains("pull request's description"),
+            "the rework summary is the PR body: {message}"
+        );
         assert!(message.contains("voro done 62 --summary"), "{message}");
     }
 
