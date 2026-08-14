@@ -917,15 +917,7 @@ impl App {
         self.config_agents = config
             .entries()
             .map(|(name, template, provenance)| {
-                let verbs = [
-                    ("sessions", template.sessions()),
-                    ("attach", template.attach()),
-                    ("resume", template.resume()),
-                    ("plan", template.plan()),
-                ]
-                .into_iter()
-                .filter_map(|(verb, defined)| defined.map(|_| verb))
-                .collect();
+                let verbs = template.verbs();
                 ConfigAgentRow {
                     name: name.to_string(),
                     dispatch: template.dispatch().to_string(),
