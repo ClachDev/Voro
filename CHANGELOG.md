@@ -161,6 +161,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A quick propose is named for its project, like the planning session beside
+  it.** `n` used to launch its agent under `voro-propose-<project_id>` while `N`
+  on the same project opened `voro-plan-<project>`, so the two read in
+  `claude agents` as different kinds of thing, and the bare number was the one
+  shape a Voro-composed name otherwise reserves for a task id. A quick propose
+  on the `voro` project is now `voro-propose-voro`, sanitised exactly as a
+  planning session's name is, and its prompt and log files under the runtime
+  directory are stamped `propose-voro` to match. Nothing else about it moves: it
+  still runs the `dispatch` verb, opens no session row and files its task with
+  `voro add`.
 - **The project picker offers only projects that can take the work, weightiest
   first.** It used to list every project alphabetically, archived ones included
   — and an archived project refuses new tasks, so picking one could only fail,

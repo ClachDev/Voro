@@ -98,8 +98,9 @@ resume   = "codex resume {session}"
   `<id>`, where the slug is the first whole words of the task's title —
   lowercased, and stopping before it runs past about twenty characters, since
   that listing and the phone's both truncate; `voro-<id>-refine` for a refine
-  of it (DESIGN.md §6); and `voro-plan-<project>` for a planning session, which
-  belongs to no task and so is named for its project — by name, so the bare
+  of it (DESIGN.md §6); and `voro-plan-<project>` for a planning session and
+  `voro-propose-<project>` for a quick propose, neither of which belongs to a
+  task and so both are named for their project — by name, so the bare
   number in a Voro-composed session name is always a task id. Project names are
   unique, and any character outside `[A-Za-z0-9._-]` is replaced with `-`
   before the name is used; a title that survives none of that leaves the bare

@@ -957,7 +957,8 @@ pub fn refine(
 ///
 /// The *default* agent runs it whatever the queue holds, for the same reason a
 /// refine's does: writing a brief is not executing it. The session is named
-/// `voro-propose-<project_id>` ([`Launch::Propose`]).
+/// `voro-propose-<project>` ([`Launch::Propose`]), as a planning session on the
+/// same project is named `voro-plan-<project>`.
 pub fn propose(
     store: &Store,
     ctx: &DispatchCtx,
@@ -999,7 +1000,9 @@ pub fn propose(
     let spawned = spawn_expansion(
         ctx,
         Expansion {
-            launch: Launch::Propose { project_id },
+            launch: Launch::Propose {
+                project: project.name.clone(),
+            },
             agent: &agent,
             deep: false,
             prompt: render_propose_prompt(&project.name, &ctx.db_path, intent),
@@ -2039,6 +2042,35 @@ mod tests {
         // Nothing was created, transitioned, or recorded — the agent's own
         // `voro add` is what makes the task exist.
         assert!(store.tasks().unwrap().is_empty());
+    }
+
+    /// A quick propose names its session for its project the way the planning
+    /// session beside it does, so the two read alike in the agent's listing and
+    /// a bare number in a Voro-composed name is always a task id (task #447).
+    #[test]
+    fn propose_names_its_session_for_the_project() {
+        let (mut store, ctx, project) =
+            fixture("echo --name {session_name} > marker.txt; : {prompt_file}");
+        let p = store
+            .create_project("odm 2", project.to_str().unwrap())
+            .unwrap();
+
+        propose(&store, &ctx, p.id, "cache the score view").unwrap();
+
+        assert_eq!(
+            marker_text(&project.join("marker.txt")),
+            "--name voro-propose-odm-2"
+        );
+        let prompt = prompt_files(&ctx).pop().unwrap();
+        assert!(
+            prompt
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("propose-odm-2-"),
+            "{}",
+            prompt.display()
+        );
     }
 
     /// An intent that says nothing spawns nothing, and an archived project is
