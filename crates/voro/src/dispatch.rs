@@ -1918,7 +1918,12 @@ fn default_base_branch(repo_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use voro_core::{LivenessSource, NewTask, Priority};
+
+    /// Distinguishes fixtures built within the same clock tick, which the
+    /// nanosecond stamp alone cannot separate.
+    static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
     /// A scratch database, a freshly-`git init`ed clean project, and an
     /// `voro.toml` whose one agent is a stub command that just reads the
@@ -1932,14 +1937,7 @@ mod tests {
     /// Like [`fixture`], but with the whole `voro.toml` supplied, for tests
     /// exercising the session verbs.
     fn fixture_toml(agents_toml: &str) -> (Store, DispatchCtx, PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "voro-dispatch-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = fixture_root();
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
         git(&project, &["init", "-q"]);
@@ -1957,6 +1955,70 @@ mod tests {
             message_grace: std::time::Duration::from_millis(300),
         };
         (store, ctx, project)
+    }
+
+    /// A scratch directory no other fixture can name, however many are built
+    /// at once: the process id separates test binaries, the counter separates
+    /// fixtures within one, and the stamp keeps reruns of a recycled pid apart.
+    fn fixture_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "voro-dispatch-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn fixtures_built_at_once_on_many_threads_get_distinct_roots() {
+        const THREADS: usize = 8;
+        let gate = std::sync::Barrier::new(THREADS);
+
+        let roots: Vec<PathBuf> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        gate.wait();
+                        let (_store, _ctx, project) = fixture("true");
+                        project.parent().unwrap().to_path_buf()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let distinct: std::collections::HashSet<_> = roots.iter().collect();
+        assert_eq!(distinct.len(), THREADS, "roots collided: {roots:?}");
+    }
+
+    /// Eight fixtures are too few to catch a root name that leans on the clock
+    /// alone, so name a great many with nothing else running between them.
+    #[test]
+    fn roots_named_back_to_back_on_many_threads_are_all_distinct() {
+        const THREADS: usize = 8;
+        const EACH: usize = 500;
+        let gate = std::sync::Barrier::new(THREADS);
+
+        let roots: Vec<PathBuf> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        gate.wait();
+                        (0..EACH).map(|_| fixture_root()).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        let distinct: std::collections::HashSet<_> = roots.iter().collect();
+        assert_eq!(distinct.len(), THREADS * EACH, "roots collided");
     }
 
     fn git(dir: &Path, args: &[&str]) {
