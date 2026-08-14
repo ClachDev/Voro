@@ -2222,19 +2222,45 @@ impl App {
         // have to invert — with no keypress behind it, an untimed cap has
         // nothing saying the window has opened.
         let (mut ready, mut waiting): (Vec<i64>, Vec<i64>) = (Vec::new(), Vec::new());
+        let mut retrying = 0usize;
         for (id, reading) in &self.caps {
+            // A session retrying the rejected request is the one badged shape
+            // that must be walked past. It is mid-turn, so it will carry on by
+            // itself — and since the nudge stops its target before resuming it
+            // (`nudge_one`), sending into one does not add a redundant turn but
+            // ends the turn already running. That the operator pressed the key
+            // is no argument for it either: the untimed cap below is swept on
+            // their judgement because nothing else knows whether the window is
+            // open, whereas here the session has said outright that it is
+            // working.
+            if reading.retrying {
+                retrying += 1;
+                continue;
+            }
             let due =
                 reading.reset_minutes.is_none() || now.is_some_and(|now| reading.reset_passed(now));
             if due { &mut ready } else { &mut waiting }.push(*id);
         }
         // A sweep visits the strip in a stable order rather than the map's.
         ready.sort_unstable();
+        // Every badged session the sweep declined to touch is accounted for in
+        // what it reports, retrying ones included: a row left alone in silence
+        // reads as one the sweep missed.
+        let retrying_note = match retrying {
+            0 => String::new(),
+            n => format!(" — {n} retrying"),
+        };
         if ready.is_empty() {
-            self.status = Some(if waiting.is_empty() {
+            self.status = Some(if waiting.is_empty() && retrying == 0 {
                 "no session is capped".into()
+            } else if waiting.is_empty() {
+                format!(
+                    "{retrying} capped session{} — retrying, none waiting on you",
+                    if retrying == 1 { "" } else { "s" }
+                )
             } else {
                 format!(
-                    "{} capped session{} — none has reached its reset yet",
+                    "{} capped session{} — none has reached its reset yet{retrying_note}",
                     waiting.len(),
                     if waiting.len() == 1 { "" } else { "s" }
                 )
@@ -2265,6 +2291,7 @@ impl App {
         if !waiting.is_empty() {
             note.push_str(&format!(" — {} still before its reset", waiting.len()));
         }
+        note.push_str(&retrying_note);
         if !refused.is_empty() {
             note.push_str(&format!(" — refused {}", refused.join("; ")));
         }
@@ -5841,8 +5868,10 @@ mod tests {
                 std::process::id()
             ),
         );
+        // Double-quoted in the shell so a fixture can carry the apostrophe the
+        // agent's real cap message has in it.
         let logs = if define_logs {
-            format!("logs = \"printf '%s' '{logs_output}' # {{session}}\"\n")
+            format!("logs = \"printf '%s' \\\"{logs_output}\\\" # {{session}}\"\n")
         } else {
             String::new()
         };
@@ -5913,7 +5942,7 @@ mod tests {
     #[test]
     fn a_live_capped_dispatch_is_read_with_its_reset_time() {
         let (mut app, task_id, project_path) =
-            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+            cap_env(true, "You've hit your session limit · resets 9:50pm");
         assert_eq!(app.cap_target_ids(), vec![task_id]);
 
         settle_cap(&mut app, task_id, true);
@@ -5993,7 +6022,7 @@ mod tests {
     #[test]
     fn u_nudges_a_capped_session_whose_window_has_reopened() {
         let (mut app, task_id, project_path) =
-            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+            cap_env(true, "You've hit your session limit · resets 9:50pm");
         settle_cap(&mut app, task_id, true);
         // An hour past the 21:50 the agent named.
         app.now_minutes = Some(22 * 60 + 50);
@@ -6036,7 +6065,7 @@ mod tests {
     #[test]
     fn u_releases_the_capped_session_before_resuming_it() {
         let (mut app, task_id, project_path) =
-            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+            cap_env(true, "You've hit your session limit · resets 9:50pm");
         settle_cap(&mut app, task_id, true);
         app.now_minutes = Some(22 * 60 + 50);
 
@@ -6066,7 +6095,7 @@ mod tests {
     #[test]
     fn a_nudge_whose_release_fails_sends_nothing() {
         let (mut app, task_id, project_path) =
-            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+            cap_env(true, "You've hit your session limit · resets 9:50pm");
         settle_cap(&mut app, task_id, true);
         app.now_minutes = Some(22 * 60 + 50);
         set_verb(
@@ -6096,7 +6125,7 @@ mod tests {
     #[test]
     fn u_leaves_a_capped_session_that_is_still_waiting() {
         let (mut app, task_id, project_path) =
-            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+            cap_env(true, "You've hit your session limit · resets 9:50pm");
         settle_cap(&mut app, task_id, true);
         // An hour short of the 21:50 the agent named.
         app.now_minutes = Some(20 * 60 + 50);
@@ -6153,6 +6182,47 @@ mod tests {
             Some(NUDGE),
             "{:?}",
             app.status
+        );
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// The one badged session the sweep walks past (DESIGN.md §8): one that is
+    /// retrying the request the limit rejected. It is mid-turn and will carry
+    /// on by itself, and a nudge would not add a turn to it but end the one
+    /// running, since the send stops its target first. So it is skipped however
+    /// far past the named time the clock has gone — and said aloud, because a
+    /// row passed over in silence reads as one the sweep failed to reach.
+    #[test]
+    fn u_leaves_a_retrying_session_alone() {
+        let (mut app, task_id, project_path) = cap_env(
+            true,
+            "429 exceeded your rate limit · Retrying in 30s · attempt 3/10",
+        );
+        settle_cap(&mut app, task_id, true);
+        assert!(app.caps[&task_id].retrying);
+        app.now_minutes = Some(22 * 60 + 50);
+
+        key(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(
+            delivered(&project_path),
+            None,
+            "a mid-turn session is not sent into: {:?}",
+            app.status
+        );
+        assert_eq!(
+            nudge_stopped(&project_path),
+            None,
+            "nor stopped, which is what a send would have done to it first"
+        );
+        assert!(
+            app.caps.contains_key(&task_id),
+            "and it keeps its badge, since nothing was done about it"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("1 capped session — retrying, none waiting on you")
         );
 
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
