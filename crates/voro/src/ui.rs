@@ -1715,20 +1715,11 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
         } else {
             format!("  [{}]", a.verbs.join(" "))
         };
-        // What `{model}` resolves to, so the placeholder in the command line
-        // below reads without opening voro.toml.
-        let models = match &a.models {
-            None => String::new(),
-            Some((model, deep, plan)) => {
-                format!("  <model {model} · deep {deep} · plan {plan}>")
-            }
-        };
         agent_lines.push(Line::from(vec![
             Span::raw(marker),
             Span::styled(format!("{:<10}", a.name), Style::new().bold()),
             Span::styled(format!(" {:<14}", a.provenance), Style::new().dim()),
             Span::raw(verbs),
-            Span::styled(models, Style::new().dim()),
         ]));
         // The dispatch command on a dim continuation line (clipped to the pane),
         // so the row shows what each agent actually runs.
@@ -1736,6 +1727,16 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             format!("    {}", a.dispatch),
             Style::new().dim(),
         )));
+        // What `{model}` resolves to, under the command whose placeholder it
+        // fills, so it reads without opening voro.toml. It is a line of its own
+        // rather than a tail on the name row above, which the verb list has
+        // grown long enough to push off an ordinary terminal (DESIGN.md §5).
+        if let Some((model, deep, plan)) = &a.models {
+            agent_lines.push(Line::from(Span::styled(
+                format!("    {{model}}: {model} · deep {deep} · plan {plan}"),
+                Style::new().dim(),
+            )));
+        }
         if !a.missing_verbs.is_empty() {
             agent_lines.push(Line::from(Span::styled(
                 format!("    ! override drops: {}", a.missing_verbs.join(", ")),
@@ -1750,7 +1751,11 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
         )));
     }
 
-    let agents_h = (agent_lines.len() as u16 + 2).clamp(3, 14);
+    // The pane takes the height its rows need, yielding only what the viewers
+    // list below needs for a border and a row: that list scrolls with its
+    // selection while this paragraph does not, so an agent hidden here is the
+    // more expensive truncation.
+    let agents_h = (agent_lines.len() as u16 + 2).clamp(3, main.height.saturating_sub(3).max(3));
     let [agents_area, viewers_area] =
         Layout::vertical([Constraint::Length(agents_h), Constraint::Min(3)]).areas(main);
 
@@ -2665,6 +2670,93 @@ mod tests {
             rendered.contains("zed") && rendered.contains("zed {path}"),
             "{rendered}"
         );
+        // An ordinary terminal keeps both halves of what the built-in claude
+        // row says: every optional verb it defines, and — on its own line under
+        // the command whose placeholder it fills — what `{model}` resolves to.
+        // Both are read off the row rather than spelled out here, so the test
+        // asserts that the width survives the built-in's verbs and model map
+        // rather than pinning what they currently are.
+        let claude = app
+            .config_agents
+            .iter()
+            .find(|a| a.name == "claude")
+            .expect("the built-in claude");
+        let verbs = format!("[{}]", claude.verbs.join(" "));
+        assert!(
+            rendered.contains(&verbs),
+            "verbs {verbs} clipped:\n{rendered}"
+        );
+        let (model, deep, plan) = claude.models.as_ref().expect("claude names a model");
+        let models = format!("{{model}}: {model} · deep {deep} · plan {plan}");
+        assert!(
+            rendered.contains(&models),
+            "model map {models} clipped:\n{rendered}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The agents pane sizes to the rows it has: an operator with several
+    /// model-carrying agents, each now three lines tall, still sees every one
+    /// of them, and the viewers list below keeps a row (DESIGN.md §9).
+    #[test]
+    fn config_screen_shows_every_agent_it_has() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::Store;
+
+        let dir = std::env::temp_dir().join(format!(
+            "voro-ui-config-many-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agents_path = dir.join("voro.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut toml = String::from("[viewers.zed]\ncmd = \"zed {path}\"\n");
+        for n in 1..=4 {
+            toml.push_str(&format!(
+                "\n[agents.mine{n}]\ndispatch = \"mine{n} run {{prompt_file}} --model {{model}}\"\n\
+                 model = \"m{n}\"\n"
+            ));
+        }
+        std::fs::write(&agents_path, toml).unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+        let ctx = crate::dispatch::DispatchCtx {
+            db_path: dir.join("voro.db"),
+            agents_path,
+            runtime_dir: dir.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
+        };
+        let mut app = App::new(store, ctx).unwrap();
+        alt_screen(&mut app, '4');
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        for n in 1..=4 {
+            assert!(rendered.contains(&format!("mine{n}")), "{rendered}");
+            assert!(rendered.contains(&format!("{{model}}: m{n}")), "{rendered}");
+        }
+        // The viewers list keeps a row of its own; what it gave up it can still
+        // scroll to, which the agents paragraph could not.
+        assert!(rendered.contains("Viewers"), "{rendered}");
+        assert!(rendered.contains("code -n {path}"), "{rendered}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
