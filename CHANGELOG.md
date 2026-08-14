@@ -272,6 +272,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Config screen's agents pane no longer hides agents in silence.** It drew
+  the rows it could fit and dropped the rest, and its bottom border looked the
+  same either way — on a short terminal with several agents configured, the ones
+  past the fold could only be read by resizing the terminal or running `voro
+  agent list` at the shell. The pane now scrolls with `J`/`K` and the page keys,
+  the same gesture the cockpit's focus card takes and for the same reason: this
+  pane has no selection of its own, `j`/`k` on that screen belonging to the
+  viewers list below it. When there is nothing hidden the border says nothing;
+  when there is, it carries the overflow and the keys that move it.
+
 - **A capped session's badge now shows the reset time it actually named.** Real
   cap messages end with an upgrade prompt that mentions a usage limit of its
   own, and that trailing mention was winning: it carries no time, so every

@@ -576,6 +576,14 @@ pub struct App {
     /// silently rendering an empty config.
     pub config_error: Option<String>,
     pub config_sel: usize,
+    /// Vertical scroll offset of the Config screen's agents pane (DESIGN.md §9),
+    /// driven by `J`/`K` and `PgDn`/`PgUp`. The pane carries no selection of its
+    /// own — `j`/`k` belong to the viewers list below it — so the scroll is the
+    /// only way past the fold on a terminal too short for every agent.
+    pub config_agents_scroll: u16,
+    /// The largest useful `config_agents_scroll` for the pane as last rendered,
+    /// recorded by `draw_config` for the same reason as `detail_max_scroll`.
+    pub config_agents_max_scroll: std::cell::Cell<u16>,
 
     pub mode: Mode,
     /// Whether the detail views fold the score decomposition (DESIGN.md §7) and
@@ -666,6 +674,8 @@ impl App {
             config_anon_viewer: None,
             config_error: None,
             config_sel: 0,
+            config_agents_scroll: 0,
+            config_agents_max_scroll: std::cell::Cell::new(0),
             mode: Mode::Normal,
             show_score: false,
             show_history: false,
@@ -1224,6 +1234,13 @@ impl App {
     fn scroll_detail(&mut self, delta: i64) {
         let max = self.detail_max_scroll.get() as i64;
         self.detail_scroll = (self.detail_scroll as i64 + delta).clamp(0, max) as u16;
+    }
+
+    /// Scroll the Config screen's agents pane, clamped the same way against the
+    /// overflow `draw_config` last measured.
+    fn scroll_config_agents(&mut self, delta: i64) {
+        let max = self.config_agents_max_scroll.get() as i64;
+        self.config_agents_scroll = (self.config_agents_scroll as i64 + delta).clamp(0, max) as u16;
     }
 
     /// Tab cycles cockpit → tasks → projects → config → cockpit; `alt-1` to
@@ -3200,6 +3217,14 @@ impl App {
             KeyCode::Char('d') => self.delete_selected_viewer(),
             KeyCode::Char('V') => self.open_default_picker(DefaultKind::Viewer),
             KeyCode::Char('A') => self.open_default_picker(DefaultKind::Agent),
+            // The agents pane takes the cockpit card's scroll keys for the same
+            // reason it has there: `j`/`k` are the list's — here the viewers'
+            // — so the pane below them is driven by the shifted pair and the
+            // page keys (DESIGN.md §9).
+            KeyCode::Char('J') => self.scroll_config_agents(1),
+            KeyCode::Char('K') => self.scroll_config_agents(-1),
+            KeyCode::PageDown => self.scroll_config_agents(DETAIL_PAGE_STEP),
+            KeyCode::PageUp => self.scroll_config_agents(-DETAIL_PAGE_STEP),
             _ => {}
         }
     }
