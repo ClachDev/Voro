@@ -57,6 +57,12 @@
 //! — is not taken here at all: it is slow enough to need its own off-loop
 //! runner ([`crate::probe::CapProbe`]), and it changes nothing in the database.
 //!
+//! Whatever a pass finalises, it also stops (task #433): the agent's `stop` verb
+//! is fired at the closed session's reference so its own listing loses the entry
+//! along with the row, best-effort and unwaited-on. Sessions left open —
+//! `needs-input`, `review`, `waiting` — are never stopped; the operator still
+//! answers and rejects into them.
+//!
 //! There is no daemon watching for process exit. Reconciliation runs on read:
 //! `App::refresh` and every CLI verb call [`reconcile_live_sessions`] before
 //! consulting session or task state, so a dead session is finalised the next
@@ -64,12 +70,12 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
 
 use voro_core::{
     AgentSessionEntry, AgentsConfig, LivenessSource, Result, Store, TaskState, read_cap,
 };
 
+use crate::dispatch::{DispatchCtx, stop_session};
 use crate::session_probe::{
     listing_says_live, pid_is_alive, read_session_cap, run_sessions_command,
 };
@@ -82,7 +88,7 @@ const LOG_TAIL_BYTES: u64 = 4096;
 /// owns the resulting write. Returns how many were finalised. Cheap to call on
 /// every read — with no live sessions it costs one query, and the agents config
 /// is only consulted when a `running` session needs a listing-based probe.
-pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<usize> {
+pub fn reconcile_live_sessions(store: &mut Store, ctx: &DispatchCtx) -> Result<usize> {
     let live = store.live_sessions()?;
     if live.is_empty() {
         return Ok(0);
@@ -90,7 +96,7 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
     // A missing or invalid voro.toml costs the listing-authoritative sessions
     // their probe — they are left alone — rather than failing the read that
     // triggered reconciliation.
-    let config = AgentsConfig::load(agents_path).ok();
+    let config = AgentsConfig::load(&ctx.agents_path).ok();
     // One listing per agent per pass, however many of its sessions are live.
     let mut listings: HashMap<String, Option<Vec<AgentSessionEntry>>> = HashMap::new();
 
@@ -100,7 +106,8 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
         if !matches!(task_state, TaskState::Running | TaskState::Refining) {
             // needs-input / review keep their session open (reconcile_session
             // returns None); a session on a closed task is stale and finalised.
-            if store.reconcile_session(session.id, false, false)?.is_some() {
+            if let Some((closed, _)) = store.reconcile_session(session.id, false, false)? {
+                stop_finalised(ctx, config.as_ref(), &closed);
                 finalised += 1;
             }
             continue;
@@ -165,14 +172,23 @@ pub fn reconcile_live_sessions(store: &mut Store, agents_path: &Path) -> Result<
                 .as_deref()
                 .is_some_and(log_tail_looks_capped),
         };
-        if store
-            .reconcile_session(session.id, false, likely_capped)?
-            .is_some()
-        {
+        if let Some((closed, _)) = store.reconcile_session(session.id, false, likely_capped)? {
+            stop_finalised(ctx, config.as_ref(), &closed);
             finalised += 1;
         }
     }
     Ok(finalised)
+}
+
+/// Retire the agent's registry entry for a session reconciliation has just
+/// finalised (DESIGN.md §8) — both flavours, the dead dispatch it stalls and the
+/// stale row it heals, since either way the session is over and Voro has said so.
+/// Skipped in silence when the config would not load, which is the same cost a
+/// missing config already carries here.
+fn stop_finalised(ctx: &DispatchCtx, config: Option<&AgentsConfig>, closed: &voro_core::Session) {
+    if let Some(config) = config {
+        stop_session(ctx, config, closed);
+    }
 }
 
 /// Best-effort usage-cap detector for an agent with no `logs` verb (DESIGN.md
@@ -201,11 +217,27 @@ mod tests {
     use std::process::{Command, Stdio};
     use voro_core::{Action, NewTask, Priority, SessionOutcome, TaskState};
 
-    /// An agents path that never exists — loads the built-ins, so a verb-less
-    /// agent name like `manual` degrades to the pid check while the built-in
-    /// `claude`/`codex` (which carry a `sessions` verb) take the listing path.
-    fn no_config() -> PathBuf {
-        PathBuf::from("/nonexistent/voro.toml")
+    /// A dispatch context pointed at `agents_path`, with its runtime artefacts
+    /// — the launch log a stop would write to — beside it rather than in the
+    /// operator's own session directory.
+    fn ctx_at(agents_path: PathBuf) -> DispatchCtx {
+        let db_path = agents_path.with_file_name("voro.db");
+        DispatchCtx {
+            agents_path,
+            ..DispatchCtx::from_db_path(&db_path)
+        }
+    }
+
+    /// A context whose agents path never exists — loads the built-ins, so a
+    /// verb-less agent name like `manual` degrades to the pid check while the
+    /// built-in `claude`/`codex` (which carry a `sessions` verb) take the
+    /// listing path.
+    fn no_config() -> DispatchCtx {
+        ctx_at(
+            std::env::temp_dir()
+                .join(format!("voro-reconcile-none-{}", std::process::id()))
+                .join("voro.toml"),
+        )
     }
 
     /// A ready task started (`running`), ready to hang a session off of.
@@ -444,7 +476,7 @@ mod tests {
 
     /// An `voro.toml` whose `claude` agent lists sessions by catting a
     /// canned JSON file, plus that file's path for the test to fill in.
-    fn sessions_fixture(name: &str, listing_json: &str) -> (PathBuf, PathBuf) {
+    fn sessions_fixture(name: &str, listing_json: &str) -> (DispatchCtx, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "voro-reconcile-verbs-{name}-{}",
             std::process::id()
@@ -463,7 +495,7 @@ mod tests {
             ),
         )
         .unwrap();
-        (agents_path, dir)
+        (ctx_at(agents_path), dir)
     }
 
     /// The trap case: a `--bg`-style launch's spawned pid exits at birth, so
@@ -471,7 +503,7 @@ mod tests {
     /// and leave the task running, never the dead pid.
     #[test]
     fn a_listed_live_session_is_left_alone_despite_a_dead_pid() {
-        let (agents_path, dir) = sessions_fixture(
+        let (ctx, dir) = sessions_fixture(
             "alive",
             r#"[{"id": "dead1234", "sessionId": "full-uuid-1", "cwd": "/tmp/proj",
                 "startedAt": 1, "status": "idle", "state": "working"}]"#,
@@ -491,7 +523,7 @@ mod tests {
             .unwrap();
         s.set_session_ref(session.id, "full-uuid-1").unwrap();
 
-        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0);
         assert!(s.session(session.id).unwrap().ended_at.is_none());
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
 
@@ -511,7 +543,7 @@ mod tests {
             ),
             ("gone", "[]"),
         ] {
-            let (agents_path, dir) = sessions_fixture(name, listing);
+            let (ctx, dir) = sessions_fixture(name, listing);
             let (mut s, task_id) = running_task();
             // The launcher pid of a `--bg` dispatch, dead as it always is by
             // now, so the listing is what decides (a *live* pid would override
@@ -527,11 +559,7 @@ mod tests {
                 .unwrap();
             s.set_session_ref(session.id, "full-uuid-1").unwrap();
 
-            assert_eq!(
-                reconcile_live_sessions(&mut s, &agents_path).unwrap(),
-                1,
-                "{name}"
-            );
+            assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 1, "{name}");
             assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled, "{name}");
             assert_eq!(
                 s.session(session.id).unwrap().outcome,
@@ -549,7 +577,7 @@ mod tests {
     /// the task rides the strip as live forever.
     #[test]
     fn a_pidless_blocked_zombie_stalls_the_task() {
-        let (agents_path, dir) = sessions_fixture(
+        let (ctx, dir) = sessions_fixture(
             "zombie",
             r#"[{"sessionId": "full-uuid-1", "cwd": "/tmp/proj",
                 "startedAt": 1, "state": "blocked"}]"#,
@@ -566,7 +594,7 @@ mod tests {
             .unwrap();
         s.set_session_ref(session.id, "full-uuid-1").unwrap();
 
-        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 1);
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 1);
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
         assert_eq!(
             s.session(session.id).unwrap().outcome,
@@ -581,7 +609,7 @@ mod tests {
     /// the operator does not stall the task under them.
     #[test]
     fn a_blocked_entry_with_a_live_pid_is_left_alone() {
-        let (agents_path, dir) = sessions_fixture(
+        let (ctx, dir) = sessions_fixture(
             "blocked-live",
             &format!(
                 r#"[{{"sessionId": "full-uuid-1", "cwd": "/tmp/proj",
@@ -595,7 +623,7 @@ mod tests {
             .unwrap();
         s.set_session_ref(session.id, "full-uuid-1").unwrap();
 
-        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0);
         assert!(s.session(session.id).unwrap().ended_at.is_none());
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
 
@@ -609,7 +637,7 @@ mod tests {
     /// would stall the task under the agent working on it.
     #[test]
     fn a_live_pid_outlives_its_absence_from_the_listing() {
-        let (agents_path, dir) = sessions_fixture("message-fork", "[]");
+        let (ctx, dir) = sessions_fixture("message-fork", "[]");
         let (mut s, task_id) = running_task();
         let session = s
             .create_session(task_id, "claude", None, LivenessSource::Listing, None)
@@ -617,7 +645,7 @@ mod tests {
         s.record_session_send(session.id, Some("forked-uuid"), std::process::id() as i64)
             .unwrap();
 
-        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0);
         assert!(s.session(session.id).unwrap().ended_at.is_none());
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
 
@@ -630,7 +658,7 @@ mod tests {
     /// above.
     #[test]
     fn a_refless_listing_session_is_left_alone() {
-        let (agents_path, dir) = sessions_fixture("refless", "[]");
+        let (ctx, dir) = sessions_fixture("refless", "[]");
         let (mut s, task_id) = running_task();
         let mut child = Command::new("true").stdout(Stdio::null()).spawn().unwrap();
         let dead_pid = child.id() as i64;
@@ -645,7 +673,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0);
         assert!(s.session(session.id).unwrap().ended_at.is_none());
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
 
@@ -669,17 +697,160 @@ mod tests {
              dispatch = \"cat {prompt_file}\"\nsessions = \"false\"\n",
         )
         .unwrap();
+        let ctx = ctx_at(agents_path);
         let (mut s, task_id) = running_task();
         let session = s
             .create_session(task_id, "claude", Some(1), LivenessSource::Listing, None)
             .unwrap();
         s.set_session_ref(session.id, "full-uuid-1").unwrap();
 
-        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0);
         assert!(s.session(session.id).unwrap().ended_at.is_none());
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- finalising a session stops it (task #433) ---
+
+    /// A `voro.toml` whose `claude` agent lists nothing and whose `stop` verb
+    /// records the reference it was fired at, plus that marker's path — so a
+    /// test can tell a stop that happened from one that did not, and read which
+    /// session it named.
+    fn stop_fixture(name: &str) -> (DispatchCtx, PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("voro-reconcile-stop-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("stopped");
+        let agents_path = dir.join("voro.toml");
+        std::fs::write(
+            &agents_path,
+            format!(
+                "default_agent = \"claude\"\n\n[agents.claude]\n\
+                 dispatch = \"cat {{prompt_file}}\"\nsessions = \"printf '[]'\"\n\
+                 stop = \"printf '%s' {{session}} >> '{}'\"\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        (ctx_at(agents_path), marker, dir)
+    }
+
+    /// Wait for a detached stop to have written its marker, since nothing in the
+    /// reconcile path waits on it. Returns what it wrote, or `None` if it never
+    /// ran.
+    fn stopped_ref(marker: &std::path::Path) -> Option<String> {
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(marker)
+                && !text.is_empty()
+            {
+                return Some(text);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        None
+    }
+
+    /// The dead-dispatch path: a session the reconciler finalises is also
+    /// retired from the agent's own listing, at the reference Voro captured for
+    /// it, so the entry goes when the row does.
+    #[test]
+    fn a_finalised_dead_session_is_stopped() {
+        let (ctx, marker, dir) = stop_fixture("dead");
+        let (mut s, task_id) = running_task();
+        let session = s
+            .create_session(
+                task_id,
+                "claude",
+                Some(dead_pid()),
+                LivenessSource::Listing,
+                None,
+            )
+            .unwrap();
+        s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 1);
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
+        assert_eq!(stopped_ref(&marker).as_deref(), Some("full-uuid-1"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stale-row heal: a session still open on a task that has already
+    /// closed is finalised without a probe, and stopped on the same terms.
+    #[test]
+    fn a_healed_stale_session_is_stopped() {
+        let (ctx, marker, dir) = stop_fixture("stale");
+        let (mut s, task_id) = running_task();
+        let session = s
+            .create_session(task_id, "claude", None, LivenessSource::Listing, None)
+            .unwrap();
+        s.set_session_ref(session.id, "stale-uuid").unwrap();
+        s.apply(task_id, Action::Complete(None)).unwrap();
+        s.apply(task_id, Action::Accept).unwrap();
+        // Accept closes the row itself, so reopen one to strand: this is the
+        // row a crash between the two writes would leave behind.
+        let stranded = s
+            .create_session(task_id, "claude", None, LivenessSource::Listing, None)
+            .unwrap();
+        s.set_session_ref(stranded.id, "stale-uuid").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 1);
+        assert_eq!(stopped_ref(&marker).as_deref(), Some("stale-uuid"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sessions that stay open are never stopped, whatever their process is
+    /// doing: the operator answers into a `needs-input` session and rejects into
+    /// a `review` one, so retiring either would take away the conversation they
+    /// are about to continue.
+    #[test]
+    fn a_session_kept_open_is_never_stopped() {
+        for (name, action) in [
+            ("needs-input", Action::Ask("A or B?".into())),
+            ("review", Action::Complete(None)),
+        ] {
+            let (ctx, marker, dir) = stop_fixture(name);
+            let (mut s, task_id) = running_task();
+            let session = s
+                .create_session(
+                    task_id,
+                    "claude",
+                    Some(dead_pid()),
+                    LivenessSource::Listing,
+                    None,
+                )
+                .unwrap();
+            s.set_session_ref(session.id, "full-uuid-1").unwrap();
+            s.apply(task_id, action).unwrap();
+
+            assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0, "{name}");
+            assert!(!marker.exists(), "{name} stopped a session it kept open");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// An agent naming no `stop` verb degrades to what Voro did before: the row
+    /// closes, the entry lingers, and nothing errors.
+    #[test]
+    fn a_stopless_agent_finalises_without_stopping() {
+        let (mut s, task_id) = running_task();
+        let session = s
+            .create_session(
+                task_id,
+                "manual",
+                Some(dead_pid()),
+                LivenessSource::Pid,
+                None,
+            )
+            .unwrap();
+        s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+        assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 1);
+        assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
     }
 
     // --- capped deaths read the session's own output (task #415) ---
@@ -687,7 +858,7 @@ mod tests {
     /// A `voro.toml` whose `claude` agent lists no sessions and prints
     /// `logs_output` for any session, plus the log file path a launch would
     /// have written, so a test can set the two channels against each other.
-    fn logs_fixture(name: &str, logs_output: &str) -> (PathBuf, PathBuf, PathBuf) {
+    fn logs_fixture(name: &str, logs_output: &str) -> (DispatchCtx, PathBuf, PathBuf) {
         let dir =
             std::env::temp_dir().join(format!("voro-reconcile-logs-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -703,7 +874,7 @@ mod tests {
         )
         .unwrap();
         let log = dir.join("launch.log");
-        (agents_path, log, dir)
+        (ctx_at(agents_path), log, dir)
     }
 
     /// The whole point of the `logs` verb on the dead path (DESIGN.md §8): a
@@ -713,7 +884,7 @@ mod tests {
     /// every capped bg dispatch as a plain failure.
     #[test]
     fn a_dead_session_is_classified_capped_from_its_own_output() {
-        let (agents_path, log, dir) = logs_fixture("capped", "Session limit reached");
+        let (ctx, log, dir) = logs_fixture("capped", "Session limit reached");
         std::fs::write(&log, "[voro] launched in background, pid 1234\n").unwrap();
         let (mut s, task_id) = running_task();
         let session = s
@@ -727,7 +898,7 @@ mod tests {
             .unwrap();
         s.set_session_ref(session.id, "full-uuid-1").unwrap();
 
-        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 1);
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 1);
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
         assert_eq!(
             s.session(session.id).unwrap().outcome,
@@ -743,7 +914,7 @@ mod tests {
     /// cannot re-label a death the agent itself accounts for otherwise.
     #[test]
     fn a_dead_session_the_verb_calls_healthy_is_a_plain_failure() {
-        let (agents_path, log, dir) = logs_fixture("failed", "compiling... done.");
+        let (ctx, log, dir) = logs_fixture("failed", "compiling... done.");
         std::fs::write(&log, "hit the usage limit\n").unwrap();
         let (mut s, task_id) = running_task();
         let session = s
@@ -757,7 +928,7 @@ mod tests {
             .unwrap();
         s.set_session_ref(session.id, "full-uuid-1").unwrap();
 
-        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 1);
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 1);
         assert_eq!(
             s.session(session.id).unwrap().outcome,
             Some(SessionOutcome::Failed)
@@ -806,7 +977,7 @@ mod tests {
     /// as failures; with a ref captured, the listing is what answers.
     #[test]
     fn a_listed_live_refine_round_is_left_alone_despite_a_dead_pid() {
-        let (agents_path, dir) = sessions_fixture(
+        let (ctx, dir) = sessions_fixture(
             "refine-alive",
             r#"[{"sessionId": "refine-uuid", "cwd": "/tmp/proj",
                 "startedAt": 1, "state": "working"}]"#,
@@ -815,7 +986,7 @@ mod tests {
             refining_task("claude", Some(dead_pid()), LivenessSource::Listing);
         s.set_session_ref(session_id, "refine-uuid").unwrap();
 
-        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0);
         assert!(s.session(session_id).unwrap().ended_at.is_none());
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Refining);
         assert!(!s.refine_failed_flag(task_id).unwrap());
@@ -827,12 +998,12 @@ mod tests {
     /// and still marked, the launcher pid on its row proving nothing either way.
     #[test]
     fn a_refine_round_gone_from_the_listing_is_marked_failed() {
-        let (agents_path, dir) = sessions_fixture("refine-gone", "[]");
+        let (ctx, dir) = sessions_fixture("refine-gone", "[]");
         let (mut s, task_id, session_id) =
             refining_task("claude", Some(dead_pid()), LivenessSource::Listing);
         s.set_session_ref(session_id, "refine-uuid").unwrap();
 
-        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 1);
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 1);
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Proposed);
         assert!(s.refine_failed_flag(task_id).unwrap());
         assert_eq!(
@@ -875,11 +1046,11 @@ mod tests {
     /// listing says it is gone, exactly as a ref-less dispatch already was.
     #[test]
     fn a_headless_refine_round_with_no_ref_is_left_alone() {
-        let (agents_path, dir) = sessions_fixture("refine-refless", "[]");
+        let (ctx, dir) = sessions_fixture("refine-refless", "[]");
         let (mut s, task_id, session_id) =
             refining_task("claude", Some(dead_pid()), LivenessSource::Listing);
 
-        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 0);
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0);
         assert!(s.session(session_id).unwrap().ended_at.is_none());
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Refining);
         assert!(!s.refine_failed_flag(task_id).unwrap());
@@ -894,11 +1065,11 @@ mod tests {
     /// leaves a round another window's reconcile can finish.
     #[test]
     fn an_interactive_refine_round_is_pid_checked_under_a_sessions_agent() {
-        let (agents_path, dir) = sessions_fixture("refine-interactive", "[]");
+        let (ctx, dir) = sessions_fixture("refine-interactive", "[]");
         let (mut s, task_id, session_id) =
             refining_task("claude", Some(dead_pid()), LivenessSource::Pid);
 
-        assert_eq!(reconcile_live_sessions(&mut s, &agents_path).unwrap(), 1);
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 1);
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Proposed);
         assert!(s.refine_failed_flag(task_id).unwrap());
         assert_eq!(
@@ -908,13 +1079,13 @@ mod tests {
 
         // The live half of the same flavour: a conversation still going is left
         // alone, however empty the listing it never joined.
-        let (agents_path2, dir2) = sessions_fixture("refine-interactive-live", "[]");
+        let (ctx2, dir2) = sessions_fixture("refine-interactive-live", "[]");
         let (mut s, task_id, _) = refining_task(
             "claude",
             Some(std::process::id() as i64),
             LivenessSource::Pid,
         );
-        assert_eq!(reconcile_live_sessions(&mut s, &agents_path2).unwrap(), 0);
+        assert_eq!(reconcile_live_sessions(&mut s, &ctx2).unwrap(), 0);
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Refining);
 
         let _ = std::fs::remove_dir_all(&dir);

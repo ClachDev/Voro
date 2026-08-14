@@ -1776,6 +1776,22 @@ pub(crate) fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
 
 pub(crate) const SESSION_COLUMNS: &str = "id, task_id, agent, pid, session_ref, liveness_source, log_path, started_at, ended_at, outcome";
 
+/// A task's currently-open session, if it has one. The one-open-session
+/// invariant (DESIGN.md §8) means there is at most one row to find, so this is
+/// how a transaction learns *which* session it is about to close.
+pub(crate) fn get_open_session(conn: &Connection, task_id: i64) -> Result<Option<Session>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {SESSION_COLUMNS} FROM sessions
+                 WHERE task_id = ?1 AND ended_at IS NULL"
+            ),
+            [task_id],
+            session_from_row,
+        )
+        .optional()?)
+}
+
 pub(crate) fn get_session(conn: &Connection, id: i64) -> Result<Option<Session>> {
     Ok(conn
         .query_row(
