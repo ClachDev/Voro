@@ -110,13 +110,20 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// and that supervisor refuses a headless `--resume` for as long as it lives,
 /// so the plain resume was a send that could never land (DESIGN.md §8).
 ///
-/// It carries `--permission-mode` for the same reason `dispatch` does. The flag
-/// is per invocation rather than a property of the session, so a resumed turn
-/// without it runs in the default ask mode against a stdin at `/dev/null`: every
-/// edit and every command outside the allowlist stops for an approval nobody can
+/// It carries `--permission-mode` for the same reason `dispatch` does: the mode
+/// belongs to a launch rather than to a verb (DESIGN.md §8). The flag is per
+/// invocation rather than a property of the session, so a resumed turn without
+/// it runs in the default ask mode against a stdin at `/dev/null`: every edit
+/// and every command outside the allowlist stops for an approval nobody can
 /// give, and the refusals land in the launch log rather than the TUI. A send
 /// like that appears to have been delivered and quietly does nothing, which is
-/// the one failure a fire-and-forget channel cannot report.
+/// the one failure a fire-and-forget channel cannot report — and since `message`
+/// carries every rejection's feedback, a rework session missing the flag cannot
+/// even run `voro done`, so its finished work goes unreported and reconcile
+/// lands the task in `stalled`, reading as an agent that died.
+///
+/// `resume` deliberately carries no mode: it hands the operator a terminal and
+/// no prompt, so the ask-mode default is answerable by whoever is sitting there.
 ///
 /// The claude `logs` verb replays a background session's screen, which is the
 /// only place a usage cap is legible (DESIGN.md §8): `claude agents --json`
@@ -2086,6 +2093,35 @@ mod tests {
             Path::new("/run/msg-2.md"),
         );
         assert_ne!(again.new_session_ref, Some(new_ref));
+    }
+
+    /// The permission mode belongs to a launch rather than to a verb: every
+    /// built-in `claude` template that hands an agent a prompt to act on
+    /// carries it, headless or not. `resume` carries none because it carries no
+    /// prompt either — it reopens a session for the operator and starts no work
+    /// of its own, so the ask-mode default is answerable by the person sitting
+    /// in front of it.
+    #[test]
+    fn every_builtin_claude_launch_that_prompts_carries_a_permission_mode() {
+        let claude = &builtin_agents()["claude"];
+        for (verb, template) in [
+            ("dispatch", claude.dispatch()),
+            ("message", claude.message().expect("claude defines message")),
+            ("plan", claude.plan().expect("claude defines plan")),
+        ] {
+            assert!(
+                template.contains(PROMPT_FILE_PLACEHOLDER),
+                "{verb} is meant to be a prompted launch: {template}"
+            );
+            assert!(
+                template.contains("--permission-mode auto"),
+                "{verb} asks an agent to act, so it cannot stop for an approval \
+                 nobody is there to give: {template}"
+            );
+        }
+        let resume = claude.resume().expect("claude defines resume");
+        assert!(!resume.contains(PROMPT_FILE_PLACEHOLDER), "{resume}");
+        assert!(!resume.contains("--permission-mode"), "{resume}");
     }
 
     /// The placeholder is bound only where a send happens; on any other verb it
