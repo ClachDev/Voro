@@ -1337,6 +1337,10 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             let hint = match verb {
                 voro_core::NextAction::Pr => "  (g opens one from the summary)",
                 voro_core::NextAction::Open => "  (o shows the diff in a viewer)",
+                // No branch, so no PR and no diff — the report above is the
+                // whole deliverable and ⏎ is where the verdict lives
+                // (DESIGN.md §6).
+                voro_core::NextAction::Accept => "  (⏎ offers accept)",
                 _ => "",
             };
             lines.push(Line::from(Span::styled(
@@ -2846,6 +2850,9 @@ mod tests {
         store
             .apply(task, Action::Complete(Some("did it".into())))
             .unwrap();
+        // The degrade is about the medium of a diff, so the task must have one
+        // to show: with no branch it would advertise `accept` (DESIGN.md §6).
+        store.set_branch(task, Some("feat/finished")).unwrap();
 
         let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
             "/nonexistent/voro.db",
@@ -2945,6 +2952,64 @@ mod tests {
         assert!(out.contains("[incomplete report]"), "{out}");
 
         std::fs::remove_dir_all(&project).ok();
+    }
+
+    /// A review task with nothing to push — an investigation, an audit — asks
+    /// to be accepted, not for a PR that could only fail (DESIGN.md §6). The
+    /// card names that verb and the key that reaches it, and asks the checkout
+    /// nothing: there is no medium to resolve, which is why this renders in a
+    /// path that is no git repository at all.
+    #[test]
+    fn the_detail_card_advertises_accept_with_nothing_to_push() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store
+            .create_project("voro", "/tmp/voro-not-a-repo")
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "the investigation".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap()
+            .id;
+        store
+            .record_dispatch(task, "claude", None, LivenessSource::Listing, None)
+            .unwrap();
+        store
+            .apply(task, Action::Complete(Some("what I found".into())))
+            .unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let app = App::new(store, ctx).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal
+            .draw(|f| draw_cockpit(f, &app, &mut HitMap::default()))
+            .unwrap();
+        let out: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(out.contains("next: accept"), "{out}");
+        assert!(out.contains("(⏎ offers accept)"), "{out}");
+        assert!(!out.contains("next: pr"), "{out}");
+        assert!(!out.contains("next: open"), "{out}");
     }
 
     /// End-to-end through the real cockpit draw (DESIGN.md §9): a hand-off

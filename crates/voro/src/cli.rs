@@ -3519,14 +3519,41 @@ mod tests {
         ok(&mut s, &["start", "1"]);
         assert!(!ok(&mut s, &["show", "1"]).contains("next:"));
 
+        // This task produced no code, so its summary is the deliverable and the
+        // move is to accept it (DESIGN.md §6).
         ok(&mut s, &["done", "1", "--summary", "did it"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("next: accept"));
+
+        ok(&mut s, &["accept", "1"]);
+        assert!(!ok(&mut s, &["show", "1"]).contains("next:"));
+    }
+
+    /// The `review` arm reads what the task carries (DESIGN.md §6): a branch
+    /// makes the move `pr`, a tracked PR makes it `review PR`, and neither —
+    /// an investigation, an audit — makes it `accept`, since `pr` could only
+    /// refuse.
+    #[test]
+    fn show_names_the_review_verb_by_what_the_task_carries() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["add", "demo", "An idea"]);
+        ok(&mut s, &["triage", "1", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["done", "1", "--summary", "did it"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("next: accept"));
+        // and `pr` on it refuses, which is what makes `accept` the honest verb
+        assert!(err(&mut s, &["pr", "1", "--yes"]).contains("branch"));
+
+        ok(&mut s, &["set", "1", "--branch", "feat/idea"]);
         assert!(ok(&mut s, &["show", "1"]).contains("next: pr"));
 
         ok(&mut s, &["set", "1", "--pr", "acme/widget#42"]);
         assert!(ok(&mut s, &["show", "1"]).contains("next: review PR"));
 
-        ok(&mut s, &["accept", "1"]);
-        assert!(!ok(&mut s, &["show", "1"]).contains("next:"));
+        // clearing the branch does not undo a tracked PR: there is a diff to
+        // read, so the verb stays `review PR`
+        ok(&mut s, &["set", "1", "--no-branch"]);
+        assert!(ok(&mut s, &["show", "1"]).contains("next: review PR"));
     }
 
     /// `list` shows state in its own column, so only `review` earns a next
@@ -3539,6 +3566,8 @@ mod tests {
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         let complete = review_task(&mut s, Some("feat/thing"), Some("did it"));
         let half = review_task(&mut s, Some("feat/other"), None);
+        // no branch and a summary: a task whose report is the whole product
+        let report = review_task(&mut s, None, Some("what I found"));
         ok(&mut s, &["add", "demo", "Startable", "--state", "ready"]);
 
         let out = ok(&mut s, &["list"]);
@@ -3550,7 +3579,8 @@ mod tests {
         assert!(line(complete).ends_with("next: pr"), "{out}");
         assert!(line(half).ends_with("[incomplete report]"), "{out}");
         assert!(!line(half).contains("next:"), "{out}");
-        assert!(!line(3).contains("next:"), "{out}");
+        assert!(line(report).ends_with("next: accept"), "{out}");
+        assert!(!line(4).contains("next:"), "{out}");
 
         ok(&mut s, &["set", &complete.to_string(), "--pr", "acme/w#1"]);
         let out = ok(&mut s, &["list"]);
