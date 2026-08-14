@@ -594,14 +594,11 @@ fn title_slug(title: &str) -> Option<String> {
     }
 
     if RESERVED_NAME_SUFFIXES.contains(&slug.as_str()) {
-        match words.get(taken) {
-            // Over budget by a word, which beats colliding with a kind name.
-            Some(next) => {
-                slug.push('-');
-                slug.push_str(next);
-            }
-            None => return None,
-        }
+        // Over budget by a word, which beats colliding with a kind name; a
+        // title with no further word to give falls back to the bare name.
+        let next = words.get(taken)?;
+        slug.push('-');
+        slug.push_str(next);
     }
 
     (!slug.is_empty()).then_some(slug)
