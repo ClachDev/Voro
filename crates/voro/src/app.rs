@@ -1734,19 +1734,25 @@ impl App {
     }
 
     /// Whether the selection has work to look at locally — what gates the `o`
-    /// hint (DESIGN.md §9), and the same pair of states the key itself allows.
+    /// hint (DESIGN.md §9). The two states the key itself allows, and a branch
+    /// to diff: opening builds its diff from the task's branch, so a task
+    /// without one — an investigation whose whole product is its summary, or a
+    /// dispatch that has yet to name a branch — has nothing to look at.
     pub fn selected_has_a_diff(&self) -> bool {
-        self.selected_task()
-            .is_some_and(|t| matches!(t.state, TaskState::Review | TaskState::Running))
+        self.selected_task().is_some_and(|t| {
+            matches!(t.state, TaskState::Review | TaskState::Running) && t.branch.is_some()
+        })
     }
 
     /// Whether the selection is the task `g` has a PR to show or create — what
     /// gates that hint (DESIGN.md §9). The key stays bound in every state, for
     /// jumping to a tracked PR and linking one; only the advertisement is
-    /// narrowed to the moment the PR is the review.
+    /// narrowed to the moment the PR is the review, which needs a PR to jump to
+    /// or a branch to open one from — `plan_pr` refuses without a branch.
     pub fn selected_is_in_review(&self) -> bool {
-        self.selected_task()
-            .is_some_and(|t| t.state == TaskState::Review)
+        self.selected_task().is_some_and(|t| {
+            t.state == TaskState::Review && (t.branch.is_some() || t.pr_url.is_some())
+        })
     }
 
     /// Whether the selection still has a dispatch ahead of it, so the model
