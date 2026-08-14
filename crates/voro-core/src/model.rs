@@ -378,6 +378,20 @@ pub struct Project {
     pub archived: bool,
 }
 
+/// The projects a new task can be created in, in the order to offer them
+/// (DESIGN.md §9). Archived projects are dropped — `Store::create_task` refuses
+/// them (§5), so offering one is offering a choice that can only fail, and in
+/// the `$EDITOR` and planning flows it fails only after the operator has
+/// written the task out. The rest sort by weight descending, which is the one
+/// per-project priority Voro holds (§7), with name ascending inside a weight so
+/// the order is stable. Weight 0 is a snooze rather than a retirement, so a
+/// parked project stays offered and sorts last.
+pub fn projects_for_new_task(projects: &[Project]) -> Vec<&Project> {
+    let mut offered: Vec<&Project> = projects.iter().filter(|p| !p.archived).collect();
+    offered.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.name.cmp(&b.name)));
+    offered
+}
+
 /// A checkout a project's work runs in (DESIGN.md §3): the execution target
 /// dispatch, `pr`/`open`, worktree cleanup, and `import` resolve against. A
 /// project owns at least one, exactly one of which is its default.
@@ -676,6 +690,45 @@ mod tests {
     fn priority_display_honors_width() {
         assert_eq!(format!("{:>6}", Priority::P0), "    P0");
         assert_eq!(format!("{:>6}", Priority::P2), "    P2");
+    }
+
+    fn project(name: &str, weight: i64, archived: bool) -> Project {
+        Project {
+            id: 1,
+            name: name.into(),
+            weight,
+            viewer: None,
+            archived,
+        }
+    }
+
+    #[test]
+    fn new_task_projects_drop_the_archived_at_any_weight() {
+        let projects = [
+            project("live", 1, false),
+            project("retired-heavy", 5, true),
+            project("retired-parked", 0, true),
+        ];
+        let offered = projects_for_new_task(&projects);
+        assert_eq!(
+            offered.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["live"]
+        );
+    }
+
+    #[test]
+    fn new_task_projects_sort_by_weight_then_name() {
+        let projects = [
+            project("beta", 3, false),
+            project("parked", 0, false),
+            project("alpha", 3, false),
+            project("heaviest", 5, false),
+        ];
+        let offered = projects_for_new_task(&projects);
+        assert_eq!(
+            offered.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["heaviest", "alpha", "beta", "parked"]
+        );
     }
 
     fn task_in(state: TaskState, pr_url: Option<&str>, human: bool) -> Task {
