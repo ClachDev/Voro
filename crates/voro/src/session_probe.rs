@@ -21,7 +21,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use voro_core::{
-    AgentSessionEntry, CapReading, SessionLiveness, parse_sessions_json, read_cap, render_session,
+    AgentSessionEntry, CapReading, LocalNow, SessionLiveness, parse_sessions_json, read_cap,
+    render_session,
 };
 
 /// Run an agent's `sessions` command and parse its listing, in a given
@@ -109,24 +110,23 @@ pub fn read_session_cap(logs_cmd: &str, session_ref: &str) -> Option<CapReading>
     read_cap(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// The local wall clock as minutes past midnight, which is what a bare reset
-/// time in an agent's output is compared against ([`CapReading::reset_passed`]).
+/// The local wall clock and today's date, which is what a reset time in an
+/// agent's output is compared against ([`CapReading::reset_passed`]).
 ///
 /// Read from `date` because the agent renders that time in the operator's own
 /// timezone and the standard library offers no local time — a dependency for
 /// one clock reading would cost more than the subprocess, which runs only when
-/// a badge with a time is actually on screen. An unreadable clock answers
-/// `None`, and the badge simply shows the time without judging it.
-pub fn local_minutes() -> Option<u16> {
+/// a badge with a time is actually on screen. Both halves come from the one
+/// call, so a reading taken a second before midnight cannot pair yesterday's
+/// date with today's clock. An unreadable clock answers `None`, and the badge
+/// simply shows the time without judging it.
+pub fn local_now() -> Option<LocalNow> {
     let output = Command::new("date")
-        .arg("+%H:%M")
+        .arg("+%H:%M %m-%d")
         .stdin(Stdio::null())
         .output()
         .ok()?;
-    let stamp = String::from_utf8_lossy(&output.stdout);
-    let (hour, minute) = stamp.trim().split_once(':')?;
-    let (hour, minute): (u16, u16) = (hour.parse().ok()?, minute.parse().ok()?);
-    (hour < 24 && minute < 60).then_some(hour * 60 + minute)
+    LocalNow::parse(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// What one listing says about one session, for a caller that needs more than
@@ -274,11 +274,16 @@ mod tests {
     }
 
     /// The wall clock the reset badge is judged against is a real reading, in
-    /// range — the badge is wrong in both directions if this is not.
+    /// range — the badge is wrong in both directions if this is not. Today's
+    /// date rides along with it, which is what a dated reset is compared
+    /// against.
     #[test]
     fn the_local_clock_reads_within_the_day() {
-        let minutes = local_minutes().expect("a local clock");
-        assert!(minutes < 24 * 60, "{minutes}");
+        let now = local_now().expect("a local clock");
+        assert!(now.minutes < 24 * 60, "{now:?}");
+        let date = now.date.expect("today's date");
+        assert!((1..=12).contains(&date.month), "{date:?}");
+        assert!((1..=31).contains(&date.day), "{date:?}");
     }
 
     /// The rest reading the send path and the reconciler act on: a session the

@@ -729,8 +729,13 @@ fn strip_pr_span() -> Span<'static> {
 /// to do about it, so it says so. With no time parsed at all, the bare badge:
 /// the cap is the part worth knowing, and suppressing it for want of a
 /// timestamp would trade the whole signal for a detail.
-fn capped_span(reading: &CapReading, now_minutes: Option<u16>) -> Span<'static> {
-    let past = now_minutes.is_some_and(|now| reading.reset_passed(now));
+///
+/// A reset that named a date shows its clock and not the date, which is a row
+/// on a strip rather than a diary. The date is still what decides the middle
+/// shape from the first: without it a weekly reset claimed the window had
+/// reopened as soon as tonight's 9pm went by.
+fn capped_span(reading: &CapReading, now: Option<voro_core::LocalNow>) -> Span<'static> {
+    let past = now.is_some_and(|now| reading.reset_passed(now));
     let text = match (reading.reset_label(), past) {
         (_, true) => "  ⚠ capped · reset passed".to_string(),
         (Some(at), false) => format!("  ⚠ capped ↻{at}"),
@@ -1442,7 +1447,7 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                 }
             }
             if let Some(reading) = app.caps.get(&r.task_id) {
-                spans.push(capped_span(reading, app.now_minutes));
+                spans.push(capped_span(reading, app.now));
             }
             // A hand-off has nothing left to be live: the work is with someone
             // else, so a closed session is the expected shape, not an orphan.
@@ -3254,6 +3259,14 @@ mod tests {
         );
     }
 
+    /// The local clock the badge judges a reset against, on 14 August.
+    fn local_now(minutes: u16, day: u8) -> voro_core::LocalNow {
+        voro_core::LocalNow {
+            minutes,
+            date: Some(voro_core::CapDate { month: 8, day }),
+        }
+    }
+
     /// The badge a capped-but-alive dispatch earns (DESIGN.md §8), end to end
     /// through the real cockpit draw. The session is `running` throughout and
     /// stays that way: a cap is a display fact about a session that will resume
@@ -3325,9 +3338,10 @@ mod tests {
             task,
             CapReading {
                 reset_minutes: Some(21 * 60 + 50),
+                reset_date: None,
             },
         );
-        app.now_minutes = Some(20 * 60 + 50);
+        app.now = Some(local_now(20 * 60 + 50, 14));
         let line = row(&app);
         assert!(line.contains("⚠ capped"), "{line}");
         assert!(line.contains("↻21:50"), "{line}");
@@ -3340,9 +3354,25 @@ mod tests {
 
         // Past that time the window is open and the session is only waiting to
         // be nudged — a different situation, said differently.
-        app.now_minutes = Some(22 * 60);
+        app.now = Some(local_now(22 * 60, 14));
         let line = row(&app);
         assert!(line.contains("⚠ capped · reset passed"), "{line}");
+
+        // A weekly cap dated days out is not that: the badge keeps showing the
+        // clock and nothing else, but the day it falls on is what decides
+        // whether the window has reopened, so tonight's 21:00 going by no
+        // longer reads as the window opening.
+        app.caps.insert(
+            task,
+            CapReading {
+                reset_minutes: Some(21 * 60),
+                reset_date: Some(voro_core::CapDate { month: 8, day: 17 }),
+            },
+        );
+        let line = row(&app);
+        assert!(line.contains("⚠ capped ↻21:00"), "{line}");
+        assert!(!line.contains("reset passed"), "{line}");
+        assert!(!line.contains("Aug"), "{line}");
 
         // A cap the agent named no time for still badges: the time is the
         // optional half, and withholding the badge for want of it would trade

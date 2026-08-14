@@ -69,12 +69,130 @@ const MENTION_PREFIXES: [&str; 2] = ["/upgrade", "increase your"];
 /// goes on the badge.
 const WINDOW: usize = 200;
 
+/// How much text before a clock time is read for the date that clock belongs
+/// to. Enough for `september 17, ` and no more: anything further back is not
+/// this clock's date.
+const DATE_WINDOW: usize = 16;
+
+/// Month names, in order, matched by any prefix of at least three letters —
+/// `aug`, `sept` and `august` all name the same month, and no shorter word can
+/// name one by accident.
+const MONTHS: [&str; 12] = [
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+];
+
+/// The span of the synthetic year [`CapDate::ordinal`] lays dates out in.
+const SYNTHETIC_YEAR: i32 = 12 * 31;
+
 /// How much text before a matched signature is read for the qualifiers that
 /// take it back. Deliberately short: every qualifier attaches directly to the
 /// phrase it modifies, so a wider look-back would let an *earlier* warning
 /// speak for a later, genuine cap — which is the one reading that loses a real
 /// cap rather than merely missing an unworded one.
 const QUALIFIER_WINDOW: usize = 32;
+
+/// A month and day as an agent writes them, for the reset times that carry one.
+///
+/// Only the *side* one of these falls on relative to another is ever read,
+/// which is what lets the comparison do without a calendar dependency (see
+/// [`CapDate::days_from`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapDate {
+    pub month: u8,
+    pub day: u8,
+}
+
+impl CapDate {
+    /// A day number in a synthetic year of twelve 31-day months.
+    ///
+    /// Non-contiguous across short months and blind to leap years, both of
+    /// which are irrelevant here: nothing reads the magnitude of a difference
+    /// between two of these, only its sign, and no pair of dates a cap window
+    /// spans comes anywhere near the half-year where that could flip.
+    fn ordinal(self) -> i32 {
+        (i32::from(self.month) - 1) * 31 + i32::from(self.day)
+    }
+
+    /// Days from `other` to `self`, negative once `self` is behind it.
+    ///
+    /// Wrapped into (-186, 186] for the same reason a bare clock is read as its
+    /// nearest occurrence: the year is no more written down than the day is, so
+    /// a reset dated 2 January read on 30 December is three days out rather
+    /// than most of a year behind.
+    fn days_from(self, other: Self) -> i32 {
+        let delta = (self.ordinal() - other.ordinal()).rem_euclid(SYNTHETIC_YEAR);
+        if delta > SYNTHETIC_YEAR / 2 {
+            delta - SYNTHETIC_YEAR
+        } else {
+            delta
+        }
+    }
+
+    /// `Aug 17`, as the sweep names the day a hold runs to.
+    fn label(self) -> String {
+        let month = MONTHS[usize::from(self.month) - 1];
+        format!("{}{} {}", month[..1].to_uppercase(), &month[1..3], self.day)
+    }
+}
+
+/// The local wall clock, as much of it as could be read (DESIGN.md §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalNow {
+    /// Minutes past local midnight.
+    pub minutes: u16,
+    /// Today's date, where the reader supplied one. A clock on its own judges a
+    /// dated reset by its clock half alone — what Voro did before any reset
+    /// carried a date.
+    pub date: Option<CapDate>,
+}
+
+impl From<u16> for LocalNow {
+    fn from(minutes: u16) -> Self {
+        Self {
+            minutes,
+            date: None,
+        }
+    }
+}
+
+impl LocalNow {
+    /// Read `22:50 08-14`: the clock and the date, asked of `date` in one call
+    /// so both halves come from one reading (`session_probe::local_now`).
+    ///
+    /// A date half that will not parse costs the date and not the clock, which
+    /// leaves every judgement exactly where it was before dates were read.
+    pub fn parse(stamp: &str) -> Option<Self> {
+        let stamp = stamp.trim();
+        let (clock, date) = stamp.split_once(' ').unwrap_or((stamp, ""));
+        let (hour, minute) = clock.split_once(':')?;
+        let (hour, minute): (u16, u16) = (hour.parse().ok()?, minute.parse().ok()?);
+        if hour > 23 || minute > 59 {
+            return None;
+        }
+        Some(Self {
+            minutes: hour * 60 + minute,
+            date: parse_stamp_date(date),
+        })
+    }
+}
+
+/// `08-14` as a date, for the clock reading above.
+fn parse_stamp_date(stamp: &str) -> Option<CapDate> {
+    let (month, day) = stamp.split_once('-')?;
+    let (month, day): (u8, u8) = (month.parse().ok()?, day.parse().ok()?);
+    ((1..=12).contains(&month) && (1..=31).contains(&day)).then_some(CapDate { month, day })
+}
 
 /// What a session's output says about a usage cap. Held in memory only: it is a
 /// reading of the current output tail, retaken on the next pass, so it clears
@@ -86,6 +204,11 @@ pub struct CapReading {
     /// named a time. Best-effort by design: an unparsed time badges without
     /// one rather than suppressing the badge.
     pub reset_minutes: Option<u16>,
+    /// The day that reset falls on, where the message named one — a weekly cap
+    /// says `resets Aug 17, 9pm`. The badge shows the clock and never the date
+    /// (§8); this half is what stops the clock alone reading a reset three days
+    /// out as passed the moment tonight's 9pm goes by.
+    pub reset_date: Option<CapDate>,
 }
 
 impl CapReading {
@@ -95,24 +218,58 @@ impl CapReading {
             .map(|m| format!("{:02}:{:02}", m / 60, m % 60))
     }
 
-    /// Whether the named reset has already gone by, given the local wall clock
-    /// as minutes past midnight.
+    /// The reset as the sweep names the window a hold runs to: the same clock,
+    /// behind the date where the message carried one, so a five-hour hold reads
+    /// `until 21:50` and a weekly one `until Aug 17 21:00`.
+    pub fn reset_stamp(&self) -> Option<String> {
+        let clock = self.reset_label()?;
+        Some(match self.reset_date {
+            Some(date) => format!("{} {clock}", date.label()),
+            None => clock,
+        })
+    }
+
+    /// How long until the named reset, negative once the window has opened and
+    /// `None` when the message named no time at all.
     ///
-    /// The agent names a bare clock time — `9:50pm`, no date — so the occurrence
-    /// meant is the one *nearest* now, in either direction. Taking the next one
-    /// instead would be self-defeating: a minute after the window reopened,
-    /// "the next 9:50pm" is tomorrow's, and the badge would claim another 24
-    /// hours of waiting exactly when it should be saying the opposite. Half a
-    /// day is the widest a bare clock time can be read unambiguously, and a cap
-    /// window the operator is watching is never further off than that.
-    pub fn reset_passed(&self, now_minutes: u16) -> bool {
-        let Some(reset) = self.reset_minutes else {
-            return false;
+    /// Where the agent names a bare clock time — `9:50pm`, no date — the
+    /// occurrence meant is the one *nearest* now, in either direction. Taking
+    /// the next one instead would be self-defeating: a minute after the window
+    /// reopened, "the next 9:50pm" is tomorrow's, and the badge would claim
+    /// another 24 hours of waiting exactly when it should be saying the
+    /// opposite. Half a day is the widest a bare clock time can be read
+    /// unambiguously, and a five-hour window is never further off than that.
+    ///
+    /// A weekly window is, and it says so with a date. Where the reading and
+    /// the clock both carry one, the date decides and the clock only refines
+    /// it — which is what stops a reset three days out reading as passed the
+    /// moment tonight's 9pm goes by. A date is compared exactly as a clock is,
+    /// nearest occurrence in either direction ([`CapDate::days_from`]), and a
+    /// reset dated *today* falls back to the clock rule, there being nothing
+    /// for the date to decide.
+    ///
+    /// A signed distance rather than a bool because the sweep has to rank two
+    /// live readings against each other to find the binding one
+    /// ([`plan_sweep`]).
+    pub fn minutes_until(&self, now: impl Into<LocalNow>) -> Option<i64> {
+        let now = now.into();
+        let reset = i64::from(self.reset_minutes?);
+        let clock = reset - i64::from(now.minutes);
+        let days = match (self.reset_date, now.date) {
+            (Some(reset), Some(today)) => i64::from(reset.days_from(today)),
+            _ => 0,
         };
+        if days != 0 {
+            return Some(days * 1440 + clock);
+        }
         // Signed distance wrapped into (-720, 720]: negative is behind us.
-        let delta = (i32::from(reset) - i32::from(now_minutes)).rem_euclid(1440);
-        let delta = if delta > 720 { delta - 1440 } else { delta };
-        delta <= 0
+        let delta = clock.rem_euclid(1440);
+        Some(if delta > 720 { delta - 1440 } else { delta })
+    }
+
+    /// Whether the named reset has already gone by, given the local wall clock.
+    pub fn reset_passed(&self, now: impl Into<LocalNow>) -> bool {
+        self.minutes_until(now).is_some_and(|left| left <= 0)
     }
 }
 
@@ -129,8 +286,10 @@ pub fn read_cap(tail: &str) -> Option<CapReading> {
         return None;
     }
     let after = &text[at..ceil_boundary(&text, (at + signature.len() + WINDOW).min(text.len()))];
+    let (reset_minutes, reset_date) = parse_reset(after);
     Some(CapReading {
-        reset_minutes: parse_clock(after),
+        reset_minutes,
+        reset_date,
     })
 }
 
@@ -201,15 +360,49 @@ pub fn strip_ansi(raw: &str) -> String {
     out
 }
 
+/// When the window reopens, read out of the text just after a cap signature,
+/// which must already be lowercased: the clock, and the date that clock belongs
+/// to where the message named one.
+fn parse_reset(text: &str) -> (Option<u16>, Option<CapDate>) {
+    let Some((minutes, at)) = find_clock(text) else {
+        return (None, None);
+    };
+    (Some(minutes), parse_date_before(text, at))
+}
+
+/// The `aug 17` immediately before the clock time at `at`, where there is one.
+///
+/// Best-effort like every reading here: anything else in front of the clock —
+/// `resets `, `retrying in 5m (`, nothing at all — is no date, which leaves the
+/// reading where it was before dates were read.
+fn parse_date_before(text: &str, at: usize) -> Option<CapDate> {
+    let before =
+        text[floor_boundary(text, at.saturating_sub(DATE_WINDOW))..at].trim_end_matches([' ', ',']);
+    let day_at = before.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let day: u8 = before[day_at..].parse().ok()?;
+    let word = before[..day_at].trim_end();
+    let month_at = word
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .len();
+    let word = &word[month_at..];
+    let month = MONTHS
+        .iter()
+        .position(|m| word.len() >= 3 && m.starts_with(word))?;
+    (1..=31).contains(&day).then_some(CapDate {
+        month: month as u8 + 1,
+        day,
+    })
+}
+
 /// Minutes past midnight for the first `9pm` / `9:50pm` clock time in `text`,
-/// which must already be lowercased.
+/// which must already be lowercased, and where in `text` that clock begins.
 ///
 /// This is the shape Claude Code renders a reset time in when it is less than a
-/// day out, which a cap window the operator is looking at always is. A longer
-/// horizon is spelled with a date (`Aug 14, 9pm`) and the clock half still
-/// reads, which is the right answer for a badge that shows a time and not a
-/// date.
-fn parse_clock(text: &str) -> Option<u16> {
+/// day out, which a five-hour window always is. A longer horizon is spelled
+/// with a date (`Aug 17, 9pm`); the clock half still reads here, which is all
+/// the badge shows, and the position handed back is what lets the date half be
+/// read beside it.
+fn find_clock(text: &str) -> Option<(u16, usize)> {
     let bytes = text.as_bytes();
     for i in 0..bytes.len().saturating_sub(1) {
         let meridiem = match (bytes[i], bytes[i + 1]) {
@@ -232,7 +425,7 @@ fn parse_clock(text: &str) -> Option<u16> {
         let Some(minutes) = clock_minutes(&text[j..end], meridiem) else {
             continue;
         };
-        return Some(minutes);
+        return Some((minutes, j));
     }
     None
 }
@@ -268,6 +461,96 @@ fn ceil_boundary(text: &str, mut at: usize) -> usize {
         at += 1;
     }
     at
+}
+
+/// One agent's badged sessions, held back from a sweep, and what holds them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapHold {
+    /// The agent entry those sessions were dispatched with — Voro's proxy for
+    /// the account whose window they are all waiting on.
+    pub agent: String,
+    /// How many of that agent's badged sessions are held.
+    pub sessions: usize,
+    /// The window they are held until, as [`CapReading::reset_stamp`] names it.
+    /// `None` where no reading in the group named a time.
+    pub until: Option<String>,
+}
+
+/// What a sweep of the badged sessions should do (DESIGN.md §8).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepPlan {
+    /// The tasks to nudge, in ascending id order — a sweep visits the strip in
+    /// a stable order rather than the caller's.
+    pub ready: Vec<i64>,
+    /// The agents nothing is nudged on, in agent-name order.
+    pub held: Vec<CapHold>,
+}
+
+/// Decide which capped sessions the sweep may nudge, given every badged
+/// reading as `(task, agent, reading)` and the local clock (DESIGN.md §8).
+///
+/// A usage cap belongs to the *account* a session was launched under and not to
+/// the session, so the verdict is taken once per account rather than once per
+/// session: every session of a capped account reports the same window, and
+/// reading N of those texts to rebuild one boolean only invites them to
+/// disagree. The way they disagree is staleness — a session capped at 4pm still
+/// displaying `resets 9pm` at midnight beside one reporting a live cap — and a
+/// per-session verdict reads that fossil as ready, quite correctly, and nudges
+/// a session the account will re-cap on its next breath.
+///
+/// Voro's proxy for the account is the agent entry the session was dispatched
+/// with, because that is what it knows. The proxy can be wrong in both
+/// directions, and the direction it errs in is chosen: two agent entries
+/// sharing one account are not pooled, which is no worse than judging each
+/// session alone; one entry run under two accounts holds a session that was in
+/// fact free, which costs a delay until the next press rather than a stopped
+/// session and a turn that re-caps at once. Since #428 a nudge stops its target
+/// first, so the conservative direction is the affordable one.
+///
+/// Within a group, one live reading holds every session — including the ones
+/// whose message named no time, whose account has just told Voro, through a
+/// sibling, that its window is shut. A group with no live reading is ready
+/// entire, untimed readings included: nothing that agent said contradicts the
+/// operator's keypress. The hold is labelled with the *furthest-out* live
+/// reset, which is the binding one — how a weekly cap speaks over a five-hour
+/// message on a sibling session.
+pub fn plan_sweep(readings: &[(i64, &str, CapReading)], now: Option<LocalNow>) -> SweepPlan {
+    let mut groups: std::collections::BTreeMap<&str, Vec<(i64, CapReading)>> =
+        std::collections::BTreeMap::new();
+    for (task_id, agent, reading) in readings {
+        groups.entry(agent).or_default().push((*task_id, *reading));
+    }
+
+    let mut plan = SweepPlan::default();
+    for (agent, mut group) in groups {
+        group.sort_unstable_by_key(|(task_id, _)| *task_id);
+        // With no clock nothing can be judged past its reset, so every timed
+        // reading is live and holds its group.
+        let live = |reading: &CapReading| match now {
+            Some(now) => reading.minutes_until(now).is_some_and(|left| left > 0),
+            None => reading.reset_minutes.is_some(),
+        };
+        if !group.iter().any(|(_, reading)| live(reading)) {
+            plan.ready.extend(group.iter().map(|(task_id, _)| *task_id));
+            continue;
+        }
+        // Unjudgeable, the hold takes the lowest task id's window rather than
+        // whichever the map happened to yield.
+        let binding = match now {
+            Some(now) => group
+                .iter()
+                .filter(|(_, reading)| live(reading))
+                .max_by_key(|(_, reading)| reading.minutes_until(now).unwrap_or(0)),
+            None => group.first(),
+        };
+        plan.held.push(CapHold {
+            agent: agent.to_string(),
+            sessions: group.len(),
+            until: binding.and_then(|(_, reading)| reading.reset_stamp()),
+        });
+    }
+    plan.ready.sort_unstable();
+    plan
 }
 
 #[cfg(test)]
@@ -442,6 +725,7 @@ mod tests {
     fn a_reset_is_passed_by_nearest_occurrence() {
         let at = |m| CapReading {
             reset_minutes: Some(m),
+            reset_date: None,
         };
         // 21:50 reset, read at 20:50 — an hour to go.
         assert!(!at(1310).reset_passed(1250));
@@ -482,6 +766,255 @@ mod tests {
         assert_eq!(strip_ansi("a\nb\tc"), "a b c");
         assert_eq!(strip_ansi("\u{1b}]0;a title\u{7}kept"), "kept");
         assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    /// A reset far enough out to be spelled with a date is read in both halves:
+    /// the clock the badge shows, and the day that tells the sweep the window
+    /// is still days away.
+    #[test]
+    fn a_dated_reset_reads_both_halves() {
+        let reading = read_cap("Opus limit reached · resets Aug 14, 9pm").expect("a cap");
+        assert_eq!(reading.reset_minutes, Some(21 * 60));
+        assert_eq!(reading.reset_date, Some(CapDate { month: 8, day: 14 }));
+        assert_eq!(reading.reset_label().as_deref(), Some("21:00"));
+        assert_eq!(reading.reset_stamp().as_deref(), Some("Aug 14 21:00"));
+
+        // The other spellings of the same day, and a five-hour reset with no
+        // date in front of it.
+        for text in ["resets august 14, 9pm", "resets aug 14 9pm"] {
+            let reading = read_cap(&format!("Weekly limit reached · {text}")).expect("a cap");
+            assert_eq!(
+                reading.reset_date,
+                Some(CapDate { month: 8, day: 14 }),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            read_cap("Session limit reached · Retrying in 5m (9:50pm)")
+                .expect("a cap")
+                .reset_date,
+            None
+        );
+    }
+
+    /// The bug a date exists to fix: a weekly reset three days out was read as
+    /// passed the moment tonight's 9pm went by, and the sweep would have
+    /// released the session to spend a turn that re-caps at once.
+    #[test]
+    fn a_weekly_reset_is_not_passed_days_early() {
+        let reading = read_cap("Weekly limit reached · resets Aug 17, 9pm").expect("a cap");
+        for hour in 0..24u16 {
+            let now = LocalNow {
+                minutes: hour * 60,
+                date: Some(CapDate { month: 8, day: 14 }),
+            };
+            assert!(!reading.reset_passed(now), "{hour}:00");
+        }
+    }
+
+    /// And the other direction: a date behind today has gone by whatever the
+    /// clock says, where the bare clock would have called half of those hours
+    /// a wait.
+    #[test]
+    fn a_reset_dated_behind_today_has_passed() {
+        let reading = read_cap("Weekly limit reached · resets Aug 12, 9pm").expect("a cap");
+        for hour in 0..24u16 {
+            let now = LocalNow {
+                minutes: hour * 60,
+                date: Some(CapDate { month: 8, day: 14 }),
+            };
+            assert!(reading.reset_passed(now), "{hour}:00");
+        }
+    }
+
+    /// Dates are compared by nearest occurrence exactly as clocks are, the year
+    /// being no more written down than the day: a reset in early January read
+    /// on 30 December is days out, not most of a year behind.
+    #[test]
+    fn dates_wrap_the_year_boundary() {
+        let ahead = read_cap("Weekly limit reached · resets Jan 2, 9pm").expect("a cap");
+        let behind = read_cap("Weekly limit reached · resets Dec 30, 9pm").expect("a cap");
+        let dec30 = LocalNow {
+            minutes: 12 * 60,
+            date: Some(CapDate { month: 12, day: 30 }),
+        };
+        let jan2 = LocalNow {
+            minutes: 12 * 60,
+            date: Some(CapDate { month: 1, day: 2 }),
+        };
+        assert!(!ahead.reset_passed(dec30));
+        assert!(behind.reset_passed(jan2));
+    }
+
+    /// A date invents no clock, and a date in text that never said a cap
+    /// invents no reading at all.
+    #[test]
+    fn a_date_alone_is_not_a_reset_time() {
+        let reading = read_cap("Weekly limit reached · resets Aug 17").expect("a cap");
+        assert_eq!(reading.reset_minutes, None);
+        assert_eq!(reading.reset_date, None);
+        assert_eq!(read_cap("your slot resets Aug 17, 9pm"), None);
+    }
+
+    /// A reading with no clock to read `now` against is judged as it always
+    /// was, by the clock half alone — which is the whole of what an unreadable
+    /// date leaves behind.
+    #[test]
+    fn an_undated_clock_judges_a_dated_reset_by_its_clock() {
+        let reading = read_cap("Weekly limit reached · resets Aug 17, 9pm").expect("a cap");
+        assert!(!reading.reset_passed(20 * 60));
+        assert!(reading.reset_passed(22 * 60));
+    }
+
+    /// A cap reading with a reset `minutes` minutes past midnight and no date.
+    fn timed(minutes: u16) -> CapReading {
+        CapReading {
+            reset_minutes: Some(minutes),
+            reset_date: None,
+        }
+    }
+
+    /// Midday on 14 August, the clock the plan tests judge against.
+    fn midday() -> Option<LocalNow> {
+        Some(LocalNow {
+            minutes: 12 * 60,
+            date: Some(CapDate { month: 8, day: 14 }),
+        })
+    }
+
+    /// The account fact, which is the point of the whole rollup: one agent's
+    /// two sessions, one reporting a live window and one still showing the
+    /// window it was capped in hours ago. Judged apart, the fossil reads ready
+    /// and is nudged into an account that is still shut; judged together, the
+    /// live sibling holds them both and the report names the real window.
+    #[test]
+    fn a_live_sibling_holds_a_fossil_of_the_same_agent() {
+        let plan = plan_sweep(
+            &[(1, "claude", timed(9 * 60)), (2, "claude", timed(13 * 60))],
+            midday(),
+        );
+        assert!(plan.ready.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.held,
+            vec![CapHold {
+                agent: "claude".into(),
+                sessions: 2,
+                until: Some("13:00".into()),
+            }]
+        );
+    }
+
+    /// The same two sessions under different agent names are different
+    /// accounts, and nothing pools them: the one whose window has reopened is
+    /// swept, the other held.
+    #[test]
+    fn different_agents_are_judged_apart() {
+        let plan = plan_sweep(
+            &[(1, "claude", timed(9 * 60)), (2, "codex", timed(13 * 60))],
+            midday(),
+        );
+        assert_eq!(plan.ready, vec![1]);
+        assert_eq!(
+            plan.held,
+            vec![CapHold {
+                agent: "codex".into(),
+                sessions: 1,
+                until: Some("13:00".into()),
+            }]
+        );
+    }
+
+    /// A cap whose message named no time is the operator's call, not the
+    /// clock's — unless the account itself contradicts them, which is what a
+    /// live sibling of the same agent does and a live session of another agent
+    /// does not.
+    #[test]
+    fn an_untimed_reading_is_swept_unless_its_own_agent_is_held() {
+        let alone = plan_sweep(&[(1, "claude", CapReading::default())], midday());
+        assert_eq!(alone.ready, vec![1]);
+        assert!(alone.held.is_empty());
+
+        let sibling = plan_sweep(
+            &[
+                (1, "claude", CapReading::default()),
+                (2, "claude", timed(13 * 60)),
+            ],
+            midday(),
+        );
+        assert!(sibling.ready.is_empty(), "{sibling:?}");
+        assert_eq!(sibling.held[0].sessions, 2);
+
+        let stranger = plan_sweep(
+            &[
+                (1, "claude", CapReading::default()),
+                (2, "codex", timed(13 * 60)),
+            ],
+            midday(),
+        );
+        assert_eq!(stranger.ready, vec![1]);
+        assert_eq!(stranger.held[0].agent, "codex");
+    }
+
+    /// The binding window is the furthest-out live one — how a weekly cap on
+    /// one session speaks over a five-hour message on its sibling.
+    #[test]
+    fn a_hold_is_labelled_with_the_furthest_out_reset() {
+        let weekly = CapReading {
+            reset_minutes: Some(21 * 60),
+            reset_date: Some(CapDate { month: 8, day: 17 }),
+        };
+        let plan = plan_sweep(
+            &[(1, "claude", timed(13 * 60)), (2, "claude", weekly)],
+            midday(),
+        );
+        assert_eq!(plan.held[0].until.as_deref(), Some("Aug 17 21:00"));
+    }
+
+    /// With no clock to read, nothing can be judged past its reset: every timed
+    /// reading holds, and a group that named no times at all is still the
+    /// operator's call.
+    #[test]
+    fn an_unknown_clock_judges_nothing_passed() {
+        let plan = plan_sweep(
+            &[
+                (2, "claude", timed(13 * 60)),
+                (1, "claude", timed(9 * 60)),
+                (3, "codex", CapReading::default()),
+            ],
+            None,
+        );
+        assert_eq!(plan.ready, vec![3]);
+        assert_eq!(
+            plan.held,
+            vec![CapHold {
+                agent: "claude".into(),
+                sessions: 2,
+                // The lowest task id's window, rather than whichever the map
+                // happened to yield.
+                until: Some("09:00".into()),
+            }]
+        );
+    }
+
+    /// A sweep visits the strip in a stable order rather than the caller's.
+    #[test]
+    fn ready_tasks_come_back_in_ascending_order() {
+        let plan = plan_sweep(
+            &[
+                (9, "codex", timed(9 * 60)),
+                (2, "claude", timed(9 * 60)),
+                (5, "claude", CapReading::default()),
+            ],
+            midday(),
+        );
+        assert_eq!(plan.ready, vec![2, 5, 9]);
+        assert!(plan.held.is_empty());
+    }
+
+    /// Nothing badged is no plan at all.
+    #[test]
+    fn nothing_badged_plans_nothing() {
+        assert_eq!(plan_sweep(&[], midday()), SweepPlan::default());
     }
 
     /// A signature landing at the very edge of the text windows the qualifier

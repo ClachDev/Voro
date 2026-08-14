@@ -397,6 +397,20 @@ fn state_jump_verb(state: TaskState) -> Option<JumpVerb> {
 /// that was only ever interrupted.
 const NUDGE: &str = "continue";
 
+/// How the sweep names one agent's hold: `claude capped until Aug 17 21:00`,
+/// or `claude capped` where no reading in the group named a window at all.
+fn hold_clause(hold: &voro_core::CapHold) -> String {
+    match &hold.until {
+        Some(until) => format!("{} capped until {until}", hold.agent),
+        None => format!("{} capped", hold.agent),
+    }
+}
+
+/// How many sessions that hold covers, as the status line says it.
+fn held_sessions(count: usize) -> String {
+    format!("{count} session{}", if count == 1 { "" } else { "s" })
+}
+
 fn state_accepts_message(state: TaskState) -> bool {
     matches!(
         state,
@@ -550,12 +564,14 @@ pub struct App {
     /// The background threads taking those readings, drained by
     /// `poll_cap_probes`.
     cap_probe: crate::probe::CapProbe,
-    /// The local wall clock as minutes past midnight, for deciding whether a
-    /// badged reset time has gone by. Refreshed on a slow cadence rather than
-    /// per frame: reading it costs a subprocess, and a badge that flips from
-    /// "waiting" to "window open" within half a minute is timely enough.
-    pub now_minutes: Option<u16>,
-    /// When `now_minutes` was last read.
+    /// The local wall clock and date, for deciding whether a badged reset has
+    /// gone by — the date because a weekly cap names one and a clock alone
+    /// reads such a reset as passed days early. Refreshed on a slow cadence
+    /// rather than per frame: reading it costs a subprocess, and a badge that
+    /// flips from "waiting" to "window open" within half a minute is timely
+    /// enough.
+    pub now: Option<voro_core::LocalNow>,
+    /// When `now` was last read.
     clock_read_at: Option<std::time::Instant>,
 
     pub cockpit_rows: Vec<CockpitRow>,
@@ -655,7 +671,7 @@ impl App {
             cap_targets: Vec::new(),
             caps: std::collections::HashMap::new(),
             cap_probe: crate::probe::CapProbe::default(),
-            now_minutes: None,
+            now: None,
             clock_read_at: None,
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
@@ -1138,7 +1154,7 @@ impl App {
             return;
         }
         self.clock_read_at = Some(now);
-        self.now_minutes = crate::session_probe::local_minutes();
+        self.now = crate::session_probe::local_now();
     }
 
     /// Record every revision a background capture has finished (DESIGN.md §8).
@@ -2192,7 +2208,8 @@ impl App {
         };
     }
 
-    /// Nudge every cap-stuck session whose window has reopened (DESIGN.md §8).
+    /// Nudge every cap-stuck session whose account's window has reopened
+    /// (DESIGN.md §8).
     ///
     /// A usage cap ends a session's turn and leaves it sitting there: nothing
     /// retries, so the work waits for a human however long ago the window
@@ -2203,10 +2220,10 @@ impl App {
     /// A keypress starts it, which is where this begins rather than where it is
     /// meant to end: firing automatically once the window reopens is wanted, and
     /// nothing here is shaped to prevent it. Automation needs a trigger, not a
-    /// channel — the same `reset_passed` test, read on the tick instead of on
-    /// the key — so it layers on top of this rather than replacing it. Manual
-    /// first only because a badge that false-positives costs one wasted keypress
-    /// today and an unwatched agent once it is automatic.
+    /// channel — the same [`voro_core::plan_sweep`], read on the tick instead
+    /// of on the key — so it layers on top of this rather than replacing it.
+    /// Manual first only because a badge that false-positives costs one wasted
+    /// keypress today and an unwatched agent once it is automatic.
     ///
     /// Both guards the quick-message key answers to are stood down here, and the
     /// cap reading is what earns that: [`state_accepts_message`] refuses a
@@ -2215,36 +2232,39 @@ impl App {
     /// one that is up, `running`, and *not* mid-turn. Nothing else in the cockpit
     /// can tell those apart, so nothing else may skip the guards.
     fn nudge_capped(&mut self) {
-        let now = self.now_minutes;
-        // A cap whose time never parsed is the operator's call, not the clock's:
-        // they pressed the key, and a nudge sent early is refused by the agent
-        // rather than doing harm. This is the one rule an automatic sweep would
-        // have to invert — with no keypress behind it, an untimed cap has
-        // nothing saying the window has opened.
-        let (mut ready, mut waiting): (Vec<i64>, Vec<i64>) = (Vec::new(), Vec::new());
-        for (id, reading) in &self.caps {
-            let due =
-                reading.reset_minutes.is_none() || now.is_some_and(|now| reading.reset_passed(now));
-            if due { &mut ready } else { &mut waiting }.push(*id);
-        }
-        // A sweep visits the strip in a stable order rather than the map's.
-        ready.sort_unstable();
-        if ready.is_empty() {
-            self.status = Some(if waiting.is_empty() {
+        // Who is ready is a question about the *account*, not the session, and
+        // the agent entry a session was dispatched with is Voro's proxy for it
+        // (DESIGN.md §8) — so the readings go to `plan_sweep` paired with their
+        // agent and the verdict comes back per group. A session that has since
+        // left `last_sessions` names no agent and is skipped rather than
+        // guessed at.
+        let plan = {
+            let readings: Vec<(i64, &str, voro_core::CapReading)> = self
+                .caps
+                .iter()
+                .filter_map(|(task_id, reading)| {
+                    let agent = self.last_sessions.get(task_id)?.agent.as_str();
+                    Some((*task_id, agent, *reading))
+                })
+                .collect();
+            voro_core::plan_sweep(&readings, self.now)
+        };
+        if plan.ready.is_empty() {
+            self.status = Some(if plan.held.is_empty() {
                 "no session is capped".into()
             } else {
-                format!(
-                    "{} capped session{} — none has reached its reset yet",
-                    waiting.len(),
-                    if waiting.len() == 1 { "" } else { "s" }
-                )
+                plan.held
+                    .iter()
+                    .map(|hold| format!("{} — {}", hold_clause(hold), held_sessions(hold.sessions)))
+                    .collect::<Vec<_>>()
+                    .join("; ")
             });
             return;
         }
 
         let mut sent = 0usize;
         let mut refused: Vec<String> = Vec::new();
-        for task_id in ready {
+        for task_id in plan.ready {
             match self.nudge_one(task_id) {
                 Ok(()) => {
                     sent += 1;
@@ -2262,8 +2282,15 @@ impl App {
             "nudged {sent} capped session{}",
             if sent == 1 { "" } else { "s" }
         );
-        if !waiting.is_empty() {
-            note.push_str(&format!(" — {} still before its reset", waiting.len()));
+        if !plan.held.is_empty() {
+            note.push_str(&format!(
+                " — {}",
+                plan.held
+                    .iter()
+                    .map(|hold| format!("{} ({})", hold_clause(hold), held_sessions(hold.sessions)))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
         }
         if !refused.is_empty() {
             note.push_str(&format!(" — refused {}", refused.join("; ")));
@@ -5893,6 +5920,14 @@ mod tests {
         (app, task.id, project_path)
     }
 
+    /// The local clock the sweep judges a reset against, on 14 August.
+    fn local_now(minutes: u16) -> voro_core::LocalNow {
+        voro_core::LocalNow {
+            minutes,
+            date: Some(voro_core::CapDate { month: 8, day: 14 }),
+        }
+    }
+
     /// Drive the probe until its reading lands, which is a background thread
     /// running a subprocess and so not instant.
     fn settle_cap(app: &mut App, task_id: i64, want: bool) {
@@ -5996,7 +6031,7 @@ mod tests {
             cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
         settle_cap(&mut app, task_id, true);
         // An hour past the 21:50 the agent named.
-        app.now_minutes = Some(22 * 60 + 50);
+        app.now = Some(local_now(22 * 60 + 50));
 
         key(&mut app, KeyCode::Char('u'));
 
@@ -6038,7 +6073,7 @@ mod tests {
         let (mut app, task_id, project_path) =
             cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
         settle_cap(&mut app, task_id, true);
-        app.now_minutes = Some(22 * 60 + 50);
+        app.now = Some(local_now(22 * 60 + 50));
 
         key(&mut app, KeyCode::Char('u'));
 
@@ -6068,7 +6103,7 @@ mod tests {
         let (mut app, task_id, project_path) =
             cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
         settle_cap(&mut app, task_id, true);
-        app.now_minutes = Some(22 * 60 + 50);
+        app.now = Some(local_now(22 * 60 + 50));
         set_verb(
             &app.dispatch_ctx.agents_path,
             "stop",
@@ -6099,7 +6134,7 @@ mod tests {
             cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
         settle_cap(&mut app, task_id, true);
         // An hour short of the 21:50 the agent named.
-        app.now_minutes = Some(20 * 60 + 50);
+        app.now = Some(local_now(20 * 60 + 50));
 
         key(&mut app, KeyCode::Char('u'));
 
@@ -6108,12 +6143,10 @@ mod tests {
             app.caps.contains_key(&task_id),
             "the badge stands until the window opens"
         );
-        assert!(
-            app.status
-                .as_deref()
-                .is_some_and(|s| s.contains("none has reached its reset")),
-            "{:?}",
-            app.status
+        assert_eq!(
+            app.status.as_deref(),
+            Some("stub capped until 21:50 — 1 session"),
+            "the hold names the agent whose window everything waits on"
         );
 
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
@@ -6133,6 +6166,86 @@ mod tests {
 
         assert_eq!(delivered(&project_path), None);
         assert_eq!(app.status.as_deref(), Some("no session is capped"));
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// A weekly cap names a date, and the date is what the sweep judges: three
+    /// days out is three days out, however many times tonight's 9pm goes by.
+    /// Read as a bare clock this was swept the same evening, which stopped the
+    /// session to spend a turn the account re-capped at once.
+    #[test]
+    fn u_leaves_a_weekly_cap_dated_days_out() {
+        let (mut app, task_id, project_path) =
+            cap_env(true, "Weekly limit reached - resets Aug 17, 9pm");
+        settle_cap(&mut app, task_id, true);
+        // Late on the 14th: tonight's 21:00 has gone by, the 17th has not.
+        app.now = Some(local_now(22 * 60 + 50));
+
+        key(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(delivered(&project_path), None, "nothing was sent");
+        assert!(app.caps.contains_key(&task_id), "the badge stands");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("stub capped until Aug 17 21:00 — 1 session"),
+            "a hold names the date it runs to where the agent gave one"
+        );
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// The account fact the sweep now reads (DESIGN.md §8): two sessions of one
+    /// agent, one reporting a live window and one still displaying the window
+    /// it was capped in hours ago. The fossil's own reading says ready, quite
+    /// correctly — its window did reopen — but the account's has not, so
+    /// nudging it would stop a session for a turn that re-caps at once. One
+    /// hold, named for the live window, and nothing sent.
+    #[test]
+    fn u_holds_a_stale_reading_beside_a_live_sibling() {
+        let (mut app, task_id, project_path) =
+            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+        settle_cap(&mut app, task_id, true);
+
+        let sibling = app
+            .store
+            .create_task(NewTask {
+                project_id: app.store.task(task_id).unwrap().project_id,
+                repo_id: None,
+                title: "the stale one".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap()
+            .id;
+        app.store
+            .record_dispatch(sibling, "stub", None, LivenessSource::Listing, None)
+            .unwrap();
+        app.refresh().unwrap();
+        // Capped at four, still saying so at nine — the one way two sessions of
+        // one account can disagree.
+        app.caps.insert(
+            sibling,
+            voro_core::CapReading {
+                reset_minutes: Some(16 * 60),
+                reset_date: None,
+            },
+        );
+        app.now = Some(local_now(20 * 60 + 50));
+
+        key(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(delivered(&project_path), None, "nothing was sent");
+        assert!(app.caps.contains_key(&sibling), "both badges stand");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("stub capped until 21:50 — 2 sessions"),
+            "the live window speaks for the account, and both sessions are held"
+        );
 
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }

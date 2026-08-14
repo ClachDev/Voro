@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/ClachDev/Voro/compare/v0.1.0...HEAD) - ReleaseDate
 
+### Fixed
+
+- **A weekly cap is no longer read as reopening tonight.** An agent writes a
+  reset more than a day out with a date — `resets Aug 17, 9pm` — and only the
+  clock half was read, so the badge claimed the window had reopened the moment
+  tonight's 9pm went by, and `u` would release the session for a turn that
+  re-capped at once. The date is now read beside the clock and is what decides
+  whether the window has opened. The badge still shows the time and not the
+  date; a hold in the sweep's report names both where the agent gave both.
+
+- **The sweep asks whether the *account* is capped, not each session.** A usage
+  cap belongs to the account a session was launched under, so every session on
+  it reports the same window — and the only way two of them can differ is that
+  one is stale, still displaying the window it was capped in hours ago. `u` used
+  to read that fossil as ready and nudge a session the account would refuse
+  again on its next breath. Readiness is now judged once per agent entry, which
+  is Voro's proxy for the account: one live reading holds every badged session
+  of that agent, including those whose message named no time, and a group with
+  no live reading is swept entire as before. The report names the holds rather
+  than counting them — `claude capped until Aug 17 21:00 — 3 sessions` — so it
+  says what is being waited on instead of how many sessions said so.
+
 ### Added
 
 - **One key gets every capped session working again.** A usage cap ends a
