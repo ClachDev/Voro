@@ -930,7 +930,7 @@ fn review_next_span(app: &App, task: &voro_core::Task) -> Option<Span<'static>> 
     if task.state != voro_core::TaskState::Review {
         return None;
     }
-    let verb = app.next_action(task)?;
+    let verb = app.advertised_action(task)?;
     Some(Span::styled(
         format!("  next: {verb}"),
         Style::new().fg(Color::Blue),
@@ -1328,20 +1328,25 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         {
             lines.push(Line::from(conflict_span()));
         }
-    } else if app.incomplete_report.contains(&task.id) {
-        // A review task with a branch and no summary: `pr` would fail, so say
-        // what is needed rather than the optimistic "next: pr".
-        lines.push(Line::from(incomplete_report_span()));
-    } else if let Some(verb) = app.next_action(task) {
-        let hint = match verb {
-            voro_core::NextAction::Pr => "  (g opens one from the summary)",
-            voro_core::NextAction::Open => "  (o shows the diff in a viewer)",
-            _ => "",
-        };
-        lines.push(Line::from(Span::styled(
-            format!("next: {verb}{hint}"),
-            Style::new().fg(Color::Blue),
-        )));
+    } else {
+        // A review task with a branch and no summary withholds `pr`, which
+        // would fail, and says what is needed instead; a checkout that
+        // advertises `open` keeps its recommendation and wears the marker
+        // under it, since reading the diff needs no summary (DESIGN.md §8).
+        if let Some(verb) = app.advertised_action(task) {
+            let hint = match verb {
+                voro_core::NextAction::Pr => "  (g opens one from the summary)",
+                voro_core::NextAction::Open => "  (o shows the diff in a viewer)",
+                _ => "",
+            };
+            lines.push(Line::from(Span::styled(
+                format!("next: {verb}{hint}"),
+                Style::new().fg(Color::Blue),
+            )));
+        }
+        if app.incomplete_report.contains(&task.id) {
+            lines.push(Line::from(incomplete_report_span()));
+        }
     }
     if let Some(branch) = &task.branch {
         lines.push(Line::from(branch_span(branch)));
@@ -1544,10 +1549,11 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             if app.refine_failed.contains(&r.task.id) {
                 spans.push(refine_failed_span());
             }
+            if let Some(span) = review_next_span(app, &r.task) {
+                spans.push(span);
+            }
             if app.incomplete_report.contains(&r.task.id) {
                 spans.push(incomplete_report_span());
-            } else if let Some(span) = review_next_span(app, &r.task) {
-                spans.push(span);
             }
             spans.extend(blocker_spans(r));
             ListItem::new(Line::from(spans))
@@ -2807,6 +2813,84 @@ mod tests {
         assert!(out.contains("next: open"), "{out}");
         assert!(out.contains("(o shows the diff in a viewer)"), "{out}");
         assert!(!out.contains("next: pr"), "{out}");
+
+        std::fs::remove_dir_all(&project).ok();
+    }
+
+    /// The half-written report withholds `pr` and nothing else (DESIGN.md §8).
+    /// In a checkout with no remote the card advertises `open`, which reads a
+    /// diff and needs no summary, so the recommendation stands and the marker
+    /// sits beside it — the operator sees both what is missing and what they
+    /// can do about the work today.
+    #[test]
+    fn an_incomplete_report_leaves_the_local_review_verb_standing() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::process::{Command, Stdio};
+        use voro_core::{Action, NewTask, Store};
+
+        let project = std::env::temp_dir().join(format!(
+            "voro-ui-half-report-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["init", "-q"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store
+            .create_project("voro", project.to_str().unwrap())
+            .unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "the unreported work".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap()
+            .id;
+        store.set_branch(task, Some("feat/thing")).unwrap();
+        store
+            .record_dispatch(task, "claude", None, LivenessSource::Listing, None)
+            .unwrap();
+        // A branch and no summary: the half-written report.
+        store.apply(task, Action::Complete(None)).unwrap();
+
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let app = App::new(store, ctx).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal
+            .draw(|f| draw_cockpit(f, &app, &mut HitMap::default()))
+            .unwrap();
+        let out: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(out.contains("next: open"), "{out}");
+        assert!(out.contains("[incomplete report]"), "{out}");
 
         std::fs::remove_dir_all(&project).ok();
     }

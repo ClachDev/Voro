@@ -1669,9 +1669,6 @@ impl App {
         Ok(self.store.repo_for_task(&task)?.path)
     }
 
-    /// The repo a task names, as (name, path), or `None` when it runs in its
-    /// project's default — the detail pane renders the line only when it says
-    /// something the project row does not.
     /// The verb a task's row advertises (DESIGN.md §3), degraded to the local
     /// review path where the checkout has no remote to open a pull request on
     /// (§8). Every rendered `next:` resolves through here so the advertisement
@@ -1684,6 +1681,22 @@ impl App {
         })
     }
 
+    /// The same verb, withheld where the `[incomplete report]` marker stands in
+    /// its place (DESIGN.md §8). Only `pr` is withheld: a pull request is built
+    /// from the summary, so a half-written report cannot become one and the
+    /// marker is the truer line to show. Every other verb — `open` above all,
+    /// which is what a checkout with no remote advertises — the missing summary
+    /// does not block, so the recommendation stands and the marker sits beside
+    /// it rather than in place of it.
+    pub fn advertised_action(&self, task: &voro_core::Task) -> Option<voro_core::NextAction> {
+        let verb = self.next_action(task)?;
+        (verb != voro_core::NextAction::Pr || !self.incomplete_report.contains(&task.id))
+            .then_some(verb)
+    }
+
+    /// The repo a task names, as (name, path), or `None` when it runs in its
+    /// project's default — the detail pane renders the line only when it says
+    /// something the project row does not.
     pub fn task_repo(&self, task: &voro_core::Task) -> Option<(String, String)> {
         task.repo_id?;
         let repo = self.store.repo_for_task(task).ok()?;
