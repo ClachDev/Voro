@@ -1752,19 +1752,34 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     }
 
     // The pane takes the height its rows need, yielding only what the viewers
-    // list below needs for a border and a row: that list scrolls with its
-    // selection while this paragraph does not, so an agent hidden here is the
-    // more expensive truncation.
+    // list below needs for a border and a row: both panes scroll, so the split
+    // is about which one is read whole without a keypress, and that is this one.
     let agents_h = (agent_lines.len() as u16 + 2).clamp(3, main.height.saturating_sub(3).max(3));
     let [agents_area, viewers_area] =
         Layout::vertical([Constraint::Length(agents_h), Constraint::Min(3)]).areas(main);
 
-    let agents = Paragraph::new(agent_lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Agents (read-only — * default)"),
+    // The rows the pane cannot fit are reached with `J`/`K` and the page keys,
+    // the cockpit card's gesture: the pane carries no selection to scroll with,
+    // and `j`/`k` here are the viewers list's. The count and the keys ride the
+    // bottom border, so a pane that is hiding agents says so.
+    let total = agent_lines.len() as u16;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Agents (read-only — * default)");
+    let max_scroll = total.saturating_sub(agents_area.height.saturating_sub(2));
+    app.config_agents_max_scroll.set(max_scroll);
+    let scroll = app.config_agents_scroll.min(max_scroll);
+    let block = if max_scroll > 0 {
+        block.title_bottom(
+            Line::from(format!(" {scroll}/{max_scroll} ↕ J/K PgDn/PgUp ")).right_aligned(),
+        )
+    } else {
+        block
+    };
+    frame.render_widget(
+        Paragraph::new(agent_lines).scroll((scroll, 0)).block(block),
+        agents_area,
     );
-    frame.render_widget(agents, agents_area);
 
     // Viewers: every viewer `open` can run — the built-ins with the user's
     // tables layered over them, each carrying its provenance like the agents
@@ -2004,12 +2019,13 @@ const NEW_KEYS: [(&str, &str); 2] = [
 
 /// The uppercase keys DESIGN.md §9 names as standing outside the case
 /// convention, because none is the shifted half of a pair: `C` and the projects
-/// screen's `A` share a letter with an unrelated action, `J`/`K` scroll the
-/// card, and the Config screen's `V`/`A` pick defaults. Every other uppercase
-/// binding has to be the interactive half of a pair, which the test below
-/// enforces screen by screen.
+/// screen's `A` share a letter with an unrelated action, `J`/`K` scroll a pane
+/// that has no selection to scroll with — the cockpit's card and the Config
+/// screen's agents — and the Config screen's `V`/`A` pick defaults. Every other
+/// uppercase binding has to be the interactive half of a pair, which the test
+/// below enforces screen by screen.
 #[cfg(test)]
-const CASE_EXCEPTIONS: [(Screen, &str); 7] = [
+const CASE_EXCEPTIONS: [(Screen, &str); 9] = [
     (Screen::Cockpit, "C"),
     (Screen::Cockpit, "J"),
     (Screen::Cockpit, "K"),
@@ -2017,6 +2033,8 @@ const CASE_EXCEPTIONS: [(Screen, &str); 7] = [
     (Screen::Projects, "A"),
     (Screen::Config, "V"),
     (Screen::Config, "A"),
+    (Screen::Config, "J"),
+    (Screen::Config, "K"),
 ];
 const MESSAGE_KEYS: [(&str, &str); 2] = [
     ("a", "message the task's session, headless"),
@@ -2158,6 +2176,8 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
                 "Navigation",
                 vec![
                     ("j/k", "move the selection"),
+                    ("J/K", "scroll the agents pane"),
+                    ("PgUp/PgDn", "page the agents pane"),
                     ("?", "this key map"),
                     ("q", "quit"),
                 ],
@@ -2754,9 +2774,108 @@ mod tests {
             assert!(rendered.contains(&format!("{{model}}: m{n}")), "{rendered}");
         }
         // The viewers list keeps a row of its own; what it gave up it can still
-        // scroll to, which the agents paragraph could not.
+        // scroll to.
         assert!(rendered.contains("Viewers"), "{rendered}");
         assert!(rendered.contains("code -n {path}"), "{rendered}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The bug (task #450): where the pane cannot fit its rows, the ones past
+    /// the fold were simply not drawn and nothing said so. Now the bottom
+    /// border carries the overflow and the keys that move it, and `J` walks the
+    /// hidden agents into view — on a terminal no larger than 80x24.
+    #[test]
+    fn config_agents_pane_scrolls_to_the_agents_it_cannot_fit() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        use voro_core::Store;
+
+        let dir = std::env::temp_dir().join(format!(
+            "voro-ui-config-scroll-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agents_path = dir.join("voro.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut toml = String::from("[viewers.zed]\ncmd = \"zed {path}\"\n");
+        for n in 1..=6 {
+            toml.push_str(&format!(
+                "\n[agents.mine{n}]\ndispatch = \"mine{n} run {{prompt_file}} --model {{model}}\"\n\
+                 model = \"m{n}\"\n"
+            ));
+        }
+        std::fs::write(&agents_path, toml).unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+        let ctx = crate::dispatch::DispatchCtx {
+            db_path: dir.join("voro.db"),
+            agents_path,
+            runtime_dir: dir.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
+        };
+        let mut app = App::new(store, ctx).unwrap();
+        alt_screen(&mut app, '4');
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, app: &App| {
+            terminal
+                .draw(|f| {
+                    draw(f, app);
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        let rendered = render(&mut terminal, &app);
+        let hidden = app.config_agents_max_scroll.get();
+        assert!(
+            hidden > 0,
+            "eight agents should overflow an 80x24 pane:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("0/{hidden} ↕ J/K PgDn/PgUp")),
+            "the pane hides rows without saying so:\n{rendered}"
+        );
+
+        // Every agent is reachable: walk to the bottom a row at a time and the
+        // last one — the one the fold ate — is on screen.
+        let last = app
+            .config_agents
+            .last()
+            .expect("agents are configured")
+            .name
+            .clone();
+        assert!(!rendered.contains(&last), "{rendered}");
+        for _ in 0..hidden {
+            app.on_key(KeyEvent::from(KeyCode::Char('J')));
+        }
+        assert_eq!(app.config_agents_scroll, hidden, "J clamps at the bottom");
+        let rendered = render(&mut terminal, &app);
+        assert!(rendered.contains(&last), "{rendered}");
+        assert!(
+            rendered.contains(&format!("{hidden}/{hidden} ↕ J/K PgDn/PgUp")),
+            "{rendered}"
+        );
+
+        // `K` walks back, and the viewers list keeps its own `j`/`k`.
+        app.on_key(KeyEvent::from(KeyCode::PageUp));
+        assert!(app.config_agents_scroll < hidden);
+        let before = app.config_sel;
+        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_ne!(app.config_sel, before, "j still moves the viewer selection");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
