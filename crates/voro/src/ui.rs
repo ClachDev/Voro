@@ -2673,13 +2673,24 @@ mod tests {
         // An ordinary terminal keeps both halves of what the built-in claude
         // row says: every optional verb it defines, and — on its own line under
         // the command whose placeholder it fills — what `{model}` resolves to.
+        // Both are read off the row rather than spelled out here, so the test
+        // asserts that the width survives the built-in's verbs and model map
+        // rather than pinning what they currently are.
+        let claude = app
+            .config_agents
+            .iter()
+            .find(|a| a.name == "claude")
+            .expect("the built-in claude");
+        let verbs = format!("[{}]", claude.verbs.join(" "));
         assert!(
-            rendered.contains("[sessions attach resume message(fork) logs stop plan]"),
-            "{rendered}"
+            rendered.contains(&verbs),
+            "verbs {verbs} clipped:\n{rendered}"
         );
+        let (model, deep, plan) = claude.models.as_ref().expect("claude names a model");
+        let models = format!("{{model}}: {model} · deep {deep} · plan {plan}");
         assert!(
-            rendered.contains("{model}: opus · deep fable · plan fable"),
-            "{rendered}"
+            rendered.contains(&models),
+            "model map {models} clipped:\n{rendered}"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
