@@ -514,14 +514,22 @@ it rides an optional verb: a claude that drops it degrades to a lingering listin
 entry, nothing broken.
 
 The rest-release the built-in `message` depends on is verified on the same
-footing. A stop releases the resume lock as well as retiring the entry, so a
-following `claude -p --resume <uuid>` succeeds in place, answers on the same
-session id, and appends to the same transcript; the finished `-p` turn
-re-registers the session and re-takes the lock, which the rest rule then clears
-again on the next handover, so consecutive messages need no manual step between
-them. The display name rides the transcript's own record and survives both the
-stop and the in-place resume, in the `claude agents` listing and the `/resume`
-picker alike — which is the whole reason delivery resumes rather than forks.
+footing, end to end against a real `--bg` dispatch on a scratch store. The
+session hands over, reconcile releases it (its entry leaves the default listing;
+a second stop the same second is accepted and exits zero, which is the
+idempotence the rule relies on), and two quick messages then land back to back
+with a `voro done` between them — both rendered as `claude -p --resume <uuid>`
+against the *same* session id, with no stop between them and no manual step. The
+work of all three turns is there afterwards, and the conversation is one
+transcript file: no fork siblings. The display name rides the transcript's own
+`customTitle` record and survives the stop and both in-place resumes, which is
+the whole reason delivery resumes rather than forks. One observation worth
+recording because it cuts the other way from the assumption: on this version a
+finished `-p` turn did *not* put the session back into the default listing, so
+no further release was needed and none was made. The rule is written to be
+indifferent to that — a session that does re-register reads `done` and is
+released on the next pass — but nothing should be built on the re-registration
+happening.
 
 The hooks *firing* is verified against a live Claude Code session (v2.1.206): the
 sample configuration above, driving a real session under a dispatched task's
