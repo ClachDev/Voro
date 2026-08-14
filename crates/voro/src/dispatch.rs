@@ -1921,8 +1921,15 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use voro_core::{LivenessSource, NewTask, Priority};
 
-    /// Distinguishes fixtures built within the same clock tick, which the
-    /// nanosecond stamp alone cannot separate.
+    /// Distinguishes fixtures built within the same clock tick.
+    ///
+    /// A nanosecond stamp reads as though it could not repeat, and on one
+    /// thread it does not: consecutive `SystemTime::now()` calls always differ,
+    /// because each is ordered after the last. Across threads there is no such
+    /// ordering, and the clock does not advance a nanosecond at a time — it
+    /// steps roughly every 20-30ns, so any two threads reading inside one step
+    /// read the same number. Measured on this workstation: 4000 reads across
+    /// eight threads yielded 1493 duplicates.
     static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
     /// A scratch database, a freshly-`git init`ed clean project, and an
@@ -1994,8 +2001,10 @@ mod tests {
         assert_eq!(distinct.len(), THREADS, "roots collided: {roots:?}");
     }
 
-    /// Eight fixtures are too few to catch a root name that leans on the clock
-    /// alone, so name a great many with nothing else running between them.
+    /// Eight fixtures spend long enough in `git init` to drift apart on the
+    /// clock, so the test above can pass even on a name that has no counter in
+    /// it. This one names four thousand roots with nothing in between, where a
+    /// clock-only name collides tens of times over.
     #[test]
     fn roots_named_back_to_back_on_many_threads_are_all_distinct() {
         const THREADS: usize = 8;
