@@ -1565,7 +1565,10 @@ fn spawn_session(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let launch = Launch::Dispatch { task_id };
+    let launch = Launch::Dispatch {
+        task_id,
+        title: task.title.clone(),
+    };
     let prompt_path = ctx
         .runtime_dir
         .join(format!("{}-{stamp}.prompt.md", launch.slug()));
@@ -1612,7 +1615,7 @@ fn spawn_session(
         .map_err(|e| format!("cannot open log {}: {e}", log_path.display()))?;
 
     // `launch_command` binds every placeholder the template may carry in one
-    // pass: the prompt file, the session name `voro-<id>`, the task id, and
+    // pass: the prompt file, the session name `voro-<id>-<slug>`, the task id, and
     // `{model}` resolved from the task's depth — the deeper model for a deep
     // task, the workhorse otherwise, and nothing at all for an agent whose
     // template names no model (DESIGN.md §8).
@@ -3219,8 +3222,16 @@ mod tests {
             .apply(id, voro_core::Action::Triage(voro_core::Triage::Ready))
             .unwrap();
         dispatch(&mut store, &ctx, id, None).unwrap();
-        let dispatch_marker = read_marker(&project.join(format!("voro-{id}.txt")), "--for");
-        assert_eq!(dispatch_marker, format!("--name voro-{id} --for {id}"));
+        // The dispatch name carries a slug of the task's title, so the agents
+        // view and the `/resume` picker say what the session is working on.
+        let dispatch_marker = read_marker(
+            &project.join(format!("voro-{id}-sloppy-proposal.txt")),
+            "--for",
+        );
+        assert_eq!(
+            dispatch_marker,
+            format!("--name voro-{id}-sloppy-proposal --for {id}")
+        );
 
         assert_ne!(refine_marker, dispatch_marker);
         for rendered in [&refine_marker, &dispatch_marker] {

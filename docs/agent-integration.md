@@ -94,14 +94,19 @@ resume   = "codex resume {session}"
   Voro composes for the session that launch opens. It is used above with
   Claude's `--name` flag so every session Voro starts is identifiable in
   `claude agents` and the `/resume` picker; agents with no session-naming flag
-  simply leave it out. The scheme is `voro-<id>` for a dispatch of task `<id>`,
-  `voro-<id>-refine` for a refine of it (DESIGN.md §6), and
-  `voro-plan-<project>` for a planning session, which belongs to no task and so
-  is named for its project — by name, so the bare number in a Voro-composed
-  session name is always a task id. Project names are unique, and any character
-  outside `[A-Za-z0-9._-]` is replaced with `-` before the name is used. A
-  dispatch's name is a stable contract — anything else pointed at the same task
-  suffixes a kind rather than colliding with it.
+  simply leave it out. The scheme is `voro-<id>-<slug>` for a dispatch of task
+  `<id>`, where the slug is the first whole words of the task's title —
+  lowercased, and stopping before it runs past about twenty characters, since
+  that listing and the phone's both truncate; `voro-<id>-refine` for a refine
+  of it (DESIGN.md §6); and `voro-plan-<project>` for a planning session, which
+  belongs to no task and so is named for its project — by name, so the bare
+  number in a Voro-composed session name is always a task id. Project names are
+  unique, and any character outside `[A-Za-z0-9._-]` is replaced with `-`
+  before the name is used; a title that survives none of that leaves the bare
+  `voro-<id>`. Every name still opens `voro-<id>`, which is the stable part of
+  the contract — anything else pointed at the same task suffixes a kind rather
+  than colliding with it, and a dispatch whose slug would be exactly such a
+  kind takes another word instead.
 - `dispatch` may also carry `{task_id}`, replaced with the task's numeric id,
   for a template that wants the id somewhere other than the session name. It is
   optional — a template that omits it dispatches unchanged — and it is refused

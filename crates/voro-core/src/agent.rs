@@ -257,9 +257,10 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #   * add your own agent — a new [agents.<name>] table. Only `dispatch` is
 #     required (`cmd` is an alias): it starts a session on a task, with
 #     `{prompt_file}` replaced by the prompt file's path, the optional
-#     `{session_name}` by the name Voro composes for the session (`voro-<id>`
-#     for a dispatch, `voro-<id>-refine` for a refine, `voro-plan-<project>`
-#     for planning), and the optional `{task_id}` by the task's numeric id.
+#     `{session_name}` by the name Voro composes for the session
+#     (`voro-<id>-<title-slug>` for a dispatch, `voro-<id>-refine` for a
+#     refine, `voro-plan-<project>` for planning), and the optional `{task_id}`
+#     by the task's numeric id.
 #     The optional session verbs unlock attachable dispatch, and each degrades
 #     gracefully when absent:
 #       sessions  list the agent's sessions as JSON (liveness + ref capture).
@@ -473,15 +474,17 @@ impl AgentTemplate {
 /// literally, on every task at once.
 ///
 /// The invariant it carries: every session Voro launches has a Voro-composed
-/// name, `voro-<id>` for a dispatch and `voro-<id>-<kind>` for anything else
-/// pointed at that task, so nothing Voro starts shows up anonymous or
-/// duplicately named in the agent's own session listing. A planning session
-/// belongs to no task, so it is named for its project — by name, not id, since
-/// a bare number there would read as a task id.
+/// name starting `voro-<id>` — a dispatch continues into a slug of the task's
+/// title, anything else pointed at that task into its kind — so nothing Voro
+/// starts shows up anonymous or duplicately named in the agent's own session
+/// listing. A planning session belongs to no task, so it is named for its
+/// project — by name, not id, since a bare number there would read as a task
+/// id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launch {
-    /// A task dispatched to a headless session (DESIGN.md §8).
-    Dispatch { task_id: i64 },
+    /// A task dispatched to a headless session (DESIGN.md §8), carrying the
+    /// task's title so the session name can say what it is working on.
+    Dispatch { task_id: i64, title: String },
     /// A proposed task's body rewritten by an agent (DESIGN.md §6), at either
     /// intensity — the headless note-driven one and the interactive one are the
     /// same operation, and only one of them is ever backgrounded.
@@ -500,13 +503,18 @@ pub enum Launch {
 
 impl Launch {
     /// The name the agent's session carries, filling [`SESSION_NAME_PLACEHOLDER`].
-    /// `voro-<id>` for a dispatch is the published contract
+    /// `voro-<id>-<slug>` for a dispatch is the published contract
     /// (docs/agent-integration.md) and what `attach` and the `/resume` picker
     /// are read by, so anything else pointed at the same task suffixes a kind
-    /// rather than colliding with it.
+    /// rather than colliding with it. The slug says what the task *is*, which
+    /// is all the operator gets in the agents view and on the phone; a title
+    /// that survives sanitization to nothing leaves the bare `voro-<id>`.
     pub fn session_name(&self) -> String {
         match self {
-            Launch::Dispatch { task_id } => format!("voro-{task_id}"),
+            Launch::Dispatch { task_id, title } => match title_slug(title) {
+                Some(slug) => format!("voro-{task_id}-{slug}"),
+                None => format!("voro-{task_id}"),
+            },
             Launch::Refine { task_id } => format!("voro-{task_id}-refine"),
             Launch::Plan { project } => format!("voro-plan-{}", sanitize_for_name(project)),
             Launch::Propose { project_id } => format!("voro-propose-{project_id}"),
@@ -517,7 +525,7 @@ impl Launch {
     /// launch-log lines carry.
     pub fn slug(&self) -> String {
         match self {
-            Launch::Dispatch { task_id } => format!("task-{task_id}"),
+            Launch::Dispatch { task_id, .. } => format!("task-{task_id}"),
             Launch::Refine { task_id } => format!("refine-{task_id}"),
             Launch::Plan { project } => format!("plan-{}", sanitize_for_name(project)),
             Launch::Propose { project_id } => format!("propose-{project_id}"),
@@ -529,7 +537,7 @@ impl Launch {
     /// [`TASK_ID_PLACEHOLDER`] is refused on the `plan` verb.
     pub fn task_id(&self) -> Option<i64> {
         match self {
-            Launch::Dispatch { task_id } | Launch::Refine { task_id } => Some(*task_id),
+            Launch::Dispatch { task_id, .. } | Launch::Refine { task_id } => Some(*task_id),
             Launch::Plan { .. } | Launch::Propose { .. } => None,
         }
     }
@@ -552,6 +560,71 @@ fn sanitize_for_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The kind suffixes a per-task session name may carry after `voro-<id>`. A
+/// dispatch of a task titled "Refine the scheduler" must not slug down to
+/// `voro-<id>-refine` and land on the name that task's own refine round would
+/// take.
+const RESERVED_NAME_SUFFIXES: &[&str] = &["refine"];
+
+/// How long a dispatch's title slug may grow before it stops taking words. The
+/// agents view and the phone's session list both truncate, so the first words
+/// have to carry the meaning and the rest are noise. Around twenty characters:
+/// the width that takes the three-word phrase most titles open with.
+const TITLE_SLUG_BUDGET: usize = 24;
+
+/// Reduce a task title to the tail of its session name: whole words from the
+/// front, lowercased and sanitized the same way a project name is, joined with
+/// `-` and stopped before the budget is exceeded. Always at least one word,
+/// even an over-long one — a name cut mid-word reads as a different task.
+/// `None` where nothing survives, which a title of punctuation or of a script
+/// outside `[A-Za-z0-9._-]` produces; the caller falls back to the bare
+/// `voro-<id>`.
+fn title_slug(title: &str) -> Option<String> {
+    let words: Vec<String> = title
+        .split_whitespace()
+        .map(|word| tidy_dashes(&sanitize_for_name(&word.to_lowercase())))
+        .filter(|word| !word.is_empty())
+        .collect();
+
+    let mut slug = String::new();
+    let mut taken = 0;
+    for word in &words {
+        if !slug.is_empty() && slug.len() + 1 + word.len() > TITLE_SLUG_BUDGET {
+            break;
+        }
+        if !slug.is_empty() {
+            slug.push('-');
+        }
+        slug.push_str(word);
+        taken += 1;
+    }
+
+    if RESERVED_NAME_SUFFIXES.contains(&slug.as_str()) {
+        // Over budget by a word, which beats colliding with a kind name; a
+        // title with no further word to give falls back to the bare name.
+        let next = words.get(taken)?;
+        slug.push('-');
+        slug.push_str(next);
+    }
+
+    (!slug.is_empty()).then_some(slug)
+}
+
+/// Collapse runs of `-` and drop them from both ends. A title is prose rather
+/// than a handle, so sanitizing its punctuation leaves dashes where a project
+/// name would never have them: `it's "fine"` reads better as `it-s-fine` than
+/// as `it-s--fine-`.
+fn tidy_dashes(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    for c in word.chars() {
+        if c == '-' && (out.is_empty() || out.ends_with('-')) {
+            continue;
+        }
+        out.push(c);
+    }
+    out.trim_end_matches('-').to_string()
 }
 
 /// Everything a verb template needs bound to become a command line: which
@@ -2580,7 +2653,10 @@ mod tests {
     /// a stable string to assert on.
     fn spec(deep: bool) -> LaunchSpec<'static> {
         LaunchSpec {
-            launch: Launch::Dispatch { task_id: 7 },
+            launch: Launch::Dispatch {
+                task_id: 7,
+                title: "Widen the strip".into(),
+            },
             prompt_file: Path::new("/tmp/p.md"),
             deep,
         }
@@ -2588,7 +2664,10 @@ mod tests {
 
     #[test]
     fn a_launch_names_its_session_and_its_files() {
-        let dispatch = Launch::Dispatch { task_id: 42 };
+        let dispatch = Launch::Dispatch {
+            task_id: 42,
+            title: "Widen the strip".into(),
+        };
         let refine = Launch::Refine { task_id: 42 };
         let plan = Launch::Plan {
             project: "mote".into(),
@@ -2597,7 +2676,7 @@ mod tests {
         // the same task suffixes a kind rather than colliding with it. A
         // planning session names its project, so the bare number in a session
         // name is always a task id.
-        assert_eq!(dispatch.session_name(), "voro-42");
+        assert_eq!(dispatch.session_name(), "voro-42-widen-the-strip");
         assert_eq!(refine.session_name(), "voro-42-refine");
         assert_eq!(plan.session_name(), "voro-plan-mote");
         assert_ne!(dispatch.session_name(), refine.session_name());
@@ -2622,8 +2701,99 @@ mod tests {
         assert_eq!(propose.task_id(), None);
         assert_ne!(
             propose.session_name(),
-            Launch::Dispatch { task_id: 2 }.session_name()
+            Launch::Dispatch {
+                task_id: 2,
+                title: "Propose".into(),
+            }
+            .session_name()
         );
+    }
+
+    /// A dispatch says what it is working on, because the name is all the
+    /// operator gets in the agents view, the `/resume` picker and the phone's
+    /// session list.
+    #[test]
+    fn a_dispatch_names_its_session_for_the_task_title() {
+        let named = |id: i64, title: &str| {
+            Launch::Dispatch {
+                task_id: id,
+                title: title.into(),
+            }
+            .session_name()
+        };
+        assert_eq!(
+            named(428, "Deliver quick messages"),
+            "voro-428-deliver-quick-messages"
+        );
+        // Whole words only: the budget stops the name before the word that
+        // would overrun it rather than cutting that word in half.
+        assert_eq!(
+            named(1, "Make the score decomposition legible"),
+            "voro-1-make-the-score"
+        );
+        // At least one word, even where that word alone is over budget: a name
+        // cut mid-word reads as a different task.
+        assert_eq!(
+            named(2, "Internationalisation everywhere"),
+            "voro-2-internationalisation"
+        );
+        // Every name still starts `voro-<id>`, so prefix reading is untouched.
+        for name in [named(7, "Anything at all"), named(7, "")] {
+            assert!(name.starts_with("voro-7"), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_dispatch_slug_survives_punctuation_and_unsanitizable_titles() {
+        let named = |title: &str| {
+            Launch::Dispatch {
+                task_id: 9,
+                title: title.into(),
+            }
+            .session_name()
+        };
+        // The name reaches a shell command line, so nothing outside
+        // `[A-Za-z0-9._-]` may survive — and the dashes punctuation leaves
+        // behind are collapsed rather than kept.
+        assert_eq!(named("It's \"fine\"; rm -rf /"), "voro-9-it-s-fine-rm-rf");
+        assert_eq!(named("Fix voro-core_v1.2"), "voro-9-fix-voro-core_v1.2");
+        // Case is dropped, unlike a project name: a title is a sentence.
+        assert_eq!(named("ODM handoff"), "voro-9-odm-handoff");
+        // A title that sanitizes to nothing leaves the bare name rather than a
+        // row of dashes.
+        assert_eq!(named(""), "voro-9");
+        assert_eq!(named("   "), "voro-9");
+        assert_eq!(named("!!! ???"), "voro-9");
+        assert_eq!(named("日本語"), "voro-9");
+    }
+
+    /// The one name a dispatch may not take: its own task's refine session.
+    #[test]
+    fn a_dispatch_cannot_slug_onto_a_kind_suffix() {
+        let named = |title: &str| {
+            Launch::Dispatch {
+                task_id: 42,
+                title: title.into(),
+            }
+            .session_name()
+        };
+        let refine = Launch::Refine { task_id: 42 }.session_name();
+        // A second word takes the slug clear of the suffix on its own.
+        assert_eq!(named("Refine the rewrite"), "voro-42-refine-the-rewrite");
+        // Where the second word is over budget the guard takes it anyway,
+        // since overrunning beats colliding.
+        assert_eq!(
+            named("Refine internationalisation"),
+            "voro-42-refine-internationalisation"
+        );
+        assert_eq!(
+            named("Refine"),
+            "voro-42",
+            "a one-word title has no next word to extend with"
+        );
+        for title in ["Refine the rewrite", "Refine", "refine!", "  refine  "] {
+            assert_ne!(named(title), refine, "collided on {title}");
+        }
     }
 
     #[test]
@@ -2652,7 +2822,10 @@ mod tests {
         let config = AgentsConfig::builtin_only(Path::new("/tmp/voro.toml"));
         let claude = config.resolve(Some("claude")).unwrap();
         let dispatch = claude.launch_command(&spec(false));
-        assert!(dispatch.contains("--name \"voro-7\""), "{dispatch}");
+        assert!(
+            dispatch.contains("--name \"voro-7-widen-the-strip\""),
+            "{dispatch}"
+        );
 
         let refined = claude.launch_command(&LaunchSpec {
             launch: Launch::Refine { task_id: 7 },
@@ -2859,7 +3032,7 @@ mod tests {
         let a = config.resolve(Some("a")).unwrap();
         assert_eq!(
             a.launch_command(&spec(false)),
-            "run --name voro-7 --for 7 '/tmp/p.md'"
+            "run --name voro-7-widen-the-strip --for 7 '/tmp/p.md'"
         );
         assert_eq!(
             a.plan_launch_command(&LaunchSpec {
