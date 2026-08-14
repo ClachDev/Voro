@@ -698,7 +698,7 @@ impl App {
         // Reconcile-on-read (DESIGN.md §8): finalise any session whose
         // process has already exited before anything below reads state that
         // depends on it.
-        crate::reconcile::reconcile_live_sessions(&mut self.store, &self.dispatch_ctx.agents_path)?;
+        crate::reconcile::reconcile_live_sessions(&mut self.store, &self.dispatch_ctx)?;
 
         self.projects = self.store.projects()?;
         let candidates = self.store.candidates()?;
@@ -1290,10 +1290,22 @@ impl App {
     /// Apply a transition and refresh. `resume` (needs-input → running) and
     /// reject-with-feedback (review → running) both leave the agent's session
     /// open, so the operator answers the question or addresses the feedback in
-    /// that same session — Voro only moves the state (DESIGN.md §6/§8).
+    /// that same session — Voro only moves the state (DESIGN.md §6/§8). A
+    /// transition that *closes* the session stops it too, so the agent's own
+    /// listing loses the entry along with the row (§8); that is fire-and-forget
+    /// and never reported, since a stop the operator did not ask for has nothing
+    /// useful to say on the status line.
     fn apply_and_refresh(&mut self, task_id: i64, action: Action) {
         let rejected = matches!(action, Action::RejectWork(_));
-        let result = self.store.apply(task_id, action);
+        let result = match self.store.apply_closing(task_id, action) {
+            Ok((task, stopped)) => {
+                if let Some(session) = stopped {
+                    crate::dispatch::stop_closed_session(&self.dispatch_ctx, &session);
+                }
+                Ok(task)
+            }
+            Err(e) => Err(e),
+        };
         if self.report(result).is_some() {
             if rejected {
                 // The head the operator just judged, so the re-review can be

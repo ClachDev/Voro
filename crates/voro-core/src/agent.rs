@@ -4,8 +4,8 @@
 //! resolves which agent a task dispatches with.
 //!
 //! An agent is a set of verb templates; only `dispatch` is required (`cmd` is
-//! an accepted alias). The optional `sessions`/`attach`/`resume`/`message` verbs
-//! unlock session-aware dispatch and `plan` unlocks the TUI's interactive
+//! an accepted alias). The optional `sessions`/`attach`/`resume`/`message`/`stop`
+//! verbs unlock session-aware dispatch and `plan` unlocks the TUI's interactive
 //! planning sessions (DESIGN.md §8); each degrades gracefully when absent
 //! (docs/agent-integration.md). Config is layered: built-ins under `voro.toml`,
 //! which may add agents, override a built-in wholesale, and set `default_agent`
@@ -40,9 +40,9 @@ pub const TASK_ID_PLACEHOLDER: &str = "{task_id}";
 /// is — they act on a session that already exists and has its name.
 pub const SESSION_NAME_PLACEHOLDER: &str = "{session_name}";
 
-/// The session-reference substitution in the `attach`, `resume` and `message`
-/// templates: the agent-opaque reference captured at dispatch (a Claude session
-/// UUID, a Codex session id, a tmux session name).
+/// The session-reference substitution in the `attach`, `resume`, `message`,
+/// `logs` and `stop` templates: the agent-opaque reference captured at dispatch
+/// (a Claude session UUID, a Codex session id, a tmux session name).
 pub const SESSION_PLACEHOLDER: &str = "{session}";
 
 /// The fresh-reference substitution in the `message` template, bound to a v4
@@ -121,6 +121,17 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// read whole by the caller. It exits zero when it finds no such job, printing
 /// a not-found line instead, which is why nothing reads its status: text with
 /// no cap signature in it means "not capped", however it came about.
+///
+/// The claude `stop` verb retires a session from the agent's own listing once
+/// Voro closes its row (DESIGN.md §8). A `claude --bg` session outlives its work
+/// twice over — the entry stays in `claude agents` and the supervisor holding it
+/// runs until the machine reboots — so an operator who dispatches all week reads
+/// their session list through a wall of finished ones. The conversation survives
+/// the call: `claude stop` keeps the transcript and drops only the entry from the
+/// default listing, which `claude attach` can still reopen. It keys on the *job*
+/// id as `logs` does, so `{session}` is truncated to the same eight characters,
+/// and it exits zero on a session whose supervisor is already gone, which is what
+/// lets Voro fire it without checking first.
 const BUILTIN_AGENTS: &str = "\
 [agents.claude]
 dispatch   = \"claude --bg --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
@@ -129,6 +140,7 @@ attach     = \"claude attach {session}\"
 resume     = \"claude --resume {session}\"
 message    = \"claude -p --resume {session} --fork-session --session-id {new_session} \\\"$(cat {prompt_file})\\\"\"
 logs       = \"claude logs \\\"$(printf %.8s {session})\\\" 2>/dev/null | tail -c 20000\"
+stop       = \"claude stop \\\"$(printf %.8s {session})\\\"\"
 plan       = \"claude --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
 model      = \"opus\"
 model_deep = \"fable\"
@@ -258,6 +270,11 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #                 usage cap, which is badged on the running strip and used to
 #                 tell a capped death from an ordinary one. Tail it in the
 #                 template — Voro reads whatever it prints.
+#       stop      retire a session from the agent's own registry ({session})
+#                 Fired when Voro closes the session's row, so the agent's
+#                 listing shows work actually in flight. Fire and forget: Voro
+#                 reads neither output nor status, and a session already gone
+#                 is not an error.
 #       plan      run an interactive foreground planning session ({prompt_file})
 #     `plan` may carry `{session_name}` too, but not `{task_id}`: a planning
 #     session drafts a task rather than naming one.
@@ -366,6 +383,14 @@ pub struct AgentTemplate {
     /// produce output for a session simply omits it, and Voro classifies a dead
     /// session from the launch log as it always has and badges no live one.
     logs: Option<String>,
+    /// Retire a session from the agent's own registry, carrying
+    /// [`SESSION_PLACEHOLDER`]: fired when Voro closes the session's row, so the
+    /// agent's listing converges on work actually in flight (DESIGN.md §8).
+    /// Fire-and-forget — Voro reads neither its output nor its status — and
+    /// wholly optional, since an agent that keeps no registry has nothing to
+    /// retire and one that keeps a listing it never prunes simply lingers as it
+    /// always did.
+    stop: Option<String>,
     /// An interactive foreground command carrying [`PROMPT_FILE_PLACEHOLDER`],
     /// run by the TUI's planning flow (DESIGN.md §8) — no `{session}`, since a
     /// planning session belongs to no task or session row.
@@ -409,6 +434,10 @@ impl AgentTemplate {
 
     pub fn logs(&self) -> Option<&str> {
         self.logs.as_deref()
+    }
+
+    pub fn stop(&self) -> Option<&str> {
+        self.stop.as_deref()
     }
 
     pub fn plan(&self) -> Option<&str> {
@@ -736,6 +765,7 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
         ("resume", &agent.resume),
         ("message", &agent.message),
         ("logs", &agent.logs),
+        ("stop", &agent.stop),
     ] {
         if let Some(template) = template
             && !template.contains(SESSION_PLACEHOLDER)
@@ -767,6 +797,7 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
         ("resume", &agent.resume),
         ("message", &agent.message),
         ("logs", &agent.logs),
+        ("stop", &agent.stop),
     ] {
         let Some(template) = template else { continue };
         if template.contains(MODEL_PLACEHOLDER) {
@@ -794,6 +825,7 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
         ("attach", agent.attach.as_deref()),
         ("resume", agent.resume.as_deref()),
         ("logs", agent.logs.as_deref()),
+        ("stop", agent.stop.as_deref()),
         ("plan", agent.plan.as_deref()),
     ] {
         if template.is_some_and(|t| t.contains(NEW_SESSION_PLACEHOLDER)) {
@@ -868,6 +900,7 @@ pub struct ResolvedAgent {
     pub resume: Option<String>,
     pub message: Option<String>,
     pub logs: Option<String>,
+    pub stop: Option<String>,
     pub plan: Option<String>,
     pub model: Option<String>,
     pub model_deep: Option<String>,
@@ -1116,6 +1149,7 @@ impl AgentsConfig {
             resume: agent.resume.clone(),
             message: agent.message.clone(),
             logs: agent.logs.clone(),
+            stop: agent.stop.clone(),
             plan: agent.plan.clone(),
             model: agent.model.clone(),
             model_deep: agent.model_deep.clone(),
@@ -1295,6 +1329,7 @@ impl AgentsConfig {
             ("resume", builtin.resume.is_some(), user.resume.is_some()),
             ("message", builtin.message.is_some(), user.message.is_some()),
             ("logs", builtin.logs.is_some(), user.logs.is_some()),
+            ("stop", builtin.stop.is_some(), user.stop.is_some()),
             ("plan", builtin.plan.is_some(), user.plan.is_some()),
         ]
         .into_iter()
@@ -2049,6 +2084,75 @@ mod tests {
             assert!(message.contains("logs"), "{message}");
             assert!(message.contains(expected), "{message}");
         }
+    }
+
+    /// The built-in `stop` renders through the same session binder `logs` does,
+    /// down to the truncation: `claude stop` keys on the eight-character job id,
+    /// so the reference goes in shell-quoted inside the `printf` that trims it
+    /// rather than whole.
+    #[test]
+    fn the_claude_stop_verb_renders_the_short_id() {
+        let config = AgentsConfig::load(Path::new("/nonexistent/voro.toml")).unwrap();
+        let stop = config
+            .agent("claude")
+            .expect("the built-in claude")
+            .stop()
+            .expect("a stop verb");
+        assert_eq!(
+            render_session(stop, "3f6c1111-2222-3333-4444-555555555555"),
+            "claude stop \"$(printf %.8s '3f6c1111-2222-3333-4444-555555555555')\""
+        );
+    }
+
+    /// The degradation the verb rides on: `codex` names no `stop`, so a close
+    /// under it retires nothing and leaves exactly the behaviour Voro had.
+    #[test]
+    fn the_codex_builtin_defines_no_stop() {
+        let config = AgentsConfig::load(Path::new("/nonexistent/voro.toml")).unwrap();
+        assert!(config.agent("codex").expect("codex").stop().is_none());
+    }
+
+    /// `stop` joins the session verbs on both rules: it must name the session it
+    /// retires, and it may not carry a launch placeholder only `dispatch` and
+    /// `plan` can resolve.
+    #[test]
+    fn stop_is_validated_as_a_session_verb() {
+        for (stop, expected) in [
+            ("agent-stop --all", SESSION_PLACEHOLDER),
+            ("agent-stop {session} --model {model}", MODEL_PLACEHOLDER),
+            ("agent-stop {session} --task {task_id}", TASK_ID_PLACEHOLDER),
+            (
+                "agent-stop {session} --name {session_name}",
+                SESSION_NAME_PLACEHOLDER,
+            ),
+            (
+                "agent-stop {session} --into {new_session}",
+                NEW_SESSION_PLACEHOLDER,
+            ),
+        ] {
+            let toml = format!(
+                "[agents.a]\ndispatch = \"run {{prompt_file}}\"\nmodel = \"m\"\nstop = \"{stop}\"\n"
+            );
+            let raw: RawConfig = toml::from_str(&toml).unwrap();
+            let err = validate_agent("a", &raw.agents["a"], Path::new("/c.toml"))
+                .expect_err("{stop} is refused");
+            let message = err.to_string();
+            assert!(message.contains("stop"), "{message}");
+            assert!(message.contains(expected), "{message}");
+        }
+    }
+
+    /// An override that drops `stop` is reported like any other dropped verb, so
+    /// `agent list` can say the sessions it closes will now linger in the
+    /// agent's own listing.
+    #[test]
+    fn an_override_dropping_stop_is_reported() {
+        let config = AgentsConfig::parse(
+            "[agents.claude]\ndispatch = \"claude {prompt_file}\"\n",
+            Path::new("/c.toml"),
+        )
+        .unwrap();
+        assert!(config.override_missing_verbs("claude").contains(&"stop"));
     }
 
     /// The one-pass rule (§8): a value carrying its own braces reaches the

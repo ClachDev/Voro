@@ -79,6 +79,7 @@ attach     = "claude attach {session}"
 resume     = "claude --resume {session}"
 message    = "claude -p --resume {session} --fork-session --session-id {new_session} \"$(cat {prompt_file})\""
 logs       = "claude logs \"$(printf %.8s {session})\" 2>/dev/null | tail -c 20000"
+stop       = "claude stop \"$(printf %.8s {session})\""
 plan       = "claude --name \"{session_name}\" --permission-mode auto --model {model} \"$(cat {prompt_file})\""
 model      = "opus"
 model_deep = "fable"
@@ -157,6 +158,23 @@ resume   = "codex resume {session}"
   the built-in does; Voro reads whatever it prints. Note the built-in's
   truncation: `claude logs` keys on the *job* id, the first eight characters of
   the session id, so `{session}` is trimmed rather than passed whole.
+- `stop` retires a session from the agent's own registry, taking `{session}`
+  alone. Voro fires it when it closes the session's row (DESIGN.md §8), so the
+  agent's listing shows work actually in flight rather than every dispatch ever
+  made — a `claude --bg` session otherwise keeps both its `claude agents` entry
+  and a supervisor process until the machine reboots, and that listing is how
+  you find a session to attach to and how Voro reads liveness. It is fire and
+  forget: Voro spawns it detached with its output going to the launch log, reads
+  neither the output nor the exit status, and never waits on it or rolls a
+  transition back for it. Nothing is checked first, so the verb must tolerate
+  being fired at a session that is already gone (`claude stop` prints its line
+  and exits zero). Define it only if stopping is *safe* — Voro fires it on the
+  operator's closing verdicts (accept, abort, abandon) and on a reconciled dead
+  or stale session, never on a session it is keeping open for an answer or a
+  rejection. Note the built-in's truncation, the same as `logs`: `claude stop`
+  keys on the eight-character job id, so `{session}` is trimmed rather than
+  passed whole. `codex` names none, and a session under it lingers in whatever
+  listing it keeps exactly as before.
 - `plan` runs an interactive *foreground* session for the TUI's agent-assisted
   task creation (DESIGN.md §8): `{prompt_file}` holds the planning brief, and
   the command owns the terminal until the conversation ends, so it must not
@@ -272,7 +290,8 @@ model intact: a dispatched agent still cannot push. The task never leaves
 Every verb degrades gracefully when absent: no `attach`/`resume` disables the
 jump-in key for that agent, no `message` turns the quick-message key into a
 status line pointing at the jump-in, no `sessions` keeps pid-liveness
-reconciliation, no `plan` turns the TUI's planning key into a status line saying
+reconciliation, no `stop` leaves closed sessions registered with the agent as
+they always were, no `plan` turns the TUI's planning key into a status line saying
 what to configure, and no `{model}` anywhere makes the deep flag a no-op for
 that agent. An agent defining only `dispatch`/`cmd` behaves exactly as before
 the verbs existed.
@@ -289,13 +308,17 @@ as a `sessions` listing (session name as the ref, `jq -s` to build the array):
 dispatch = "tmux new-session -d -s \"voro-$VORO_TASK_ID\" \"myagent run $(cat {prompt_file})\""
 sessions = "tmux list-sessions -F '{\"sessionId\":\"#{session_name}\",\"cwd\":\"#{session_path}\",\"startedAt\":#{session_created}000,\"state\":\"working\"}' 2>/dev/null | jq -s ."
 attach   = "tmux attach -t {session}"
+stop     = "tmux kill-session -t {session}"
 ```
 
 A tmux session vanishes from `list-sessions` when its command exits, which is
 exactly the drop-out the reconciler treats as finished-without-reporting — it
 finalises the session and lands the task in `stalled` (DESIGN.md §8), where
 redispatch is one key away. There is no honest `resume` for a dead tmux
-session, so leave that verb off and let redispatch handle it.
+session, so leave that verb off and let redispatch handle it. `stop` is honest
+here, though: an abort takes the running session down with the task, and on a
+close where the command has already exited `kill-session` finds nothing and says
+so in the launch log, which is all a failed stop ever does.
 
 ## Hooks as a fallback
 
@@ -438,6 +461,16 @@ in code (`voro-core`'s `full_transition_matrix` test, plus reading the `apply`
 path: an illegal transition returns before any write and never commits). The
 verb-to-state mapping and the `VORO_TASK_ID`/`VORO_DB` export are verified against
 the dispatch and CLI source (DESIGN.md §8).
+
+The built-in `stop` is verified against a live `claude` (v2.1.206) on throwaway
+sessions: `claude stop <short-id>` retires the entry from the default `claude
+agents --json` listing (it survives only under `--all`) and kills the supervisor
+daemon, keeping the conversation for a later `claude attach`; and stopping a
+session whose supervisor is already dead prints `stopped <id>` and exits zero,
+which is what lets Voro fire it without checking first. `claude stop` has its own
+`--help` but is absent from `claude --help`'s command table, which is exactly why
+it rides an optional verb: a claude that drops it degrades to a lingering listing
+entry, nothing broken.
 
 The hooks *firing* is verified against a live Claude Code session (v2.1.206): the
 sample configuration above, driving a real session under a dispatched task's

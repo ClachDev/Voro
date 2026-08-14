@@ -679,8 +679,7 @@ impl TryFrom<TriageTarget> for Triage {
 pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<String, String> {
     // Reconcile-on-read (DESIGN.md §8): before any verb consults session or
     // task state, close out sessions whose process has already exited.
-    crate::reconcile::reconcile_live_sessions(store, &ctx.agents_path)
-        .map_err(|e| e.to_string())?;
+    crate::reconcile::reconcile_live_sessions(store, ctx).map_err(|e| e.to_string())?;
 
     // Every help request gets the hand-written overview page; clap's own help
     // machinery is disabled so it can never shadow this.
@@ -720,16 +719,16 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Done(args) => done_verb(store, args),
         Verb::Import(args) => import_verb(store, args),
         Verb::Triage(args) => triage_verb(store, args, ctx),
-        Verb::Start { task_id } => apply_action(store, task_id, Action::Start, false),
-        Verb::Ask(args) => ask_verb(store, args),
-        Verb::Resume { task_id } => apply_action(store, task_id, Action::Resume, false),
-        Verb::Accept { task_id, yes } => apply_action(store, task_id, Action::Accept, yes),
-        Verb::Wait { task_id } => apply_action(store, task_id, Action::HandOff, false),
-        Verb::Reclaim { task_id } => apply_action(store, task_id, Action::Reclaim, false),
-        Verb::Abort { task_id } => apply_action(store, task_id, Action::Abort, false),
-        Verb::Park { task_id } => apply_action(store, task_id, Action::Park, false),
-        Verb::Unpark { task_id } => apply_action(store, task_id, Action::Unpark, false),
-        Verb::Abandon { task_id, yes } => apply_action(store, task_id, Action::Abandon, yes),
+        Verb::Start { task_id } => apply_action(store, ctx, task_id, Action::Start, false),
+        Verb::Ask(args) => ask_verb(store, ctx, args),
+        Verb::Resume { task_id } => apply_action(store, ctx, task_id, Action::Resume, false),
+        Verb::Accept { task_id, yes } => apply_action(store, ctx, task_id, Action::Accept, yes),
+        Verb::Wait { task_id } => apply_action(store, ctx, task_id, Action::HandOff, false),
+        Verb::Reclaim { task_id } => apply_action(store, ctx, task_id, Action::Reclaim, false),
+        Verb::Abort { task_id } => apply_action(store, ctx, task_id, Action::Abort, false),
+        Verb::Park { task_id } => apply_action(store, ctx, task_id, Action::Park, false),
+        Verb::Unpark { task_id } => apply_action(store, ctx, task_id, Action::Unpark, false),
+        Verb::Abandon { task_id, yes } => apply_action(store, ctx, task_id, Action::Abandon, yes),
     }
 }
 
@@ -2332,12 +2331,12 @@ fn import_verb(store: &mut Store, args: ImportArgs) -> Result<String, String> {
     Ok(out)
 }
 
-fn ask_verb(store: &mut Store, args: AskArgs) -> Result<String, String> {
+fn ask_verb(store: &mut Store, ctx: &DispatchCtx, args: AskArgs) -> Result<String, String> {
     let question = match args.question {
         Some(q) => q,
         None => joined(&args.text, "question (--question TEXT)")?,
     };
-    apply_action(store, args.task_id, Action::Ask(question), false)
+    apply_action(store, ctx, args.task_id, Action::Ask(question), false)
 }
 
 /// Triage a proposal (DESIGN.md §6). Three of the four outcomes are verdicts
@@ -2355,7 +2354,7 @@ fn triage_verb(store: &mut Store, args: TriageArgs, ctx: &DispatchCtx) -> Result
             if note.is_some() {
                 return Err("--note applies to `triage <id> refine` only".into());
             }
-            apply_action(store, args.task_id, Action::Triage(verdict), false)
+            apply_action(store, ctx, args.task_id, Action::Triage(verdict), false)
         }
         Err(()) => {
             let Some(note) = note else {
@@ -2373,10 +2372,21 @@ fn triage_verb(store: &mut Store, args: TriageArgs, ctx: &DispatchCtx) -> Result
 
 /// Apply a plain state-machine action. `accept`/`abandon` are the terminal
 /// transitions that own the dispatch worktree's teardown (§8; `yes` skips its
-/// confirmation). The transition applies first and stands regardless of cleanup.
-fn apply_action(store: &mut Store, id: i64, action: Action, yes: bool) -> Result<String, String> {
+/// confirmation). The transition applies first and stands regardless of cleanup
+/// — and regardless of the agent-session stop that rides the same close (§8),
+/// which is fire-and-forget.
+fn apply_action(
+    store: &mut Store,
+    ctx: &DispatchCtx,
+    id: i64,
+    action: Action,
+    yes: bool,
+) -> Result<String, String> {
     let closes = matches!(action, Action::Accept | Action::Abandon);
-    let task = store.apply(id, action).map_err(|e| e.to_string())?;
+    let (task, stopped) = store.apply_closing(id, action).map_err(|e| e.to_string())?;
+    if let Some(session) = stopped {
+        dispatch::stop_closed_session(ctx, &session);
+    }
     let mut out = format!("task {} -> {}", task.id, task.state);
     if closes && let Some(line) = clean_up_worktree(store, &task, yes)? {
         out.push('\n');
@@ -2749,6 +2759,192 @@ mod tests {
         ok(&mut s, &["done", "1"]);
         let out = ok(&mut s, &["accept", "1"]);
         assert!(out.contains("-> done"), "{out}");
+    }
+
+    // --- closing verdicts stop the agent's session (task #433) ---
+
+    /// A context whose `claude` agent records what its `stop` verb was fired at,
+    /// plus that marker's path and the directory to clean up.
+    fn stop_ctx(name: &str) -> (DispatchCtx, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("voro-cli-stop-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("stopped");
+        let agents_path = dir.join("voro.toml");
+        std::fs::write(
+            &agents_path,
+            format!(
+                "default_agent = \"claude\"\n\n[agents.claude]\n\
+                 dispatch = \"cat {{prompt_file}}\"\n\
+                 stop = \"printf '%s' {{session}} >> '{}'\"\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let ctx = DispatchCtx {
+            agents_path,
+            ..DispatchCtx::from_db_path(&dir.join("voro.db"))
+        };
+        (ctx, marker, dir)
+    }
+
+    /// Wait for the detached stop to have written its marker — nothing in the
+    /// transition path waits on it — and return what it recorded.
+    fn stopped_ref(marker: &std::path::Path) -> Option<String> {
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(marker)
+                && !text.is_empty()
+            {
+                return Some(text);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        None
+    }
+
+    /// A project, a task in `review`, and an open session on it carrying the
+    /// reference the agent knows it by — the state each closing verdict acts on.
+    fn task_in_review_with_a_session(s: &mut Store, ctx: &DispatchCtx) {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        run(s, args(&["project", "add", "demo", "/tmp"]), ctx).unwrap();
+        run(s, args(&["add", "demo", "A task", "--state", "ready"]), ctx).unwrap();
+        let (_, session) = s
+            .record_dispatch(1, "claude", Some(1), LivenessSource::Listing, None)
+            .unwrap();
+        s.set_session_ref(session.id, "full-uuid-1").unwrap();
+        run(s, args(&["done", "1"]), ctx).unwrap();
+    }
+
+    /// Each closing verdict retires the agent's own entry for the session it
+    /// closed, at the reference Voro captured (DESIGN.md §8) — so the agent's
+    /// listing shows work in flight rather than every dispatch ever made.
+    #[test]
+    fn a_closing_verdict_stops_the_agents_session() {
+        for (name, verb) in [("accept", "accept"), ("abandon", "abandon")] {
+            let (ctx, marker, dir) = stop_ctx(name);
+            let mut s = store();
+            task_in_review_with_a_session(&mut s, &ctx);
+
+            let out = run(
+                &mut s,
+                vec![verb.to_string(), "1".to_string(), "--yes".to_string()],
+                &ctx,
+            )
+            .unwrap();
+            assert!(out.contains("task 1"), "{out}");
+            assert_eq!(
+                stopped_ref(&marker).as_deref(),
+                Some("full-uuid-1"),
+                "{name}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// `abort` is the third, from `running` rather than `review`: the operator
+    /// calling the work off, which takes the session down with it.
+    #[test]
+    fn abort_stops_the_agents_session() {
+        let (ctx, marker, dir) = stop_ctx("abort");
+        let mut s = store();
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        run(&mut s, args(&["project", "add", "demo", "/tmp"]), &ctx).unwrap();
+        run(
+            &mut s,
+            args(&["add", "demo", "A task", "--state", "ready"]),
+            &ctx,
+        )
+        .unwrap();
+        let (_, session) = s
+            .record_dispatch(
+                1,
+                "claude",
+                Some(std::process::id() as i64),
+                LivenessSource::Pid,
+                None,
+            )
+            .unwrap();
+        s.set_session_ref(session.id, "full-uuid-1").unwrap();
+
+        run(&mut s, args(&["abort", "1"]), &ctx).unwrap();
+        assert_eq!(stopped_ref(&marker).as_deref(), Some("full-uuid-1"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stop rides the transition rather than gating it: a `stop` verb that
+    /// fails, and an agent that names none at all, both leave the accept
+    /// committed and reported exactly as before.
+    #[test]
+    fn a_failing_or_absent_stop_leaves_the_transition_committed() {
+        for (name, stop) in [("failing", "false # {session}"), ("absent", "")] {
+            let dir =
+                std::env::temp_dir().join(format!("voro-cli-stop-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let agents_path = dir.join("voro.toml");
+            let stop_line = if stop.is_empty() {
+                String::new()
+            } else {
+                format!("stop = \"{stop}\"\n")
+            };
+            std::fs::write(
+                &agents_path,
+                format!(
+                    "default_agent = \"claude\"\n\n[agents.claude]\n\
+                     dispatch = \"cat {{prompt_file}}\"\n{stop_line}"
+                ),
+            )
+            .unwrap();
+            let ctx = DispatchCtx {
+                agents_path,
+                ..DispatchCtx::from_db_path(&dir.join("voro.db"))
+            };
+            let mut s = store();
+            task_in_review_with_a_session(&mut s, &ctx);
+
+            let out = run(&mut s, vec!["accept".into(), "1".into()], &ctx).unwrap();
+            assert!(out.contains("-> done"), "{name}: {out}");
+            assert_eq!(
+                s.task(1).unwrap().state,
+                voro_core::TaskState::Done,
+                "{name}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The transitions that keep the session stop nothing: the operator answers
+    /// into a `needs-input` session and rejects into a `review` one, so both
+    /// must still be there afterwards.
+    #[test]
+    fn a_transition_that_keeps_the_session_stops_nothing() {
+        for (name, argv) in [
+            ("ask", vec!["ask", "1", "--question", "A or B?"]),
+            ("reject", vec!["reject", "1", "tests missing"]),
+            ("wait", vec!["wait", "1"]),
+        ] {
+            let (ctx, marker, dir) = stop_ctx(name);
+            let mut s = store();
+            task_in_review_with_a_session(&mut s, &ctx);
+            if name == "ask" {
+                // ask is legal from running, so put the task back there first
+                run(
+                    &mut s,
+                    vec!["reject".into(), "1".into(), "wip".into()],
+                    &ctx,
+                )
+                .unwrap();
+            }
+
+            run(&mut s, argv.iter().map(|a| a.to_string()).collect(), &ctx).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert!(!marker.exists(), "{name} stopped a session it kept open");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// `wait` hands a review task off to an external party and `reclaim` pulls
