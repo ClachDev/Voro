@@ -43,8 +43,9 @@ dispatch = "echo usage limit reached # {prompt_file}" # cap phrase -> capped
 ```
 
 The dispatch template must contain `{prompt_file}` or config validation
-rejects it. Capped detection matches "usage limit", "rate limit", or
-"quota exceeded" in the log tail (`crates/voro/src/reconcile.rs`).
+rejects it. Capped detection matches the signatures in
+`crates/voro-core/src/cap.rs` (`CAP_SIGNATURES` — "usage limit",
+"session limit", "weekly limit", …) against the log tail.
 
 ## Driving the TUI
 
@@ -59,8 +60,9 @@ broken for non-interactive use — call `/bin/tmux` directly:
 /bin/tmux -L <socket> kill-server
 ```
 
-`r` refreshes in place after CLI mutations from outside; `PAGER` is honoured
-by the `l` log key, so setting it to `less` keeps the pager capturable.
+`ctrl-r` refreshes in place after CLI mutations from outside (`r` is the
+refine key); `PAGER` is honoured by the `l` log key, so setting it to `less`
+keeps the pager capturable.
 
 A scratch store opens empty — the fixture seeds only the dev store — so the
 first capture of an unseeded run shows a board with no projects and no tasks.

@@ -5,7 +5,7 @@
 [![docs.rs](https://img.shields.io/docsrs/voro-core)](https://docs.rs/voro-core)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-An attention based session manager for AI-assisted development across many
+An attention-based session manager for AI-assisted development across many
 projects. Voro tracks tasks per project, weights each project by how much it
 matters *today*, and answers one question: **where should your attention go right
 now?**
