@@ -138,10 +138,16 @@ when its last blocker closes.
 voro start <id>                      # ready → running (claim the task)
 voro ask <id> --question "A or B?"   # running → needs-input (blocked on human)
 voro answer <id> TEXT                # needs-input → running
-voro done <id> [--branch NAME]       # running → review; --branch records the
+voro done <id> [--summary TEXT] [--branch NAME]
+                                     # running → review; --branch records the
                                      #   git branch your work landed on
 voro abort <id>                      # running → ready (backing out)
 ```
+
+`done`'s `--summary` (or `--summary-file PATH`, for a multi-line one) is your
+account of the work, and it is the pull request's description: `voro pr` opens
+the PR with it as the body, so write it as one — what changed and why, then how
+you verified it — rather than a status line.
 
 **When you are asked to work on a task, run `voro start <id>` before you do
 anything else.** This claims the task and moves it to `running`, so the queue
