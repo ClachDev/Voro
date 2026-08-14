@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Migrating your real store now takes a yes.** Every build used to migrate
+  any database it opened as a side effect of opening it, which is how an
+  unreleased migration from a worktree once landed on real data. The operator's
+  store now carries a `protected` marker — in the file itself, so it survives a
+  symlink, a moved data directory, or a restored copy — and a protected store
+  with pending migrations refuses to migrate silently: launching the TUI shows
+  the pending count and asks before the terminal is taken, every CLI verb
+  refuses with a message pointing at the new `voro migrate` verb, and
+  `voro migrate --yes` consents from a script, recorded in the migration
+  journal's `applied_by` so even the override leaves a trace. A fresh install
+  still creates its database with no ceremony, and dev and scratch stores
+  migrate on open exactly as before.
+
 - **One key gets every capped session working again.** A usage cap ends a
   session's turn and leaves it there — nothing retries — so recovering the fleet
   used to mean attaching to each capped session in turn and typing "continue",

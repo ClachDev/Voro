@@ -166,6 +166,14 @@ tasks
                                   from a target/ directory seeds it by itself
                                   on first run; --force rebuilds it. Refused
                                   against your real store
+  migrate [--yes]                 apply pending schema migrations to your real
+                                  store, the one store that never migrates as
+                                  a side effect of being opened (the TUI asks
+                                  the same question at launch). Asks at a
+                                  terminal; --yes consents from a script and
+                                  is recorded in the migration journal. Dev
+                                  and scratch stores migrate on open and need
+                                  none of this
   import <project> [--repo NAME] [--gh-repo owner/name]
                                   import open GitHub issues as proposed
                                   tasks via `gh issue list`; idempotent.
@@ -310,6 +318,15 @@ enum Verb {
         /// Discard what is there and rebuild it.
         #[arg(long)]
         force: bool,
+    },
+    /// Apply pending migrations to a protected store (DESIGN.md §5). The
+    /// pending case never reaches this handler — the store refuses to open, and
+    /// `main` collects consent before there is a `Store` to pass — so what is
+    /// left to report here is that nothing was pending.
+    Migrate {
+        /// Consent from a script; recorded in the migration journal.
+        #[arg(long)]
+        yes: bool,
     },
     Explain {
         task_id: i64,
@@ -709,6 +726,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Next => next_verb(store),
         Verb::Stats => stats_verb(store),
         Verb::Seed { force } => seed_verb(store, ctx, force),
+        Verb::Migrate { .. } => migrate_verb(store, ctx),
         Verb::Explain { task_id } => explain_verb(store, task_id, ctx),
         Verb::Agent { cmd } => agent_verb(cmd, ctx),
         Verb::Dispatch { task_id, agent } => {
@@ -2103,6 +2121,14 @@ fn seed_verb(store: &mut Store, ctx: &DispatchCtx, force: bool) -> Result<String
         ctx.db_path.display(),
         summary.projects,
         summary.tasks
+    ))
+}
+
+fn migrate_verb(store: &Store, ctx: &DispatchCtx) -> Result<String, String> {
+    let version = store.schema_version().map_err(|e| e.to_string())?;
+    Ok(format!(
+        "nothing pending: {} is at schema {version}, the newest this build carries",
+        ctx.db_path.display()
     ))
 }
 
