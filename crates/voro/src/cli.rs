@@ -1766,14 +1766,22 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
     if let Some(branch) = &task.branch {
         writeln!(out, "branch: {branch}").unwrap();
     }
-    if let Some(verb) = task.next_action() {
-        let verb = advertised(store, &mut ForgeMemo::default(), &task, verb);
+    // The incomplete-report flag withholds `pr` and nothing else (DESIGN.md §8),
+    // so it is read before the verb is advertised: a pull request is built from
+    // the summary a half-written report is missing, and recommending one above
+    // the line explaining why it cannot be built is a recommendation that could
+    // only fail, merely spelled out. The marker itself keeps its own line.
+    let incomplete = store
+        .incomplete_report_flag(id)
+        .map_err(|e| e.to_string())?;
+    if let Some(verb) = task
+        .next_action()
+        .map(|verb| advertised(store, &mut ForgeMemo::default(), &task, verb))
+        .filter(|verb| !incomplete || *verb != NextAction::Pr)
+    {
         writeln!(out, "next: {verb}").unwrap();
     }
-    if store
-        .incomplete_report_flag(id)
-        .map_err(|e| e.to_string())?
-    {
+    if incomplete {
         writeln!(
             out,
             "incomplete report: a branch is recorded but no summary — complete it with `voro set {id} --summary ...`"
@@ -3689,6 +3697,48 @@ mod tests {
         let line = row(&out);
         assert!(!line.contains("next:"), "{out}");
         assert!(line.ends_with("[incomplete report]"), "{out}");
+
+        std::fs::remove_dir_all(&project).ok();
+    }
+
+    /// `show` prints the marker as a sentence of its own rather than in the
+    /// `next:` line's place, but it withholds the same one verb the single-line
+    /// surfaces do (DESIGN.md §8): recommending `pr` above a line explaining
+    /// that the summary it is built from is missing is the recommendation that
+    /// could only fail, merely spelled out. The local verb still stands.
+    #[test]
+    fn show_withholds_the_pr_recommendation_from_a_half_written_report() {
+        let project = remoteless_checkout("show-incomplete");
+        let mut s = store();
+        ok(
+            &mut s,
+            &["project", "add", "demo", project.to_str().unwrap()],
+        );
+        let half = review_task(&mut s, Some("feat/thing"), None);
+        let id = half.to_string();
+        let next = |out: &str| {
+            out.lines()
+                .find(|l| l.starts_with("next:"))
+                .map(str::to_string)
+        };
+
+        let out = ok(&mut s, &["show", &id]);
+        assert_eq!(next(&out).as_deref(), Some("next: open"), "{out}");
+        assert!(out.contains("incomplete report:"), "{out}");
+
+        git_in(
+            &project,
+            &["remote", "add", "origin", "https://github.com/acme/w.git"],
+        );
+        let out = ok(&mut s, &["show", &id]);
+        assert_eq!(next(&out), None, "{out}");
+        assert!(out.contains("incomplete report:"), "{out}");
+
+        // Supplying the missing half restores the recommendation it withheld.
+        ok(&mut s, &["set", &id, "--summary", "What it did"]);
+        let out = ok(&mut s, &["show", &id]);
+        assert_eq!(next(&out).as_deref(), Some("next: pr"), "{out}");
+        assert!(!out.contains("incomplete report:"), "{out}");
 
         std::fs::remove_dir_all(&project).ok();
     }
