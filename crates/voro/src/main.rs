@@ -63,6 +63,95 @@ fn resolved_db() -> PathBuf {
     }
 }
 
+/// The protected store has pending migrations and opening it refused to apply
+/// them (DESIGN.md §5). Consent is collected here, before the terminal is
+/// taken, on plain stdin — which is itself the test that a human is present: a
+/// launch with no terminal to answer from cannot consent, and that headless
+/// bare `voro` is exactly the shape the incident behind the gate took. A bare
+/// launch asks and continues into the TUI on a yes; `voro migrate` is the
+/// explicit spelling, asking at a terminal and taking `--yes` from a script;
+/// every other verb repeats the refusal, whose message routes an agent to the
+/// operator. Only a TUI-bound yes returns; every other outcome exits.
+fn migration_gate(
+    path: &std::path::Path,
+    verb_args: &[String],
+    refusal: voro_core::Error,
+) -> Store {
+    let voro_core::Error::MigrationsPending {
+        pending,
+        version,
+        known,
+        ..
+    } = &refusal
+    else {
+        unreachable!("migration_gate is only called with MigrationsPending");
+    };
+    let (pending, version, known) = (*pending, *version, *known);
+    let confirmed = |consent: &str| -> Store {
+        let store = or_exit(Store::open_migrate(path, consent));
+        eprintln!(
+            "voro: applied {pending} migration(s) to {} (schema {version} -> {known}); \
+             the pre-migration snapshot is in backups/ beside it.",
+            path.display()
+        );
+        store
+    };
+    let ask = || {
+        confirm(&format!(
+            "voro: {} has {pending} pending migration(s) (schema {version} -> {known}).\n\
+             A snapshot is written to backups/ beside it first. Apply them now?",
+            path.display()
+        ))
+    };
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let declined = || -> ! {
+        eprintln!("voro: left unmigrated — run `voro migrate` when ready.");
+        std::process::exit(1);
+    };
+    match verb_args.first().map(String::as_str) {
+        Some("migrate") if verb_args.iter().any(|a| a == "--yes") => {
+            confirmed("via voro migrate --yes");
+            std::process::exit(0);
+        }
+        Some("migrate") if interactive => {
+            if !ask() {
+                declined();
+            }
+            confirmed("via voro migrate");
+            std::process::exit(0);
+        }
+        None if interactive => {
+            if !ask() {
+                declined();
+            }
+            confirmed("confirmed at the TUI prompt")
+        }
+        _ => {
+            eprintln!("voro: {refusal}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Ask a yes/no question on the plain terminal. Anything but a terminal on
+/// stdin, or any answer but a yes, is a no — an unanswerable question must
+/// refuse, never hang or assume.
+fn confirm(question: &str) -> bool {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    print!("{question} [y/N] ");
+    if std::io::stdout().flush().is_err() {
+        return false;
+    }
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim(), "y" | "Y" | "yes" | "Yes")
+}
+
 /// Report a startup failure the way the CLI verbs report theirs: the error's
 /// own message, on stderr. Returning it from `main` would print the derived
 /// `Debug` form instead, which buries the sentence the operator has to read.
@@ -78,7 +167,11 @@ fn or_exit<T>(result: voro_core::Result<T>) -> T {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (path, verb_args) = split_db(std::env::args().skip(1).collect());
-    let mut store = or_exit(Store::open(&path));
+    let mut store = match Store::open(&path) {
+        Ok(store) => store,
+        Err(e @ voro_core::Error::MigrationsPending { .. }) => migration_gate(&path, &verb_args, e),
+        Err(e) => or_exit(Err(e)),
+    };
     // The dev store carries its fixture from first use (DESIGN.md §5); empty,
     // it renders as a blank board indistinguishable from a broken query.
     if path == Store::dev_db_path() && or_exit(voro_core::seed::is_empty(&store)) {

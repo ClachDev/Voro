@@ -20,6 +20,23 @@ pub enum Error {
     },
 
     #[error(
+        "{} is protected and has {pending} pending migration(s) (schema {version} -> {known}); \
+         the operator's store never migrates as a side effect of being opened. The operator \
+         applies them by launching `voro` at a terminal, which asks first, or with \
+         `voro migrate`. If you are an agent or a script seeing this, stop and tell the \
+         operator; `voro migrate --yes` consents on their behalf and is recorded in the \
+         migration journal. A snapshot is written to backups/ beside the store before anything \
+         is applied.",
+        path.display()
+    )]
+    MigrationsPending {
+        path: PathBuf,
+        pending: usize,
+        version: usize,
+        known: usize,
+    },
+
+    #[error(
         "this database's migration {idx} differs from the one this build carries: it was applied \
          {applied_at} by {applied_by}. The version numbers agree, so nothing else will catch \
          this — and since the two migrations are not the same text, this build cannot assume the \
