@@ -17,7 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the reset hours went missing overnight. `u` now sweeps every badged
   session whose reset has passed, tells each to continue, and reports how many
   it nudged, how many are still waiting on their window, and any the agent
-  refused. For now it fires only when you press it — resuming capped sessions
+  refused. A capped session's supervisor is still holding it, so the sweep
+  releases each one before resuming it and abandons that nudge if the release
+  fails — nothing is sent that could only be refused. For now it fires only when
+  you press it — resuming capped sessions
   automatically once the window reopens is the intended next step, and this is
   the half that will sit underneath it. Sessions already back at work are
   untouched, and the badge drops as each nudge lands so a second press cannot

@@ -2273,15 +2273,35 @@ impl App {
         self.report(refreshed);
     }
 
-    /// Say [`NUDGE`] into one capped session and record the send, exactly as the
-    /// quick-message key does — the same verb, the same forked reference, the
-    /// same tracked pid — so a nudged session stays as visible to the reconciler
-    /// as a messaged one.
+    /// Say [`NUDGE`] into one capped session and record the send, much as the
+    /// quick-message key does — the same verb, the same tracked pid — so a
+    /// nudged session stays as visible to the reconciler as a messaged one.
+    ///
+    /// It releases the session first, and *unconditionally*, which is the one
+    /// place a send departs from the rest rule (DESIGN.md §8). That rule's
+    /// `done` test is only sufficient because every session it does not cover is
+    /// refused by the liveness gate before a send is ever attempted — and a
+    /// capped session is exactly such a session, `blocked` with its supervisor
+    /// alive, which the sweep walks past on the strength of the cap reading.
+    /// Having stood down the guard that made the test sufficient, it cannot then
+    /// lean on the test: the hold is there, nothing will ever report it as
+    /// `done`, and an in-place resume would simply be refused. The bypass has to
+    /// be complete or the nudge does not land.
+    ///
+    /// What that costs is worth naming. The stop is exactly as safe as the cap
+    /// reading is right — the same bet the sweep already makes — but the
+    /// consequence of a wrong one is worse than it was: a send into a session
+    /// that turned out to be mid-turn used to be a redundant turn, and is now a
+    /// killed one. The reading can also be up to a probe interval stale, so a
+    /// session an operator restarted by hand in the last minute is still badged
+    /// and can still be stopped from under them. Both are why the sweep stays on
+    /// a keypress rather than on the clock (DESIGN.md §8).
     fn nudge_one(&mut self, task_id: i64) -> Result<(), String> {
         let target = self
             .message_target(task_id)
             .ok_or_else(|| self.status.clone().unwrap_or_else(|| "no session".into()))?;
         let cwd = self.task_checkout(task_id).map_err(|e| e.to_string())?;
+        self.release_session(&target.session)?;
         let sent = crate::dispatch::send_message(
             &self.dispatch_ctx,
             crate::dispatch::SessionMessage {
@@ -2306,10 +2326,12 @@ impl App {
         Ok(())
     }
 
-    /// Release the agent's hold on a session that has handed back, waiting for
-    /// the answer (DESIGN.md §8). The reconciler's rest-stop does this off the
-    /// send path on every pass; this is the same call made inline, for the
-    /// window between an agent handing back and the next pass noticing.
+    /// Release the agent's hold on a session, waiting for the answer (DESIGN.md
+    /// §8), so a headless resume into it can land. The reconciler's rest-stop
+    /// makes this call off the send path on every pass; the two senders make it
+    /// inline where that pass cannot have covered them — the quick-message key
+    /// for the window between an agent handing back and the next pass noticing,
+    /// the capped-session sweep because no pass will ever release its target.
     ///
     /// Nothing about the row changes either way — the session stays the task's
     /// conversation — so a config that will not load costs the release and
@@ -5828,15 +5850,22 @@ mod tests {
         // the quick-message key uses, so the stub defines one that records what
         // it was told and exits — a delivered send, as far as the caller can see.
         let delivered = project_path.parent().unwrap().join("delivered.txt");
+        // A capped session is `blocked` with its supervisor alive, so the hold
+        // that would refuse an in-place resume is still there and the sweep has
+        // to release it itself (DESIGN.md §8). The stub records what it was
+        // fired at, so a test can see that it ran and at which session.
+        let stopped = project_path.parent().unwrap().join("stopped.txt");
         std::fs::write(
             &ctx.agents_path,
             format!(
                 "default_agent = \"stub\"\n\n[agents.stub]\n\
                  dispatch = \"cat {{prompt_file}} && sleep 30\"\n\
                  sessions = \"cat '{}'\"\n\
-                 message = \"cat {{prompt_file}} >> '{}' # {{session}}\"\n{logs}",
+                 message = \"cat {{prompt_file}} >> '{}' # {{session}}\"\n\
+                 stop = \"printf '%s' {{session}} >> '{}'\"\n{logs}",
                 listing.display(),
-                delivered.display()
+                delivered.display(),
+                stopped.display()
             ),
         )
         .unwrap();
@@ -5951,6 +5980,11 @@ mod tests {
         std::fs::read_to_string(project_path.parent().unwrap().join("delivered.txt")).ok()
     }
 
+    /// Which session the sweep released before sending, if it released one.
+    fn nudge_stopped(project_path: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(project_path.parent().unwrap().join("stopped.txt")).ok()
+    }
+
     /// The headline case (DESIGN.md §8): one key puts every capped session whose
     /// window has reopened back to work, without the operator visiting any of
     /// them. Both the guards the quick-message key answers to are stood down —
@@ -5988,6 +6022,70 @@ mod tests {
             "{:?}",
             app.status
         );
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// The sweep releases its target before resuming it, and does so
+    /// unconditionally (DESIGN.md §8). A capped session is `blocked` with its
+    /// supervisor alive — it never reads `done`, so no reconcile pass will ever
+    /// release it, and the rest rule's own test would answer "nothing to do"
+    /// while the hold that refuses an in-place resume sits right there. The
+    /// sweep has already walked past the liveness gate that makes that test
+    /// sufficient, so it cannot lean on the test.
+    #[test]
+    fn u_releases_the_capped_session_before_resuming_it() {
+        let (mut app, task_id, project_path) =
+            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+        settle_cap(&mut app, task_id, true);
+        app.now_minutes = Some(22 * 60 + 50);
+
+        key(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(
+            nudge_stopped(&project_path).as_deref(),
+            Some("ref-1"),
+            "the sweep released the session it was about to resume: {:?}",
+            app.status
+        );
+        // And the send still went, at the same reference: a release, not a move.
+        assert_eq!(
+            delivered(&project_path).as_deref().map(str::trim),
+            Some(NUDGE)
+        );
+        let session = app.store.sessions_for(task_id).unwrap().remove(0);
+        assert_eq!(session.session_ref.as_deref(), Some("ref-1"));
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// A release that fails means the hold is still there and the resume behind
+    /// it could only be refused, so the nudge is abandoned before it spawns
+    /// anything — the session keeps its badge and the sweep reports the refusal
+    /// rather than counting a send that never happened.
+    #[test]
+    fn a_nudge_whose_release_fails_sends_nothing() {
+        let (mut app, task_id, project_path) =
+            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+        settle_cap(&mut app, task_id, true);
+        app.now_minutes = Some(22 * 60 + 50);
+        set_verb(
+            &app.dispatch_ctx.agents_path,
+            "stop",
+            "printf 'no such session' >&2; exit 1 # {session}",
+        );
+
+        key(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(delivered(&project_path), None, "nothing was sent");
+        assert!(
+            app.caps.contains_key(&task_id),
+            "the badge stays, since the session was never nudged"
+        );
+        let status = app.status.as_deref().unwrap_or("").to_string();
+        assert!(status.contains("nudged 0"), "{status}");
+        assert!(status.contains("refused"), "{status}");
+        assert!(status.contains("could not be released"), "{status}");
 
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }

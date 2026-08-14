@@ -176,8 +176,8 @@ resume   = "codex resume {session}"
   truncation: `claude logs` keys on the *job* id, the first eight characters of
   the session id, so `{session}` is trimmed rather than passed whole.
 - `stop` retires a session from the agent's own registry, taking `{session}`
-  alone. Voro fires it on two triggers (DESIGN.md §8), and both must be safe
-  before you define it.
+  alone. Voro fires it on three triggers (DESIGN.md §8), and all three must be
+  safe before you define it.
 
   The first is **closing the session's row**, so the agent's listing shows work
   actually in flight rather than every dispatch ever made — a `claude --bg`
@@ -199,12 +199,21 @@ resume   = "codex resume {session}"
   released, because the handover verbs run from inside a turn that may still be
   finishing.
 
-  It is otherwise fire and forget: Voro spawns it detached with its output going
+  The third is the **capped-session sweep** (`u`), and it is the one that fires
+  with no listing test at all. A session sitting on a usage cap is `blocked`
+  with its supervisor alive, so it will never read `done` and the rest trigger
+  will never reach it — yet the hold is exactly what would refuse the resume the
+  sweep is about to make. What identifies it instead is the `logs` reading, and
+  on the strength of that the sweep releases unconditionally. If your agent's
+  sessions cannot be safely stopped while merely idle-looking, define no `stop`
+  and the sweep degrades to a refused send rather than doing damage.
+
+  The first two are fire and forget: Voro spawns them detached with output going
   to the launch log, reads neither the output nor the exit status, and never
-  waits on it or rolls a transition back for it. The one exception is a send
-  that has to make the rest-release itself, having outrun a reconcile pass:
-  there Voro waits, and a non-zero exit refuses the send rather than spawning a
-  message that could not land. Nothing is checked first either way, so the verb
+  waits or rolls a transition back. A stop made by a *sender* is waited on
+  instead — the quick message that outran a reconcile pass, and every nudge —
+  and a non-zero exit refuses that send rather than spawning a message that
+  could not land. Nothing is checked first in any case, so the verb
   must tolerate being fired at a session that is already gone (`claude stop`
   prints its line and exits zero). Note the built-in's truncation, the same as
   `logs`: `claude stop` keys on the eight-character job id, so `{session}` is
