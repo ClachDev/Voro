@@ -147,7 +147,9 @@ resume   = "codex resume {session}"
   the jump-in keys, and reconciliation all follow the conversation to where it
   continued. A `message` template without the placeholder resumes in place and
   keeps the reference it had. `{new_session}` is refused on every other verb:
-  it names the session a send opens, and nothing else opens one.
+  it names the session a send opens, and nothing else opens one. Which of the
+  two a configured agent got is visible without reading the file back: `voro
+  agent list` names a forking send `message(fork)` and a resuming one `message`.
 - A `message` template should carry whatever permission flag its agent's
   `dispatch` carries — the built-in `claude` one carries `--permission-mode
   auto`. A resumed turn does real work, and on agents where the flag is per

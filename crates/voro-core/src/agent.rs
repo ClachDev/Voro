@@ -464,7 +464,45 @@ impl AgentTemplate {
     pub fn model_plan(&self) -> Option<&str> {
         self.model_plan.as_deref()
     }
+
+    /// The optional verbs this agent defines, in roster order, as `agent list`
+    /// and the Config screen name them (DESIGN.md §8). A `message` that carries
+    /// [`NEW_SESSION_PLACEHOLDER`] reads `message(fork)`, because forking is
+    /// what a send into a supervisor-held session needs and it moves the
+    /// session reference the row afterwards addresses.
+    pub fn verbs(&self) -> Vec<&'static str> {
+        OPTIONAL_VERBS
+            .iter()
+            .filter_map(|(verb, defined)| {
+                let template = defined(self)?;
+                Some(
+                    if *verb == "message" && template.contains(NEW_SESSION_PLACEHOLDER) {
+                        "message(fork)"
+                    } else {
+                        *verb
+                    },
+                )
+            })
+            .collect()
+    }
 }
+
+/// A verb's name beside the accessor for its template.
+type VerbAccessor = (&'static str, fn(&AgentTemplate) -> Option<&str>);
+
+/// Every verb an agent may define beyond `dispatch`, in the order they are
+/// listed to the operator. One roster serves both the positive listing and the
+/// dropped-verb warning under it, so the two lines cannot disagree about the
+/// same agent.
+const OPTIONAL_VERBS: [VerbAccessor; 7] = [
+    ("sessions", AgentTemplate::sessions),
+    ("attach", AgentTemplate::attach),
+    ("resume", AgentTemplate::resume),
+    ("message", AgentTemplate::message),
+    ("logs", AgentTemplate::logs),
+    ("stop", AgentTemplate::stop),
+    ("plan", AgentTemplate::plan),
+];
 
 /// What a launch *is* (DESIGN.md §8): the one place a backgrounded or
 /// foreground agent session's identity is composed. A launch names its session,
@@ -1400,22 +1438,11 @@ impl AgentsConfig {
         else {
             return Vec::new();
         };
-        [
-            (
-                "sessions",
-                builtin.sessions.is_some(),
-                user.sessions.is_some(),
-            ),
-            ("attach", builtin.attach.is_some(), user.attach.is_some()),
-            ("resume", builtin.resume.is_some(), user.resume.is_some()),
-            ("message", builtin.message.is_some(), user.message.is_some()),
-            ("logs", builtin.logs.is_some(), user.logs.is_some()),
-            ("stop", builtin.stop.is_some(), user.stop.is_some()),
-            ("plan", builtin.plan.is_some(), user.plan.is_some()),
-        ]
-        .into_iter()
-        .filter_map(|(verb, in_builtin, in_user)| (in_builtin && !in_user).then_some(verb))
-        .collect()
+        OPTIONAL_VERBS
+            .iter()
+            .filter(|(_, defined)| defined(builtin).is_some() && defined(user).is_none())
+            .map(|(verb, _)| *verb)
+            .collect()
     }
 
     /// Every agent as `(name, template, provenance)`, sorted by name, for
@@ -2041,6 +2068,57 @@ mod tests {
             "{:?}",
             config.override_missing_verbs("claude")
         );
+    }
+
+    /// The listing and the dropped-verb warning read the same roster, so an
+    /// agent cannot be listed as lacking a verb the warning says it dropped.
+    #[test]
+    fn verbs_lists_every_optional_verb_and_marks_a_forking_message() {
+        let agents = builtin_agents();
+        assert_eq!(
+            agents["claude"].verbs(),
+            vec![
+                "sessions",
+                "attach",
+                "resume",
+                "message(fork)",
+                "logs",
+                "stop",
+                "plan"
+            ]
+        );
+        assert_eq!(agents["codex"].verbs(), vec!["resume"]);
+
+        // A message that resumes in place keeps the reference it had, so it is
+        // named plainly; the roster still lists it.
+        let text = r#"
+            [agents.a]
+            dispatch = "run {prompt_file}"
+            message = "say --into {session} {prompt_file}"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        assert_eq!(config.agent("a").unwrap().verbs(), vec!["message"]);
+    }
+
+    /// Every verb the warning can name is a verb the listing can name, which is
+    /// the invariant that kept the two lines disagreeing before they shared a
+    /// roster: a wholesale override of claude that drops everything reports the
+    /// same set the built-in row lists.
+    #[test]
+    fn the_listing_and_the_dropped_verb_warning_cover_the_same_verbs() {
+        let text = r#"
+            [agents.claude]
+            cmd = "claude -p {prompt_file}"
+        "#;
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        let dropped = config.override_missing_verbs("claude");
+        let listed: Vec<&str> = builtin_agents()["claude"]
+            .verbs()
+            .into_iter()
+            .map(|verb| verb.split('(').next().expect("a verb name"))
+            .collect();
+        assert_eq!(dropped, listed);
+        assert!(config.agent("claude").unwrap().verbs().is_empty());
     }
 
     #[test]

@@ -1306,15 +1306,7 @@ fn agent_verb(cmd: AgentCmd, ctx: &DispatchCtx) -> Result<String, String> {
                 } else {
                     "  "
                 };
-                let verbs: Vec<&str> = [
-                    ("sessions", template.sessions()),
-                    ("attach", template.attach()),
-                    ("resume", template.resume()),
-                    ("plan", template.plan()),
-                ]
-                .into_iter()
-                .filter_map(|(verb, defined)| defined.map(|_| verb))
-                .collect();
+                let verbs = template.verbs();
                 let suffix = if verbs.is_empty() {
                     String::new()
                 } else {
@@ -2589,6 +2581,12 @@ mod tests {
         assert!(listed.contains("claude"), "{listed}");
         assert!(listed.contains("codex"), "{listed}");
         assert!(listed.contains("built-in"), "{listed}");
+        // every optional verb the agent defines, the quick message included and
+        // marked as the forking send it is
+        assert!(
+            listed.contains("[sessions attach resume message(fork) logs stop plan]"),
+            "{listed}"
+        );
 
         // init writes an optional skeleton
         let out = call(&mut s, &["agent", "init"]).unwrap();
