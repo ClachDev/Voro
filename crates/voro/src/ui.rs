@@ -109,7 +109,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> HitMap {
 fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     match &app.mode {
         Mode::Normal => {}
-        Mode::KeyMap => draw_key_map(frame, app),
+        Mode::KeyMap { page } => draw_key_map(frame, app, *page),
         Mode::AddProject {
             name,
             path,
@@ -2007,15 +2007,15 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 /// the lowercase acts headlessly and stays in the TUI, the uppercase names the
 /// surface it opens.
 const DISPATCH_KEYS: [(&str, &str); 2] = [
-    ("d", "dispatch to the resolved agent, headless"),
-    ("D", "dispatch, choosing the agent in a picker"),
+    ("d", "dispatch to the resolved agent"),
+    ("D", "dispatch, choosing the agent"),
 ];
 const REFINE_KEYS: [(&str, &str); 2] = [
     ("r", "refine a brief from a note, headless"),
     ("R", "refine a brief in an agent session"),
 ];
 const NEW_KEYS: [(&str, &str); 2] = [
-    ("n", "new task, proposed by a background agent"),
+    ("n", "new task, proposed headless"),
     ("N", "new task, planned in an agent session"),
 ];
 
@@ -2037,7 +2037,7 @@ const CASE_EXCEPTIONS: [(Screen, &str); 7] = [
 ];
 const MESSAGE_KEYS: [(&str, &str); 2] = [
     ("a", "message the task's session, headless"),
-    ("A", "message it in person — attach or resume"),
+    ("A", "message in person — attach or resume"),
 ];
 
 /// A titled group of key/label pairs in the key map.
@@ -2069,11 +2069,11 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
             actions.extend([
                 ("0-3", "set the task's priority"),
                 ("s", "change state"),
-                ("!", "toggle deep — the agent's strongest model"),
+                ("!", "toggle deep — the agent's best model"),
                 ("c", "link and unlink documents"),
                 ("C", "cancel a refine in flight"),
-                ("x", "fold the score decomposition into the card"),
-                ("h", "fold the task's history into the card"),
+                ("x", "fold the score decomposition in"),
+                ("h", "fold the task's history in"),
                 ("o", "open the local diff in a viewer"),
                 ("g", "open the PR on GitHub"),
             ]);
@@ -2108,7 +2108,7 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
             actions.extend([
                 ("0-3", "set the task's priority"),
                 ("s", "change state"),
-                ("!", "toggle deep — the agent's strongest model"),
+                ("!", "toggle deep — the agent's best model"),
                 ("c", "link and unlink documents"),
                 ("C", "cancel a refine in flight"),
                 ("o", "open the local diff in a viewer"),
@@ -2182,14 +2182,20 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
     }
 }
 
-/// The key map's rows for one column, keys right-aligned to the column's widest.
-fn key_map_column(sections: &[KeySection]) -> Vec<Vec<Span<'static>>> {
-    let key_w = sections
-        .iter()
-        .flat_map(|(_, entries)| entries.iter())
-        .map(|(key, _)| key.chars().count())
-        .max()
-        .unwrap_or(0);
+/// The widest key and the widest gloss in a column's sections — the two halves
+/// of its natural width.
+fn key_map_widths(sections: &[KeySection]) -> (usize, usize) {
+    let entries = || sections.iter().flat_map(|(_, entries)| entries.iter());
+    let width = |f: fn(&(&'static str, &'static str)) -> &'static str| {
+        entries().map(|e| f(e).chars().count()).max().unwrap_or(0)
+    };
+    (width(|(key, _)| key), width(|(_, label)| label))
+}
+
+/// The key map's rows for one column, keys right-aligned to the column's widest
+/// and glosses held to `label_w`, over-long ones ending in an ellipsis.
+fn key_map_column(sections: &[KeySection], label_w: usize) -> Vec<Vec<Span<'static>>> {
+    let (key_w, _) = key_map_widths(sections);
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
     for (i, (title, entries)) in sections.iter().enumerate() {
         if i > 0 {
@@ -2197,9 +2203,15 @@ fn key_map_column(sections: &[KeySection]) -> Vec<Vec<Span<'static>>> {
         }
         rows.push(vec![Span::styled(*title, Style::new().bold())]);
         for (key, label) in entries {
+            let label = if label.chars().count() <= label_w {
+                (*label).to_string()
+            } else {
+                let kept: String = label.chars().take(label_w.saturating_sub(1)).collect();
+                format!("{kept}…")
+            };
             rows.push(vec![
                 Span::styled(format!("{key:>key_w$}  "), Style::new().bold()),
-                Span::styled(*label, Style::new().dim()),
+                Span::styled(label, Style::new().dim()),
             ]);
         }
     }
@@ -2207,16 +2219,36 @@ fn key_map_column(sections: &[KeySection]) -> Vec<Vec<Span<'static>>> {
 }
 
 /// The `?` overlay: the current screen's whole key map, actions in one column
-/// and navigation over screen switching in the other so a screenful fits.
-fn draw_key_map(frame: &mut Frame, app: &App) {
+/// and navigation over screen switching in the other. Both dimensions are the
+/// terminal's rather than the content's (DESIGN.md §9) — the Actions glosses
+/// give up width before the Navigation column beside them clips, and what will
+/// not fit the height moves to a further page `tab` turns to — so every entry
+/// stays reachable however many keys the map grows.
+fn draw_key_map(frame: &mut Frame, app: &App, page: usize) {
+    const GAP: usize = 3;
+    /// Under this a gloss says nothing whatever it does, so the Actions column
+    /// stops giving width up and the overlay clips as any pane does.
+    const MIN_LABEL: usize = 8;
+
     let sections = key_map(app.screen, app.projects.is_empty());
     let (actions, rest) = sections.split_at(1);
-    let (left, right) = (key_map_column(actions), key_map_column(rest));
+    let (key_l, natural_l) = key_map_widths(actions);
+    let (key_r, label_r) = key_map_widths(rest);
+    let chrome = key_l + 2 + GAP + key_r + 2 + 2;
+    let avail = frame.area().width as usize;
+    let label_l = if chrome + natural_l + label_r > avail {
+        avail.saturating_sub(chrome + label_r).max(MIN_LABEL)
+    } else {
+        natural_l
+    };
+    let (left, right) = (
+        key_map_column(actions, label_l),
+        key_map_column(rest, label_r),
+    );
     let width_of =
         |row: &Vec<Span<'static>>| -> usize { row.iter().map(|s| s.content.chars().count()).sum() };
     let left_w = left.iter().map(width_of).max().unwrap_or(0);
     let right_w = right.iter().map(width_of).max().unwrap_or(0);
-    const GAP: usize = 3;
 
     let lines: Vec<Line<'static>> = (0..left.len().max(right.len()))
         .map(|i| {
@@ -2230,19 +2262,37 @@ fn draw_key_map(frame: &mut Frame, app: &App) {
         })
         .collect();
 
+    // Pages are as few as the height allows and then evenly filled, so a map
+    // one row too tall splits down the middle rather than stranding that row
+    // alone on a second page; the box keeps one height throughout, so turning
+    // a page does not resize the overlay under the reader.
+    let box_h = (frame.area().height as usize).saturating_sub(2).max(1);
+    let pages = lines.len().div_ceil(box_h).max(1);
+    let per_page = lines.len().div_ceil(pages).max(1);
+    let page = page % pages;
+    let shown: Vec<Line<'static>> = lines
+        .into_iter()
+        .skip(page * per_page)
+        .take(per_page)
+        .collect();
+
     let screen = match app.screen {
         Screen::Cockpit => "cockpit",
         Screen::Tasks => "tasks",
         Screen::Projects => "projects",
         Screen::Config => "config",
     };
+    let title = if pages > 1 {
+        format!(
+            "Keys — {screen} — {}/{pages}, tab pages — any key closes",
+            page + 1
+        )
+    } else {
+        format!("Keys — {screen} — any key closes")
+    };
     let width = (left_w + GAP + right_w + 2) as u16;
-    let area = popup_area(frame, width, lines.len() as u16 + 2);
-    let para = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Keys — {screen} — any key closes")),
-    );
+    let area = popup_area(frame, width, per_page as u16 + 2);
+    let para = Paragraph::new(shown).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(para, area);
 }
 
@@ -4876,7 +4926,7 @@ mod tests {
         .unwrap();
         app.screen = Screen::Projects;
         app.on_key(KeyEvent::from(KeyCode::Char('?')));
-        assert!(matches!(app.mode, Mode::KeyMap));
+        assert!(matches!(app.mode, Mode::KeyMap { .. }));
 
         let width: u16 = 120;
         let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
@@ -4899,43 +4949,85 @@ mod tests {
         // Any key is a dismissal, including one the screen binds.
         app.on_key(KeyEvent::from(KeyCode::Char('a')));
         assert!(matches!(app.mode, Mode::Normal));
+    }
 
-        // The cockpit's map is the longest, and it has to fit the smallest
-        // terminal worth supporting — 80x24 clips nothing.
-        app.screen = Screen::Cockpit;
-        app.on_key(KeyEvent::from(KeyCode::Char('?')));
-        let width: u16 = 80;
-        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
-        terminal
-            .draw(|f| {
-                draw(f, &app);
-            })
+    /// The map has to *hold* what it lists: on the smallest terminal worth
+    /// supporting, every entry of every screen is reachable — paged to with
+    /// `tab` where one screenful cannot carry it, and never clipped, key and
+    /// whole gloss both. Asserting a handful of entries instead is what let the
+    /// list outgrow the overlay in the first place: the two that fell off the
+    /// bottom were simply not among the ones checked.
+    #[test]
+    fn every_key_map_entry_is_reachable_on_a_small_terminal() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+        const W: u16 = 80;
+        const H: u16 = 24;
+
+        for projects in [0, 1] {
+            let mut store = voro_core::Store::open_in_memory().unwrap();
+            for i in 0..projects {
+                store.create_project(&format!("p{i}"), "/tmp").unwrap();
+            }
+            let mut app = App::new(
+                store,
+                crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                    "/nonexistent/voro.db",
+                )),
+            )
             .unwrap();
-        let rendered: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .chunks(width as usize)
-            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
-        // The keys the trimmed line no longer carries, and the uppercase
-        // glosses it never carried.
-        for expected in [
-            "message it in person — attach or resume",
-            "page the session log",
-            "fold the score decomposition",
-            "dispatch, choosing the agent in a picker",
-            "new task, planned in an agent session",
-            "refine a brief in an agent session",
-            // The right-hand column, whole — nothing clipped at 80 columns.
-            "page the card",
-            "next screen",
-        ] {
-            assert!(
-                rendered.contains(expected),
-                "{expected:?} missing:\n{rendered}"
-            );
+            let mut terminal = Terminal::new(TestBackend::new(W, H)).unwrap();
+
+            for screen in [
+                Screen::Cockpit,
+                Screen::Tasks,
+                Screen::Projects,
+                Screen::Config,
+            ] {
+                app.screen = screen;
+                app.on_key(KeyEvent::from(KeyCode::Char('?')));
+                // More turns than any screen's map has pages; the page index
+                // wraps, so the extra ones re-read a page already seen.
+                let mut seen = String::new();
+                for _ in 0..8 {
+                    terminal
+                        .draw(|f| {
+                            draw(f, &app);
+                        })
+                        .unwrap();
+                    seen.push_str(
+                        &terminal
+                            .backend()
+                            .buffer()
+                            .content()
+                            .chunks(W as usize)
+                            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                    seen.push('\n');
+                    app.on_key(KeyEvent::from(KeyCode::Tab));
+                }
+                app.on_key(KeyEvent::from(KeyCode::Esc));
+
+                for (title, entries) in key_map(screen, app.projects.is_empty()) {
+                    assert!(seen.contains(title), "{screen:?}: no {title:?}:\n{seen}");
+                    for (key, label) in entries {
+                        // Keys are right-aligned with two trailing spaces, so
+                        // the pair is one substring of the row it renders on.
+                        let row = format!("{key}  {label}");
+                        assert!(
+                            seen.contains(&row),
+                            "{screen:?} with {projects} project(s): {row:?} is in the key map but \
+                             no page of it at {W}x{H} shows that entry whole — the map has \
+                             outgrown its overlay (DESIGN.md §9):\n{seen}"
+                        );
+                    }
+                }
+            }
         }
     }
 

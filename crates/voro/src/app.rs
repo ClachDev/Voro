@@ -253,9 +253,13 @@ pub enum Mode {
     /// picker's "new viewer…" — share it.
     ViewerForm(ViewerFormState),
     /// The current screen's full key map (DESIGN.md §9), opened with `?`. It is
-    /// a peek rather than a screen — any key dismisses it — and it carries no
-    /// state of its own, since the screen it describes is the App's.
-    KeyMap,
+    /// a peek rather than a screen — any key but `tab` dismisses it — and the
+    /// page is the only state it carries, since the screen it describes is the
+    /// App's. It counts up without bound; the renderer knows how many pages the
+    /// terminal makes of the map and wraps within them.
+    KeyMap {
+        page: usize,
+    },
     /// Picking `default_agent` or `default_viewer` from the configured set
     /// (DESIGN.md §5), on the Config screen.
     DefaultPicker {
@@ -1371,9 +1375,13 @@ impl App {
                 sel,
             } => self.key_viewer_picker(key, project_id, options, current, sel),
             Mode::ViewerForm(form) => self.key_viewer_form(key, form),
-            // The key map is dismissed by any key, and `on_key` has already
-            // restored `Mode::Normal`, so there is nothing left to do.
-            Mode::KeyMap => {}
+            // `tab` turns the page; every other key dismisses the map, and
+            // `on_key` has already restored `Mode::Normal` for it.
+            Mode::KeyMap { page } => {
+                if key.code == KeyCode::Tab {
+                    self.mode = Mode::KeyMap { page: page + 1 };
+                }
+            }
             Mode::DefaultPicker {
                 kind,
                 names,
@@ -1428,7 +1436,7 @@ impl App {
                 return;
             }
             KeyCode::Char('?') => {
-                self.mode = Mode::KeyMap;
+                self.mode = Mode::KeyMap { page: 0 };
                 return;
             }
             KeyCode::Tab => {
