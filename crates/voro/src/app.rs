@@ -706,6 +706,12 @@ impl App {
         &self.dispatch_ctx.agents_path
     }
 
+    /// The database this run opened (DESIGN.md §5), for the footer to name it
+    /// when it is not the operator's own store (§9).
+    pub fn db_path(&self) -> &std::path::Path {
+        &self.dispatch_ctx.db_path
+    }
+
     /// Refresh if another process has committed since the last check. Cheap
     /// enough to call every poll tick; `PRAGMA data_version` ignores our own
     /// writes, so this fires only on genuinely external changes.

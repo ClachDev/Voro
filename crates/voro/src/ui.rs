@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -6,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use voro_core::{
     ActionRow, CapReading, CompletionReport, DepKind, DepRef, DigestRow, EffectiveScore, Event,
-    QueueRow, ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
+    QueueRow, ScoreBreakdown, Session, SessionOutcome, StateCounts, Store, TaskState,
 };
 
 use crate::app::{
@@ -1860,7 +1862,10 @@ fn wrap_status(msg: &str, width: u16) -> Vec<String> {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    // A red status message overrides the key line, as before.
+    // A red status message overrides the key line, as before, and owns the row
+    // whole — the indicator below would be competing with wrapped text for a
+    // right margin that moves (DESIGN.md §9). The message is gone on the next
+    // keystroke; the store is not going anywhere.
     if let Some(msg) = &app.status {
         let lines: Vec<Line> = wrap_status(msg, area.width)
             .into_iter()
@@ -1877,8 +1882,77 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(key, Style::new().bold()));
         spans.push(Span::styled(format!(" {label}"), Style::new().dim()));
     }
-    frame.render_widget(Line::from(spans), area);
+    // The store, right-aligned the way the header right-aligns its counts, so
+    // the key line keeps the left margin it has always started at. On the
+    // operator's own store there is no indicator, the reserved width is zero,
+    // and the key line gets the row back byte for byte.
+    let indicator = db_indicator(app.db_path(), area.width);
+    let reserved = indicator
+        .as_deref()
+        .map_or(0, |text| Span::raw(text).width() as u16 + 1);
+    let [keys, store] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(reserved)]).areas(area);
+    frame.render_widget(Line::from(spans), keys);
+    if let Some(text) = indicator {
+        frame.render_widget(
+            Line::from(vec![Span::raw(" "), Span::styled(text, Style::new().dim())]),
+            store,
+        );
+    }
 }
+
+/// The store to name in the footer, or `None` when it is the operator's own and
+/// there is nothing to say (DESIGN.md §9).
+///
+/// The comparison is against [`Store::production_db_path`] rather than
+/// [`Store::default_db_path`], which is the crux of it: the default is `dev.db`
+/// for a `target/` build, so an indicator keyed on it would stay silent on a dev
+/// store — the very case that asks the question. This is the rule dispatch's
+/// `--db` flag and `voro seed` already follow (§5).
+fn db_indicator(db_path: &Path, width: u16) -> Option<String> {
+    if db_path == Store::production_db_path() {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    Some(shorten_store_path(db_path, home.as_deref(), width))
+}
+
+/// A store path cut down to what identifies it inside `width` columns of footer:
+/// `~` for the home directory, and — if it is still longer than about a third of
+/// the row — leading directories dropped for a `…`, since the filename and its
+/// parent are the half that names the store and the path to them is the half
+/// that does not. Components go whole, so what is left is still a path; a
+/// filename too long even on its own is cut mid-word as a last resort.
+fn shorten_store_path(path: &Path, home: Option<&Path>, width: u16) -> String {
+    let text = match home
+        .filter(|home| !home.as_os_str().is_empty())
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    };
+    let budget = usize::from(width / 3)
+        .max(MIN_STORE_INDICATOR)
+        .min(usize::from(width));
+    let len = text.chars().count();
+    if len <= budget || budget == 0 {
+        return text;
+    }
+    let parts: Vec<&str> = text.split('/').collect();
+    for first in 1..parts.len() {
+        let candidate = format!("…/{}", parts[first..].join("/"));
+        if candidate.chars().count() <= budget {
+            return candidate;
+        }
+    }
+    let tail: String = text.chars().skip(len - (budget - 1)).collect();
+    format!("…{tail}")
+}
+
+/// The narrowest the store indicator is allowed to get before it stops shrinking
+/// with the row — narrower than this and a truncated path is little more than
+/// its own filename, which no longer says which store it is.
+const MIN_STORE_INDICATOR: usize = 16;
 
 /// Whether the selection is a brief refine can still rewrite — a proposal or a
 /// ready task (DESIGN.md §6).
@@ -2614,6 +2688,100 @@ mod tests {
         let app = app_with_status(&GH_REFUSAL.repeat(20), 1, 0);
         assert_eq!(status_height(&app, Rect::new(0, 0, 40, 24)), 12);
         assert_eq!(status_height(&app, Rect::new(0, 0, 40, 3)), 1);
+    }
+
+    /// The footer names the store only when it is not the operator's own
+    /// (DESIGN.md §9), and the comparison is against the production path rather
+    /// than the default one — so a dev build, whose default *is* `dev.db`, says
+    /// so instead of staying silent (§5).
+    #[test]
+    fn the_footer_names_every_store_but_the_operator_s() {
+        assert_eq!(db_indicator(&Store::production_db_path(), 110), None);
+        assert!(
+            db_indicator(&Store::dev_db_path(), 110).is_some_and(|text| text.ends_with("dev.db")),
+            "a dev build has to name dev.db, got {:?}",
+            db_indicator(&Store::dev_db_path(), 110)
+        );
+        assert_eq!(
+            db_indicator(Path::new("/tmp/scratch/voro.db"), 110),
+            Some("/tmp/scratch/voro.db".to_string())
+        );
+    }
+
+    /// A store under the home directory is shown against `~`, which is both
+    /// shorter and how the operator refers to it.
+    #[test]
+    fn a_store_under_home_is_shown_against_a_tilde() {
+        assert_eq!(
+            shorten_store_path(
+                Path::new("/home/op/.local/share/voro/dev.db"),
+                Some(Path::new("/home/op")),
+                110
+            ),
+            "~/.local/share/voro/dev.db"
+        );
+        // No home to compare against leaves the path as it is.
+        assert_eq!(
+            shorten_store_path(Path::new("/srv/voro/voro.db"), None, 110),
+            "/srv/voro/voro.db"
+        );
+    }
+
+    /// Past about a third of the row the path is cut from the *left*: the
+    /// filename and its parent name the store, the leading directories do not.
+    #[test]
+    fn a_long_store_path_is_truncated_from_the_left() {
+        let long = Path::new("/home/op/very/deeply/nested/scratch/area/voro.db");
+        let text = shorten_store_path(long, Some(Path::new("/home/op")), 60);
+        assert_eq!(text, "…/area/voro.db");
+        assert!(text.chars().count() <= 20, "{text}");
+
+        // It stops shrinking with the row while the parent still fits.
+        assert_eq!(
+            shorten_store_path(long, Some(Path::new("/home/op")), 24),
+            "…/area/voro.db"
+        );
+        // A filename with nowhere left to give is cut mid-word rather than
+        // pushed past the budget.
+        assert_eq!(
+            shorten_store_path(Path::new("/tmp/a-very-long-store-name.db"), None, 30),
+            "…g-store-name.db"
+        );
+    }
+
+    /// End-to-end: the indicator reaches the footer of a drawn screen, dim and
+    /// right of the key line, without costing the region a row.
+    #[test]
+    fn the_footer_carries_the_store_on_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with_status("", 1, 0);
+        app.status = None;
+        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        let text = screen_text(&terminal);
+        // `dummy_ctx`'s store is not the operator's, so the row names it.
+        assert!(text.contains("/nonexistent/voro.db"), "{text}");
+        assert!(
+            text.contains("⏎ act · d/D dispatch"),
+            "the key line still starts the row: {text}"
+        );
+
+        // A message owns the row alone; nothing competes with it.
+        app.status = Some("task 9 has no session on record".into());
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        let text = screen_text(&terminal);
+        assert!(text.contains("task 9 has no session on record"), "{text}");
+        assert!(!text.contains("/nonexistent/voro.db"), "{text}");
     }
 
     /// End-to-end: the Config screen renders the read-only agents (with the
