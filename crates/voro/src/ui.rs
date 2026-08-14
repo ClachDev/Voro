@@ -784,7 +784,7 @@ fn state_span(state: TaskState) -> Span<'static> {
     Span::styled(format!("{:11}", state.as_str()), style)
 }
 
-/// The human-only flag (task #100) rendered as a row marker. A property of the
+/// The human-only flag rendered as a row marker. A property of the
 /// task rather than an anomaly, so it stays dim where the warning flags shout.
 fn human_span() -> Span<'static> {
     Span::styled("  [human]", Style::new().dim())
@@ -798,7 +798,7 @@ fn human_line() -> Line<'static> {
     ))
 }
 
-/// The deep flag (task #241) as a one-column row marker sitting beside the
+/// The deep flag as a one-column row marker sitting beside the
 /// priority cell: `!` when the task dispatches on the agent's strongest model,
 /// a blank of the same width otherwise, so the columns after it stay aligned
 /// whether or not any row in the list is deep.
@@ -830,7 +830,7 @@ fn pr_span(url: &str) -> Span<'static> {
     )
 }
 
-/// The task's git branch (task #81) rendered for the detail pane — the intended
+/// The task's git branch rendered for the detail pane — the intended
 /// name dispatch injects, or the name the agent reported it worked on.
 fn branch_span(branch: &str) -> Span<'static> {
     Span::styled(format!("branch: {branch}"), Style::new().fg(Color::Green))
@@ -940,7 +940,7 @@ fn completion_lines(report: &CompletionReport, width: u16) -> Vec<Line<'static>>
 const GUTTER: &str = "│ ";
 
 /// An agent-authored block — a completion summary, its rework variant, or a
-/// question — rendered as markdown behind a quote-style gutter (task #430).
+/// question — rendered as markdown behind a quote-style gutter.
 /// The content is styled exactly as a task body is, so cyan text means inline
 /// code here as it does there; the voice is carried by the bar in the margin
 /// instead of by a colour wash. Lines are wrapped to fit inside the gutter
@@ -970,7 +970,7 @@ fn agent_voice_block(heading: &str, text: &str, width: u16) -> Vec<Line<'static>
         .collect()
 }
 
-/// A task's newest session, rendered for the attention states (tasks #73/#110).
+/// A task's newest session, rendered for the attention states.
 /// A finished session is a post-mortem: its outcome (`capped` yellow — it clears
 /// when the quota resets — `failed` red and wanting its log read), agent, and
 /// end time. An open one shows agent and start time. Both end on the log path
@@ -1563,7 +1563,7 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     draw_status(frame, app, status);
 }
 
-/// The dependency section of a detail view (task #103), both directions, one
+/// The dependency section of a detail view, both directions, one
 /// line per edge: `blocked by #N title` for the task's own blockers, `blocks #N
 /// title` for the reverse edges, and other forward kinds by name. Closed tasks
 /// are dimmed, as in `blocker_spans`.
@@ -4099,7 +4099,7 @@ mod tests {
 
     /// End-to-end: a deep task carries the `!` marker beside the priority cell
     /// on its queue and browser rows and the spelled-out line in the cockpit
-    /// detail pane; a task on the workhorse carries neither (task #241).
+    /// detail pane; a task on the workhorse carries neither.
     #[test]
     fn deep_flag_renders_in_queue_browser_and_detail() {
         use crate::app::App;
@@ -4816,8 +4816,8 @@ mod tests {
         );
     }
 
-    /// The cockpit detail pane answers "what happened" for a stalled task
-    /// (task #73): the dead session's outcome, agent, end time, and log path
+    /// The cockpit detail pane answers "what happened" for a stalled task:
+    /// the dead session's outcome, agent, end time, and log path
     /// render under the metadata. A capped session reads `capped`; a clean
     /// ready task carries none of it.
     #[test]
@@ -4912,7 +4912,7 @@ mod tests {
 
     /// A task whose session is still open — here needs-input, whose session
     /// survives the transition (DESIGN.md §8) — shows the session's agent,
-    /// start time, and log path instead of a post-mortem (task #110), and the
+    /// start time, and log path instead of a post-mortem, and the
     /// key line advertises `l` there too.
     #[test]
     fn detail_pane_shows_an_open_session_on_a_needs_input_task() {
@@ -4973,7 +4973,7 @@ mod tests {
 
     /// A multi-line question renders across multiple lines in the cockpit
     /// detail pane (DESIGN.md §6), each behind the agent-voice gutter that
-    /// marks the block as the agent's own words (task #430).
+    /// marks the block as the agent's own words.
     #[test]
     fn detail_pane_renders_a_multi_line_question_across_lines() {
         use crate::app::App;
@@ -5043,7 +5043,7 @@ mod tests {
         }
     }
 
-    /// The agent's blocks are parsed as markdown, not printed raw (task #430):
+    /// The agent's blocks are parsed as markdown, not printed raw:
     /// bold and inline code are styled rather than showing their markers, and
     /// every visual line of the block — continuations included, at a pane too
     /// narrow to hold the line — carries the cyan gutter.
@@ -5174,7 +5174,7 @@ mod tests {
     }
 
     /// A review card leads with the agent's account of what it did, above the
-    /// body it was given (task #407) — on a first review, where there is no
+    /// body it was given — on a first review, where there is no
     /// rejection behind it, and on a rework, where the feedback heads it.
     #[test]
     fn review_card_shows_the_completion_summary_above_the_body() {
@@ -5235,7 +5235,7 @@ mod tests {
         let heading =
             row_of(&first, "│ completion summary:").unwrap_or_else(|| panic!("{first:?}"));
         // Each summary line on its own row behind the gutter, as the question
-        // block renders (task #430).
+        // block renders.
         assert!(
             row_of(&first, "│ README.md: +2 lines").is_some(),
             "{first:?}"

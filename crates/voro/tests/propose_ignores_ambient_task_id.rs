@@ -1,4 +1,4 @@
-//! Regression test for the `VORO_TASK_ID` leak (task #184): the `voro` binary
+//! Regression test for the `VORO_TASK_ID` leak: the `voro` binary
 //! must read no environment when resolving `propose`'s discovered-from source.
 //! A dispatched session runs with `VORO_TASK_ID` exported, and before this fix a
 //! bare `propose` picked it up as the `--from` default — so `cargo test` run

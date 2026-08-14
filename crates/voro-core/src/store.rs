@@ -1600,7 +1600,7 @@ impl Store {
         self.session(id)
     }
 
-    /// Record the agent's own reference for a session (task #75), captured
+    /// Record the agent's own reference for a session, captured
     /// after launch — the row necessarily exists before the reference does,
     /// so this is an update rather than a `create_session` parameter.
     pub fn set_session_ref(&mut self, id: i64, session_ref: &str) -> Result<Session> {
@@ -2787,7 +2787,7 @@ mod tests {
         );
     }
 
-    // --- the deep flag (task #241) ---
+    // --- the deep flag ---
 
     fn deep_new(project_id: i64, human: bool, deep: bool) -> NewTask {
         NewTask {
@@ -4329,7 +4329,7 @@ mod tests {
     }
 
     /// Each launch records which source reconciliation must read it by
-    /// (DESIGN.md §8, task #387), and it survives the round trip: a headless
+    /// (DESIGN.md §8), and it survives the round trip: a headless
     /// launch under a supervisor is listing-authoritative, an interactive round
     /// is not, and neither is inferred from anything else on the row.
     #[test]
