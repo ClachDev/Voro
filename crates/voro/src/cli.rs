@@ -2592,7 +2592,7 @@ mod tests {
         // every optional verb the agent defines, the quick message included —
         // named plainly, since the built-in resumes its session in place
         assert!(
-            listed.contains("[sessions attach resume message logs stop plan]"),
+            listed.contains("[sessions attach resume message logs cap stop plan]"),
             "{listed}"
         );
 

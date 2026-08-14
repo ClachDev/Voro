@@ -141,6 +141,25 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// a not-found line instead, which is why nothing reads its status: text with
 /// no cap signature in it means "not capped", however it came about.
 ///
+/// The claude `cap` verb answers the same question `logs` does — when does the
+/// window reopen — about the account rather than about a session, and as an
+/// instant rather than as a clock time on a screen (DESIGN.md §8). The CLI's
+/// stream transport emits a `rate_limit_event` carrying `resetsAt`, a Unix
+/// epoch, so the spelling is a one-turn print with the event filtered out of
+/// the stream: `"status":"rejected"` is what makes it a report of a cap the
+/// account is *held at* rather than a note on the window it is spending, and
+/// the greps keep the epoch beside it. A live cap always carries the reset,
+/// since the same header the message renders its time from is where this comes
+/// from.
+///
+/// Two properties of the spelling are load-bearing. It prints *nothing* when
+/// the account is not refused, which is the contract's whole negative answer;
+/// and it names `--model haiku` rather than `{model}`, because unlike every
+/// other verb this one spends an API call to ask — a cent or two, mostly cache
+/// creation — and the answer is the same whichever model is refused. The
+/// `timeout` is the belt to that brace: a cap is not retried (§8), so the turn
+/// ends at once, but nothing in Voro should wait on an agent indefinitely.
+///
 /// The claude `stop` verb retires a session from the agent's own listing once
 /// Voro closes its row — and, at rest, once it hands back (DESIGN.md §8): the
 /// release the supervisor holds is what a headless `message` resumes through.
@@ -161,6 +180,7 @@ attach     = \"claude attach {session}\"
 resume     = \"claude --resume {session}\"
 message    = \"claude -p --resume {session} --permission-mode auto \\\"$(cat {prompt_file})\\\"\"
 logs       = \"claude logs \\\"$(printf %.8s {session})\\\" 2>/dev/null | tail -c 20000\"
+cap        = '''timeout 120 claude -p --output-format stream-json --verbose --model haiku hi 2>/dev/null | grep -o '\"status\":\"rejected\"[^}]*\"resetsAt\":[0-9]*' | grep -o '[0-9][0-9]*$' | tail -1'''
 stop       = \"claude stop \\\"$(printf %.8s {session})\\\"\"
 plan       = \"claude --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
 model      = \"opus\"
@@ -293,6 +313,12 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #                 usage cap, which is badged on the running strip and used to
 #                 tell a capped death from an ordinary one. Tail it in the
 #                 template — Voro reads whatever it prints.
+#       cap       print when the account's usage window reopens, as a Unix
+#                 epoch, while the account is capped — and nothing when it is
+#                 not (no placeholders). Read instead of the clock time on a
+#                 session's screen, which carries no date. Costs whatever
+#                 asking the agent costs, so Voro asks only while a session is
+#                 badged capped.
 #       stop      retire a session from the agent's own registry ({session})
 #                 Fired when Voro closes the session's row, so the agent's
 #                 listing shows work actually in flight. Fire and forget: Voro
@@ -406,6 +432,18 @@ pub struct AgentTemplate {
     /// produce output for a session simply omits it, and Voro classifies a dead
     /// session from the launch log as it always has and badges no live one.
     logs: Option<String>,
+    /// When the *account* this agent dispatches on has its usage window
+    /// reopen, as a Unix epoch and nothing else (DESIGN.md §8). Carries no
+    /// placeholder at all: it names no session, because a cap is a property of
+    /// the account rather than of any one conversation, and one reading
+    /// therefore answers for every session on the strip.
+    ///
+    /// Its contract is silence-as-negative like [`AgentTemplate::logs`]: print
+    /// the instant while the account is refused, print nothing otherwise. An
+    /// agent that cannot say — `codex` names none — leaves Voro reading the
+    /// reset time off the session's own screen, ambiguous by half a day, as it
+    /// always did.
+    cap: Option<String>,
     /// Retire a session from the agent's own registry, carrying
     /// [`SESSION_PLACEHOLDER`]: fired when Voro closes the session's row, so the
     /// agent's listing converges on work actually in flight (DESIGN.md §8).
@@ -459,6 +497,10 @@ impl AgentTemplate {
         self.logs.as_deref()
     }
 
+    pub fn cap(&self) -> Option<&str> {
+        self.cap.as_deref()
+    }
+
     pub fn stop(&self) -> Option<&str> {
         self.stop.as_deref()
     }
@@ -508,12 +550,13 @@ type VerbAccessor = (&'static str, fn(&AgentTemplate) -> Option<&str>);
 /// listed to the operator. One roster serves both the positive listing and the
 /// dropped-verb warning under it, so the two lines cannot disagree about the
 /// same agent.
-const OPTIONAL_VERBS: [VerbAccessor; 7] = [
+const OPTIONAL_VERBS: [VerbAccessor; 8] = [
     ("sessions", AgentTemplate::sessions),
     ("attach", AgentTemplate::attach),
     ("resume", AgentTemplate::resume),
     ("message", AgentTemplate::message),
     ("logs", AgentTemplate::logs),
+    ("cap", AgentTemplate::cap),
     ("stop", AgentTemplate::stop),
     ("plan", AgentTemplate::plan),
 ];
@@ -948,6 +991,26 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
             }
         }
     }
+    // `cap` asks about the account, not about a session or a launch, so every
+    // placeholder there is a category error: there is nothing for Voro to bind
+    // one to, and it would reach the shell as literal braces.
+    if let Some(template) = &agent.cap {
+        for placeholder in [
+            SESSION_PLACEHOLDER,
+            PROMPT_FILE_PLACEHOLDER,
+            MODEL_PLACEHOLDER,
+            SESSION_NAME_PLACEHOLDER,
+            TASK_ID_PLACEHOLDER,
+            NEW_SESSION_PLACEHOLDER,
+        ] {
+            if template.contains(placeholder) {
+                return Err(invalid(format!(
+                    "agent '{name}' cap carries {placeholder}, but a cap reading is about the \
+                     account rather than any one session or launch — it takes no placeholders"
+                )));
+            }
+        }
+    }
     // `{new_session}` names the session a *send* opens, so `message` is the one
     // verb that can bind it; anywhere else it would reach the shell as literal
     // braces.
@@ -1032,6 +1095,7 @@ pub struct ResolvedAgent {
     pub resume: Option<String>,
     pub message: Option<String>,
     pub logs: Option<String>,
+    pub cap: Option<String>,
     pub stop: Option<String>,
     pub plan: Option<String>,
     pub model: Option<String>,
@@ -1281,6 +1345,7 @@ impl AgentsConfig {
             resume: agent.resume.clone(),
             message: agent.message.clone(),
             logs: agent.logs.clone(),
+            cap: agent.cap.clone(),
             stop: agent.stop.clone(),
             plan: agent.plan.clone(),
             model: agent.model.clone(),
@@ -2104,7 +2169,7 @@ mod tests {
         assert_eq!(
             agents["claude"].verbs(),
             vec![
-                "sessions", "attach", "resume", "message", "logs", "stop", "plan"
+                "sessions", "attach", "resume", "message", "logs", "cap", "stop", "plan"
             ]
         );
         assert_eq!(agents["codex"].verbs(), vec!["resume"]);
@@ -2303,6 +2368,55 @@ mod tests {
             assert!(message.contains("logs"), "{message}");
             assert!(message.contains(expected), "{message}");
         }
+    }
+
+    /// The built-in `claude` defines `cap` and `codex` does not, and the
+    /// spelling carries the two halves Voro depends on: it asks about the
+    /// account with a model of its own choosing, and it keeps only the *epoch*
+    /// out of a rejection, so an account merely spending its window prints
+    /// nothing.
+    #[test]
+    fn only_the_claude_builtin_defines_cap() {
+        let config = AgentsConfig::load(Path::new("/nonexistent/voro.toml")).unwrap();
+        let cap = config
+            .agent("claude")
+            .expect("the built-in claude")
+            .cap()
+            .expect("a cap verb");
+        assert!(cap.contains("rejected"), "{cap}");
+        assert!(cap.contains("resetsAt"), "{cap}");
+        assert!(cap.contains("--model haiku"), "{cap}");
+        assert!(config.agent("codex").expect("codex").cap().is_none());
+    }
+
+    /// `cap` takes no placeholders at all. It reads the account rather than a
+    /// session, so `{session}` has nothing to name — and it is not a launch,
+    /// so the launch placeholders have nothing to bind either.
+    #[test]
+    fn cap_is_validated_as_naming_nothing() {
+        for placeholder in [
+            SESSION_PLACEHOLDER,
+            PROMPT_FILE_PLACEHOLDER,
+            MODEL_PLACEHOLDER,
+            SESSION_NAME_PLACEHOLDER,
+            TASK_ID_PLACEHOLDER,
+            NEW_SESSION_PLACEHOLDER,
+        ] {
+            let toml = format!(
+                "[agents.a]\ndispatch = \"run {{prompt_file}}\"\nmodel = \"m\"\n\
+                 cap = \"agent-cap {placeholder}\"\n"
+            );
+            let raw: RawConfig = toml::from_str(&toml).unwrap();
+            let err = validate_agent("a", &raw.agents["a"], Path::new("/c.toml"))
+                .expect_err("a placeholder on cap is refused");
+            let message = err.to_string();
+            assert!(message.contains("cap"), "{message}");
+            assert!(message.contains(placeholder), "{message}");
+        }
+        // And a template that names nothing is exactly what the verb wants.
+        let toml = "[agents.a]\ndispatch = \"run {prompt_file}\"\ncap = \"agent-cap --epoch\"\n";
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        validate_agent("a", &raw.agents["a"], Path::new("/c.toml")).expect("a bare cap is valid");
     }
 
     /// The built-in `stop` renders through the same session binder `logs` does,

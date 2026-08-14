@@ -24,7 +24,9 @@ pub use agent::{
     VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, ViewerTemplate,
     is_builtin_viewer, parse_sessions_json, render_message, render_session,
 };
-pub use cap::{CAP_SIGNATURES, CapReading, read_cap, strip_ansi};
+pub use cap::{
+    AccountCap, CAP_SIGNATURES, CapReading, CapWindow, parse_reset_epoch, read_cap, strip_ansi,
+};
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};
 pub use model::{

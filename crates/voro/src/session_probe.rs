@@ -21,7 +21,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use voro_core::{
-    AgentSessionEntry, CapReading, SessionLiveness, parse_sessions_json, read_cap, render_session,
+    AccountCap, AgentSessionEntry, CapReading, SessionLiveness, parse_reset_epoch,
+    parse_sessions_json, read_cap, render_session,
 };
 
 /// Run an agent's `sessions` command and parse its listing, in a given
@@ -107,6 +108,69 @@ pub fn read_session_cap(logs_cmd: &str, session_ref: &str) -> Option<CapReading>
         .output()
         .ok()?;
     read_cap(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Run an agent's `cap` command and read the account's reset instant from it
+/// (DESIGN.md §8). `None` means "nothing says this account is capped", which is
+/// also what a command that would not run answers, and what an account merely
+/// spending its window answers: the verb prints an instant while the account is
+/// refused and prints nothing otherwise, so silence is the whole negative
+/// answer and every way of arriving at it lands the same.
+///
+/// Unlike [`read_session_cap`] this costs the agent an API call rather than a
+/// screen replay, which is why the caller asks rarely and only while a session
+/// is already badged capped. The template names no session and takes no
+/// substitution — the answer is about the account, and one of them serves the
+/// whole strip.
+///
+/// The label is rendered here, beside the reading, because it is the one part
+/// that needs the operator's timezone and the render path may not shell out for
+/// it. A `date` that cannot render the instant costs the badge its time, not
+/// the reading its meaning: the comparison that says whether the window has
+/// reopened is made on the instant itself.
+pub fn read_account_cap(cap_cmd: &str, now_epoch: i64) -> Option<AccountCap> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(cap_cmd)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    let reset_epoch = parse_reset_epoch(&String::from_utf8_lossy(&output.stdout), now_epoch)?;
+    Some(AccountCap {
+        reset_epoch,
+        reset_label: local_label(reset_epoch),
+    })
+}
+
+/// An instant as the local `21:50` the badge shows, via the same `date` the
+/// wall clock is read from and for the same reason — the agent's instant means
+/// nothing to an operator until it is in their own timezone, and the standard
+/// library offers no local time.
+fn local_label(epoch: i64) -> Option<String> {
+    let output = Command::new("date")
+        .arg(format!("-d@{epoch}"))
+        .arg("+%H:%M")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stamp = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let (hour, minute) = stamp.split_once(':')?;
+    let (hour, minute): (u16, u16) = (hour.parse().ok()?, minute.parse().ok()?);
+    (hour < 24 && minute < 60).then_some(stamp)
+}
+
+/// The wall clock as seconds since the Unix epoch, which is what an agent's own
+/// reset instant is compared against ([`CapWindow::resolve`]). No subprocess and
+/// no timezone: an instant is an instant, which is the whole reason it beats the
+/// clock time on a session's screen.
+pub fn local_epoch() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_secs() as i64)
 }
 
 /// The local wall clock as minutes past midnight, which is what a bare reset
@@ -279,6 +343,47 @@ mod tests {
     fn the_local_clock_reads_within_the_day() {
         let minutes = local_minutes().expect("a local clock");
         assert!(minutes < 24 * 60, "{minutes}");
+    }
+
+    /// The `cap` verb end to end: an agent printing an instant is read as one,
+    /// and rendered into the local time the badge shows.
+    #[test]
+    fn a_capped_account_reads_as_an_instant_with_its_label() {
+        let now = local_epoch().expect("a clock");
+        let reading = read_account_cap(&format!("printf '%s\\n' {}", now + 3600), now)
+            .expect("an account reading");
+        assert_eq!(reading.reset_epoch, now + 3600);
+        let label = reading.reset_label.expect("a rendered label");
+        assert_eq!(label.len(), 5, "{label}");
+        assert!(label.as_bytes()[2] == b':', "{label}");
+    }
+
+    /// Every way of learning nothing lands the same, because the verb's
+    /// negative answer *is* silence: an account with room left prints nothing,
+    /// and so does a command that would not run.
+    #[test]
+    fn an_uncapped_or_unreadable_account_reads_as_nothing() {
+        let now = local_epoch().expect("a clock");
+        for cmd in ["true", "false", "exit 127", "printf ''", "printf 'allowed'"] {
+            assert_eq!(read_account_cap(cmd, now), None, "{cmd}");
+        }
+        // And a number that cannot be a reset instant is not read as one.
+        assert_eq!(read_account_cap("printf '2'", now), None);
+    }
+
+    /// The two clocks agree about now: the instant a reset is compared against
+    /// and the minutes-past-midnight a parsed time is compared against are
+    /// readings of the same moment, or the badge contradicts itself.
+    #[test]
+    fn both_clocks_read_the_same_moment() {
+        let epoch = local_epoch().expect("a clock");
+        let minutes = local_minutes().expect("a local clock");
+        let label = local_label(epoch).expect("a rendered label");
+        let (hour, minute) = label.split_once(':').expect("HH:MM");
+        let rendered: u16 = hour.parse::<u16>().unwrap() * 60 + minute.parse::<u16>().unwrap();
+        // A minute may tick between the two readings, midnight included.
+        let apart = (i32::from(rendered) - i32::from(minutes)).rem_euclid(1440);
+        assert!(apart <= 1, "{label} vs {minutes} minutes past midnight");
     }
 
     /// The rest reading the send path and the reconciler act on: a session the

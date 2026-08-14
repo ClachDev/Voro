@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use voro_core::{
-    ActionRow, CapReading, CompletionReport, DepKind, DepRef, DigestRow, EffectiveScore, Event,
+    ActionRow, CapWindow, CompletionReport, DepKind, DepRef, DigestRow, EffectiveScore, Event,
     QueueRow, ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
 };
 
@@ -723,15 +723,21 @@ fn strip_pr_span() -> Span<'static> {
 /// in progress.
 ///
 /// Three shapes, in decreasing order of what Voro managed to learn. With a
-/// parsed reset time still ahead, `⚠ capped ↻21:50` — the operator can decide
+/// reset time still ahead, `⚠ capped ↻21:50` — the operator can decide
 /// whether to wait. Past that time the window is open and the session is merely
 /// waiting to be nudged, which is a different situation and a different thing
-/// to do about it, so it says so. With no time parsed at all, the bare badge:
+/// to do about it, so it says so. With no time learned at all, the bare badge:
 /// the cap is the part worth knowing, and suppressing it for want of a
 /// timestamp would trade the whole signal for a detail.
-fn capped_span(reading: &CapReading, now_minutes: Option<u16>) -> Span<'static> {
-    let past = now_minutes.is_some_and(|now| reading.reset_passed(now));
-    let text = match (reading.reset_label(), past) {
+///
+/// The time itself comes from whichever source could give it — the account's
+/// own instant where the agent reports one, the clock time on the session's
+/// screen otherwise ([`CapWindow`]) — and the badge is the same either way. It
+/// is only the *third* shape that differs, and invisibly: "reset passed" read
+/// off an instant is a fact, where read off a bare `6:40pm` it is the nearest
+/// occurrence of a time that carries no date.
+fn capped_span(window: &CapWindow) -> Span<'static> {
+    let text = match (&window.label, window.passed) {
         (_, true) => "  ⚠ capped · reset passed".to_string(),
         (Some(at), false) => format!("  ⚠ capped ↻{at}"),
         (None, false) => "  ⚠ capped".to_string(),
@@ -1441,8 +1447,8 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                     spans.push(strip_pr_span());
                 }
             }
-            if let Some(reading) = app.caps.get(&r.task_id) {
-                spans.push(capped_span(reading, app.now_minutes));
+            if let Some(window) = app.cap_window(r.task_id) {
+                spans.push(capped_span(&window));
             }
             // A hand-off has nothing left to be live: the work is with someone
             // else, so a closed session is the expected shape, not an orphan.
