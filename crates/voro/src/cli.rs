@@ -1910,17 +1910,13 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
             .map(|p| p.name.as_str())
             .unwrap_or("?");
         let incomplete = incomplete_report_suffix(store, task.id);
-        let suffix = if incomplete.is_empty() {
-            review_next_suffix(store, &mut forges, &task)
-        } else {
-            incomplete.to_string()
-        };
         writeln!(
             out,
-            "{}{}{}",
+            "{}{}{}{}",
             task_line(&task, name),
             refined_suffix(store, task.id),
-            suffix
+            review_next_suffix(store, &mut forges, &task, !incomplete.is_empty()),
+            incomplete
         )
         .unwrap();
     }
@@ -1930,13 +1926,24 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
 /// A review row's next action as a browser suffix (DESIGN.md §3). The list
 /// shows state in its own column, so only `review` — whose verb reads the
 /// tracked PR, not the state alone — earns the suffix.
-fn review_next_suffix(store: &Store, forges: &mut ForgeMemo, task: &Task) -> String {
+///
+/// `incomplete` says the row already carries the `[incomplete report]` marker,
+/// which withholds `pr` and nothing else (§8): a pull request is built from the
+/// summary the row is missing, but reading a diff is not, so a checkout with no
+/// remote keeps its `next: open` and wears the marker beside it.
+fn review_next_suffix(
+    store: &Store,
+    forges: &mut ForgeMemo,
+    task: &Task,
+    incomplete: bool,
+) -> String {
     if task.state != TaskState::Review {
         return String::new();
     }
-    task.next_action().map_or_else(String::new, |verb| {
-        format!("  next: {}", advertised(store, forges, task, verb))
-    })
+    task.next_action()
+        .map(|verb| advertised(store, forges, task, verb))
+        .filter(|verb| !incomplete || *verb != NextAction::Pr)
+        .map_or_else(String::new, |verb| format!("  next: {verb}"))
 }
 
 /// The verb a row advertises (DESIGN.md §3): the derived one, except that `pr`
@@ -3523,8 +3530,9 @@ mod tests {
     }
 
     /// `list` shows state in its own column, so only `review` earns a next
-    /// suffix — and the incomplete-report marker takes its place when the
-    /// report is half-finished, as in the TUI browser.
+    /// suffix — and where that suffix would read `pr`, the incomplete-report
+    /// marker takes its place when the report is half-finished, as in the TUI
+    /// browser.
     #[test]
     fn list_suffixes_review_rows_with_the_next_action() {
         let mut s = store();
@@ -3541,6 +3549,7 @@ mod tests {
         };
         assert!(line(complete).ends_with("next: pr"), "{out}");
         assert!(line(half).ends_with("[incomplete report]"), "{out}");
+        assert!(!line(half).contains("next:"), "{out}");
         assert!(!line(3).contains("next:"), "{out}");
 
         ok(&mut s, &["set", &complete.to_string(), "--pr", "acme/w#1"]);
@@ -3554,29 +3563,8 @@ mod tests {
     /// back, and a tracked PR is untouched either way.
     #[test]
     fn a_review_row_in_a_remoteless_checkout_advertises_open() {
-        use std::process::{Command, Stdio};
-
-        let project = std::env::temp_dir().join(format!(
-            "voro-cli-remoteless-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&project).unwrap();
-        let git = |args: &[&str]| {
-            let status = Command::new("git")
-                .arg("-C")
-                .arg(&project)
-                .args(args)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?} failed");
-        };
-        git(&["init", "-q"]);
+        let project = remoteless_checkout("remoteless");
+        let git = |args: &[&str]| git_in(&project, args);
 
         let mut s = store();
         ok(
@@ -3603,6 +3591,74 @@ mod tests {
         assert!(show.contains("next: pr"), "{show}");
         let inbox = ok(&mut s, &["inbox"]);
         assert!(inbox.contains(&format!("#{id} pr ")), "{inbox}");
+
+        std::fs::remove_dir_all(&project).ok();
+    }
+
+    /// A throwaway checkout with no remotes — the shape of a first project
+    /// (DESIGN.md §8), which advertises `open` rather than `pr`.
+    fn remoteless_checkout(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "voro-cli-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        git_in(&path, &["init", "-q"]);
+        path
+    }
+
+    fn git_in(path: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The `[incomplete report]` marker withholds one verb and no more
+    /// (DESIGN.md §8): `pr` builds its body from the summary the row is
+    /// missing, so it cannot be recommended, but `open` reads a diff and needs
+    /// no summary — a remoteless row therefore keeps `next: open` and wears the
+    /// marker beside it rather than in its place.
+    #[test]
+    fn an_incomplete_report_keeps_the_local_review_verb() {
+        let project = remoteless_checkout("incomplete");
+        let mut s = store();
+        ok(
+            &mut s,
+            &["project", "add", "demo", project.to_str().unwrap()],
+        );
+        let half = review_task(&mut s, Some("feat/thing"), None);
+
+        let row = |out: &str| {
+            out.lines()
+                .find(|l| l.starts_with(&format!("#{half} ")))
+                .unwrap_or_else(|| panic!("no row for #{half}: {out}"))
+                .to_string()
+        };
+        let out = ok(&mut s, &["list"]);
+        let line = row(&out);
+        assert!(line.contains("next: open"), "{out}");
+        assert!(line.ends_with("[incomplete report]"), "{out}");
+
+        // Give the checkout somewhere to push and the row advertises `pr`,
+        // which a half-written report cannot reach: the marker stands alone.
+        git_in(
+            &project,
+            &["remote", "add", "origin", "https://github.com/acme/w.git"],
+        );
+        let out = ok(&mut s, &["list"]);
+        let line = row(&out);
+        assert!(!line.contains("next:"), "{out}");
+        assert!(line.ends_with("[incomplete report]"), "{out}");
 
         std::fs::remove_dir_all(&project).ok();
     }
