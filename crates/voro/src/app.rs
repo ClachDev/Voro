@@ -2082,9 +2082,13 @@ impl App {
     /// detach per session, which is why the reset hours go missing overnight.
     /// This is that walk as one key.
     ///
-    /// It deliberately fires nothing on its own. The sweep is the operator
-    /// saying "the window is open, go" — there is no daemon, and an agent that
-    /// resumed unwatched on a mis-read badge would be worse than a lost hour.
+    /// A keypress starts it, which is where this begins rather than where it is
+    /// meant to end: firing automatically once the window reopens is wanted, and
+    /// nothing here is shaped to prevent it. Automation needs a trigger, not a
+    /// channel — the same `reset_passed` test, read on the tick instead of on
+    /// the key — so it layers on top of this rather than replacing it. Manual
+    /// first only because a badge that false-positives costs one wasted keypress
+    /// today and an unwatched agent once it is automatic.
     ///
     /// Both guards the quick-message key answers to are stood down here, and the
     /// cap reading is what earns that: [`state_accepts_message`] refuses a
@@ -2096,7 +2100,9 @@ impl App {
         let now = self.now_minutes;
         // A cap whose time never parsed is the operator's call, not the clock's:
         // they pressed the key, and a nudge sent early is refused by the agent
-        // rather than doing harm.
+        // rather than doing harm. This is the one rule an automatic sweep would
+        // have to invert — with no keypress behind it, an untimed cap has
+        // nothing saying the window has opened.
         let (mut ready, mut waiting): (Vec<i64>, Vec<i64>) = (Vec::new(), Vec::new());
         for (id, reading) in &self.caps {
             let due =
