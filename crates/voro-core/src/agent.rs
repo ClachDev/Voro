@@ -266,7 +266,8 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #     `{prompt_file}` replaced by the prompt file's path, the optional
 #     `{session_name}` by the name Voro composes for the session
 #     (`voro-<id>-<title-slug>` for a dispatch, `voro-<id>-refine` for a
-#     refine, `voro-plan-<project>` for planning), and the optional `{task_id}`
+#     refine, `voro-plan-<project>` for planning, `voro-propose-<project>` for
+#     a quick propose), and the optional `{task_id}`
 #     by the task's numeric id.
 #     The optional session verbs unlock attachable dispatch, and each degrades
 #     gracefully when absent:
@@ -522,9 +523,8 @@ const OPTIONAL_VERBS: [VerbAccessor; 7] = [
 /// name starting `voro-<id>` — a dispatch continues into a slug of the task's
 /// title, anything else pointed at that task into its kind — so nothing Voro
 /// starts shows up anonymous or duplicately named in the agent's own session
-/// listing. A planning session belongs to no task, so it is named for its
-/// project — by name, not id, since a bare number there would read as a task
-/// id.
+/// listing. A launch that belongs to no task is named for its project — by
+/// name, not id, since a bare number there would read as a task id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launch {
     /// A task dispatched to a headless session (DESIGN.md §8), carrying the
@@ -540,10 +540,10 @@ pub enum Launch {
     Plan { project: String },
     /// A headless agent expanding the operator's one-line intent into a task it
     /// files itself (DESIGN.md §6/§8). Like a planning session it belongs to no
-    /// task — it is drafting one — so it names its project instead; the id
-    /// serves here, since `propose` already occupies the position a bare number
-    /// would otherwise be read in.
-    Propose { project_id: i64 },
+    /// task — it is drafting one — so it names its project, by name, and the
+    /// two task-less launches share that one convention: a bare number in a
+    /// Voro-composed session name is always a task id.
+    Propose { project: String },
 }
 
 impl Launch {
@@ -562,7 +562,7 @@ impl Launch {
             },
             Launch::Refine { task_id } => format!("voro-{task_id}-refine"),
             Launch::Plan { project } => format!("voro-plan-{}", sanitize_for_name(project)),
-            Launch::Propose { project_id } => format!("voro-propose-{project_id}"),
+            Launch::Propose { project } => format!("voro-propose-{}", sanitize_for_name(project)),
         }
     }
 
@@ -573,12 +573,12 @@ impl Launch {
             Launch::Dispatch { task_id, .. } => format!("task-{task_id}"),
             Launch::Refine { task_id } => format!("refine-{task_id}"),
             Launch::Plan { project } => format!("plan-{}", sanitize_for_name(project)),
-            Launch::Propose { project_id } => format!("propose-{project_id}"),
+            Launch::Propose { project } => format!("propose-{}", sanitize_for_name(project)),
         }
     }
 
-    /// The task this launch is pointed at, if any — `None` for a planning
-    /// session, which drafts a task rather than naming one, and why
+    /// The task this launch is pointed at, if any — `None` for the two launches
+    /// that draft a task rather than naming one, and why
     /// [`TASK_ID_PLACEHOLDER`] is refused on the `plan` verb.
     pub fn task_id(&self) -> Option<i64> {
         match self {
@@ -2807,11 +2807,13 @@ mod tests {
     #[test]
     fn a_quick_propose_names_its_project_and_has_no_task() {
         // Like a planning session it is drafting a task rather than naming one,
-        // so it carries no task id; `propose` occupies the position a bare
-        // number would otherwise be read as a task id in.
-        let propose = Launch::Propose { project_id: 2 };
-        assert_eq!(propose.session_name(), "voro-propose-2");
-        assert_eq!(propose.slug(), "propose-2");
+        // so it carries no task id and names its project the way `N`'s session
+        // does — leaving a bare number in a session name always a task id.
+        let propose = Launch::Propose {
+            project: "mote".into(),
+        };
+        assert_eq!(propose.session_name(), "voro-propose-mote");
+        assert_eq!(propose.slug(), "propose-mote");
         assert_eq!(propose.task_id(), None);
         assert_ne!(
             propose.session_name(),
@@ -2911,7 +2913,7 @@ mod tests {
     }
 
     #[test]
-    fn a_planning_session_sanitizes_its_project_name() {
+    fn a_task_less_launch_sanitizes_its_project_name() {
         // The session name is substituted into a shell command line and the
         // slug becomes a filename, so nothing outside `[A-Za-z0-9._-]` may
         // survive either. Case does, so a project named in capitals reads as
@@ -2929,6 +2931,21 @@ mod tests {
         assert_eq!(plan("a/b").slug(), "plan-a-b");
         // The characters a name may keep pass through untouched.
         assert_eq!(plan("voro-core_v1.2").slug(), "plan-voro-core_v1.2");
+
+        // The other task-less launch reduces a name the same way, so the two
+        // sessions a project can have without a task read alike.
+        let propose = |name: &str| Launch::Propose {
+            project: name.to_string(),
+        };
+        assert_eq!(propose("odm 2").session_name(), "voro-propose-odm-2");
+        assert_eq!(propose("odm 2").slug(), "propose-odm-2");
+        assert_eq!(propose("ODM").session_name(), "voro-propose-ODM");
+        assert_eq!(
+            propose("it's \"fine\"; rm -rf /").session_name(),
+            "voro-propose-it-s--fine---rm--rf--"
+        );
+        assert_eq!(propose("a/b").slug(), "propose-a-b");
+        assert_eq!(propose("voro-core_v1.2").slug(), "propose-voro-core_v1.2");
     }
 
     #[test]
