@@ -1023,6 +1023,13 @@ const MESSAGE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// How much of a failed send's log to look at for the line to quote back.
 const LOG_TAIL_BYTES: u64 = 4096;
 
+/// How long the send path's inline rest-stop is waited on before the send is
+/// refused ([`stop_session_now`]). Generous next to the sub-second call it
+/// covers, and it is only ever paid when the operator has outrun a reconcile
+/// tick — but bounded, because a stop that hangs must not take the cockpit with
+/// it.
+const STOP_WAIT: Duration = Duration::from_secs(5);
+
 /// One line said into a session that already exists (DESIGN.md §8), assembled by
 /// the TUI's quick-message key. Unlike an [`Expansion`] this opens no session
 /// row: it joins a conversation Voro already knows about rather than starting
@@ -1272,11 +1279,77 @@ pub(crate) fn append_launch_log(path: &Path, line: &str) {
 /// log rather than an error the caller must decide about. Nothing waits on it —
 /// the entry is gone or it is not, and Voro reads neither answer.
 pub fn stop_session(ctx: &DispatchCtx, config: &AgentsConfig, session: &Session) {
+    let Ok(Some((mut child, label, launch_log))) = spawn_stop(ctx, config, session) else {
+        return;
+    };
+    // Nothing waits on the stop, so reap it off the loop — an exited child must
+    // not linger as a zombie in a long-lived TUI.
+    std::thread::spawn(move || {
+        if let Ok(status) = child.wait()
+            && !status.success()
+        {
+            append_launch_log(&launch_log, &format!("{label}: exited with {status}"));
+        }
+    });
+}
+
+/// The same stop, waited on: the send path's inline fallback (DESIGN.md §8),
+/// where the operator has outrun a reconcile tick and the session is still
+/// registered at rest. Unlike the detached form the answer matters — a session
+/// whose hold was not released cannot be resumed in place — so this reports
+/// rather than merely logging, and the caller refuses the send on an `Err`
+/// having committed nothing.
+///
+/// "Nothing to stop" is `Ok(())`, not a failure: an agent that defines no `stop`
+/// verb, or a session with no captured reference, is one Voro was never going to
+/// release, and the send that follows either lands or is refused by the agent
+/// itself — which is the pre-#428 behaviour, not a regression this should
+/// pre-empt. A stop still running when [`STOP_WAIT`] is up is a failure, since
+/// the lock demonstrably has not been released yet; the straggler is reaped off
+/// the loop as the detached form's is.
+pub fn stop_session_now(
+    ctx: &DispatchCtx,
+    config: &AgentsConfig,
+    session: &Session,
+) -> Result<(), String> {
+    let Some((mut child, label, launch_log)) = spawn_stop(ctx, config, session)? else {
+        return Ok(());
+    };
+    match wait_for_early_exit(&mut child, STOP_WAIT) {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => {
+            append_launch_log(&launch_log, &format!("{label}: exited with {status}"));
+            Err(format!(
+                "the session could not be released for a headless resume ({status}){}",
+                log_tail_note(&launch_log)
+            ))
+        }
+        None => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Err(format!(
+                "the session is still being released after {}s",
+                STOP_WAIT.as_secs()
+            ))
+        }
+    }
+}
+
+/// Spawn an agent's `stop` verb at one session, shared by the detached and
+/// waited-on forms. `Ok(None)` is nothing to stop — no verb, no reference, or a
+/// launch log that would not open — and `Err` is a spawn that failed, both
+/// already recorded in the launch log where there was anything to record.
+fn spawn_stop(
+    ctx: &DispatchCtx,
+    config: &AgentsConfig,
+    session: &Session,
+) -> Result<Option<(Child, String, PathBuf)>, String> {
     let (Some(template), Some(session_ref)) = (
         config.agent(&session.agent).and_then(|a| a.stop()),
         session.session_ref.as_deref(),
     ) else {
-        return;
+        return Ok(None);
     };
     let command = voro_core::render_session(template, session_ref);
     let launch_log = ctx.launch_log_path();
@@ -1288,33 +1361,26 @@ pub fn stop_session(ctx: &DispatchCtx, config: &AgentsConfig, session: &Session)
         .append(true)
         .open(&launch_log)
     else {
-        return;
+        return Ok(None);
     };
-    let Ok(log_err) = log.try_clone() else { return };
-    let child = Command::new("sh")
+    let Ok(log_err) = log.try_clone() else {
+        return Ok(None);
+    };
+    match Command::new("sh")
         .arg("-c")
         .arg(&command)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
         .process_group(0)
-        .spawn();
-    let mut child = match child {
-        Ok(child) => child,
+        .spawn()
+    {
+        Ok(child) => Ok(Some((child, label, launch_log))),
         Err(e) => {
             append_launch_log(&launch_log, &format!("{label}: cannot spawn: {e}"));
-            return;
+            Err(format!("the session's agent could not be stopped: {e}"))
         }
-    };
-    // Nothing waits on the stop, so reap it off the loop — an exited child must
-    // not linger as a zombie in a long-lived TUI.
-    std::thread::spawn(move || {
-        if let Ok(status) = child.wait()
-            && !status.success()
-        {
-            append_launch_log(&launch_log, &format!("{label}: exited with {status}"));
-        }
-    });
+    }
 }
 
 /// Load the agents config for a one-off [`stop_session`], best-effort: a missing

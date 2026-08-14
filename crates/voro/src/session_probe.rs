@@ -61,6 +61,18 @@ pub fn listing_says_live(entries: &[AgentSessionEntry], session_ref: &str) -> bo
         .is_some_and(entry_is_live)
 }
 
+/// Whether a listing shows this ref as a session whose turn has ended and which
+/// the agent is therefore still holding registered — the rest-stop's trigger
+/// (DESIGN.md §8). A ref that has dropped out of the listing answers no: it was
+/// never registered, or it has already been stopped, and either way there is
+/// nothing to release.
+pub fn listing_says_at_rest(entries: &[AgentSessionEntry], session_ref: &str) -> bool {
+    entries
+        .iter()
+        .find(|e| e.matches_ref(session_ref))
+        .is_some_and(AgentSessionEntry::at_rest)
+}
+
 /// Whether a process with this pid still exists, via `kill -0` (existence
 /// check, no signal sent). A non-positive pid is refused: 0 and negative pids
 /// address process groups, not the single process meant here. Shared by both
@@ -117,12 +129,40 @@ pub fn local_minutes() -> Option<u16> {
     (hour < 24 && minute < 60).then_some(hour * 60 + minute)
 }
 
-/// Whether a session is still running, for a caller holding no listing of its
-/// own — one probe, one answer. `None` when liveness is unknowable.
+/// What one listing says about one session, for a caller that needs more than
+/// the liveness bool out of a single probe — the send path, which asks both
+/// whether the session is mid-turn (refuse) and whether it is registered at rest
+/// (release it first). Running the listing twice for the two questions would
+/// cost a second subprocess on a keypress, and could answer them from two
+/// different readings of a session that moved in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionVerdict {
+    /// Whether the session is still going, `None` when that is unknowable.
+    pub live: Option<bool>,
+    /// Whether the agent still holds it registered with its turn ended
+    /// ([`listing_says_at_rest`]). Unknowable reads as no, since the rest-stop
+    /// acts only on positive evidence.
+    pub at_rest: bool,
+}
+
+/// Read one session's listing entry, for a caller holding no listing of its own
+/// — one probe, both answers.
+pub fn probe_session(sessions_cmd: Option<&str>, session_ref: Option<&str>) -> SessionVerdict {
+    let read = || {
+        let session_ref = session_ref?;
+        let entries = run_sessions_command(sessions_cmd?, None)?;
+        Some(SessionVerdict {
+            live: Some(listing_says_live(&entries, session_ref)),
+            at_rest: listing_says_at_rest(&entries, session_ref),
+        })
+    };
+    read().unwrap_or_default()
+}
+
+/// Whether a session is still running, for a caller that needs only that.
+/// `None` when liveness is unknowable.
 pub fn session_is_live(sessions_cmd: Option<&str>, session_ref: Option<&str>) -> Option<bool> {
-    let session_ref = session_ref?;
-    let entries = run_sessions_command(sessions_cmd?, None)?;
-    Some(listing_says_live(&entries, session_ref))
+    probe_session(sessions_cmd, session_ref).live
 }
 
 #[cfg(test)]
@@ -239,6 +279,38 @@ mod tests {
     fn the_local_clock_reads_within_the_day() {
         let minutes = local_minutes().expect("a local clock");
         assert!(minutes < 24 * 60, "{minutes}");
+    }
+
+    /// The rest reading the send path and the reconciler act on: a session the
+    /// agent still holds registered with its turn ended. `blocked` — a
+    /// permission prompt, a supervisor mid-turn — is the one that must not
+    /// answer yes, and an entry that has left the listing has nothing to
+    /// release.
+    #[test]
+    fn only_a_done_entry_reads_as_at_rest() {
+        let at_rest = |json: &str| probe_session(Some(&listing_cmd(json)), Some("uuid-1")).at_rest;
+        assert!(at_rest(r#"[{"sessionId": "uuid-1", "state": "done"}]"#));
+        assert!(!at_rest(r#"[{"sessionId": "uuid-1", "state": "blocked"}]"#));
+        assert!(!at_rest(r#"[{"sessionId": "uuid-1", "state": "working"}]"#));
+        assert!(!at_rest("[]"));
+        // and the unknowable cases read as no rather than as a stop to make
+        assert!(!probe_session(None, Some("uuid-1")).at_rest);
+        assert!(!probe_session(Some("false"), Some("uuid-1")).at_rest);
+        assert!(!probe_session(Some(&listing_cmd("[]")), None).at_rest);
+    }
+
+    /// Both readings come off one listing run, so the send path cannot see a
+    /// session as mid-turn and at rest from two different moments.
+    #[test]
+    fn one_probe_answers_both_questions() {
+        let cmd = listing_cmd(r#"[{"sessionId": "uuid-1", "state": "done"}]"#);
+        assert_eq!(
+            probe_session(Some(&cmd), Some("uuid-1")),
+            SessionVerdict {
+                live: Some(false),
+                at_rest: true
+            }
+        );
     }
 
     /// The three ways liveness is unknowable, each answering `None` rather
