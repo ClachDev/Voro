@@ -141,6 +141,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the keypress, which is soon enough: nothing reads the revision until
         // the rework comes back.
         app.poll_reviewed_capture();
+        // Land the pull requests confirmed creates are opening (DESIGN.md §8):
+        // record the URL, show it in the browser, or say why it failed. The
+        // push and `gh pr create` run on a background thread, so the queue stays
+        // interactive for the seconds they take.
+        app.poll_pr_create();
         // Advance the usage-cap readings behind the running strip's badge
         // (DESIGN.md §8). A capped `--bg` session never dies, so nothing else
         // would ever notice it; the `logs` verb that reads it is slow, so it

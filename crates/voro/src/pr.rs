@@ -255,31 +255,86 @@ pub fn plan(store: &Store, task_id: i64) -> Result<PrPlan, String> {
     plan_pr(&task, summary.as_deref()).map_err(|e| e.to_string())
 }
 
-/// Create a ready-for-review GitHub PR for a review task and record its URL
-/// (DESIGN.md §8): push the task's branch, open a non-draft PR titled with the
-/// task title and bodied with the completion summary, and store the URL. No
-/// state change — the task stays in `review` until a human accepts. The
-/// operator has already been gated by the caller; `pr` is operator-invoked, so
-/// the dispatched agent still cannot publish. Only called when no PR is
-/// tracked; a tracked one jumps to [`open`] instead. Returns the canonical URL
-/// so a caller can chain into [`open_url`] without re-reading the task.
-/// `local_diff` is the caller's spelling of the local-diff key, for the
-/// non-GitHub error in [`ensure_github_repo`].
-pub fn create(store: &mut Store, task_id: i64, local_diff: &str) -> Result<String, String> {
+/// Everything opening a PR needs once the store has been read (DESIGN.md §8):
+/// the checkout to run in and the plan to open. Holds owned strings and no
+/// `Store` handle, so it can move into the background thread the TUI pushes and
+/// creates on (`crate::probe::PrCreate`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrCreateInput {
+    /// The task's own checkout: a task dispatched into a second repo has its
+    /// branch there, so that is where the push and `gh pr create` must run.
+    repo_path: String,
+    plan: PrPlan,
+}
+
+#[cfg(test)]
+impl PrCreateInput {
+    /// An input naming no checkout, so a job started on it fails at
+    /// [`ensure_github_repo`] before anything is pushed — enough to exercise
+    /// the runner around it without a forge.
+    pub fn unrunnable() -> Self {
+        PrCreateInput {
+            repo_path: String::new(),
+            plan: PrPlan {
+                branch: String::new(),
+                title: String::new(),
+                body: String::new(),
+            },
+        }
+    }
+}
+
+/// The store half of a create (DESIGN.md §8): a few cheap SQLite reads, so it
+/// runs on the TUI event loop. Every not-PR-ready gap — wrong state, no branch,
+/// no completion summary — is named here, before anything is confirmed or
+/// pushed.
+pub fn create_input(store: &Store, task_id: i64) -> Result<PrCreateInput, String> {
     let plan = plan(store, task_id)?;
     let task = store.task(task_id).map_err(|e| e.to_string())?;
-    // The task's own checkout: a task dispatched into a second repo has its
-    // branch there, so that is where the push and `gh pr create` must run.
     let repo = store.repo_for_task(&task).map_err(|e| e.to_string())?;
-    let url = open_pr_on_github(&repo.path, &plan, local_diff)?;
-    // Canonicalise before storing, so the tracked URL matches what `set --pr`
-    // would record and a later jump-to-PR is addressable.
-    let pr = PrRef::parse(&url)
+    Ok(PrCreateInput {
+        repo_path: repo.path,
+        plan,
+    })
+}
+
+/// The subprocess half of a create (DESIGN.md §8), which is why it takes a
+/// [`PrCreateInput`] rather than a task: the TUI runs it off the event loop,
+/// where no `Store` is in reach. Pushes the task's branch and opens a non-draft
+/// PR titled with the task title and bodied with the completion summary,
+/// returning the URL `gh` printed. `local_diff` is the caller's spelling of the
+/// local-diff key, for the non-GitHub error in [`ensure_github_repo`].
+pub fn run_create(input: &PrCreateInput, local_diff: &str) -> Result<String, String> {
+    open_pr_on_github(&input.repo_path, &input.plan, local_diff)
+}
+
+/// The store write that closes a create (DESIGN.md §8), separate for the same
+/// reason: the thread that opened the PR cannot reach the store, so the event
+/// loop records what it sent back. Canonicalises before storing, so the tracked
+/// URL matches what `set --pr` would record and a later jump-to-PR is
+/// addressable. No state change — the task stays in `review` until a human
+/// accepts.
+pub fn record_created(store: &mut Store, task_id: i64, url: &str) -> Result<String, String> {
+    let pr = PrRef::parse(url)
         .map_err(|e| format!("gh opened a PR but its URL was unusable ({url}): {e}"))?;
     store
         .set_pr(task_id, Some(&pr.url))
         .map_err(|e| e.to_string())?;
     Ok(pr.url)
+}
+
+/// Create a ready-for-review GitHub PR for a review task and record its URL
+/// (DESIGN.md §8), all three halves in a row. Blocking, which is what a one-shot
+/// CLI verb should be; the TUI runs the same halves either side of its event
+/// loop instead (`crate::probe::PrCreate`). The operator has already been gated
+/// by the caller; `pr` is operator-invoked, so the dispatched agent still cannot
+/// publish. Only called when no PR is tracked; a tracked one jumps to [`open`]
+/// instead. Returns the canonical URL so a caller can chain into [`open_url`]
+/// without re-reading the task.
+pub fn create(store: &mut Store, task_id: i64, local_diff: &str) -> Result<String, String> {
+    let input = create_input(store, task_id)?;
+    let url = run_create(&input, local_diff)?;
+    record_created(store, task_id, &url)
 }
 
 /// Ask GitHub whether a review task's tracked PR still merges cleanly with its
