@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voro_core::{
-    AgentsConfig, Launch, LaunchSpec, ResolvedAgent, ReviewDiff, Store, TaskState,
+    AgentsConfig, Launch, LaunchSpec, ResolvedAgent, ReviewDiff, Session, Store, TaskState,
     VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, render,
 };
 
@@ -1248,6 +1248,74 @@ pub(crate) fn append_launch_log(path: &Path, line: &str) {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let _ = writeln!(file, "[{ts}] {line}");
+    }
+}
+
+/// Retire an agent's own registry entry for a session Voro has just closed
+/// (DESIGN.md §8) — the process half of the rule that a session's entry follows
+/// its row. `voro-core` decides *whether* a close should stop (the session comes
+/// from `Store::apply_closing` or a reconciler finalisation); this supplies the
+/// spawn.
+///
+/// Best-effort in every direction, which is what makes it safe to fire from
+/// inside a transition that has already committed: an agent that defines no
+/// `stop` verb, or a session with no captured reference, is skipped in silence,
+/// and a stop that fails to spawn or exits non-zero leaves a line in the launch
+/// log rather than an error the caller must decide about. Nothing waits on it —
+/// the entry is gone or it is not, and Voro reads neither answer.
+pub fn stop_session(ctx: &DispatchCtx, config: &AgentsConfig, session: &Session) {
+    let (Some(template), Some(session_ref)) = (
+        config.agent(&session.agent).and_then(|a| a.stop()),
+        session.session_ref.as_deref(),
+    ) else {
+        return;
+    };
+    let command = voro_core::render_session(template, session_ref);
+    let launch_log = ctx.launch_log_path();
+    let label = format!("stop-{}", session.task_id);
+    append_launch_log(&launch_log, &format!("{label}: {command}"));
+
+    let Ok(log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&launch_log)
+    else {
+        return;
+    };
+    let Ok(log_err) = log.try_clone() else { return };
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .process_group(0)
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => {
+            append_launch_log(&launch_log, &format!("{label}: cannot spawn: {e}"));
+            return;
+        }
+    };
+    // Nothing waits on the stop, so reap it off the loop — an exited child must
+    // not linger as a zombie in a long-lived TUI.
+    std::thread::spawn(move || {
+        if let Ok(status) = child.wait()
+            && !status.success()
+        {
+            append_launch_log(&launch_log, &format!("{label}: exited with {status}"));
+        }
+    });
+}
+
+/// Load the agents config for a one-off [`stop_session`], best-effort: a missing
+/// or malformed `voro.toml` costs the stop, never the transition that asked for
+/// it. Callers that already hold a config — the reconciler, sweeping many
+/// sessions — pass their own rather than reloading per session.
+pub fn stop_closed_session(ctx: &DispatchCtx, session: &Session) {
+    if let Ok(config) = AgentsConfig::load(&ctx.agents_path) {
+        stop_session(ctx, &config, session);
     }
 }
 

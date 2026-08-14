@@ -1197,14 +1197,10 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     });
     if empty {
         let inner = area.inner(ratatui::layout::Margin::new(1, 1));
-        // With nothing registered, `n` has nothing to create a task against, so
-        // the empty box points at registration instead (DESIGN.md §9).
-        let hint = if app.projects.is_empty() {
-            crate::app::NO_PROJECTS_HINT
-        } else {
-            "nothing to do — press n"
-        };
-        frame.render_widget(Paragraph::new(hint).dim(), inner);
+        // The cockpit is gated behind having a project (DESIGN.md §9), so an
+        // empty queue here is always the drained one and `n` is always the way
+        // to fill it.
+        frame.render_widget(Paragraph::new("nothing to do — press n").dim(), inner);
     }
 }
 
@@ -1567,21 +1563,15 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     hits.push_list(list_area, state.offset(), app.all.len(), Hit::TaskRow);
     if empty {
         let inner = list_area.inner(ratatui::layout::Margin::new(1, 1));
-        frame.render_widget(Paragraph::new(tasks_empty_message(app)).dim(), inner);
+        // Like the cockpit's, this box has only one case to explain: the
+        // browser is gated behind having a project (DESIGN.md §9), so `n` can
+        // always create one.
+        frame.render_widget(
+            Paragraph::new("no tasks yet — press n to add one").dim(),
+            inner,
+        );
     }
     draw_status(frame, app, status);
-}
-
-/// What an empty task browser says. The two cases need different advice: with no
-/// project registered `n` cannot create anything, so the message points at the
-/// projects screen in the same words the `n` key itself uses; otherwise `n` is
-/// the way in.
-fn tasks_empty_message(app: &App) -> &'static str {
-    if app.projects.is_empty() {
-        "no projects yet — add one on the projects screen (3)"
-    } else {
-        "no tasks yet — press n to add one"
-    }
 }
 
 /// The dependency section of a detail view (task #103), both directions, one
@@ -1973,6 +1963,13 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
         ],
         Screen::Config => {
             let viewers = !app.config_viewers.is_empty();
+            // While the gate holds (DESIGN.md §9) `tab` cycles the shorter
+            // Projects ↔ Config ring, so the slot has to name where it lands.
+            let next = if app.projects.is_empty() {
+                "projects"
+            } else {
+                "cockpit"
+            };
             vec![
                 ("a", "add viewer", true),
                 ("e", "edit", viewers),
@@ -1980,7 +1977,7 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
                 ("V", "default viewer", viewers),
                 ("A", "default agent", true),
                 ("?", "keys", true),
-                ("tab", "cockpit", true),
+                ("tab", next, true),
                 ("q", "quit", true),
             ]
         }
@@ -2049,20 +2046,20 @@ type KeySection = (&'static str, Vec<(&'static str, &'static str)>);
 /// A screen's complete key map (DESIGN.md §9), grouped into actions,
 /// navigation, and screen switching. Unlike [`key_hints`] it is ungated by
 /// selection — it is the map, so it lists every key the screen binds, including
-/// the ones the line has no room to advertise.
-fn key_map(screen: Screen) -> Vec<KeySection> {
+/// the ones the line has no room to advertise. `no_projects` is the one thing
+/// it does gate on, because a map that advertised a jump the gate refuses would
+/// be promising a refusal.
+fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
     let pairs = |set: [(&'static str, &'static str); 2]| set.into_iter();
     let screens = |current: &'static str| {
-        (
-            "Screens",
-            vec![
-                ("tab", current),
-                ("alt-1", "cockpit"),
-                ("alt-2", "tasks"),
-                ("alt-3", "projects"),
-                ("alt-4", "config"),
-            ],
-        )
+        let mut keys = vec![("tab", current)];
+        if !no_projects {
+            keys.push(("alt-1", "cockpit"));
+            keys.push(("alt-2", "tasks"));
+        }
+        keys.push(("alt-3", "projects"));
+        keys.push(("alt-4", "config"));
+        ("Screens", keys)
     };
     match screen {
         Screen::Cockpit => {
@@ -2214,7 +2211,7 @@ fn key_map_column(sections: &[KeySection]) -> Vec<Vec<Span<'static>>> {
 /// The `?` overlay: the current screen's whole key map, actions in one column
 /// and navigation over screen switching in the other so a screenful fits.
 fn draw_key_map(frame: &mut Frame, app: &App) {
-    let sections = key_map(app.screen);
+    let sections = key_map(app.screen, app.projects.is_empty());
     let (actions, rest) = sections.split_at(1);
     let (left, right) = (key_map_column(actions), key_map_column(rest));
     let width_of =
@@ -2341,37 +2338,52 @@ mod tests {
         app
     }
 
-    /// An empty cockpit says what the next press actually is: with nothing
-    /// registered `n` cannot create anything, so the box points at Projects.
+    /// The cockpit is gated behind having a project (DESIGN.md §9), so its
+    /// empty box has one case left to explain — the drained queue — and `n` is
+    /// what fills it.
     #[test]
-    fn an_empty_cockpit_points_at_projects_until_one_exists() {
+    fn an_empty_queue_points_at_n() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use voro_core::Store;
-
-        let render = |app: &crate::app::App| {
-            let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
-            terminal
-                .draw(|f| {
-                    draw(f, app);
-                })
-                .unwrap();
-            screen_text(&terminal)
-        };
-
-        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
-            "/nonexistent/voro.db",
-        ));
-        let mut bare = crate::app::App::new(Store::open_in_memory().unwrap(), ctx).unwrap();
-        bare.screen = crate::app::Screen::Cockpit;
-        bare.status = None;
-        let text = render(&bare);
-        assert!(text.contains(crate::app::NO_PROJECTS_HINT), "{text}");
 
         let mut registered = app_with_status("", 0, 0);
         registered.status = None;
-        let text = render(&registered);
+        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &registered);
+            })
+            .unwrap();
+        let text = screen_text(&terminal);
         assert!(text.contains("nothing to do — press n"), "{text}");
+    }
+
+    /// The key map may not advertise a jump the gate would refuse (DESIGN.md
+    /// §9): with no project registered the Screens section drops `alt-1` and
+    /// `alt-2`, and gets them back the moment one exists.
+    #[test]
+    fn the_key_map_hides_the_gated_screen_jumps() {
+        for screen in [
+            Screen::Cockpit,
+            Screen::Tasks,
+            Screen::Projects,
+            Screen::Config,
+        ] {
+            let jumps = |no_projects: bool| -> Vec<&'static str> {
+                key_map(screen, no_projects)
+                    .into_iter()
+                    .flat_map(|(_, entries)| entries)
+                    .map(|(key, _)| key)
+                    .filter(|key| key.starts_with("alt-"))
+                    .collect()
+            };
+            assert_eq!(jumps(true), vec!["alt-3", "alt-4"], "{screen:?}");
+            assert_eq!(
+                jumps(false),
+                vec!["alt-1", "alt-2", "alt-3", "alt-4"],
+                "{screen:?}"
+            );
+        }
     }
 
     #[test]
@@ -2630,9 +2642,9 @@ mod tests {
         assert!(!open.style.add_modifier.contains(Modifier::DIM));
     }
 
-    /// An empty browser explains itself rather than drawing a blank box, and
-    /// distinguishes its two cases: nothing can be created until a project
-    /// exists, so only a store that has one points at `n`.
+    /// An empty browser explains itself rather than drawing a blank box. The
+    /// gate (DESIGN.md §9) leaves it one case to explain — a project exists and
+    /// has no tasks — so `n` is always the way in.
     #[test]
     fn browser_render_explains_an_empty_list() {
         use crate::app::App;
@@ -2640,40 +2652,28 @@ mod tests {
         use ratatui::backend::TestBackend;
         use voro_core::Store;
 
-        let render = |store: Store| -> String {
-            let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
-                "/nonexistent/voro.db",
-            ));
-            let mut app = App::new(store, ctx).unwrap();
-            // The screen `App::new` opens on depends on whether the store has a
-            // project (DESIGN.md §9), so the browser is selected outright rather
-            // than counted to from the default.
-            app.screen = crate::app::Screen::Tasks;
-            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-            terminal
-                .draw(|f| draw_tasks(f, &app, &mut HitMap::default()))
-                .unwrap();
-            terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(|c| c.symbol())
-                .collect()
-        };
-
-        let bare = render(Store::open_in_memory().unwrap());
-        assert!(
-            bare.contains("no projects yet — add one on the projects screen (3)"),
-            "empty browser with no projects did not point at the projects screen: {bare}"
-        );
-
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
         let mut store = Store::open_in_memory().unwrap();
         store.create_project("voro", "/tmp/voro").unwrap();
-        let no_tasks = render(store);
+        let mut app = App::new(store, ctx).unwrap();
+        app.screen = crate::app::Screen::Tasks;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|f| draw_tasks(f, &app, &mut HitMap::default()))
+            .unwrap();
+        let no_tasks: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
         assert!(
             no_tasks.contains("no tasks yet — press n to add one"),
-            "empty browser with a project did not point at n: {no_tasks}"
+            "empty browser did not point at n: {no_tasks}"
         );
     }
 
@@ -4809,7 +4809,7 @@ mod tests {
             )
             .unwrap();
             app.screen = screen;
-            let mapped: Vec<&str> = key_map(screen)
+            let mapped: Vec<&str> = key_map(screen, app.projects.is_empty())
                 .iter()
                 .flat_map(|(_, entries)| entries.iter())
                 .flat_map(|(key, _)| split(key))
@@ -4842,17 +4842,19 @@ mod tests {
             Screen::Projects,
             Screen::Config,
         ] {
-            let uppercase = key_map(screen)
-                .into_iter()
-                .flat_map(|(_, entries)| entries)
-                .flat_map(|(key, _)| key.split('/').collect::<Vec<_>>())
-                .filter(|key| key.chars().count() == 1 && key.chars().all(char::is_uppercase));
-            for key in uppercase {
-                assert!(
-                    paired.contains(&key) || CASE_EXCEPTIONS.contains(&(screen, key)),
-                    "{screen:?} binds {key:?} uppercase, but it is neither half of a pair \
-                     nor a documented exception — see DESIGN.md §9"
-                );
+            for no_projects in [false, true] {
+                let uppercase = key_map(screen, no_projects)
+                    .into_iter()
+                    .flat_map(|(_, entries)| entries)
+                    .flat_map(|(key, _)| key.split('/').collect::<Vec<_>>())
+                    .filter(|key| key.chars().count() == 1 && key.chars().all(char::is_uppercase));
+                for key in uppercase {
+                    assert!(
+                        paired.contains(&key) || CASE_EXCEPTIONS.contains(&(screen, key)),
+                        "{screen:?} binds {key:?} uppercase, but it is neither half of a pair \
+                         nor a documented exception — see DESIGN.md §9"
+                    );
+                }
             }
         }
     }

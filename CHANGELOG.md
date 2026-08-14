@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   untouched, and the badge drops as each nudge lands so a second press cannot
   start a second agent on the same worktree.
 
+- **Closing a task stops its agent session.** Voro used to leave every session
+  it launched registered with the agent forever: a `claude agents` listing full
+  of finished `voro-*` entries, each backed by a supervisor process that runs
+  until you reboot. That listing is how you find a session to attach to and how
+  Voro reads liveness, so both got worse the longer it grew. A session's entry
+  now follows its row — accept, abort or abandon a task, or let the reconciler
+  finalise a dead or stale session, and the agent is asked to retire its own
+  entry for it. The conversation is kept: `claude stop` drops the entry from the
+  default listing and `claude attach` still reopens it. Sessions Voro keeps open
+  on purpose (`needs-input`, `review`, `waiting`) are never stopped — you still
+  answer and reject into them. Agents declare the capability with a new optional
+  `stop` verb (`{session}`), built in for `claude`; an agent without one, such
+  as `codex`, behaves exactly as before, and a stop that fails leaves a line in
+  `launches.log` rather than touching the transition.
+
 - **Capped sessions are visible instead of silently stuck.** A usage cap does
   not kill a backgrounded agent — the supervisor stays alive and waits for the
   window to reset — so capped work used to ride the running strip looking

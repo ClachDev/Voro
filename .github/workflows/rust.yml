@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - name: Install toolchain components
       run: rustup component add rustfmt clippy
     - name: Check formatting
@@ -26,3 +26,19 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --workspace
+
+  # The pinned version below must match `rust-version` in the workspace
+  # Cargo.toml. Raising one without the other is what this job exists to catch.
+  msrv:
+
+    runs-on: ubuntu-latest
+
+    env:
+      MSRV: "1.88"
+
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install pinned toolchain
+      run: rustup toolchain install $MSRV --profile minimal --no-self-update
+    - name: Check the declared MSRV still compiles
+      run: cargo +$MSRV check --workspace --all-targets

@@ -11,10 +11,15 @@ use voro_core::{
 /// the key handler runs without the pane's geometry.
 const DETAIL_PAGE_STEP: i64 = 10;
 
-/// What an operator with no project registered is told, wherever they meet the
-/// fact: the empty cockpit's box and `n`'s refusal say the same thing in the
-/// same words, and in the keys README.md teaches.
+/// `n`'s refusal with no project registered, in the keys README.md teaches.
+/// The gate (DESIGN.md §9) keeps the operator on the two screens `n` is not
+/// bound on, so this is a defensive path rather than one they can reach.
 pub const NO_PROJECTS_HINT: &str = "no projects yet — press tab to Projects, then a to add one";
+
+/// How a gated screen jump refuses (DESIGN.md §9). It names `alt-3` rather than
+/// `tab` because the jump is the shortest route from either screen the gate
+/// leaves reachable, and it lands on Projects from both.
+pub const NO_PROJECTS_JUMP_HINT: &str = "no projects yet — press alt-3, then a to add one";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -700,7 +705,7 @@ impl App {
         // Reconcile-on-read (DESIGN.md §8): finalise any session whose
         // process has already exited before anything below reads state that
         // depends on it.
-        crate::reconcile::reconcile_live_sessions(&mut self.store, &self.dispatch_ctx.agents_path)?;
+        crate::reconcile::reconcile_live_sessions(&mut self.store, &self.dispatch_ctx)?;
 
         self.projects = self.store.projects()?;
         let candidates = self.store.candidates()?;
@@ -1176,14 +1181,35 @@ impl App {
     }
 
     /// Tab cycles cockpit → tasks → projects → config → cockpit; `alt-1` to
-    /// `alt-4` jump directly (DESIGN.md §9).
+    /// `alt-4` jump directly (DESIGN.md §9). Until a project is registered the
+    /// ring is the shorter Projects ↔ Config, the cockpit and the browser
+    /// having nothing to show and nothing to do until one exists; a screen off
+    /// that ring enters it at Projects, where the first step is.
     pub fn toggle_screen(&mut self) {
+        if self.projects.is_empty() {
+            self.screen = match self.screen {
+                Screen::Projects => Screen::Config,
+                _ => Screen::Projects,
+            };
+            return;
+        }
         self.screen = match self.screen {
             Screen::Cockpit => Screen::Tasks,
             Screen::Tasks => Screen::Projects,
             Screen::Projects => Screen::Config,
             Screen::Config => Screen::Cockpit,
         };
+    }
+
+    /// Take a direct screen jump, or refuse it while the target is gated behind
+    /// having a project (DESIGN.md §9), in Voro's usual shape for a refusal: no
+    /// move, and a status line naming the key to press instead.
+    fn jump_to_screen(&mut self, screen: Screen) {
+        if self.projects.is_empty() && matches!(screen, Screen::Cockpit | Screen::Tasks) {
+            self.status = Some(NO_PROJECTS_JUMP_HINT.into());
+            return;
+        }
+        self.screen = screen;
     }
 
     /// The primary action of the current selection. On the Tasks screen every
@@ -1271,10 +1297,22 @@ impl App {
     /// Apply a transition and refresh. `resume` (needs-input → running) and
     /// reject-with-feedback (review → running) both leave the agent's session
     /// open, so the operator answers the question or addresses the feedback in
-    /// that same session — Voro only moves the state (DESIGN.md §6/§8).
+    /// that same session — Voro only moves the state (DESIGN.md §6/§8). A
+    /// transition that *closes* the session stops it too, so the agent's own
+    /// listing loses the entry along with the row (§8); that is fire-and-forget
+    /// and never reported, since a stop the operator did not ask for has nothing
+    /// useful to say on the status line.
     fn apply_and_refresh(&mut self, task_id: i64, action: Action) {
         let rejected = matches!(action, Action::RejectWork(_));
-        let result = self.store.apply(task_id, action);
+        let result = match self.store.apply_closing(task_id, action) {
+            Ok((task, stopped)) => {
+                if let Some(session) = stopped {
+                    crate::dispatch::stop_closed_session(&self.dispatch_ctx, &session);
+                }
+                Ok(task)
+            }
+            Err(e) => Err(e),
+        };
         if self.report(result).is_some() {
             if rejected {
                 // The head the operator just judged, so the re-review can be
@@ -1417,23 +1455,24 @@ impl App {
         // Direct screen jumps carry the modifier (DESIGN.md §9), which leaves
         // the bare digits to the numbers on the selected row. The arm sits ahead
         // of the two screens that handle their own keys below, so the jumps
-        // reach every screen.
+        // reach every screen — and so this is the only place the gate's refusal
+        // can fire, `tab` merely cycling a shorter ring.
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
                 KeyCode::Char('1') => {
-                    self.screen = Screen::Cockpit;
+                    self.jump_to_screen(Screen::Cockpit);
                     return;
                 }
                 KeyCode::Char('2') => {
-                    self.screen = Screen::Tasks;
+                    self.jump_to_screen(Screen::Tasks);
                     return;
                 }
                 KeyCode::Char('3') => {
-                    self.screen = Screen::Projects;
+                    self.jump_to_screen(Screen::Projects);
                     return;
                 }
                 KeyCode::Char('4') => {
-                    self.screen = Screen::Config;
+                    self.jump_to_screen(Screen::Config);
                     return;
                 }
                 _ => {}
@@ -3755,6 +3794,74 @@ mod tests {
         assert_eq!(app.status, None);
     }
 
+    /// Register a project in an app that had none and reload, so a test can
+    /// watch the gate lift on the very app it watched hold.
+    fn register_a_project(app: &mut App) {
+        app.store.create_project("voro", "/tmp/voro").unwrap();
+        app.refresh().unwrap();
+    }
+
+    /// The gate (DESIGN.md §9): until a project exists `tab` cycles the two
+    /// screens that work without one, never landing on the cockpit or the
+    /// browser.
+    #[test]
+    fn tab_cycles_only_projects_and_config_until_a_project_exists() {
+        let mut app = empty_app();
+        assert_eq!(app.screen, Screen::Projects);
+        for _ in 0..6 {
+            key(&mut app, KeyCode::Tab);
+            assert!(
+                matches!(app.screen, Screen::Projects | Screen::Config),
+                "tab reached {:?} with no projects",
+                app.screen
+            );
+        }
+
+        register_a_project(&mut app);
+        app.screen = Screen::Projects;
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.screen, Screen::Config);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.screen, Screen::Cockpit);
+    }
+
+    /// The gate's only refusal: the alt-digit jumps to the cockpit and the
+    /// browser no-op and say where to go instead, while `alt-3` and `alt-4`
+    /// keep working. All four jump again once a project is registered.
+    #[test]
+    fn the_gated_screen_jumps_refuse_until_a_project_exists() {
+        let mut app = empty_app();
+        for (press, blocked) in [('1', Screen::Cockpit), ('2', Screen::Tasks)] {
+            for from in [Screen::Projects, Screen::Config] {
+                app.screen = from;
+                app.status = None;
+                alt_key(&mut app, KeyCode::Char(press));
+                assert_eq!(app.screen, from, "alt-{press} left {from:?}");
+                assert_eq!(app.status.as_deref(), Some(NO_PROJECTS_JUMP_HINT));
+                assert_ne!(app.screen, blocked);
+            }
+        }
+
+        app.screen = Screen::Config;
+        alt_key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.screen, Screen::Projects);
+        alt_key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.screen, Screen::Config);
+
+        register_a_project(&mut app);
+        for (press, screen) in [
+            ('1', Screen::Cockpit),
+            ('2', Screen::Tasks),
+            ('3', Screen::Projects),
+            ('4', Screen::Config),
+        ] {
+            app.status = None;
+            alt_key(&mut app, KeyCode::Char(press));
+            assert_eq!(app.screen, screen);
+            assert_eq!(app.status, None);
+        }
+    }
+
     /// The landing is decided once, at startup. `refresh` runs after every
     /// mutation and on every external-change poll, so deciding there would yank
     /// the operator to Projects mid-session — for instance on the cockpit of a
@@ -3768,7 +3875,10 @@ mod tests {
     }
 
     /// `n` with no projects refuses in the keys README.md teaches — `tab` and
-    /// `a`, not a screen number.
+    /// `a`, not a screen number. The gate (DESIGN.md §9) keeps the operator off
+    /// the two screens `n` is bound on until a project exists, so this covers a
+    /// defensive path rather than one the TUI can reach; it is kept because the
+    /// refusal guards a real invariant for a single line.
     #[test]
     fn new_task_without_projects_points_at_tab_and_a() {
         let mut app = empty_app();

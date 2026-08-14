@@ -11,7 +11,7 @@ use rusqlite::{Connection, params};
 use crate::error::{Error, Result};
 use crate::model::{LivenessSource, RefineOutcome, Session, SessionOutcome, Task, TaskState};
 use crate::store::{
-    Store, close_open_session, get_session, get_task, insert_session, log_event,
+    Store, close_open_session, get_open_session, get_session, get_task, insert_session, log_event,
     set_session_outcome,
 };
 
@@ -87,6 +87,22 @@ impl Action {
             Action::Abandon => "abandon",
         }
     }
+
+    /// Whether this transition ends the agent's session for good — the
+    /// operator's closing verdicts on work that is over or being called off
+    /// (DESIGN.md §8). Those are the ones after which the agent may also be
+    /// asked to retire its own registry entry for the session, through its
+    /// optional `stop` verb, so its listing converges on work in flight.
+    ///
+    /// Deliberately narrower than "closes the session row". A refine round's
+    /// conclusion closes a row too, and its commonest trigger is the rewriting
+    /// agent's own `voro set --body-file` — a call made from inside the session,
+    /// mid-turn, so stopping there would kill the agent that just reported. The
+    /// three verdicts here are all issued from outside the session, about work
+    /// the operator has finished with.
+    pub fn stops_session(&self) -> bool {
+        matches!(self, Action::Accept | Action::Abort | Action::Abandon)
+    }
 }
 
 impl Store {
@@ -140,10 +156,41 @@ impl Store {
     }
 
     pub fn apply(&mut self, task_id: i64, action: Action) -> Result<Task> {
+        self.apply_closing(task_id, action).map(|(task, _)| task)
+    }
+
+    /// [`apply`](Store::apply), plus the session this transition retired, for a
+    /// caller that owns process I/O (DESIGN.md §8). A session's registry entry
+    /// follows its row: on the operator's closing verdicts
+    /// ([`Action::stops_session`]) the shell fires the agent's `stop` verb at
+    /// what comes back here, so the agent's own listing converges on work still
+    /// in flight.
+    ///
+    /// `None` covers every case there is nothing to stop: a transition that
+    /// leaves the session open on purpose, one that closes it as the agent's own
+    /// report rather than a verdict on it, and a task that had no open session
+    /// at all. The session is read back after the commit, so what comes back is
+    /// the closed row rather than the live one it was.
+    pub fn apply_closing(
+        &mut self,
+        task_id: i64,
+        action: Action,
+    ) -> Result<(Task, Option<Session>)> {
         let tx = self.conn.transaction()?;
+        // Read before the transition, since the close is what makes it
+        // unfindable: after `apply_action` the row is no longer the task's open
+        // session.
+        let closing = if action.stops_session() {
+            get_open_session(&tx, task_id)?.map(|s| s.id)
+        } else {
+            None
+        };
         apply_action(&tx, task_id, action)?;
         tx.commit()?;
-        self.task(task_id)
+        Ok((
+            self.task(task_id)?,
+            closing.map(|id| self.session(id)).transpose()?,
+        ))
     }
 
     /// Dispatch's atomic write (DESIGN.md §8): move the task `ready → running`
@@ -2211,6 +2258,92 @@ mod tests {
             // a manual abort lands in plain ready, never stalled — the human
             // chose to stop the work; nothing about the dispatch died.
             assert_eq!(s.task(task_id).unwrap().state, TaskState::Ready);
+        }
+
+        /// The stop seam (DESIGN.md §8): each closing verdict hands back the
+        /// session it retired — exactly one, already closed, carrying the
+        /// reference the agent knows it by — so the shell can fire the agent's
+        /// `stop` verb at it.
+        #[test]
+        fn the_closing_verdicts_hand_back_the_session_they_retired() {
+            for (action, setup) in [
+                (Action::Abort, Vec::new()),
+                (Action::Accept, vec![Action::Complete(None)]),
+                (Action::Abandon, vec![Action::Complete(None)]),
+            ] {
+                let (mut s, p) = store_with_project();
+                let (task_id, session_id) = dispatch(&mut s, p);
+                s.set_session_ref(session_id, "full-uuid-1").unwrap();
+                for step in setup {
+                    s.apply(task_id, step).unwrap();
+                }
+
+                let (_, stopped) = s.apply_closing(task_id, action.clone()).unwrap();
+                let stopped = stopped.unwrap_or_else(|| panic!("{action:?} retires its session"));
+                assert_eq!(stopped.id, session_id, "{action:?}");
+                assert_eq!(stopped.session_ref.as_deref(), Some("full-uuid-1"));
+                assert!(stopped.ended_at.is_some(), "{action:?}");
+            }
+        }
+
+        /// The other side of the same rule: a transition that leaves the session
+        /// open — or closes it as the agent's own report rather than a verdict
+        /// on it — retires nothing, so the operator's answer, feedback or
+        /// hand-off still reaches a session that is there to receive it.
+        #[test]
+        fn a_transition_that_keeps_its_session_retires_nothing() {
+            for action in [
+                Action::Ask("A or B?".into()),
+                Action::Complete(None),
+                Action::Park,
+            ] {
+                let (mut s, p) = store_with_project();
+                let (task_id, session_id) = dispatch(&mut s, p);
+                if action == Action::Park {
+                    // park is only legal from stalled here, which needs the
+                    // session finalised first
+                    s.reconcile_session(session_id, false, false).unwrap();
+                }
+                let (_, stopped) = s.apply_closing(task_id, action.clone()).unwrap();
+                assert!(stopped.is_none(), "{action:?}");
+            }
+        }
+
+        /// A refine round concludes on the rewriting agent's own `set
+        /// --body-file`, from inside the session and mid-turn, so its close is
+        /// not a verdict and retires nothing.
+        #[test]
+        fn concluding_a_refine_retires_nothing() {
+            let (mut s, p) = store_with_project();
+            let task_id = create(&mut s, p, TaskState::Proposed);
+            s.record_refine_launch(
+                task_id,
+                "thin",
+                "claude",
+                Some(1),
+                LivenessSource::Pid,
+                None,
+            )
+            .unwrap();
+
+            let (_, stopped) = s
+                .apply_closing(
+                    task_id,
+                    Action::ConcludeRefine(crate::model::RefineOutcome::Applied),
+                )
+                .unwrap();
+            assert!(stopped.is_none());
+        }
+
+        /// A verdict on a task that never had an agent on it has nothing to
+        /// retire, so nothing is spawned for it.
+        #[test]
+        fn a_task_with_no_open_session_retires_nothing() {
+            let (mut s, p) = store_with_project();
+            let task_id = create(&mut s, p, TaskState::Ready);
+            let (task, stopped) = s.apply_closing(task_id, Action::Abandon).unwrap();
+            assert_eq!(task.state, TaskState::Rejected);
+            assert!(stopped.is_none());
         }
 
         #[test]
