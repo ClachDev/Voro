@@ -10,9 +10,12 @@
 //! [`ReviewedCapture`] is the reviewed-revision capture, behind a *keypress*:
 //! there is nothing to debounce, so every start runs, and every answer is
 //! recorded against the task it was captured for rather than against whatever
-//! is selected when it lands. [`CapProbe`] is the usage-cap reading, behind
-//! neither: every in-flight session is a target on every tick, so it is the one
-//! runner debounced against the *clock* ([`CAP_INTERVAL`]) rather than against
+//! is selected when it lands. [`PrCreate`] is the create-PR push-and-open,
+//! behind a keypress too, and the one runner whose answer the operator is
+//! visibly waiting on: it lands a URL rather than a fact, and the loop opens
+//! the browser on it. [`CapProbe`] is the usage-cap reading, behind neither:
+//! every in-flight session is a target on every tick, so it is the one runner
+//! debounced against the *clock* ([`CAP_INTERVAL`]) rather than against
 //! anything the operator does.
 
 use std::collections::{HashMap, HashSet};
@@ -21,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use voro_core::{CapReading, Mergeability};
 
-use crate::pr::ReviewedSource;
+use crate::pr::{PrCreateInput, ReviewedSource};
 
 /// How long the selection must rest on a row before its probe starts. Scrolling
 /// through the queue moves faster than this, so rows passed over never spawn a
@@ -199,6 +202,86 @@ impl ReviewedCapture {
     pub fn inject_result(&mut self, task_id: i64, sha: Option<&str>) {
         self.in_flight.insert(task_id);
         let _ = self.tx.send((task_id, sha.map(str::to_string)));
+    }
+}
+
+/// The create-PR runner (DESIGN.md §8): [`crate::pr::run_create`] — a `git
+/// push` and a `gh pr create`, seconds of network between them — on a
+/// background thread, with the URL or the failure sent back for the event loop
+/// to record, open, and report.
+///
+/// Started by the confirmation modal's Enter rather than by the selection, so
+/// like [`ReviewedCapture`] it has no settle interval and nothing to debounce.
+/// It differs from that capture in what it guards and what it hands back: a
+/// second create for a task already creating one would open a second pull
+/// request, so [`Self::in_flight`] is asked before the modal opens as well as
+/// before a job starts; and a failure is as much of an answer as a URL, because
+/// this is the one runner whose result the operator pressed a key to see.
+/// Nothing that lands is discarded — a created PR is a fact about the branch,
+/// so it is recorded against its own task whatever the queue has moved on to.
+pub struct PrCreate {
+    tx: Sender<(i64, Result<String, String>)>,
+    rx: Receiver<(i64, Result<String, String>)>,
+    /// The tasks a create is running for, so neither a repeated `g` nor a
+    /// repeated Enter can open a second pull request for one branch.
+    in_flight: HashSet<i64>,
+}
+
+impl Default for PrCreate {
+    fn default() -> Self {
+        let (tx, rx) = channel();
+        PrCreate {
+            tx,
+            rx,
+            in_flight: HashSet::new(),
+        }
+    }
+}
+
+impl PrCreate {
+    /// Whether a create is already running for this task.
+    pub fn in_flight(&self, task_id: i64) -> bool {
+        self.in_flight.contains(&task_id)
+    }
+
+    /// Push and open the PR `input` describes on a background thread. Returns
+    /// whether a thread was started — `false` when this task already has a
+    /// create in flight.
+    pub fn start(&mut self, task_id: i64, input: PrCreateInput, local_diff: &str) -> bool {
+        if !self.in_flight.insert(task_id) {
+            return false;
+        }
+        let tx = self.tx.clone();
+        let local_diff = local_diff.to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send((task_id, crate::pr::run_create(&input, &local_diff)));
+        });
+        true
+    }
+
+    /// Every create that has finished since the last drain. Never blocks, and
+    /// drops nothing: the URL has to be recorded and the browser opened on it
+    /// whatever the operator is looking at, and a failure has to be said.
+    pub fn take_results(&mut self) -> Vec<(i64, Result<String, String>)> {
+        let mut landed = Vec::new();
+        loop {
+            match self.rx.try_recv() {
+                Ok((task_id, result)) => {
+                    self.in_flight.remove(&task_id);
+                    landed.push((task_id, result));
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return landed,
+            }
+        }
+    }
+
+    /// Hand back a create's outcome as though a background thread had produced
+    /// it, so the event loop's drain-record-and-open half can be tested without
+    /// `gh`.
+    #[cfg(test)]
+    pub fn inject_result(&mut self, task_id: i64, result: Result<String, String>) {
+        self.in_flight.insert(task_id);
+        let _ = self.tx.send((task_id, result));
     }
 }
 
@@ -472,6 +555,52 @@ mod tests {
             vec![(7, "aaaa1111".to_string()), (9, "bbbb2222".to_string())]
         );
         assert!(capture.take_results().is_empty());
+    }
+
+    #[test]
+    fn no_pull_request_before_a_create_runs() {
+        let mut creates = PrCreate::default();
+        assert!(creates.take_results().is_empty());
+        assert!(!creates.in_flight(7));
+    }
+
+    /// Both outcomes are handed back, for as many tasks as have creates in
+    /// flight: a URL has to be recorded and opened, and a failure is the answer
+    /// the operator pressed a key to see.
+    #[test]
+    fn draining_hands_back_every_finished_create() {
+        let mut creates = PrCreate::default();
+        creates.inject_result(7, Ok("https://github.com/o/r/pull/1".into()));
+        creates.inject_result(8, Err("`git push origin feat` failed".into()));
+        assert_eq!(
+            creates.take_results(),
+            vec![
+                (7, Ok("https://github.com/o/r/pull/1".to_string())),
+                (8, Err("`git push origin feat` failed".to_string())),
+            ]
+        );
+        assert!(creates.take_results().is_empty());
+        assert!(!creates.in_flight(7));
+    }
+
+    /// One branch, one pull request: a second confirmation while a create is
+    /// running starts nothing, and only once the first has landed can the task
+    /// be tried again. Another task is unaffected — creates are per task.
+    #[test]
+    fn at_most_one_create_in_flight_per_task() {
+        let mut creates = PrCreate::default();
+        creates.inject_result(7, Ok("https://github.com/o/r/pull/1".into()));
+        assert!(creates.in_flight(7));
+        assert!(!creates.start(7, PrCreateInput::unrunnable(), "`o`"));
+
+        assert_eq!(
+            creates.take_results(),
+            vec![(7, Ok("https://github.com/o/r/pull/1".to_string()))]
+        );
+        assert!(!creates.in_flight(7));
+        // A create for another task is unaffected: this one starts, and fails
+        // on its unrunnable checkout without pushing anything.
+        assert!(creates.start(8, PrCreateInput::unrunnable(), "`o`"));
     }
 
     /// A session never read is due at once, so a capped dispatch badges on the

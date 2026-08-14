@@ -522,6 +522,9 @@ pub struct App {
     /// The background threads capturing the revisions rejections were made
     /// against (DESIGN.md §8), drained by `poll_reviewed_capture`.
     capture: crate::probe::ReviewedCapture,
+    /// The background threads pushing branches and opening pull requests for
+    /// confirmed creates (DESIGN.md §8), drained by `poll_pr_create`.
+    pr_create: crate::probe::PrCreate,
     /// Which in-flight sessions can be read for a usage cap: task id, the
     /// session reference to read, and the agent's `logs` command. Resolved on
     /// refresh, where the agents config is already loaded, so the tick that
@@ -637,6 +640,7 @@ impl App {
             conflict_selected: None,
             probe: crate::probe::ConflictProbe::default(),
             capture: crate::probe::ReviewedCapture::default(),
+            pr_create: crate::probe::PrCreate::default(),
             cap_targets: Vec::new(),
             caps: std::collections::HashMap::new(),
             cap_probe: crate::probe::CapProbe::default(),
@@ -1143,6 +1147,38 @@ impl App {
         for (task_id, sha) in self.capture.take_results() {
             let _ = self.store.record_reviewed(task_id, &sha);
         }
+    }
+
+    /// Record, open, and report every create that has landed (DESIGN.md §8).
+    /// Each answer belongs to the task it was started for rather than to the
+    /// selection, and a tracked PR is a fact about the branch rather than about
+    /// a state, so nothing here is discarded or re-gated on what the task has
+    /// become in the meantime. A success is chained straight into the browser,
+    /// which is the promise the confirmation modal was already making; a
+    /// failure is the one thing the operator pressed a key to learn, so it
+    /// reaches the status line rather than being swallowed the way a lost
+    /// revision is.
+    pub fn poll_pr_create(&mut self) {
+        self.drain_pr_creates(crate::pr::open_url);
+    }
+
+    /// The half above with the browser launch passed in, for the same reason
+    /// `report_created_pr` takes one: the record-and-open chain is testable
+    /// without `gh`, and a test can never launch a real browser.
+    fn drain_pr_creates(&mut self, mut open: impl FnMut(&str) -> Result<String, String>) {
+        let landed = self.pr_create.take_results();
+        if landed.is_empty() {
+            return;
+        }
+        for (task_id, created) in landed {
+            let created =
+                created.and_then(|url| crate::pr::record_created(&mut self.store, task_id, &url));
+            self.report_created_pr(task_id, created, &mut open);
+        }
+        // The rows now carry a tracked PR: their `next:` verb and their marker
+        // both change, and neither would until the next unrelated refresh.
+        let result = self.refresh();
+        self.report(result);
     }
 
     pub fn move_selection(&mut self, delta: i64) {
@@ -2514,8 +2550,9 @@ impl App {
     /// project's review action says. With a tracked PR, jump to it in a browser
     /// (§11c). With none, a `review` task opens the create-PR confirmation
     /// modal, and any other state falls back to the link-an-existing-PR prompt.
-    /// A checkout GitHub cannot take refuses before the modal, naming `o` — the
-    /// local diff is the only thing left to look at.
+    /// A checkout with nowhere to push refuses before the modal, naming `o` —
+    /// the local diff is the only thing left to look at — while a remote `gh`
+    /// cannot address as GitHub is refused by the create it starts.
     fn open_selected_pr(&mut self) {
         let Some(task) = self.selected_task() else {
             return;
@@ -2536,11 +2573,18 @@ impl App {
             };
             return;
         }
-        // The network-free preconditions first, so a task missing a branch or
-        // summary names that gap without a `gh` round-trip; then the medium,
-        // which has to answer before the modal rather than after it.
+        // A create already running for this task owns the branch until it
+        // lands; a second one would open a second pull request.
+        if self.pr_create.in_flight(id) {
+            self.status = Some(format!("already creating the PR for #{id} — waiting on it"));
+            return;
+        }
+        // Both preconditions are network-free (DESIGN.md §8), so the modal is
+        // on screen the instant the key is pressed: the store says whether the
+        // task is PR-ready, and the memoised `git remote` reading says whether
+        // its checkout could take a pull request at all.
         let planned = crate::pr::plan(&self.store, id)
-            .and_then(|plan| self.pr_checkout_is_github(id).map(|()| plan));
+            .and_then(|plan| self.pr_checkout_takes_prs(id).map(|()| plan));
         match planned {
             Ok(plan) => {
                 self.mode = Mode::ConfirmPr {
@@ -2554,22 +2598,32 @@ impl App {
     }
 
     /// Whether the task's checkout can take a pull request at all, named in the
-    /// TUI's idiom so the refusal points at `o` (DESIGN.md §8).
-    fn pr_checkout_is_github(&self, task_id: i64) -> Result<(), String> {
+    /// TUI's idiom so the refusal points at `o` (DESIGN.md §8). Answered from
+    /// the memoised `git remote` reading the row's own `next:` verb is derived
+    /// through, so the key and the advertisement cannot disagree and neither
+    /// costs a round-trip. The sharper question — whether `gh` can address the
+    /// remote as a GitHub repository — is put by the background create instead,
+    /// so a non-GitHub remote reaches the same dead end a moment later.
+    fn pr_checkout_takes_prs(&self, task_id: i64) -> Result<(), String> {
+        if !self.local_review.contains(&task_id) {
+            return Ok(());
+        }
         let checkout = self.task_checkout(task_id).map_err(|e| e.to_string())?;
-        crate::pr::ensure_github_repo(&checkout, "`o`")
+        Err(format!(
+            "{checkout} has no remote to open a pull request on — \
+             use `o` to see this task's diff in a viewer"
+        ))
     }
 
     /// Drive the create-PR confirmation modal (DESIGN.md §8). Enter (or `y`)
-    /// runs the same `crate::pr::create` the CLI's `pr` calls and shows the new
-    /// PR, then refreshes; esc (or `n`) cancels without touching anything.
+    /// hands the push and the `gh pr create` to a background thread and closes
+    /// the modal at once — the browser waits on the URL, the operator does not
+    /// — and `poll_pr_create` records and opens what lands; esc (or `n`)
+    /// cancels without touching anything.
     fn key_confirm_pr(&mut self, key: KeyEvent, task_id: i64, branch: String, title: String) {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let created = crate::pr::create(&mut self.store, task_id, "`o`");
-                self.report_created_pr(task_id, created, crate::pr::open_url);
-                let result = self.refresh();
-                self.report(result);
+                self.start_pr_create(task_id);
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.status = Some(format!("cancelled — no PR opened for #{task_id}"));
@@ -2582,6 +2636,26 @@ impl App {
                 };
             }
         }
+    }
+
+    /// Start a confirmed create off the event loop (DESIGN.md §8). The store
+    /// half runs here — a few SQLite reads, and a gap it names is worth naming
+    /// before a thread is spawned — and the push and `gh pr create` go to the
+    /// background, where the operator is not waiting on them. The status line
+    /// says what is running, since the queue redraws with the task looking
+    /// exactly as it did.
+    fn start_pr_create(&mut self, task_id: i64) {
+        let input = match crate::pr::create_input(&self.store, task_id) {
+            Ok(input) => input,
+            Err(e) => {
+                self.status = Some(e);
+                return;
+            }
+        };
+        self.status = Some(match self.pr_create.start(task_id, input, "`o`") {
+            true => format!("creating the PR for #{task_id}…"),
+            false => format!("already creating the PR for #{task_id} — waiting on it"),
+        });
     }
 
     /// Report a create-PR attempt, chaining a success straight into the browser
@@ -6825,13 +6899,11 @@ mod tests {
         }
     }
 
-    /// `g` is statically the GitHub medium (DESIGN.md §8): on a review task
-    /// whose checkout cannot take a pull request it refuses on the status line
-    /// naming `o`, opens no confirmation, and does not fall back to the
-    /// project's viewer — which is what the viewer action here would have done
-    /// before the split.
-    #[test]
-    fn review_key_on_a_non_github_checkout_refuses_naming_the_viewer_key() {
+    /// A review task PR-ready in every way but its checkout: a branch, a
+    /// completion summary, and a directory nowhere near a forge. `with_repo`
+    /// decides whether that directory is a git repository at all, which is the
+    /// whole of what the press-time gate reads (DESIGN.md §8).
+    fn pr_ready_app(with_repo: bool) -> (App, i64, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "voro-review-key-{}-{}",
             std::process::id(),
@@ -6841,6 +6913,17 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        if with_repo {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["init", "-q"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git init failed");
+        }
 
         let mut store = Store::open_in_memory().unwrap();
         let project = store.create_project("demo", dir.to_str().unwrap()).unwrap();
@@ -6860,19 +6943,153 @@ mod tests {
             .unwrap();
         store.set_branch(task.id, Some("feat/thing")).unwrap();
         store.apply(task.id, Action::Start).unwrap();
-        // PR-ready in every way but the checkout, so the refusal can only be
-        // about the medium — the plan's own gaps are checked first.
         store
             .apply(task.id, Action::Complete(Some("did it".into())))
             .unwrap();
 
-        let mut app = App::new(store, dummy_ctx()).unwrap();
+        let app = App::new(store, dummy_ctx()).unwrap();
+        (app, task.id, dir)
+    }
+
+    /// `g` opens the confirmation without asking the network anything
+    /// (DESIGN.md §8). This checkout is not a GitHub repository at all — the
+    /// press-time `gh repo view` this replaces refused on exactly it — so the
+    /// modal appearing is what proves the keypress no longer waits on a
+    /// round-trip. The refusal has moved to the create itself, below.
+    #[test]
+    fn review_key_opens_the_confirmation_without_a_round_trip() {
+        let (mut app, task_id, dir) = pr_ready_app(false);
+        key(&mut app, KeyCode::Char('g'));
+
+        match app.mode {
+            Mode::ConfirmPr {
+                task_id: id,
+                ref branch,
+                ..
+            } => {
+                assert_eq!(id, task_id);
+                assert_eq!(branch, "feat/thing");
+            }
+            _ => panic!("expected the confirmation modal, got {:?}", app.status),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `g` is statically the GitHub medium (DESIGN.md §8): a checkout with no
+    /// remote to push to has no forge to open a pull request on, which `git
+    /// remote` answers without the network — so that refusal still comes before
+    /// the modal, still names `o`, and still does not fall back to the
+    /// project's viewer.
+    #[test]
+    fn review_key_on_a_remoteless_checkout_refuses_naming_the_viewer_key() {
+        let (mut app, _, dir) = pr_ready_app(true);
         key(&mut app, KeyCode::Char('g'));
 
         let status = app.status.as_deref().unwrap_or("");
         assert!(matches!(app.mode, Mode::Normal), "{status:?}");
         assert!(status.contains("`o`"), "{status:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The sharper refusal — a checkout `gh` cannot address as a GitHub
+    /// repository — survives the move off the event loop unchanged: it is the
+    /// create that asks now, and its error is still the one that points at `o`.
+    #[test]
+    fn a_create_on_a_non_github_checkout_still_names_the_viewer_key() {
+        let (mut app, task_id, dir) = pr_ready_app(false);
+        let error = crate::pr::create(&mut app.store, task_id, "`o`")
+            .expect_err("a bare directory is no GitHub repository");
+        assert!(error.contains("`o`"), "{error:?}");
+        assert!(app.store.task(task_id).unwrap().pr_url.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A create that lands is recorded, opened, and named (DESIGN.md §8): the
+    /// URL goes onto the task, the browser is launched on it, and the status
+    /// line says so. The launch is passed in so the chain runs without `gh`.
+    #[test]
+    fn a_landed_create_is_recorded_and_opened() {
+        let mut app = app_with(&[TaskState::Review]);
+        let task_id = app.selected_task_id().unwrap();
+        let url = "https://github.com/acme/widget/pull/7";
+        app.pr_create.inject_result(task_id, Ok(url.to_string()));
+
+        let mut opened = None;
+        app.drain_pr_creates(|u| {
+            opened = Some(u.to_string());
+            Ok(format!("opening {u} in the browser"))
+        });
+
+        assert_eq!(
+            app.store.task(task_id).unwrap().pr_url.as_deref(),
+            Some(url)
+        );
+        assert_eq!(opened.as_deref(), Some(url));
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(status.contains(url), "{status:?}");
+    }
+
+    /// A create that failed is the one answer the operator pressed a key to
+    /// see, so it reaches the status line rather than being swallowed the way a
+    /// lost reviewed revision is — and nothing is recorded or opened.
+    #[test]
+    fn a_failed_create_lands_in_the_status_line() {
+        let mut app = app_with(&[TaskState::Review]);
+        let task_id = app.selected_task_id().unwrap();
+        app.pr_create
+            .inject_result(task_id, Err("`git push origin feat/thing` failed".into()));
+
+        let mut opened = false;
+        app.drain_pr_creates(|_| {
+            opened = true;
+            Ok(String::new())
+        });
+
+        assert!(!opened, "the browser was launched for a failed create");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("`git push origin feat/thing` failed")
+        );
+        assert!(app.store.task(task_id).unwrap().pr_url.is_none());
+    }
+
+    /// Two creates for one branch would be two pull requests, so `g` on a task
+    /// whose create is still running opens no modal and says what it is waiting
+    /// on (DESIGN.md §8).
+    #[test]
+    fn the_github_key_refuses_while_a_create_is_in_flight() {
+        let mut app = app_with(&[TaskState::Review]);
+        let task_id = app.selected_task_id().unwrap();
+        app.pr_create
+            .inject_result(task_id, Ok("https://github.com/acme/widget/pull/7".into()));
+
+        key(&mut app, KeyCode::Char('g'));
+
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(matches!(app.mode, Mode::Normal), "{status:?}");
+        assert!(status.contains("already creating"), "{status:?}");
+    }
+
+    /// Confirming ends the operator's wait whatever the create then does: the
+    /// modal closes on the keypress (DESIGN.md §8). Here the task has no branch
+    /// to push, so the store half refuses before any thread is started, and the
+    /// gap is named rather than a create being reported as running.
+    #[test]
+    fn confirming_a_create_closes_the_modal_at_once() {
+        let mut app = app_with(&[TaskState::Review]);
+        let task_id = app.selected_task_id().unwrap();
+        app.mode = Mode::ConfirmPr {
+            task_id,
+            branch: "feat/thing".into(),
+            title: "reviewable".into(),
+        };
+
+        key(&mut app, KeyCode::Enter);
+
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(matches!(app.mode, Mode::Normal), "{status:?}");
+        assert!(status.contains("branch"), "{status:?}");
+        assert!(app.pr_create.take_results().is_empty());
     }
 
     /// Typing a reference and submitting tracks it (canonicalised) on the task
