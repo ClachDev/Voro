@@ -137,6 +137,14 @@ editor you do use instead. With the account and the diff in front of you, press
 `enter` (`⏎ review`) to accept or reject the work; rejecting with a note
 re-dispatches the agent to address it.
 
+Accepting records your verdict and completes the task — it does not merge
+anything. On a project you review through GitHub the work lands when its pull
+request is merged, which you will usually have done already, with the merged
+diff in front of you. On a project with no remote the work stays on the branch
+the agent reported, recorded on the task and printed by `voro show <id>` as
+`branch:`, and landing it is one command in the project checkout: `git merge
+<branch>`.
+
 Other keys worth knowing on a selected task: `s` change state, `x` the score
 breakdown, `h` its history, `e` edit, `l` the session log, and `q` to quit.
 
