@@ -400,16 +400,16 @@ impl CapProbe {
 /// an hour rather than pounds.
 pub const ACCOUNT_CAP_INTERVAL: Duration = Duration::from_secs(600);
 
-/// Whether an agent's account reading should be taken this tick (DESIGN.md §8).
+/// Whether an account reading should be taken this tick (DESIGN.md §8).
 ///
-/// The rule is "ask once, while it matters": a session of this agent is badged
-/// capped, nothing is in flight for it, and either nothing has been read yet or
-/// what was read has expired — a window that has reopened while a session is
-/// still badged is the one case where asking again can learn something, since
-/// the account may have entered a new one. A reading that came back *empty* is
-/// held too, and that is what stops a session capped on a limit the probe does
-/// not hit (a weekly model cap behind a healthy account) from buying a fresh
-/// call every interval for as long as it sits there.
+/// The rule is "ask once, while it matters": a session this question answers
+/// for is badged capped, nothing is in flight for it, and either nothing has
+/// been read yet or what was read has expired — a window that has reopened
+/// while a session is still badged is the one case where asking again can learn
+/// something, since the account may have entered a new one. A reading that came
+/// back *empty* is held too, and that is what stops a session whose badge has
+/// gone stale from buying a fresh call every interval for as long as it sits
+/// there.
 pub fn account_probe_due(
     in_flight: bool,
     last: Option<(Instant, Option<i64>)>,
@@ -432,20 +432,25 @@ pub fn account_probe_due(
 }
 
 /// The account-cap probe's off-loop runner (DESIGN.md §8): an agent's `cap`
-/// verb on a background thread, reading the instant its usage window reopens.
+/// verb on a background thread, reading the instant the window holding a
+/// session reopens.
 ///
 /// It is [`CapProbe`]'s counterpart and differs from it in both directions of
-/// what it costs. It is keyed by *agent* rather than by task, because a cap is a
-/// property of the account and one reading answers for every session on the
-/// strip — where a screen replay has to be taken per session. And it is
-/// debounced far harder, because the verb spends an API call rather than a
-/// subprocess: [`account_probe_due`] asks once per capped episode, and
+/// what it costs. It is keyed by the *question* — the rendered `cap` command —
+/// rather than by task, because a cap belongs to the account and one reading
+/// answers for every session that would ask the same thing, where a screen
+/// replay has to be taken per session. That key is what makes the per-model
+/// case fall out without being special: an agent asking on `{model}` renders a
+/// different command per model in flight and gets a reading each, one that
+/// names no model renders one command and is asked once. And it is debounced
+/// far harder, because the verb spends an API call rather than a subprocess:
+/// [`account_probe_due`] asks once per capped episode, and
 /// [`ACCOUNT_CAP_INTERVAL`] catches anything that would ask in a loop.
 pub struct AccountCapProbe {
     tx: Sender<(String, Option<AccountCap>)>,
     rx: Receiver<(String, Option<AccountCap>)>,
     in_flight: HashSet<String>,
-    /// Each agent's last reading: when it was started, and the instant it came
+    /// Each question's last reading: when it was asked, and the instant it came
     /// back with — `None` for a reading that found the account uncapped, which
     /// is held exactly as a positive one is.
     last: HashMap<String, (Instant, Option<i64>)>,
@@ -464,63 +469,65 @@ impl Default for AccountCapProbe {
 }
 
 impl AccountCapProbe {
-    pub fn due(&self, agent: &str, now: Instant, now_epoch: Option<i64>) -> bool {
+    pub fn due(&self, question: &str, now: Instant, now_epoch: Option<i64>) -> bool {
         account_probe_due(
-            self.in_flight.contains(agent),
-            self.last.get(agent).copied(),
+            self.in_flight.contains(question),
+            self.last.get(question).copied(),
             now,
             now_epoch,
         )
     }
 
-    /// Ask `cap_cmd` what this agent's account says, on a background thread.
-    pub fn start(&mut self, agent: String, cap_cmd: String, now: Instant, now_epoch: i64) {
-        self.in_flight.insert(agent.clone());
+    /// Ask one rendered `cap` command what the account says, on a background
+    /// thread.
+    pub fn start(&mut self, question: String, now: Instant, now_epoch: i64) {
+        self.in_flight.insert(question.clone());
         // Held from the start, not from the answer, so a verb slower than the
         // interval cannot be started twice over.
-        self.last.insert(agent.clone(), (now, None));
+        self.last.insert(question.clone(), (now, None));
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let reading = crate::session_probe::read_account_cap(&cap_cmd, now_epoch);
-            let _ = tx.send((agent, reading));
+            let reading = crate::session_probe::read_account_cap(&question, now_epoch);
+            let _ = tx.send((question, reading));
         });
     }
 
     /// Every reading that has landed since the last drain, each tagged with the
-    /// agent it was asked of. Never blocks. An empty reading is handed back as
-    /// meaningfully as a full one: it clears the account's answer, leaving the
+    /// question it answers. Never blocks. An empty reading is handed back as
+    /// meaningfully as a full one: it clears that question's answer, leaving the
     /// badge to the session's own screen again.
     pub fn take_results(&mut self) -> Vec<(String, Option<AccountCap>)> {
         let mut landed = Vec::new();
         loop {
             match self.rx.try_recv() {
-                Ok((agent, reading)) => {
-                    self.in_flight.remove(&agent);
-                    if let Some(entry) = self.last.get_mut(&agent) {
+                Ok((question, reading)) => {
+                    self.in_flight.remove(&question);
+                    if let Some(entry) = self.last.get_mut(&question) {
                         entry.1 = reading.as_ref().map(|r| r.reset_epoch);
                     }
-                    landed.push((agent, reading));
+                    landed.push((question, reading));
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return landed,
             }
         }
     }
 
-    /// Drop the debounce for agents with nothing capped on the strip, so the
-    /// next cap reads afresh rather than waiting out the last one's interval.
-    pub fn retain(&mut self, capped: &HashSet<String>) {
-        self.last.retain(|agent, _| capped.contains(agent));
+    /// Drop the debounce for questions no badged session is asking any more, so
+    /// the next cap reads afresh rather than waiting out the last one's
+    /// interval.
+    pub fn retain(&mut self, asked_for: &HashSet<String>) {
+        self.last.retain(|question, _| asked_for.contains(question));
     }
 
     /// Hand back a reading as though a background probe had produced it, so the
     /// drain-and-render half can be tested without spending an API call.
     #[cfg(test)]
-    pub fn inject_result(&mut self, agent: &str, reading: Option<AccountCap>) {
-        self.in_flight.insert(agent.to_string());
+    pub fn inject_result(&mut self, question: &str, reading: Option<AccountCap>) {
+        self.in_flight.insert(question.to_string());
         self.last
-            .entry(agent.to_string())
+            .entry(question.to_string())
             .or_insert((Instant::now(), None));
-        let _ = self.tx.send((agent.to_string(), reading));
+        let _ = self.tx.send((question.to_string(), reading));
     }
 }
 

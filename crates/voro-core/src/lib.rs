@@ -22,7 +22,8 @@ pub use agent::{
     NEW_SESSION_PLACEHOLDER, PROMPT_FILE_PLACEHOLDER, Provenance, RenderedMessage, ResolvedAgent,
     SESSION_NAME_PLACEHOLDER, SESSION_PLACEHOLDER, SessionLiveness, TASK_ID_PLACEHOLDER,
     VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, ViewerTemplate,
-    is_builtin_viewer, parse_sessions_json, render_message, render_session,
+    is_builtin_viewer, model_for_depth, parse_sessions_json, render_cap, render_message,
+    render_session,
 };
 pub use cap::{
     AccountCap, CAP_SIGNATURES, CapReading, CapWindow, parse_reset_epoch, read_cap, strip_ansi,

@@ -5,7 +5,7 @@ use voro_core::{
     Action, ActionRow, AgentsConfig, CompletionReport, DepKind, DepRef, DigestRow, Event,
     LivenessSource, PrRef, Priority, Project, Queue, QueueRow, RefineOutcome, RunningRow,
     ScoreBreakdown, StateCounts, Store, Task, TaskState, Triage, WipGate, projects_for_new_task,
-    scheduler,
+    render_cap, scheduler,
 };
 
 /// Lines `PgDn`/`PgUp` move the focus card in one press. A fixed step, since
@@ -351,10 +351,15 @@ pub struct AttachRequest {
 /// starts a probe does no I/O of its own to decide what to probe.
 ///
 /// It names two readings, on two different scales. `logs` replays *this
-/// session's* screen and is taken per row; `cap` asks *the account* this row's
-/// agent dispatches on, so every row under one agent shares one answer — which
-/// is why the agent's name is carried beside its verb rather than the verb
-/// alone.
+/// session's* screen and is taken per row; `cap` asks the account about the
+/// window this session's *model* is metered against, so rows asking the same
+/// question share one answer.
+///
+/// That question is carried already rendered, and is also the key the answer is
+/// held under, because it is exactly what distinguishes one reading from
+/// another: an agent asking per model splits into one question per model in
+/// flight, and an agent whose template names no model collapses to a single
+/// question for every row it runs — without either case being special.
 #[derive(Debug, Clone)]
 struct CapTarget {
     task_id: i64,
@@ -362,10 +367,8 @@ struct CapTarget {
     session_ref: String,
     /// The agent's `logs` verb, without which there is no target at all.
     logs: String,
-    /// The agent that ran the session, which is what an account reading is
-    /// keyed by.
-    agent_name: String,
-    /// That agent's `cap` verb, where it defines one.
+    /// The agent's `cap` verb with this session's model bound, where it defines
+    /// one.
     cap: Option<String>,
 }
 
@@ -1091,9 +1094,12 @@ impl App {
     /// contributes no targets and is probed for nothing, which is how the whole
     /// feature stays absent for `codex` rather than failing loudly on it.
     ///
-    /// It carries the agent it ran under, and that agent's `cap` verb where
-    /// there is one, because the second reading is taken per *account* and this
-    /// is where the config is already open.
+    /// It carries the agent's `cap` verb rendered for the model this session
+    /// launched with, because that is what the second reading asks and this is
+    /// where the config is already open. The model is resolved by the same rule
+    /// the launch resolved it by — the deeper model for a deep task — since a
+    /// subscription meters each strong model separately and a reading taken on
+    /// the wrong one answers about the wrong window.
     fn resolve_cap_targets(&self, config: Option<&AgentsConfig>) -> Vec<CapTarget> {
         let Some(config) = config else {
             return Vec::new();
@@ -1108,24 +1114,26 @@ impl App {
                 }
                 let session_ref = session.session_ref.clone()?;
                 let agent = config.agent(&session.agent)?;
+                let deep = self.store.task(r.task_id).is_ok_and(|t| t.deep);
                 Some(CapTarget {
                     task_id: r.task_id,
                     session_ref,
                     logs: agent.logs()?.to_string(),
-                    agent_name: session.agent.clone(),
-                    cap: agent.cap().map(str::to_string),
+                    cap: agent
+                        .cap()
+                        .map(|template| render_cap(template, agent.model_for(deep))),
                 })
             })
             .collect()
     }
 
-    /// What the account this task's session runs under says about its cap, when
+    /// What the account said about the window holding this task's session, when
     /// anything has been read for it (DESIGN.md §8). The badge and the sweep
     /// both go through here rather than reaching for the map, so the answer a
-    /// row shows is the one its own agent gave.
+    /// row shows is the one to the question that row asks.
     pub fn account_cap(&self, task_id: i64) -> Option<&voro_core::AccountCap> {
         let target = self.cap_targets.iter().find(|t| t.task_id == task_id)?;
-        self.account_caps.get(&target.agent_name)
+        self.account_caps.get(target.cap.as_ref()?)
     }
 
     /// The cap window for one badged task: its session's screen and its
@@ -1166,13 +1174,13 @@ impl App {
                 }
             }
         }
-        for (agent, reading) in self.account_probe.take_results() {
+        for (question, reading) in self.account_probe.take_results() {
             match reading {
                 Some(reading) => {
-                    self.account_caps.insert(agent, reading);
+                    self.account_caps.insert(question, reading);
                 }
                 None => {
-                    self.account_caps.remove(&agent);
+                    self.account_caps.remove(&question);
                 }
             }
         }
@@ -1198,32 +1206,30 @@ impl App {
                 .start(target.task_id, target.session_ref, target.logs, now);
         }
 
-        // An agent is worth asking about only while something under it is
-        // badged, and stops being worth holding a reading for the moment
-        // nothing is.
-        let capped: std::collections::HashSet<String> = self
+        // A question is worth asking only while a session it answers for is
+        // badged, and stops being worth holding an answer to the moment none
+        // is.
+        let asked_for: std::collections::HashSet<String> = self
             .cap_targets
             .iter()
             .filter(|t| self.caps.contains_key(&t.task_id))
-            .map(|t| t.agent_name.clone())
+            .filter_map(|t| t.cap.clone())
             .collect();
-        self.account_caps.retain(|agent, _| capped.contains(agent));
-        self.account_probe.retain(&capped);
+        self.account_caps.retain(|q, _| asked_for.contains(q));
+        self.account_probe.retain(&asked_for);
 
         let Some(now_epoch) = self.now_epoch else {
             return;
         };
-        // Collected by agent rather than by row: several capped sessions under
-        // one agent are one account, and so one reading.
-        let asking: std::collections::BTreeMap<String, String> = self
-            .cap_targets
+        // Deduplicated by the question itself, so several capped sessions
+        // asking the same thing — same agent, same model — are one call.
+        let asking: Vec<String> = asked_for
             .iter()
-            .filter(|t| capped.contains(&t.agent_name))
-            .filter_map(|t| Some((t.agent_name.clone(), t.cap.clone()?)))
-            .filter(|(agent, _)| self.account_probe.due(agent, now, self.now_epoch))
+            .filter(|question| self.account_probe.due(question, now, self.now_epoch))
+            .cloned()
             .collect();
-        for (agent, cap_cmd) in asking {
-            self.account_probe.start(agent, cap_cmd, now, now_epoch);
+        for question in asking {
+            self.account_probe.start(question, now, now_epoch);
         }
     }
 
@@ -1245,6 +1251,17 @@ impl App {
     #[cfg(test)]
     pub fn cap_target_ids(&self) -> Vec<i64> {
         self.cap_targets.iter().map(|t| t.task_id).collect()
+    }
+
+    /// The account question this task's row asks — the `cap` verb with its
+    /// session's model bound — which is also the key its answer is held under.
+    #[cfg(test)]
+    pub fn cap_question(&self, task_id: i64) -> Option<String> {
+        self.cap_targets
+            .iter()
+            .find(|t| t.task_id == task_id)?
+            .cap
+            .clone()
     }
 
     /// Keep the wall clock the reset badge is judged against roughly current,
@@ -6110,12 +6127,20 @@ mod tests {
 
     // --- the account's own reset instant (task #441) ---
 
+    /// A stub `cap` verb that asks on the session's model, so the tests below
+    /// exercise the rendering the real one depends on. `out` is what it prints.
+    fn cap_verb(out: &str) -> String {
+        format!(
+            "cap = \"printf '%s' '{out}' # {{model}}\"\nmodel = \"workhorse\"\nmodel_deep = \"strongest\"\n"
+        )
+    }
+
     /// Drive the pass until the account reading lands, which like the session
     /// one is a background thread running a subprocess.
-    fn settle_account(app: &mut App, agent: &str, want: bool) {
+    fn settle_account(app: &mut App, question: &str, want: bool) {
         for _ in 0..200 {
             app.poll_cap_probes();
-            if app.account_caps.contains_key(agent) == want {
+            if app.account_caps.contains_key(question) == want {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -6129,7 +6154,8 @@ mod tests {
     /// nothing to show and nothing for a clock to decide.
     #[test]
     fn the_accounts_instant_times_a_cap_the_screen_left_untimed() {
-        let (mut app, task_id, project_path) = cap_env(true, "Weekly limit reached");
+        let (mut app, task_id, project_path) =
+            cap_env_with(true, "Weekly limit reached", &cap_verb(""));
         settle_cap(&mut app, task_id, true);
         assert_eq!(app.caps[&task_id].reset_minutes, None);
         assert!(
@@ -6139,14 +6165,15 @@ mod tests {
 
         let now = crate::session_probe::local_epoch().expect("a clock");
         app.now_epoch = Some(now);
+        let question = app.cap_question(task_id).expect("a question");
         app.inject_account_cap(
-            "stub",
+            &question,
             Some(voro_core::AccountCap {
                 reset_epoch: now + 3600,
                 reset_label: Some("09:00".into()),
             }),
         );
-        settle_account(&mut app, "stub", true);
+        settle_account(&mut app, &question, true);
 
         let window = app.cap_window(task_id).expect("a window");
         assert_eq!(window.label.as_deref(), Some("09:00"));
@@ -6163,8 +6190,11 @@ mod tests {
     /// the sweep goes by the instant.
     #[test]
     fn the_sweep_goes_by_the_accounts_instant() {
-        let (mut app, task_id, project_path) =
-            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+        let (mut app, task_id, project_path) = cap_env_with(
+            true,
+            "Session limit reached - Retrying in 5m (9:50pm)",
+            &cap_verb(""),
+        );
         settle_cap(&mut app, task_id, true);
         // An hour short of the 21:50 the screen named: on the parse alone this
         // session is waiting, and the sweep would leave it alone.
@@ -6173,14 +6203,15 @@ mod tests {
 
         let now = crate::session_probe::local_epoch().expect("a clock");
         app.now_epoch = Some(now);
+        let question = app.cap_question(task_id).expect("a question");
         app.inject_account_cap(
-            "stub",
+            &question,
             Some(voro_core::AccountCap {
                 reset_epoch: now - 60,
                 reset_label: Some("21:50".into()),
             }),
         );
-        settle_account(&mut app, "stub", true);
+        settle_account(&mut app, &question, true);
         assert!(app.cap_window(task_id).expect("a window").passed);
 
         key(&mut app, KeyCode::Char('u'));
@@ -6227,25 +6258,51 @@ mod tests {
             true,
             "Session limit reached",
             &format!(
-                "cap = \"printf 'x' >> '{}'; printf '%s' {}\"\n",
+                "cap = \"printf '%s' {{model}} >> '{}'; printf '%s' {}\"\nmodel = \"workhorse\"\n",
                 asked.display(),
                 now + 1800
             ),
         );
         settle_cap(&mut app, task_id, true);
-        settle_account(&mut app, "stub", true);
+        let question = app.cap_question(task_id).expect("a question");
+        settle_account(&mut app, &question, true);
         for _ in 0..20 {
             app.poll_cap_probes();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        assert_eq!(app.account_caps["stub"].reset_epoch, now + 1800);
+        assert_eq!(app.account_caps[&question].reset_epoch, now + 1800);
         assert_eq!(
             std::fs::read_to_string(&asked).unwrap_or_default(),
-            "x",
-            "the account was asked more than once"
+            "workhorse",
+            "the account was asked more than once, or on the wrong model"
         );
         let _ = std::fs::remove_file(&asked);
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// The question is asked on the model the session actually launched with,
+    /// because a subscription meters each strong model separately: a deep
+    /// task's session runs the deeper model, so the window that holds it is
+    /// that model's window and not the workhorse's. A reading taken on the
+    /// wrong model would answer about the wrong window — and answer *earlier*
+    /// than the truth whenever the cheaper pool reopens first.
+    #[test]
+    fn the_question_names_the_model_its_session_ran() {
+        let (mut app, task_id, project_path) =
+            cap_env_with(true, "Session limit reached", &cap_verb(""));
+        assert!(
+            app.cap_question(task_id)
+                .expect("a question")
+                .contains("workhorse")
+        );
+
+        app.store.set_deep(task_id, true).unwrap();
+        app.refresh().unwrap();
+        let deep = app.cap_question(task_id).expect("a question");
+        assert!(deep.contains("strongest"), "{deep}");
+        assert!(!deep.contains("workhorse"), "{deep}");
 
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }

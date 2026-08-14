@@ -152,13 +152,20 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// since the same header the message renders its time from is where this comes
 /// from.
 ///
-/// Two properties of the spelling are load-bearing. It prints *nothing* when
-/// the account is not refused, which is the contract's whole negative answer;
-/// and it names `--model haiku` rather than `{model}`, because unlike every
-/// other verb this one spends an API call to ask — a cent or two, mostly cache
-/// creation — and the answer is the same whichever model is refused. The
-/// `timeout` is the belt to that brace: a cap is not retried (§8), so the turn
-/// ends at once, but nothing in Voro should wait on an agent indefinitely.
+/// It asks with `{model}` — the model whose window is in question — because a
+/// Claude subscription meters more than one: the five-hour pool, the weekly
+/// one, and a separate allowance for each strong model, which the CLI names
+/// "Opus limit", "Sonnet limit" and "Fable 5 limit". A probe on the wrong model
+/// would answer for the wrong window, and answer *earlier* than the truth
+/// whenever a cheap model's pool reopens first. Asking on the session's own
+/// model also makes the case that matters free: a refused request is a 429 and
+/// bills nothing, so the only probe that costs a turn is one that finds the
+/// account healthy — and prints nothing.
+///
+/// The other load-bearing property is that it prints nothing when the account
+/// is not refused, which is the contract's whole negative answer. The `timeout`
+/// is the belt to that brace: a cap is not retried (§8), so the turn ends at
+/// once, but nothing in Voro should wait on an agent indefinitely.
 ///
 /// The claude `stop` verb retires a session from the agent's own listing once
 /// Voro closes its row — and, at rest, once it hands back (DESIGN.md §8): the
@@ -180,7 +187,7 @@ attach     = \"claude attach {session}\"
 resume     = \"claude --resume {session}\"
 message    = \"claude -p --resume {session} --permission-mode auto \\\"$(cat {prompt_file})\\\"\"
 logs       = \"claude logs \\\"$(printf %.8s {session})\\\" 2>/dev/null | tail -c 20000\"
-cap        = '''timeout 120 claude -p --output-format stream-json --verbose --model haiku hi 2>/dev/null | grep -o '\"status\":\"rejected\"[^}]*\"resetsAt\":[0-9]*' | grep -o '[0-9][0-9]*$' | tail -1'''
+cap        = '''timeout 120 claude -p --output-format stream-json --verbose --model {model} hi 2>/dev/null | grep -o '\"status\":\"rejected\"[^}]*\"resetsAt\":[0-9]*' | grep -o '[0-9][0-9]*$' | tail -1'''
 stop       = \"claude stop \\\"$(printf %.8s {session})\\\"\"
 plan       = \"claude --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
 model      = \"opus\"
@@ -315,8 +322,10 @@ const STARTER_HEADER: &str = r#"# Voro configuration (~/.config/voro/voro.toml).
 #                 template — Voro reads whatever it prints.
 #       cap       print when the account's usage window reopens, as a Unix
 #                 epoch, while the account is capped — and nothing when it is
-#                 not (no placeholders). Read instead of the clock time on a
-#                 session's screen, which carries no date. Costs whatever
+#                 not. Read instead of the clock time on a session's screen,
+#                 which carries no date. It may name {model} and nothing else:
+#                 a subscription meters each strong model separately, so the
+#                 window that refuses depends on which one asks. Costs whatever
 #                 asking the agent costs, so Voro asks only while a session is
 #                 badged capped.
 #       stop      retire a session from the agent's own registry ({session})
@@ -432,11 +441,14 @@ pub struct AgentTemplate {
     /// produce output for a session simply omits it, and Voro classifies a dead
     /// session from the launch log as it always has and badges no live one.
     logs: Option<String>,
-    /// When the *account* this agent dispatches on has its usage window
-    /// reopen, as a Unix epoch and nothing else (DESIGN.md §8). Carries no
-    /// placeholder at all: it names no session, because a cap is a property of
-    /// the account rather than of any one conversation, and one reading
-    /// therefore answers for every session on the strip.
+    /// When the account this agent dispatches on has its usage window reopen,
+    /// as a Unix epoch and nothing else (DESIGN.md §8). It names no session — a
+    /// cap is a property of the account, not of any one conversation — and
+    /// [`MODEL_PLACEHOLDER`] is the only placeholder it may carry, because
+    /// *which* window refuses depends on which model is asking: a subscription
+    /// meters the five-hour pool, the weekly one, and each strong model's own
+    /// allowance separately. A template that binds it is asked once per model in
+    /// flight; one that does not is asked once for the agent.
     ///
     /// Its contract is silence-as-negative like [`AgentTemplate::logs`]: print
     /// the instant while the account is refused, print nothing otherwise. An
@@ -519,6 +531,14 @@ impl AgentTemplate {
 
     pub fn model_plan(&self) -> Option<&str> {
         self.model_plan.as_deref()
+    }
+
+    /// The model a launch of this agent at the given depth runs with, by the
+    /// same rule [`ResolvedAgent::launch_command`] resolves it by — shared so
+    /// the two cannot drift, since anything asking *about* a session has to
+    /// name the model that session actually started under.
+    pub fn model_for(&self, deep: bool) -> Option<&str> {
+        model_for_depth(self.model(), self.model_deep(), deep)
     }
 
     /// The optional verbs this agent defines, in roster order, as `agent list`
@@ -773,6 +793,31 @@ pub struct RenderedMessage {
 /// launch, shell-quoted so a reference carrying shell metacharacters reaches
 /// the agent as itself. Serves `logs`, whose whole contract is a session in and
 /// that session's recent output out.
+/// Which model a launch at a given depth runs with (DESIGN.md §8): the deeper
+/// one for a deep task where the agent names one, the workhorse otherwise. The
+/// one place that rule lives, because two callers now depend on agreeing about
+/// it — the launch itself, and the `cap` reading that has to ask about the
+/// window *that* model is metered against.
+pub fn model_for_depth<'a>(
+    model: Option<&'a str>,
+    model_deep: Option<&'a str>,
+    deep: bool,
+) -> Option<&'a str> {
+    if deep { model_deep.or(model) } else { model }
+}
+
+/// A `cap` template rendered into a runnable command line (DESIGN.md §8). The
+/// model is bound exactly as a launch binds it — pasted in as the opaque name
+/// the operator configured, Voro being model-blind — and a template naming no
+/// model renders unchanged, which is what makes the per-model question optional
+/// rather than required.
+pub fn render_cap(template: &str, model: Option<&str>) -> String {
+    match model {
+        Some(model) => render(template, &[(MODEL_PLACEHOLDER, model)]),
+        None => template.to_string(),
+    }
+}
+
 pub fn render_session(template: &str, session_ref: &str) -> String {
     let session = shell_quote(Path::new(session_ref));
     render(template, &[(SESSION_PLACEHOLDER, session.as_str())])
@@ -991,14 +1036,14 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
             }
         }
     }
-    // `cap` asks about the account, not about a session or a launch, so every
-    // placeholder there is a category error: there is nothing for Voro to bind
-    // one to, and it would reach the shell as literal braces.
+    // `cap` asks about the account rather than about a session or a launch, so
+    // every placeholder but `{model}` is a category error there: nothing binds
+    // it, and it would reach the shell as literal braces. `{model}` is the
+    // exception because which window refuses depends on which model asks.
     if let Some(template) = &agent.cap {
         for placeholder in [
             SESSION_PLACEHOLDER,
             PROMPT_FILE_PLACEHOLDER,
-            MODEL_PLACEHOLDER,
             SESSION_NAME_PLACEHOLDER,
             TASK_ID_PLACEHOLDER,
             NEW_SESSION_PLACEHOLDER,
@@ -1006,7 +1051,8 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
             if template.contains(placeholder) {
                 return Err(invalid(format!(
                     "agent '{name}' cap carries {placeholder}, but a cap reading is about the \
-                     account rather than any one session or launch — it takes no placeholders"
+                     account rather than any one session or launch — {MODEL_PLACEHOLDER} is the \
+                     only placeholder it may name"
                 )));
             }
         }
@@ -1046,9 +1092,13 @@ fn validate_agent(name: &str, agent: &AgentTemplate, path: &Path) -> Result<()> 
     // that drops `{model}` keeps loading), but the placeholder without them
     // has nothing to resolve to.
     if agent.model.is_none()
-        && [dispatch.as_str(), agent.plan.as_deref().unwrap_or_default()]
-            .iter()
-            .any(|t| t.contains(MODEL_PLACEHOLDER))
+        && [
+            dispatch.as_str(),
+            agent.plan.as_deref().unwrap_or_default(),
+            agent.cap.as_deref().unwrap_or_default(),
+        ]
+        .iter()
+        .any(|t| t.contains(MODEL_PLACEHOLDER))
     {
         return Err(invalid(format!(
             "agent '{name}' uses {MODEL_PLACEHOLDER} but sets no model — add model = \
@@ -1112,11 +1162,7 @@ impl ResolvedAgent {
     /// renders the same string either way, the graceful degradation of the
     /// `deep` flag.
     pub fn launch_command(&self, spec: &LaunchSpec) -> String {
-        let model = if spec.deep {
-            self.model_deep.as_deref().or(self.model.as_deref())
-        } else {
-            self.model.as_deref()
-        };
+        let model = model_for_depth(self.model.as_deref(), self.model_deep.as_deref(), spec.deep);
         render_launch(&self.dispatch, spec, model)
     }
 
@@ -2371,10 +2417,9 @@ mod tests {
     }
 
     /// The built-in `claude` defines `cap` and `codex` does not, and the
-    /// spelling carries the two halves Voro depends on: it asks about the
-    /// account with a model of its own choosing, and it keeps only the *epoch*
-    /// out of a rejection, so an account merely spending its window prints
-    /// nothing.
+    /// spelling carries the three halves Voro depends on: it asks on the
+    /// session's own model, it keeps only the *epoch* out of a rejection so an
+    /// account merely spending its window prints nothing, and it bounds itself.
     #[test]
     fn only_the_claude_builtin_defines_cap() {
         let config = AgentsConfig::load(Path::new("/nonexistent/voro.toml")).unwrap();
@@ -2385,19 +2430,20 @@ mod tests {
             .expect("a cap verb");
         assert!(cap.contains("rejected"), "{cap}");
         assert!(cap.contains("resetsAt"), "{cap}");
-        assert!(cap.contains("--model haiku"), "{cap}");
+        assert!(cap.contains(MODEL_PLACEHOLDER), "{cap}");
+        assert!(cap.contains("timeout"), "{cap}");
         assert!(config.agent("codex").expect("codex").cap().is_none());
     }
 
-    /// `cap` takes no placeholders at all. It reads the account rather than a
-    /// session, so `{session}` has nothing to name — and it is not a launch,
-    /// so the launch placeholders have nothing to bind either.
+    /// `cap` may name the model whose window it is asking about, and nothing
+    /// else. It reads the account rather than a session, so `{session}` has
+    /// nothing to name, and it is not a launch, so the launch placeholders have
+    /// nothing to bind either.
     #[test]
-    fn cap_is_validated_as_naming_nothing() {
+    fn cap_names_the_model_and_nothing_else() {
         for placeholder in [
             SESSION_PLACEHOLDER,
             PROMPT_FILE_PLACEHOLDER,
-            MODEL_PLACEHOLDER,
             SESSION_NAME_PLACEHOLDER,
             TASK_ID_PLACEHOLDER,
             NEW_SESSION_PLACEHOLDER,
@@ -2413,10 +2459,43 @@ mod tests {
             assert!(message.contains("cap"), "{message}");
             assert!(message.contains(placeholder), "{message}");
         }
-        // And a template that names nothing is exactly what the verb wants.
-        let toml = "[agents.a]\ndispatch = \"run {prompt_file}\"\ncap = \"agent-cap --epoch\"\n";
+        // The model is the exception, and a template naming nothing is valid
+        // too: that agent is asked once rather than once per model.
+        for cap in ["agent-cap --model {model}", "agent-cap --epoch"] {
+            let toml = format!(
+                "[agents.a]\ndispatch = \"run {{prompt_file}}\"\nmodel = \"m\"\ncap = \"{cap}\"\n"
+            );
+            let raw: RawConfig = toml::from_str(&toml).unwrap();
+            validate_agent("a", &raw.agents["a"], Path::new("/c.toml")).expect("a valid cap");
+        }
+        // `{model}` with nothing to resolve it to is refused, as on a launch.
+        let toml = "[agents.a]\ndispatch = \"run {prompt_file}\"\ncap = \"agent-cap {model}\"\n";
         let raw: RawConfig = toml::from_str(toml).unwrap();
-        validate_agent("a", &raw.agents["a"], Path::new("/c.toml")).expect("a bare cap is valid");
+        let err = validate_agent("a", &raw.agents["a"], Path::new("/c.toml"))
+            .expect_err("{model} with no model key is refused");
+        assert!(err.to_string().contains("sets no model"), "{err}");
+    }
+
+    /// The model a `cap` reading asks about is the one its session launched
+    /// with, resolved by the same rule the launch used — a deep task's session
+    /// runs the deeper model, so the window that holds it is that model's.
+    #[test]
+    fn a_cap_asks_on_the_model_its_session_ran() {
+        let text = "[agents.a]\ndispatch = \"run {prompt_file} --model {model}\"\n\
+                    cap = \"agent-cap --model {model}\"\nmodel = \"workhorse\"\n\
+                    model_deep = \"strongest\"\n";
+        let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
+        let agent = config.agent("a").expect("agent a");
+        assert_eq!(agent.model_for(false), Some("workhorse"));
+        assert_eq!(agent.model_for(true), Some("strongest"));
+        assert_eq!(
+            render_cap(agent.cap().unwrap(), agent.model_for(true)),
+            "agent-cap --model strongest"
+        );
+        // An agent naming no deeper model runs the workhorse at either depth,
+        // and one naming no model at all renders the template unchanged.
+        assert_eq!(model_for_depth(Some("only"), None, true), Some("only"));
+        assert_eq!(render_cap("agent-cap --epoch", None), "agent-cap --epoch");
     }
 
     /// The built-in `stop` renders through the same session binder `logs` does,
