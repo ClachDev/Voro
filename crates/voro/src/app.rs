@@ -351,8 +351,12 @@ pub struct AttachRequest {
 /// liveness probe reads to be sure the session is between turns.
 struct MessageTarget {
     /// The session row the send updates once it is confirmed — its process, and
-    /// its reference where the agent's verb forks (DESIGN.md §8).
-    session_id: i64,
+    /// its reference where the agent's verb forks (DESIGN.md §8). Carried whole
+    /// rather than as an id, because the inline rest-stop the send may have to
+    /// make first is addressed at the session itself.
+    session: voro_core::Session,
+    /// The reference the send is addressed to: the row's, already established to
+    /// be present.
     session_ref: String,
     template: String,
     sessions_cmd: Option<String>,
@@ -2291,7 +2295,7 @@ impl App {
         let pid = sent.pid();
         if let Err(e) =
             self.store
-                .record_session_send(target.session_id, sent.new_session_ref(), pid)
+                .record_session_send(target.session.id, sent.new_session_ref(), pid)
         {
             sent.abandon();
             return Err(format!(
@@ -2300,6 +2304,22 @@ impl App {
         }
         sent.confirm(&self.dispatch_ctx);
         Ok(())
+    }
+
+    /// Release the agent's hold on a session that has handed back, waiting for
+    /// the answer (DESIGN.md §8). The reconciler's rest-stop does this off the
+    /// send path on every pass; this is the same call made inline, for the
+    /// window between an agent handing back and the next pass noticing.
+    ///
+    /// Nothing about the row changes either way — the session stays the task's
+    /// conversation — so a config that will not load costs the release and
+    /// nothing else, and the send that follows is refused by the agent rather
+    /// than by Voro.
+    fn release_session(&self, session: &voro_core::Session) -> Result<(), String> {
+        let Ok(config) = AgentsConfig::load(&self.dispatch_ctx.agents_path) else {
+            return Ok(());
+        };
+        crate::dispatch::stop_session_now(&self.dispatch_ctx, &config, session)
     }
 
     /// Resolve what a quick message needs, reporting whichever piece is missing
@@ -2342,10 +2362,10 @@ impl App {
             return None;
         };
         Some(MessageTarget {
-            session_id: session.id,
-            session_ref,
-            template: template.to_string(),
             sessions_cmd: agent.and_then(|a| a.sessions()).map(str::to_string),
+            template: template.to_string(),
+            session: session.clone(),
+            session_ref,
         })
     }
 
@@ -2378,16 +2398,32 @@ impl App {
         let Some(target) = self.message_target(task_id) else {
             return;
         };
-        // A live session is mid-turn, so a headless resume would either be
-        // refused or land out of order; the operator wants the real terminal.
-        if crate::session_probe::session_is_live(
+        // One listing read answers both of the questions the send has about the
+        // session: whether it is mid-turn, and whether the agent is still
+        // holding it registered at rest.
+        let verdict = crate::session_probe::probe_session(
             target.sessions_cmd.as_deref(),
             Some(&target.session_ref),
-        ) == Some(true)
-        {
+        );
+        // A live session is mid-turn, so a headless resume would either be
+        // refused or land out of order; the operator wants the real terminal.
+        if verdict.live == Some(true) {
             self.status = Some(format!(
                 "task {task_id}'s session is still running — A attaches to it"
             ));
+            return;
+        }
+        // Normally reconcile has already released a handed-back session
+        // (DESIGN.md §8), and this finds nothing to do. It fires when the
+        // operator has outrun a pass — messaging within the same tick the agent
+        // reported in — and the hold that would refuse an in-place resume is
+        // still there. Failing to release it refuses the send outright rather
+        // than spawning one that cannot land, so the task is left exactly where
+        // it was.
+        if verdict.at_rest
+            && let Err(e) = self.release_session(&target.session)
+        {
+            self.status = Some(format!("{e} — task {task_id} is unchanged"));
             return;
         }
         let cwd = match self.task_checkout(task_id) {
@@ -2428,7 +2464,7 @@ impl App {
         let pid = sent.pid();
         if let Err(e) =
             self.store
-                .record_session_send(target.session_id, sent.new_session_ref(), pid)
+                .record_session_send(target.session.id, sent.new_session_ref(), pid)
         {
             sent.abandon();
             self.status = Some(format!(
@@ -5680,6 +5716,9 @@ mod tests {
         task_id: i64,
         project_path: std::path::PathBuf,
         listing: std::path::PathBuf,
+        /// Where the stub's `stop` verb records the reference it was fired at,
+        /// so a test can tell a release that happened from one that did not.
+        stopped: std::path::PathBuf,
     }
 
     /// Rewrite the canned listing, moving the session between live and
@@ -5703,6 +5742,7 @@ mod tests {
         let (mut store, ctx, project_path) = scratch_env("jumpin", None);
         let listing = project_path.parent().unwrap().join("listing.json");
         write_listing(&listing, listing_json);
+        let stopped = project_path.parent().unwrap().join("stopped");
         let templates = [
             ("sessions", format!("cat '{}'", listing.display())),
             ("attach", "agent attach {session}".into()),
@@ -5710,6 +5750,10 @@ mod tests {
             (
                 "message",
                 "sleep 30 # agent message {session} {prompt_file}".into(),
+            ),
+            (
+                "stop",
+                format!("printf '%s' {{session}} >> '{}'", stopped.display()),
             ),
         ]
         .into_iter()
@@ -5749,12 +5793,13 @@ mod tests {
             task_id: task.id,
             project_path,
             listing,
+            stopped,
         }
     }
 
     /// Every session verb, the ordinary configuration.
     fn all_verbs() -> &'static [&'static str] {
-        &["sessions", "attach", "resume", "message"]
+        &["sessions", "attach", "resume", "message", "stop"]
     }
 
     // --- capped-but-alive sessions (task #415) ---
@@ -6401,18 +6446,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Rewrite the stub agent's `message` verb — loaded fresh on every send, so
-    /// a test can change what a send *does* after the environment is built.
-    fn set_message_verb(env: &JumpIn, template: &str) {
-        let config = std::fs::read_to_string(&env.ctx.agents_path).unwrap();
-        let rewritten = config
+    /// Rewrite one of the stub agent's verbs — the config is loaded fresh on
+    /// every send, so a test can change what a send *does* after the environment
+    /// is built.
+    /// Define or redefine one verb of the stub agent, by path — so a test can
+    /// also do it *after* the App is built, which is what isolates a verb the
+    /// reconcile-on-read pass would otherwise have fired first.
+    fn set_verb(agents_path: &std::path::Path, verb: &str, template: &str) {
+        let prefix = format!("{verb} = ");
+        let mut config: String = std::fs::read_to_string(agents_path)
+            .unwrap()
             .lines()
-            .map(|line| match line.starts_with("message = ") {
-                true => format!("message = \"{template}\"\n"),
-                false => format!("{line}\n"),
-            })
-            .collect::<String>();
-        std::fs::write(&env.ctx.agents_path, rewritten).unwrap();
+            .filter(|line| !line.starts_with(&prefix))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        config.push_str(&format!("{prefix}\"{template}\"\n"));
+        std::fs::write(agents_path, config).unwrap();
+    }
+
+    fn set_message_verb(env: &JumpIn, template: &str) {
+        set_verb(&env.ctx.agents_path, "message", template);
     }
 
     /// The defect this ordering exists for (task #390): the send is what the
@@ -6496,6 +6549,182 @@ mod tests {
             launches(&root).contains(&format!("--session-id '{new_ref}'")),
             "the recorded reference is the one the command was given"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- releasing a session the agent still holds (task #428) ---
+
+    /// A review task whose session verbs are all defined *except* `stop`, plus
+    /// the config path a test adds one at afterwards. Withholding it until the
+    /// App exists is what separates the send path's own inline release from the
+    /// reconcile-on-read pass that would otherwise have made it first.
+    fn send_env(listing: &str) -> (App, i64, std::path::PathBuf, SendPaths) {
+        let mut env = jump_in_env(&["sessions", "attach", "resume", "message"], listing);
+        env.store
+            .apply(env.task_id, Action::Complete(None))
+            .unwrap();
+        let root = env.project_path.parent().unwrap().to_path_buf();
+        let paths = SendPaths {
+            agents_path: env.ctx.agents_path.clone(),
+            stopped: env.stopped.clone(),
+        };
+        let task_id = env.task_id;
+        (App::new(env.store, env.ctx).unwrap(), task_id, root, paths)
+    }
+
+    /// The two files a send test writes to and reads back after the App has
+    /// taken ownership of everything else.
+    struct SendPaths {
+        agents_path: std::path::PathBuf,
+        stopped: std::path::PathBuf,
+    }
+
+    impl SendPaths {
+        /// A `stop` verb that records the reference it was fired at.
+        fn recording_stop(&self) {
+            set_verb(
+                &self.agents_path,
+                "stop",
+                &format!("printf '%s' {{session}} >> '{}'", self.stopped.display()),
+            );
+        }
+
+        /// What the stop verb recorded; empty when no stop ran.
+        fn stopped_refs(&self) -> String {
+            std::fs::read_to_string(&self.stopped).unwrap_or_default()
+        }
+    }
+
+    /// The inline half of the rest rule (DESIGN.md §8). Normally reconcile has
+    /// already released a handed-back session and this finds nothing to do; when
+    /// the operator outruns a pass, the send releases the session itself, at its
+    /// own reference, and then resumes it in place. Without that the agent's hold
+    /// would refuse the resume and the feedback would go nowhere.
+    #[test]
+    fn a_send_releases_a_session_the_agent_still_holds_at_rest() {
+        let (mut app, task_id, root, paths) = send_env(FINISHED_LISTING);
+        paths.recording_stop();
+        app.toggle_screen();
+        send_message(&mut app, "the tests are missing");
+
+        assert_eq!(paths.stopped_refs(), "ref-1");
+        let task = app.store.task(task_id).unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert!(task.body.contains("the tests are missing"), "{}", task.body);
+        // Released, not moved: the send is addressed at the same reference the
+        // stop named, and the row still holds it afterwards.
+        assert!(
+            launches(&root).contains("agent message 'ref-1'"),
+            "{}",
+            launches(&root)
+        );
+        let session = app.store.sessions_for(task_id).unwrap().remove(0);
+        assert_eq!(session.session_ref.as_deref(), Some("ref-1"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half of the same guard: nothing about a send stops a session
+    /// unconditionally. A `blocked` entry is a turn still under way and an
+    /// absent one has nothing registered to release, so both go straight to the
+    /// send — the stop verb is defined and simply never fires.
+    #[test]
+    fn a_send_makes_no_stop_when_the_session_is_not_listed_at_rest() {
+        for (name, listing) in [("blocked", ZOMBIE_LISTING), ("absent", "[]")] {
+            let (mut app, task_id, root, paths) = send_env(listing);
+            paths.recording_stop();
+            app.toggle_screen();
+            send_message(&mut app, "the tests are missing");
+
+            assert_eq!(
+                paths.stopped_refs(),
+                "",
+                "{name}: stopped a session mid-turn"
+            );
+            assert_eq!(
+                app.store.task(task_id).unwrap().state,
+                TaskState::Running,
+                "{name}"
+            );
+            assert!(launches(&root).contains("agent message 'ref-1'"), "{name}");
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A release that fails is a session still held, so the resume behind it
+    /// could only be refused. The send is abandoned before it is spawned and the
+    /// task is left exactly where it was — the same commit-nothing rule a
+    /// refused send already answers to.
+    #[test]
+    fn a_failed_release_refuses_the_send_and_commits_nothing() {
+        let (mut app, task_id, root, paths) = send_env(FINISHED_LISTING);
+        set_verb(
+            &paths.agents_path,
+            "stop",
+            "printf 'no such session' >&2; exit 1 # {session}",
+        );
+        app.toggle_screen();
+        send_message(&mut app, "the tests are missing");
+
+        let task = app.store.task(task_id).unwrap();
+        assert_eq!(task.state, TaskState::Review);
+        assert!(
+            !task.body.contains("the tests are missing"),
+            "{}",
+            task.body
+        );
+        assert!(
+            !app.store
+                .events_for(task_id)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "feedback"),
+            "no rejection is logged for a message that was never sent"
+        );
+        assert!(
+            !launches(&root).contains("agent message"),
+            "{}",
+            launches(&root)
+        );
+        let status = app.status.as_deref().unwrap_or("").to_string();
+        assert!(status.contains("could not be released"), "{status}");
+        assert!(status.contains("unchanged"), "{status}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An agent defining no `stop` verb is one Voro was never going to release,
+    /// so the send goes as it always did and whatever the agent makes of it is
+    /// the agent's answer — a refusal there, not a refusal here.
+    #[test]
+    fn a_send_without_a_stop_verb_is_unaffected() {
+        let (mut app, task_id, root, _paths) = send_env(FINISHED_LISTING);
+        app.toggle_screen();
+        send_message(&mut app, "the tests are missing");
+
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Running);
+        assert!(launches(&root).contains("agent message 'ref-1'"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A confirmed in-place send moves the pid and nothing else: one session id
+    /// for the task's whole life, which is what the operator's `voro-<id>` name
+    /// is attached to.
+    #[test]
+    fn a_confirmed_in_place_send_moves_the_pid_and_keeps_the_reference() {
+        let (mut app, task_id, root, _paths) = send_env(FINISHED_LISTING);
+        let before = app.store.sessions_for(task_id).unwrap().remove(0);
+        app.toggle_screen();
+        send_message(&mut app, "the tests are missing");
+
+        let after = app.store.sessions_for(task_id).unwrap().remove(0);
+        assert_eq!(after.id, before.id, "the same session row");
+        assert_eq!(after.session_ref.as_deref(), Some("ref-1"));
+        assert_ne!(after.pid, before.pid, "the process carrying the turn");
+        assert!(crate::session_probe::pid_is_alive(after.pid.unwrap()));
 
         let _ = std::fs::remove_dir_all(&root);
     }

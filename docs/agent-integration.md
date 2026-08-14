@@ -77,7 +77,7 @@ dispatch   = "claude --bg --name \"{session_name}\" --permission-mode auto --mod
 sessions   = "claude agents --json"
 attach     = "claude attach {session}"
 resume     = "claude --resume {session}"
-message    = "claude -p --resume {session} --fork-session --session-id {new_session} --permission-mode auto \"$(cat {prompt_file})\""
+message    = "claude -p --resume {session} --permission-mode auto \"$(cat {prompt_file})\""
 logs       = "claude logs \"$(printf %.8s {session})\" 2>/dev/null | tail -c 20000"
 stop       = "claude stop \"$(printf %.8s {session})\""
 plan       = "claude --name \"{session_name}\" --permission-mode auto --model {model} \"$(cat {prompt_file})\""
@@ -138,18 +138,20 @@ resume   = "codex resume {session}"
   the status line and the jump-in still works.
 - `message` may also carry `{new_session}`, replaced with a fresh v4 UUID Voro
   generates for the send. Use it when your agent's sessions cannot be resumed
-  headlessly but can be *forked*: the built-in `claude` message verb is
-  `--resume` plus `--fork-session --session-id {new_session}`, because a
-  `claude --bg` session keeps a supervisor process after finishing its turn and
-  that supervisor refuses a plain `--resume` while it lives. The fork continues
-  the same conversation under the reference Voro named, and Voro records that
-  reference on the session row once the send is confirmed — so later messages,
-  the jump-in keys, and reconciliation all follow the conversation to where it
-  continued. A `message` template without the placeholder resumes in place and
-  keeps the reference it had. `{new_session}` is refused on every other verb:
-  it names the session a send opens, and nothing else opens one. Which of the
-  two a configured agent got is visible without reading the file back: `voro
-  agent list` names a forking send `message(fork)` and a resuming one `message`.
+  headlessly but can be *forked*: the fork continues the same conversation under
+  the reference Voro named, and Voro records that reference on the session row
+  once the send is confirmed — so later messages, the jump-in keys, and
+  reconciliation all follow the conversation to where it continued. A `message`
+  template without the placeholder resumes in place and keeps the reference it
+  had, which is what the built-in `claude` one does: a `claude --bg` session
+  keeps a supervisor process that refuses a plain `--resume` while it lives, and
+  Voro removes that hold with the `stop` verb when the session comes to rest
+  rather than forking around it (DESIGN.md §8), so the conversation stays under
+  one id and one name for the task's whole life. `{new_session}` is refused on
+  every other verb: it names the session a send opens, and nothing else opens
+  one. Which of the two a configured agent got is visible without reading the
+  file back: `voro agent list` names a forking send `message(fork)` and a
+  resuming one `message`.
 - A `message` template should carry whatever permission flag its agent's
   `dispatch` carries — the built-in `claude` one carries `--permission-mode
   auto`. A resumed turn does real work, and on agents where the flag is per
@@ -174,22 +176,41 @@ resume   = "codex resume {session}"
   truncation: `claude logs` keys on the *job* id, the first eight characters of
   the session id, so `{session}` is trimmed rather than passed whole.
 - `stop` retires a session from the agent's own registry, taking `{session}`
-  alone. Voro fires it when it closes the session's row (DESIGN.md §8), so the
-  agent's listing shows work actually in flight rather than every dispatch ever
-  made — a `claude --bg` session otherwise keeps both its `claude agents` entry
-  and a supervisor process until the machine reboots, and that listing is how
-  you find a session to attach to and how Voro reads liveness. It is fire and
-  forget: Voro spawns it detached with its output going to the launch log, reads
-  neither the output nor the exit status, and never waits on it or rolls a
-  transition back for it. Nothing is checked first, so the verb must tolerate
-  being fired at a session that is already gone (`claude stop` prints its line
-  and exits zero). Define it only if stopping is *safe* — Voro fires it on the
-  operator's closing verdicts (accept, abort, abandon) and on a reconciled dead
-  or stale session, never on a session it is keeping open for an answer or a
-  rejection. Note the built-in's truncation, the same as `logs`: `claude stop`
-  keys on the eight-character job id, so `{session}` is trimmed rather than
-  passed whole. `codex` names none, and a session under it lingers in whatever
-  listing it keeps exactly as before.
+  alone. Voro fires it on two triggers (DESIGN.md §8), and both must be safe
+  before you define it.
+
+  The first is **closing the session's row**, so the agent's listing shows work
+  actually in flight rather than every dispatch ever made — a `claude --bg`
+  session otherwise keeps both its `claude agents` entry and a supervisor
+  process until the machine reboots, and that listing is how you find a session
+  to attach to and how Voro reads liveness. Voro fires it on the operator's
+  closing verdicts (accept, abort, abandon) and on a reconciled dead or stale
+  session.
+
+  The second is **rest**: a task in `needs-input`, `review` or `waiting` — a
+  session Voro is *keeping open* — whose listing entry reports its turn ended
+  (`state: "done"`) is stopped too. This is what makes an in-place headless
+  `message` possible at all, since the registration is the hold that would
+  refuse it. The row is untouched by it: the session stays open, stays the
+  task's conversation, and stays attachable, so `stop` must keep the
+  conversation rather than discard it (`claude stop`: "Its conversation is
+  kept"). The `done` test is the whole guard — a session at `blocked`, which is
+  what a permission prompt and a supervisor mid-turn both look like, is never
+  released, because the handover verbs run from inside a turn that may still be
+  finishing.
+
+  It is otherwise fire and forget: Voro spawns it detached with its output going
+  to the launch log, reads neither the output nor the exit status, and never
+  waits on it or rolls a transition back for it. The one exception is a send
+  that has to make the rest-release itself, having outrun a reconcile pass:
+  there Voro waits, and a non-zero exit refuses the send rather than spawning a
+  message that could not land. Nothing is checked first either way, so the verb
+  must tolerate being fired at a session that is already gone (`claude stop`
+  prints its line and exits zero). Note the built-in's truncation, the same as
+  `logs`: `claude stop` keys on the eight-character job id, so `{session}` is
+  trimmed rather than passed whole. `codex` names none, and a session under it
+  lingers in whatever listing it keeps exactly as before — and its `message`,
+  were it to define one, would resume without any release being needed.
 - `plan` runs an interactive *foreground* session for the TUI's agent-assisted
   task creation (DESIGN.md §8): `{prompt_file}` holds the planning brief, and
   the command owns the terminal until the conversation ends, so it must not
@@ -260,8 +281,8 @@ agents (DESIGN.md §8). When liveness is unknowable (no ref, listing failed) the
 session is left alone. The row's own pid is still read in one direction, for
 every agent: a pid that is *alive* proves the session is, whatever the listing
 says. That is what a quick message leaves behind — the process carrying its turn
-— and a forked send never appears in the listing at all, so without this rule
-the next reconcile would stall a task whose agent is mid-answer.
+— and a headless send does not appear in the listing while it runs, so without
+this rule the next reconcile would stall a task whose agent is mid-answer.
 
 **Jump-in.** In the TUI, `A` on a running task runs the agent's `attach` command
 with the TUI suspended — the real session, full control, including answering
@@ -279,7 +300,11 @@ standing. It applies to the three states whose session is open and between turns
 `refining` are mid-turn with no injection channel, and `stalled` has a dead
 session that redispatch, not a headless resume, is the honest answer for. Voro
 probes liveness first and refuses a session still running, since that one wants
-the terminal. On a `review` or `waiting` task the message *is* a
+the terminal; if the same probe finds the session merely registered at rest, it
+releases it through `stop` before sending, which reconciliation has usually done
+already. Between them the two checks make one guarantee: a message only ever
+reaches a session that has explicitly handed back. On a `review` or `waiting`
+task the message *is* a
 reject-with-feedback: the send goes first and the transition follows it, so
 feedback is appended to the body and logged only once the message is known to
 have started, and a send the agent refuses leaves the task untouched. On a
@@ -288,7 +313,8 @@ the agent's own `voro resume` moves the task back (DESIGN.md §6). Either way th
 session row follows the send: it records the process now carrying the turn, so
 reconciliation leaves the task `running` while the agent answers, and — for a
 verb that forks (`{new_session}`) — the reference the conversation continued
-under.
+under. An in-place verb changes no reference, which is the point: one session
+id and one name for the task's whole life.
 
 The same jump-in resolves a **stale review branch**. A task can sit in `review`
 while other work merges, leaving its branch in conflict with the moved base
@@ -486,6 +512,16 @@ which is what lets Voro fire it without checking first. `claude stop` has its ow
 `--help` but is absent from `claude --help`'s command table, which is exactly why
 it rides an optional verb: a claude that drops it degrades to a lingering listing
 entry, nothing broken.
+
+The rest-release the built-in `message` depends on is verified on the same
+footing. A stop releases the resume lock as well as retiring the entry, so a
+following `claude -p --resume <uuid>` succeeds in place, answers on the same
+session id, and appends to the same transcript; the finished `-p` turn
+re-registers the session and re-takes the lock, which the rest rule then clears
+again on the next handover, so consecutive messages need no manual step between
+them. The display name rides the transcript's own record and survives both the
+stop and the in-place resume, in the `claude agents` listing and the `/resume`
+picker alike — which is the whole reason delivery resumes rather than forks.
 
 The hooks *firing* is verified against a live Claude Code session (v2.1.206): the
 sample configuration above, driving a real session under a dispatched task's

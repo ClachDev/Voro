@@ -105,10 +105,14 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// deliberate: a verb is an opaque per-agent contract, which is exactly what
 /// lets an agent define a subset of them and degrade per-verb. `codex` defines
 /// no `message` and the TUI's quick-message key says so on the status line.
-/// It forks rather than resumes in place ([`NEW_SESSION_PLACEHOLDER`]): a
+/// It resumes the session in place rather than forking it
+/// ([`NEW_SESSION_PLACEHOLDER`], which the verb no longer carries): a
 /// `claude --bg` session keeps its supervisor process after finishing its turn,
-/// and that supervisor refuses a headless `--resume` for as long as it lives,
-/// so the plain resume was a send that could never land (DESIGN.md §8).
+/// and that supervisor refuses a headless `--resume` for as long as it lives —
+/// so Voro releases it at rest instead, through `stop`, and the send then lands
+/// on the session's own reference (DESIGN.md §8). A fork would land too, but it
+/// moves the conversation out from under the name Voro composed for it, and that
+/// name is how the operator addresses the session everywhere outside Voro.
 ///
 /// It carries `--permission-mode` for the same reason `dispatch` does: the mode
 /// belongs to a launch rather than to a verb (DESIGN.md §8). The flag is per
@@ -138,7 +142,9 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// no cap signature in it means "not capped", however it came about.
 ///
 /// The claude `stop` verb retires a session from the agent's own listing once
-/// Voro closes its row (DESIGN.md §8). A `claude --bg` session outlives its work
+/// Voro closes its row — and, at rest, once it hands back (DESIGN.md §8): the
+/// release the supervisor holds is what a headless `message` resumes through.
+/// A `claude --bg` session outlives its work
 /// twice over — the entry stays in `claude agents` and the supervisor holding it
 /// runs until the machine reboots — so an operator who dispatches all week reads
 /// their session list through a wall of finished ones. The conversation survives
@@ -153,7 +159,7 @@ dispatch   = \"claude --bg --name \\\"{session_name}\\\" --permission-mode auto 
 sessions   = \"claude agents --json\"
 attach     = \"claude attach {session}\"
 resume     = \"claude --resume {session}\"
-message    = \"claude -p --resume {session} --fork-session --session-id {new_session} --permission-mode auto \\\"$(cat {prompt_file})\\\"\"
+message    = \"claude -p --resume {session} --permission-mode auto \\\"$(cat {prompt_file})\\\"\"
 logs       = \"claude logs \\\"$(printf %.8s {session})\\\" 2>/dev/null | tail -c 20000\"
 stop       = \"claude stop \\\"$(printf %.8s {session})\\\"\"
 plan       = \"claude --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
@@ -1544,6 +1550,18 @@ impl AgentSessionEntry {
             _ => SessionLiveness::Dead,
         }
     }
+
+    /// Whether this entry says its session's turn has *ended* — the narrow
+    /// reading the rest-stop rule acts on (DESIGN.md §8), which is not the same
+    /// question as [`liveness`](Self::liveness). Only `done` answers yes.
+    /// `blocked` is the case that makes the distinction load-bearing: it reads
+    /// dead without a live pid, but it is also what a permission prompt and a
+    /// supervisor mid-turn look like, and stopping either would cut a turn off
+    /// mid-sentence. Every other state, and an entry with no state at all, is
+    /// likewise not a hand-back.
+    pub fn at_rest(&self) -> bool {
+        self.state.as_deref() == Some("done")
+    }
 }
 
 /// Parse a `sessions` command's stdout. Entries without any id are skipped
@@ -2082,29 +2100,24 @@ mod tests {
     #[test]
     fn verbs_lists_every_optional_verb_and_marks_a_forking_message() {
         let agents = builtin_agents();
+        // The built-in claude resumes in place, so its message is named plainly.
         assert_eq!(
             agents["claude"].verbs(),
             vec![
-                "sessions",
-                "attach",
-                "resume",
-                "message(fork)",
-                "logs",
-                "stop",
-                "plan"
+                "sessions", "attach", "resume", "message", "logs", "stop", "plan"
             ]
         );
         assert_eq!(agents["codex"].verbs(), vec!["resume"]);
 
-        // A message that resumes in place keeps the reference it had, so it is
-        // named plainly; the roster still lists it.
+        // A message that forks names the session it forks into, and the roster
+        // says so — the marking outlives the built-in that used to carry it.
         let text = r#"
             [agents.a]
             dispatch = "run {prompt_file}"
-            message = "say --into {session} {prompt_file}"
+            message = "say --into {session} --as {new_session} {prompt_file}"
         "#;
         let config = AgentsConfig::parse(text, Path::new("/tmp/voro.toml")).unwrap();
-        assert_eq!(config.agent("a").unwrap().verbs(), vec!["message"]);
+        assert_eq!(config.agent("a").unwrap().verbs(), vec!["message(fork)"]);
     }
 
     /// Every verb the warning can name is a verb the listing can name, which is
@@ -2227,13 +2240,24 @@ mod tests {
         assert!(e.contains("dispatch carries {new_session}"), "{e}");
     }
 
-    /// The built-in `claude` message verb forks, because a `--bg` session's
-    /// supervisor refuses a headless resume while it lives (DESIGN.md §8).
+    /// The built-in `claude` message verb resumes in place (DESIGN.md §8): the
+    /// supervisor that refuses a headless resume has been released by the
+    /// rest-stop before any send is made, so the send addresses the session's own
+    /// reference and the conversation stays under the name Voro composed for it.
     #[test]
-    fn the_builtin_claude_message_verb_forks() {
+    fn the_builtin_claude_message_verb_resumes_in_place() {
         let message = builtin_agents()["claude"].message().unwrap();
-        assert!(message.contains("--fork-session"), "{message}");
-        assert!(message.contains(NEW_SESSION_PLACEHOLDER), "{message}");
+        assert!(!message.contains("--fork-session"), "{message}");
+        assert!(!message.contains(NEW_SESSION_PLACEHOLDER), "{message}");
+        assert!(message.contains("-p --resume {session}"), "{message}");
+        // The session it resumes is the one it was given, so nothing downstream
+        // has a new reference to record.
+        let rendered = render_message(message, "uuid-1", Path::new("/tmp/p.txt"));
+        assert_eq!(rendered.new_session_ref, None);
+        assert!(
+            rendered.command.contains("--resume 'uuid-1'"),
+            "{rendered:?}"
+        );
     }
 
     #[test]
@@ -2448,6 +2472,33 @@ mod tests {
         assert_eq!(entry(r#""state": "working""#), SessionLiveness::Live);
         assert_eq!(entry(r#""state": "blocked""#), SessionLiveness::Dead);
         assert_eq!(entry(r#""state": "idle""#), SessionLiveness::Dead);
+    }
+
+    /// Rest is a narrower reading than death (DESIGN.md §8): the rest-stop acts
+    /// on a turn that has *ended*, and only `done` says so. `blocked` is the
+    /// separation that matters — dead to the liveness question, yet a turn still
+    /// under way (a permission prompt, a supervisor mid-turn) that a stop would
+    /// cut off.
+    #[test]
+    fn at_rest_is_done_alone() {
+        let entry = |json: &str| {
+            let listing = format!("[{{\"sessionId\": \"u\", {json}}}]");
+            parse_sessions_json(&listing).unwrap().remove(0)
+        };
+        assert!(entry(r#""state": "done""#).at_rest());
+        // a supervisor that outlives the turn does not make it unfinished
+        assert!(entry(r#""state": "done", "pid": 4321"#).at_rest());
+        for json in [
+            r#""state": "blocked""#,
+            r#""state": "blocked", "pid": 4321"#,
+            r#""state": "working""#,
+            r#""state": "idle""#,
+            r#""state": "something-new""#,
+            r#""pid": 4321"#,
+            r#""cwd": "/tmp""#,
+        ] {
+            assert!(!entry(json).at_rest(), "{json}");
+        }
     }
 
     #[test]

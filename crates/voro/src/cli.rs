@@ -2589,10 +2589,10 @@ mod tests {
         assert!(listed.contains("claude"), "{listed}");
         assert!(listed.contains("codex"), "{listed}");
         assert!(listed.contains("built-in"), "{listed}");
-        // every optional verb the agent defines, the quick message included and
-        // marked as the forking send it is
+        // every optional verb the agent defines, the quick message included —
+        // named plainly, since the built-in resumes its session in place
         assert!(
-            listed.contains("[sessions attach resume message(fork) logs stop plan]"),
+            listed.contains("[sessions attach resume message logs stop plan]"),
             "{listed}"
         );
 

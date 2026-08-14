@@ -32,8 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finalise a dead or stale session, and the agent is asked to retire its own
   entry for it. The conversation is kept: `claude stop` drops the entry from the
   default listing and `claude attach` still reopens it. Sessions Voro keeps open
-  on purpose (`needs-input`, `review`, `waiting`) are never stopped — you still
-  answer and reject into them. Agents declare the capability with a new optional
+  on purpose (`needs-input`, `review`, `waiting`) are retired at *handover*
+  rather than at close — once the agent's own listing agrees the turn is over,
+  not merely that the task is waiting on you — which is what leaves the session
+  free for a quick message to resume in place. The row stays open either way, so
+  you still answer and reject into it and `A` still opens it with its full
+  context. Agents declare the capability with a new optional
   `stop` verb (`{session}`), built in for `claude`; an agent without one, such
   as `codex`, behaves exactly as before, and a stop that fails leaves a line in
   `launches.log` rather than touching the transition.
@@ -104,10 +108,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   untouched rather than recording feedback nobody received. The interactive
   jump-in moves from `a` to `A`. Agents declare the capability with a new
   optional `message` verb (`{session}` plus `{prompt_file}`, and the optional
-  `{new_session}` for an agent that can only be joined by forking — which is
-  how the built-in `claude` verb reaches a session its supervisor still holds),
-  built in for `claude`; an agent without one, such as `codex`, reports so on
-  the status line and keeps its jump-in.
+  `{new_session}` for an agent that can only be joined by forking), built in
+  for `claude`; an agent without one, such as `codex`, reports so on the status
+  line and keeps its jump-in. The message resumes the session in place, so the
+  whole life of a task is one session id, one `voro-<id>` name and one
+  transcript — the handle you find it by in `claude agents` and the `/resume`
+  picker never moves out from under you.
 - `voro set <id> --unlink <kind>:<other-id>` drops a single dependency edge —
   `related:7`, `discovered-from:4`, `blocks:9` — named as `voro show` lists it.
   A pair of tasks carrying two edges keeps the one not named, so an edge
