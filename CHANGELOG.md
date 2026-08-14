@@ -152,6 +152,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The key line stops offering `o` and `g` on a review task with nothing to
+  show.** A task whose whole product is its summary — an investigation, a
+  triage, an audit — reaches `review` having never made a branch, and both keys
+  were advertised there anyway: `o` builds its diff from the task's branch, and
+  `g` on a task with no tracked PR goes to `pr` create, which refuses without
+  one. The two slots are now earned by having something to show rather than by
+  the state alone — `o` on a `review` or `running` task carrying a branch, `g`
+  on a `review` task carrying a branch or a tracked PR — in the cockpit and the
+  task browser alike, which leaves the branchless review row two slots shorter
+  beside a card already recommending *accept*. Neither key's binding changes:
+  both still work everywhere they worked before, and the `?` key map still
+  lists them.
 - **A minimum supported Rust version, and an Install section that matches what
   is actually published.** The workspace declares `rust-version = "1.88"` — the
   floor its dependency tree already imposes, above the 1.85 that edition 2024

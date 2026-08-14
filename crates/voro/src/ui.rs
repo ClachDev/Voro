@@ -4712,9 +4712,10 @@ mod tests {
     }
 
     /// The review cluster's gating (DESIGN.md §9): `o` is advertised wherever
-    /// there is a diff to look at — `review` and `running` — `g` only on
-    /// `review`, where the PR is the review, and `!` nowhere past dispatch. A
-    /// `ready` row, which has none of the three states, shows the mirror image.
+    /// there is a diff to look at — a `review` or `running` task carrying a
+    /// branch — `g` only on `review`, where the PR is the review, and `!`
+    /// nowhere past dispatch. A `ready` row, which has none of the three
+    /// states, shows the mirror image.
     #[test]
     fn the_key_line_advertises_the_review_keys_only_where_they_act() {
         use crate::app::App;
@@ -4736,9 +4737,15 @@ mod tests {
         store.create_task(task("ready to go")).unwrap();
         let running = store.create_task(task("under way")).unwrap();
         store.apply(running.id, Action::Start).unwrap();
+        store
+            .set_branch(running.id, Some("feat/under-way"))
+            .unwrap();
         let reviewed = store.create_task(task("in review")).unwrap();
         store.apply(reviewed.id, Action::Start).unwrap();
         store.apply(reviewed.id, Action::Complete(None)).unwrap();
+        store
+            .set_branch(reviewed.id, Some("feat/in-review"))
+            .unwrap();
 
         let mut app = App::new(
             store,
@@ -4777,6 +4784,92 @@ mod tests {
         assert!(!review.contains(&"!"), "{review:?}");
     }
 
+    /// The other half of that gating: both review keys are earned by having
+    /// something to show, not by the state alone (DESIGN.md §9). A task whose
+    /// whole product is its summary reaches `review` with no branch and no PR,
+    /// and there the line advertises neither — the same row whose next-action
+    /// is *accept* rather than *pr*. A tracked PR earns `g` back on its own;
+    /// `o` needs the branch it diffs.
+    #[test]
+    fn the_review_keys_need_a_branch_or_a_pr_to_show_for() {
+        use crate::app::App;
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let task = |title: &str| NewTask {
+            project_id: p.id,
+            repo_id: None,
+            title: title.into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state: TaskState::Ready,
+            agent: None,
+            human: false,
+            deep: false,
+        };
+        let reviewed = |store: &mut Store, title: &str| {
+            let t = store.create_task(task(title)).unwrap();
+            store.apply(t.id, Action::Start).unwrap();
+            store.apply(t.id, Action::Complete(None)).unwrap();
+            t.id
+        };
+        let bare = reviewed(&mut store, "nothing to show");
+        let tracked = reviewed(&mut store, "a PR and no branch");
+        store
+            .set_pr(tracked, Some("https://github.com/o/r/pull/1"))
+            .unwrap();
+        // A dispatch that has not named a branch yet has nothing to diff either.
+        let running = store.create_task(task("under way")).unwrap();
+        store.apply(running.id, Action::Start).unwrap();
+
+        let mut app = App::new(
+            store,
+            crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                "/nonexistent/voro.db",
+            )),
+        )
+        .unwrap();
+
+        // Both lines read the same selection, so each screen is walked to the
+        // row that names the task rather than indexed into directly.
+        let keys_for = |app: &mut App, id: i64| {
+            let rows = match app.screen {
+                Screen::Cockpit => app.cockpit_rows.len(),
+                _ => app.all.len(),
+            };
+            let found = (0..rows).any(|i| {
+                match app.screen {
+                    Screen::Cockpit => app.cockpit_sel = i,
+                    _ => app.tasks_sel = i,
+                }
+                app.selected_task_id() == Some(id)
+            });
+            assert!(found, "{:?} has no row for task {id}", app.screen);
+            key_hints(app)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>()
+        };
+
+        for screen in [Screen::Cockpit, Screen::Tasks] {
+            app.screen = screen;
+            let keys = keys_for(&mut app, bare);
+            assert!(!keys.contains(&"o"), "{screen:?}: {keys:?}");
+            assert!(!keys.contains(&"g"), "{screen:?}: {keys:?}");
+            // The rest of the review row is untouched — the slots freed are
+            // exactly the two that could not act.
+            assert!(keys.contains(&"w"), "{screen:?}: {keys:?}");
+
+            let keys = keys_for(&mut app, tracked);
+            assert!(keys.contains(&"g"), "{screen:?}: {keys:?}");
+            assert!(!keys.contains(&"o"), "{screen:?}: {keys:?}");
+
+            let keys = keys_for(&mut app, running.id);
+            assert!(!keys.contains(&"o"), "{screen:?}: {keys:?}");
+        }
+    }
+
     /// A lowercase/uppercase pair of one action takes a single slot keyed on
     /// the pair, and the line stays short enough to scan: eleven slots or fewer
     /// on every row of a queue holding one of each kind (DESIGN.md §9). Eleven
@@ -4811,8 +4904,9 @@ mod tests {
         store
             .create_task(task("ready to go", TaskState::Ready))
             .unwrap();
-        // The review task carries a session, which is the worst case for the
-        // line: it earns the hand-off slot and the message slot at once.
+        // The review task carries a session and a branch, which is the worst
+        // case for the line: it earns the hand-off slot and the message slot at
+        // once, and the branch is what earns it the two review slots.
         let reviewed = store
             .create_task(task("in review", TaskState::Ready))
             .unwrap();
@@ -4820,6 +4914,9 @@ mod tests {
             .record_dispatch(reviewed.id, "claude", None, LivenessSource::Pid, None)
             .unwrap();
         store.apply(reviewed.id, Action::Complete(None)).unwrap();
+        store
+            .set_branch(reviewed.id, Some("feat/in-review"))
+            .unwrap();
         // ...and a refine in flight for the cancel slot, which rides the strip
         // rather than the queue.
         let refining = store
@@ -4847,6 +4944,7 @@ mod tests {
         let mut seen_wait = false;
         let mut seen_cancel = false;
         let mut seen_message = false;
+        let mut seen_review_keys = false;
         for screen in [
             Screen::Cockpit,
             Screen::Tasks,
@@ -4897,6 +4995,7 @@ mod tests {
                 seen_wait |= keys.contains(&"w");
                 seen_cancel |= keys.contains(&"C");
                 seen_message |= keys.contains(&"a/A");
+                seen_review_keys |= keys.contains(&"o") && keys.contains(&"g");
                 // Dispatch is advertised only where it can act, so the line
                 // never offers a verb whose only answer is the state it
                 // refuses — which is also what buys the message slot its room.
@@ -4914,7 +5013,7 @@ mod tests {
             }
         }
         assert!(
-            seen_refine && seen_wait && seen_cancel && seen_message,
+            seen_refine && seen_wait && seen_cancel && seen_message && seen_review_keys,
             "the conditional slots never showed"
         );
     }
