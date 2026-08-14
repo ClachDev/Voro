@@ -50,6 +50,21 @@ pub const CAP_SIGNATURES: [&str; 8] = [
 /// ("Server is temporarily limiting requests (not your usage limit)").
 const NOT_CAP_QUALIFIERS: [&str; 4] = ["approaching", "% of your", "not your", "close to your"];
 
+/// Phrases that mean the signature after them is not a *report* at all. Every
+/// real limit message ends with the upgrade prompt — `/upgrade to increase your
+/// usage limit.` — which contains a signature of its own and, being last, would
+/// otherwise be the one that decides.
+///
+/// That matters twice over. It is the *only* signature in a genuine cap whose
+/// window holds no reset time, so letting it decide drops the time from every
+/// real cap; and it says nothing about whether the session is held, so a warning
+/// that ever trailed the same prompt would badge as a cap. Both go away once the
+/// prompt is read as the boilerplate it is: skipped when choosing which
+/// signature speaks, rather than negating like a qualifier — a qualifier means
+/// "this one is not a cap", and skipping instead would let a genuine earlier cap
+/// speak past a warning that had since replaced it.
+const MENTION_PREFIXES: [&str; 2] = ["/upgrade", "increase your"];
+
 /// How much text after a matched signature is read for the reset time that
 /// goes on the badge.
 const WINDOW: usize = 200;
@@ -110,8 +125,7 @@ impl CapReading {
 pub fn read_cap(tail: &str) -> Option<CapReading> {
     let text = strip_ansi(tail).to_lowercase();
     let (at, signature) = last_signature(&text)?;
-    let before = &text[floor_boundary(&text, at.saturating_sub(QUALIFIER_WINDOW))..at];
-    if NOT_CAP_QUALIFIERS.iter().any(|q| before.contains(q)) {
+    if look_back(&text, at, &NOT_CAP_QUALIFIERS) {
         return None;
     }
     let after = &text[at..ceil_boundary(&text, (at + signature.len() + WINDOW).min(text.len()))];
@@ -120,13 +134,21 @@ pub fn read_cap(tail: &str) -> Option<CapReading> {
     })
 }
 
-/// The position and text of the last cap signature in `text`, which must
-/// already be lowercased.
+/// The position and text of the last cap signature in `text` that reports
+/// something, which must already be lowercased. Signatures the upgrade prompt
+/// merely mentions ([`MENTION_PREFIXES`]) are not candidates.
 fn last_signature(text: &str) -> Option<(usize, &'static str)> {
     CAP_SIGNATURES
         .iter()
-        .filter_map(|sig| text.rfind(sig).map(|at| (at, *sig)))
+        .flat_map(|sig| text.match_indices(sig).map(|(at, _)| (at, *sig)))
+        .filter(|(at, _)| !look_back(text, *at, &MENTION_PREFIXES))
         .max_by_key(|(at, _)| *at)
+}
+
+/// Whether any of `phrases` appears in the short span of `text` before `at`.
+fn look_back(text: &str, at: usize, phrases: &[&str]) -> bool {
+    let before = &text[floor_boundary(text, at.saturating_sub(QUALIFIER_WINDOW))..at];
+    phrases.iter().any(|p| before.contains(p))
 }
 
 /// Drop terminal escape sequences, keeping the spacing the surviving text had
@@ -260,6 +282,45 @@ mod tests {
         let reading = read_cap("Session limit reached · Retrying in 5m (9:50pm) · attempt 2/10")
             .expect("a cap");
         assert_eq!(reading.reset_label().as_deref(), Some("21:50"));
+    }
+
+    /// The wording an actual five-hour cap turned out to use, captured from
+    /// three live sessions on 2026-08-13 — the first real cap Voro has seen,
+    /// every earlier case having been read out of the agent's own binary.
+    ///
+    /// The upgrade prompt riding along behind it is the whole point: it carries
+    /// a signature of its own, it is last, and its window holds no time, so
+    /// before it was read as boilerplate every genuine cap badged without the
+    /// reset time it had actually named.
+    #[test]
+    fn the_real_cap_message_reads_with_its_reset_time() {
+        let reading = read_cap(
+            "You've hit your session limit · resets 6:40pm (Europe/London)\n\
+             /upgrade to increase your usage limit.",
+        )
+        .expect("a cap");
+        assert_eq!(reading.reset_label().as_deref(), Some("18:40"));
+    }
+
+    /// The real warning short of that cap, captured from a session that went on
+    /// working — and which must stay unbadged even though the same upgrade
+    /// prompt can follow it.
+    #[test]
+    fn the_real_warning_short_of_the_cap_is_not_capped() {
+        assert_eq!(
+            read_cap(
+                "You've used 98% of your session limit · resets 6:40pm (Europe/London)\n\
+                 /upgrade to keep using Claude Code"
+            ),
+            None
+        );
+        assert_eq!(
+            read_cap(
+                "You've used 99% of your session limit · resets 6:40pm (Europe/London)\n\
+                 /upgrade to increase your usage limit."
+            ),
+            None
+        );
     }
 
     /// The other wordings the agent uses for the same condition.

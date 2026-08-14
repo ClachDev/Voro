@@ -77,7 +77,7 @@ dispatch   = "claude --bg --name \"{session_name}\" --permission-mode auto --mod
 sessions   = "claude agents --json"
 attach     = "claude attach {session}"
 resume     = "claude --resume {session}"
-message    = "claude -p --resume {session} --fork-session --session-id {new_session} \"$(cat {prompt_file})\""
+message    = "claude -p --resume {session} --fork-session --session-id {new_session} --permission-mode auto \"$(cat {prompt_file})\""
 logs       = "claude logs \"$(printf %.8s {session})\" 2>/dev/null | tail -c 20000"
 stop       = "claude stop \"$(printf %.8s {session})\""
 plan       = "claude --name \"{session_name}\" --permission-mode auto --model {model} \"$(cat {prompt_file})\""
@@ -143,6 +143,14 @@ resume   = "codex resume {session}"
   continued. A `message` template without the placeholder resumes in place and
   keeps the reference it had. `{new_session}` is refused on every other verb:
   it names the session a send opens, and nothing else opens one.
+- A `message` template should carry whatever permission flag its agent's
+  `dispatch` carries — the built-in `claude` one carries `--permission-mode
+  auto`. A resumed turn does real work, and on agents where the flag is per
+  invocation rather than a property of the session, leaving it off runs that
+  turn in the agent's default ask mode against a stdin at `/dev/null`: every
+  edit and every command outside the allowlist stops for an approval nobody can
+  give. The refusals land in the launch log rather than the TUI, so the send
+  looks delivered and quietly does nothing.
 - `logs` prints a session's recent output, taking `{session}` alone. Voro reads
   it for exactly one thing: whether that session is sitting on a **usage cap**
   (DESIGN.md §8). A cap does not kill a backgrounded session — the supervisor

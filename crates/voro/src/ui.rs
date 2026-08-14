@@ -2085,6 +2085,7 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
             ]);
             actions.extend(pairs(MESSAGE_KEYS));
             actions.extend([
+                ("u", "nudge capped sessions past their reset"),
                 ("l", "page the session log"),
                 ("w", "hand a review task off, to wait"),
             ]);
@@ -2122,6 +2123,7 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
             ]);
             actions.extend(pairs(MESSAGE_KEYS));
             actions.extend([
+                ("u", "nudge capped sessions past their reset"),
                 ("l", "page the session log"),
                 ("w", "hand a review task off, to wait"),
             ]);

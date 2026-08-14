@@ -110,6 +110,14 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// and that supervisor refuses a headless `--resume` for as long as it lives,
 /// so the plain resume was a send that could never land (DESIGN.md §8).
 ///
+/// It carries `--permission-mode` for the same reason `dispatch` does. The flag
+/// is per invocation rather than a property of the session, so a resumed turn
+/// without it runs in the default ask mode against a stdin at `/dev/null`: every
+/// edit and every command outside the allowlist stops for an approval nobody can
+/// give, and the refusals land in the launch log rather than the TUI. A send
+/// like that appears to have been delivered and quietly does nothing, which is
+/// the one failure a fire-and-forget channel cannot report.
+///
 /// The claude `logs` verb replays a background session's screen, which is the
 /// only place a usage cap is legible (DESIGN.md §8): `claude agents --json`
 /// reports a capped session as plain `blocked`, the same word a permission
@@ -138,7 +146,7 @@ dispatch   = \"claude --bg --name \\\"{session_name}\\\" --permission-mode auto 
 sessions   = \"claude agents --json\"
 attach     = \"claude attach {session}\"
 resume     = \"claude --resume {session}\"
-message    = \"claude -p --resume {session} --fork-session --session-id {new_session} \\\"$(cat {prompt_file})\\\"\"
+message    = \"claude -p --resume {session} --fork-session --session-id {new_session} --permission-mode auto \\\"$(cat {prompt_file})\\\"\"
 logs       = \"claude logs \\\"$(printf %.8s {session})\\\" 2>/dev/null | tail -c 20000\"
 stop       = \"claude stop \\\"$(printf %.8s {session})\\\"\"
 plan       = \"claude --name \\\"{session_name}\\\" --permission-mode auto --model {model} \\\"$(cat {prompt_file})\\\"\"
