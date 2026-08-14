@@ -561,28 +561,44 @@ and one it cannot (§8). `voro viewer list` does the same for viewers, flagging
 the default.
 
 The file is writable by Voro as well as read. The TUI's Config screen (§9) and
-the `voro viewer add`/`viewer remove` verbs edit it in place — adding,
-changing, and deleting `[viewers.<name>]` tables and setting
-`default_viewer`/`default_agent` — through a single write helper
+the `voro viewer add`/`viewer remove` verbs edit it in place — adding, changing,
+and deleting `[viewers.<name>]` tables and setting `default_viewer`,
+`default_agent` and `max_running` — through a single write helper
 (`voro-core::config_edit`) built on `toml_edit`, so a machine write preserves
 the file's existing content, formatting, and comments and touches only the key
-it changes. A missing file is created on first edit. The command is optional at
-both surfaces and defaults to `<name> {path}`, which is what nearly every
-editor CLI wants; naming a *built-in* defaults to that built-in's own command
-instead, so overriding one starts from what it replaces. In the form the
-command does not merely default but *follows* the name field, rewritten on
-every keystroke and rendered dim until the operator types in it, at which point
-it is theirs; deleting it back to empty hands it to the name again. The
-user-owned surface is all that is writable this way: agents stay read-only in
-the TUI (editing a built-in means writing a wholesale override table, a sharper
-knife deferred here), and deleting a viewer that a project's `viewer` still
-names is refused with the projects named, while deleting the default viewer
-clears `default_viewer`. A built-in viewer is read-only for the same reason an
-agent is — it lives in the binary, not the file — so the Config screen lists
-the built-ins with their provenance but refuses to edit or delete one, and
-`voro viewer remove code` says the same, naming the *add* of that name that
-overrides it. Choosing one is not writing one, so both a `default_viewer` and a
-project's own viewer may name a built-in with no table defining it.
+it changes. A missing file is created on first edit.
+
+The Config screen edits those keys from a **settings list** — the default agent,
+the default viewer, and the dispatch cap — sitting above the viewers. Each row
+carries the value in force and where it came from: `voro.toml` where the file
+names the key, and otherwise the rule that resolved it (the first agent found on
+PATH, the only viewer configured, Voro's own default cap), since the value alone
+cannot tell a cap the operator chose from one that happens to equal the default.
+A setting is edited, never deleted — there is no state in which Voro runs under
+no cap — so `d` on one is refused pointing at ⏎. The cap means here what it
+means in the file: `0` is legal and stops the queue offering dispatches at all
+(§7), and a negative one is refused in the same sentence whichever surface
+writes it. Saving rebuilds the queue on that keypress, so a raised cap restores
+the dispatch rows the capacity line had replaced without restarting the TUI.
+
+The add/edit-viewer form asks for the one thing a first-time operator cannot
+answer, the command line. It is optional at both surfaces and defaults to
+`<name> {path}`, which is what nearly every editor CLI wants; naming a
+*built-in* defaults to that built-in's own command instead, so overriding one
+starts from what it replaces. In the form the command does not merely default
+but *follows* the name field, rewritten on every keystroke and rendered dim
+until the operator types in it, at which point it is theirs; deleting it back to
+empty hands it to the name again. The user-owned surface is all that is writable
+this way: agents stay read-only in the TUI (editing a built-in means writing a
+wholesale override table, a sharper knife deferred here), and deleting a viewer
+that a project's `viewer` still names is refused with the projects named, while
+deleting the default viewer clears `default_viewer`. A built-in viewer is
+read-only for the same reason an agent is — it lives in the binary, not the file
+— so the Config screen lists the built-ins with their provenance but refuses to
+edit or delete one, and `voro viewer remove code` says the same, naming the
+*add* of that name that overrides it. Choosing one is not writing one, so both a
+`default_viewer` and a project's own viewer may name a built-in with no table
+defining it.
 
 ```toml
 # ~/.config/voro/voro.toml — all optional; extends/overrides the built-in claude
@@ -974,18 +990,19 @@ operator attention, so they cannot tell a review from an idle afternoon.
 
 Dispatch is the one action the divisor prices wrongly, and it is shaped rather
 than priced. Handing a task to an agent costs the operator a keypress, so on
-attention alone it would outrank everything — but every dispatch manufactures
-a future review and loads the fleet, so its real cost is a *concurrency slot*.
-It is therefore metered: `max_running` (`voro.toml`, default 5) caps how many
-dispatches ride at once, and once `running >= max_running` every row whose
-action would open a session — *dispatch* and *redispatch* alike — leaves the
-queue, replaced by a single capacity line naming the counts (`⏸ dispatch at
-capacity (5/5 running)`). The running tally is the one `stats` already reports.
-Suppressing the rows rather than demoting them is the point: at the cap they are
-not cheap actions, they are unavailable ones, and the capacity line says so
-where an empty queue would have implied there was nothing to start. A `do` row
-is untouched by the gate — a human task spends the operator's hands, not a
-slot — and the counts (§12) keep the suppressed backlog felt.
+attention alone it would outrank everything — but every dispatch manufactures a
+future review and loads the fleet, so its real cost is a *concurrency slot*. It
+is therefore metered: `max_running` (default 5, set in `voro.toml` or on the
+Config screen's settings list, §5) caps how many dispatches ride at once, and
+once `running >= max_running` every row whose action would open a session —
+*dispatch* and *redispatch* alike — leaves the queue, replaced by a single
+capacity line naming the counts (`⏸ dispatch at capacity (5/5 running)`). The
+running tally is the one `stats` already reports. Suppressing the rows rather
+than demoting them is the point: at the cap they are not cheap actions, they are
+unavailable ones, and the capacity line says so where an empty queue would have
+implied there was nothing to start. A `do` row is untouched by the gate — a
+human task spends the operator's hands, not a slot — and the counts (§12) keep
+the suppressed backlog felt.
 
 Cheap actions need one further guard, or the pricing swaps one swamping for
 another: forty proposals at 0.8 would fill the queue with triage. Proposals
@@ -2313,34 +2330,42 @@ picker entirely and creates straight into the live one, and a store whose every
 project is archived opens no picker at all, refusing with a status line
 pointing at the projects screen.
 
-Beyond the cockpit, the TUI cycles (Tab, or `alt-1`–`alt-4`, subject to the
-gate above while no project is registered) through three further full-screen
-views: the **task browser**, the **projects screen** (weights, archive, and the
+Beyond the cockpit, the TUI cycles (Tab, or `alt-1`–`alt-4`, subject to the gate
+above while no project is registered) through three further full-screen views:
+the **task browser**, the **projects screen** (weights, archive, and the
 per-project viewer), and a **Config screen** that renders and edits the
 `voro.toml` surface (§5) — the effective agents read-only with provenance and
-the default marked, and the named viewers editable in place (add, change
-command, delete, and pick `default_viewer`/`default_agent`) through the
-comment-preserving write helper. An agent occupies more than a row there: under
-its name, provenance and verb list sit dim continuation lines carrying the
-dispatch command it runs and, where it names one, what `{model}` resolves to —
-a line of its own rather than a tail on the name row, since the verb list is
-long enough to clip a tail off an ordinary terminal's width, and the annotation
-exists precisely to be read beside the placeholder in the command above it. The
-pane sizes to the rows it has rather than to a fixed cap, yielding height only
-where the viewers list below would otherwise lose its last row. Where even that
-is not enough — a short terminal, several agents — the pane **scrolls**
-rather than silently dropping what falls past its border. It scrolls with
-`J`/`K` and the page keys, the cockpit card's gesture and for the same reason:
-the pane carries no selection of its own, `j`/`k` on this screen belonging to
-the viewers list below, and a second selection is a heavier thing to add to a
-screen than a scroll. Like the card it advertises the scroll only when there is
-one, on its bottom border, so a pane holding everything says nothing and a pane
-hiding rows says how many and which keys move them. DB-backed configuration
-(projects, weights, viewers) stays on the projects screen; the Config screen is
-the voro.toml view. The projects screen's viewer picker also offers a "new
-viewer…" entry that opens the same add-viewer form and selects the new viewer
-for that project, so first-time viewer setup needs no detour through the Config
-screen.
+the default marked, then the settings list of §5, then the named viewers
+editable in place (add, change command, delete) through the comment-preserving
+write helper. A setting is *selected*, not bound to a letter of its own: one
+selection runs over the settings rows and the viewer rows alike, and ⏎ (or `e`)
+edits whichever it is on — the pick-from-list for the default agent and the
+default viewer, a one-line numeric entry for the dispatch cap. A screen that
+spends an uppercase letter per value does not scale, and it is the wrong model:
+a config screen is a list of settings you select. Only `a` (add a viewer) and
+`d` (delete one) stay keys, because neither is an edit of the selected value:
+`a` acts with nothing selected, and `d` is destructive. An agent occupies more
+than a row there: under its name, provenance and verb list sit dim continuation
+lines carrying the dispatch command it runs and, where it names one, what
+`{model}` resolves to — a line of its own rather than a tail on the name row,
+since the verb list is long enough to clip a tail off an ordinary terminal's
+width, and the annotation exists precisely to be read beside the placeholder in
+the command above it. The pane sizes to the rows it has rather than to a fixed
+cap, yielding height to the settings list — which is exactly its rows, neither
+scrolling nor growing — and to what the viewers list below needs for a border
+and a row. Where even that is not enough — a short terminal, several agents —
+the pane **scrolls** rather than silently dropping what falls past its border.
+It scrolls with `J`/`K` and the page keys, the cockpit card's gesture and for
+the same reason: the pane carries no selection of its own, `j`/`k` on this
+screen belonging to the two lists below, and a second selection is a heavier
+thing to add to a screen than a scroll. Like the card it advertises the scroll
+only when there is one, on its bottom border, so a pane holding everything says
+nothing and a pane hiding rows says how many and which keys move them. DB-backed
+configuration (projects, weights, viewers) stays on the projects screen; the
+Config screen is the voro.toml view. The projects screen's viewer picker also
+offers a "new viewer…" entry that opens the same add-viewer form and selects the
+new viewer for that project, so first-time viewer setup needs no detour through
+the Config screen.
 
 **A bare digit sets the number on the selected row, and screen jumps carry the
 modifier.** The digit's meaning follows the selection rather than the screen:
@@ -2367,56 +2392,54 @@ or `5` pressed on a task, priority stopping at P3 where weight runs to 5.
 
 **Keys are advertised in two places, and the split between them is deliberate.**
 A contextual key line sits under every screen, listing the actions that apply to
-the current screen and selection — and only those that change a task's state
-or destiny, since a line the operator has to read twice has stopped being
+the current screen and selection — and only those that change a task's state or
+destiny, since a line the operator has to read twice has stopped being
 contextual. Where a lowercase key and its shifted sibling are two ways of doing
 *one* action, they take a single slot keyed on the pair and labelled with the
 base verb (`d/D dispatch`, `r/R refine`, `n/N new`, `a/A message`); keys that
 merely share a letter without sharing an action — the cockpit's `c` link
-documents and `C` cancel a refine, the projects screen's `a` add and `A`
-archive, the Config screen's `a` add viewer and `A` default agent — keep their
-own slots, because pairing them would claim a kinship that is not there. What
-each uppercase variant does differently is spelled out one level down, in the
-**`?` key map**: a peek-style overlay, dismissed by any key but `tab`, listing
-the current screen's *complete* bindings grouped into actions, navigation, and
-screen switching. The overlay is sized to the terminal rather than to its
-content, because the alternative is a map that quietly stops being complete.
-The Actions column gives up width — its glosses ellipsised — before the
-column beside it loses a character, and a map too tall for the terminal splits
-into evenly filled pages that `tab` turns, which is the one key the overlay
-keeps for itself. `tab` rather than a scroll key because paging is the
-peek-sized gesture: the map is read, not navigated. A test renders every
+documents and `C` cancel a refine, and the projects screen's `a` add and `A`
+archive — keep their own slots, because pairing them would claim a kinship that
+is not there. What each uppercase variant does differently is spelled out one
+level down, in the **`?` key map**: a peek-style overlay, dismissed by any key
+but `tab`, listing the current screen's *complete* bindings grouped into
+actions, navigation, and screen switching. The overlay is sized to the terminal
+rather than to its content, because the alternative is a map that quietly stops
+being complete. The Actions column gives up width — its glosses ellipsised —
+before the column beside it loses a character, and a map too tall for the
+terminal splits into evenly filled pages that `tab` turns, which is the one key
+the overlay keeps for itself. `tab` rather than a scroll key because paging is
+the peek-sized gesture: the map is read, not navigated. A test renders every
 screen's map at 80x24 and pages through it asserting each entry appears whole,
 so the map outgrowing its overlay fails the build instead of silently shedding
-its last rows. The map is what licenses the line's brevity —
-navigation, display toggles like `x`/`h`, and browsing conveniences like `l` are
-reachable and documented without ever crowding the line — so `?` itself is the
-one key every screen's line always carries. The two review keys are the
-deliberate exception to "state or destiny only": `o` (the local diff) and `g`
-(the PR) change nothing, but on a task that has just come back for review,
-looking at the diff *is* the operator's next action, and the line is where the
-moment is announced. They earn the slots by being tightly gated on that moment,
-and the moment is a state *plus* something to show: `o` on a `review` or
-`running` task that carries a branch, since the diff it opens is built from that
-branch, and `g` on a `review` task that carries a branch or a tracked PR, since
-with neither there is no pull request to jump to and none that `pr` could open
-— `plan_pr` refuses without a branch. The state alone is not enough, because a
-task whose whole product is its summary — an investigation, a triage, an audit
-— reaches `review` having never made a branch, and the line would then
-advertise two keys that cannot act beside a card whose recommended verb, for
-that very reason, is *accept* rather than *pr* (§3). So they are absent from
-the line everywhere the argument for them does not hold, even though both keys
-stay bound in every state (§8: `g` also jumps to a tracked PR, and links one).
-The rule generalises in both directions: a read-only key belongs on the line
-when the selection's state makes it the obvious next press, and a
-state-changing one drops off it when that state has passed — `!` (deep) picks
-the model of the *next* dispatch, so on a task under review, handed off, or
-closed it toggles something the operator is not about to see, and the review
-row reclaims the slot. Neither narrowing touches what the keys *do*; only the
-advertisement follows the selection. The line's budget is eleven slots, and a
-`review` row with a branch — `⏎ review`, `w wait`, `o open`, `g PR`, and the
-unconditional rest — is the row that spends them all; the branchless one
-hands two of them back.
+its last rows. The map is what licenses the line's brevity — navigation, display
+toggles like `x`/`h`, and browsing conveniences like `l` are reachable and
+documented without ever crowding the line — so `?` itself is the one key every
+screen's line always carries. The two review keys are the deliberate exception
+to "state or destiny only": `o` (the local diff) and `g` (the PR) change
+nothing, but on a task that has just come back for review, looking at the diff
+*is* the operator's next action, and the line is where the moment is announced.
+They earn the slots by being tightly gated on that moment, and the moment is a
+state *plus* something to show: `o` on a `review` or `running` task that carries
+a branch, since the diff it opens is built from that branch, and `g` on a
+`review` task that carries a branch or a tracked PR, since with neither there is
+no pull request to jump to and none that `pr` could open — `plan_pr` refuses
+without a branch. The state alone is not enough, because a task whose whole
+product is its summary — an investigation, a triage, an audit — reaches `review`
+having never made a branch, and the line would then advertise two keys that
+cannot act beside a card whose recommended verb, for that very reason, is
+*accept* rather than *pr* (§3). So they are absent from the line everywhere the
+argument for them does not hold, even though both keys stay bound in every state
+(§8: `g` also jumps to a tracked PR, and links one). The rule generalises in
+both directions: a read-only key belongs on the line when the selection's state
+makes it the obvious next press, and a state-changing one drops off it when that
+state has passed — `!` (deep) picks the model of the *next* dispatch, so on a
+task under review, handed off, or closed it toggles something the operator is
+not about to see, and the review row reclaims the slot. Neither narrowing
+touches what the keys *do*; only the advertisement follows the selection. The
+line's budget is eleven slots, and a `review` row with a branch — `⏎ review`, `w
+wait`, `o open`, `g PR`, and the unconditional rest — is the row that spends
+them all; the branchless one hands two of them back.
 
 **The same row is where Voro answers back, and it grows to fit what it has to
 say.** A status message — a refusal, or the summary of something that just
@@ -2488,20 +2511,18 @@ and the shift is the operator saying they are willing to be taken somewhere.
 The rule binds *pairs*, and only pairs, which is the same line the key line
 already draws between a shifted sibling and a mere letter-sharer. It therefore
 has nothing to say about a key whose uppercase is a different action — the
-cockpit's `c` link documents and `C` cancel a refine, the projects screen's `a`
-add and `A` archive, the Config screen's `a` add viewer and `A` default agent
-— nor about an uppercase key with no lowercase sibling at all: `J`/`K` and the
-page keys scroll the pane the screen's selection cannot reach — the cockpit's
-focus card, the Config screen's agents — which is one binding wearing one
-meaning twice rather than two, and is why the second use took those letters
-rather than fresh ones, and the Config screen's `V` picks the default viewer.
-Those are the exceptions, named here so the convention is not read wider than it
-is, and none is worth rebinding: the letters they share carry no kinship, and
-moving a key the operator's fingers already know would buy a consistency nobody
-reads. What the rule binds instead is the future — a heavier, interactive
-variant of an existing action takes that action's shifted key rather than a
-fresh letter, and a new uppercase binding that is neither of those needs a line
-here saying why.
+cockpit's `c` link documents and `C` cancel a refine, and the projects screen's
+`a` add and `A` archive — nor about an uppercase key with no lowercase sibling
+at all: `J`/`K` and the page keys scroll the pane the screen's selection cannot
+reach — the cockpit's focus card, the Config screen's agents — which is one
+binding wearing one meaning twice rather than two, and is why the second use
+took those letters rather than fresh ones. Those are the exceptions, named here
+so the convention is not read wider than it is, and none is worth rebinding: the
+letters they share carry no kinship, and moving a key the operator's fingers
+already know would buy a consistency nobody reads. What the rule binds instead
+is the future — a heavier, interactive variant of an existing action takes that
+action's shifted key rather than a fresh letter, and a new uppercase binding
+that is neither of those needs a line here saying why.
 
 Core interactions: create a task by typing one line and letting a
 background agent expand it into a proposal (§8's quick propose, on the default

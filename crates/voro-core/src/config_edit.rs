@@ -118,6 +118,19 @@ pub fn set_default_agent(path: &Path, name: &str) -> Result<()> {
     write_doc(path, &doc)
 }
 
+/// Set `max_running`, the dispatch WIP cap (DESIGN.md §7), refusing a negative
+/// count in the same words [`crate::agent::AgentsConfig::load`] refuses one
+/// read from the file. `0` is legal and means what it means there: the queue
+/// offers no dispatches at all.
+pub fn set_max_running(path: &Path, n: i64) -> Result<()> {
+    if n < 0 {
+        return Err(invalid(crate::agent::negative_max_running(n)));
+    }
+    let mut doc = load_doc(path)?;
+    doc["max_running"] = value(n);
+    write_doc(path, &doc)
+}
+
 /// Whether a viewer command lacks the `{path}` placeholder — a warning, not an
 /// error (DESIGN.md §5): such a command runs in the checkout's own directory,
 /// which is occasionally what a `git difftool -d` wants but usually a mistake.
@@ -421,6 +434,56 @@ cmd = \"git -C {path} difftool -d {base}...{branch}\"  # inline note
         );
         edit_viewer(&path, "code", "code -n {path}").unwrap();
         delete_viewer(&path, "code").unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The dispatch cap is written like any other key: comments and the
+    /// operator's own content survive it, an absent file is created by it, `0`
+    /// is legal, and a negative count is refused in the words the loader uses
+    /// (DESIGN.md §5/§7).
+    #[test]
+    fn set_max_running_writes_the_cap_and_refuses_a_negative_one() {
+        let dir = scratch("cap");
+        let path = dir.join("voro/voro.toml");
+        assert!(!path.exists());
+
+        set_max_running(&path, 3).unwrap();
+        assert_eq!(AgentsConfig::load(&path).unwrap().max_running(), 3);
+        assert_eq!(
+            AgentsConfig::load(&path).unwrap().max_running_from_file(),
+            Some(3)
+        );
+
+        // rewriting the file leaves what the operator wrote around it alone
+        let original = "\
+# how many at once
+max_running = 3  # was 5
+
+[viewers.zed]
+cmd = \"zed {path}\"
+";
+        std::fs::write(&path, original).unwrap();
+        set_max_running(&path, 9).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# how many at once"), "{text}");
+        assert!(text.contains("[viewers.zed]"), "{text}");
+        assert!(text.contains("max_running = 9"), "{text}");
+        assert_eq!(AgentsConfig::load(&path).unwrap().max_running(), 9);
+
+        // 0 is a cap, not an absence: the queue offers nothing
+        set_max_running(&path, 0).unwrap();
+        assert_eq!(AgentsConfig::load(&path).unwrap().max_running(), 0);
+
+        // and the refusal is the loader's own sentence, not a second wording
+        let refused = set_max_running(&path, -1).unwrap_err().to_string();
+        assert!(refused.contains("cannot be negative"), "{refused}");
+        assert_eq!(AgentsConfig::load(&path).unwrap().max_running(), 0);
+
+        let hand_written = dir.join("by-hand.toml");
+        std::fs::write(&hand_written, "max_running = -1\n").unwrap();
+        let from_file = AgentsConfig::load(&hand_written).unwrap_err().to_string();
+        assert!(from_file.contains(&refused), "{from_file} vs {refused}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

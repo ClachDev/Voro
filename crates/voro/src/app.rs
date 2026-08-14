@@ -89,6 +89,37 @@ pub struct ConfigViewerRow {
     pub editable: bool,
 }
 
+/// Which `voro.toml` value a settings row edits (DESIGN.md §5). The two
+/// defaults carry the [`DefaultKind`] their shared picker is keyed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingKind {
+    Default(DefaultKind),
+    MaxRunning,
+}
+
+/// One setting row on the Config screen (DESIGN.md §5): a `voro.toml` value the
+/// operator selects and edits with one key, showing what is in force and where
+/// it came from — the file, or the rule Voro fell back to. Derived once per
+/// refresh, like every other row on the screen.
+#[derive(Debug, Clone)]
+pub struct ConfigSettingRow {
+    pub name: &'static str,
+    pub value: String,
+    /// Where `value` came from, parenthesised on screen: `voro.toml` when the
+    /// key is set, else the resolution rule that produced it.
+    pub source: String,
+    pub kind: SettingKind,
+}
+
+/// One selectable row on the Config screen: the settings list and the viewers
+/// list share a single selection, so both index into one flat row list the way
+/// the cockpit's [`CockpitRow`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigRow {
+    Setting(usize),
+    Viewer(usize),
+}
+
 /// One selectable row on the cockpit; indices point into the App caches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CockpitRow {
@@ -199,6 +230,13 @@ pub enum Mode {
     /// transition, so it carries no `PromptKind`.
     LinkPr {
         task_id: i64,
+        buffer: String,
+    },
+    /// Collecting the dispatch WIP cap from the Config screen's settings list
+    /// (DESIGN.md §5/§7). A one-line entry like [`LinkPr`](Mode::LinkPr), and
+    /// like it it names nothing else: the setting it writes is the one the
+    /// selection was on when it opened.
+    EditMaxRunning {
         buffer: String,
     },
     /// Collecting the one line `n` expands into a task (DESIGN.md §6/§8). Like
@@ -565,11 +603,15 @@ pub struct App {
 
     /// The Config screen's view of `voro.toml` (DESIGN.md §5), reloaded every
     /// refresh so an edit — from either this screen or a dispatch — is reflected
-    /// immediately. Agents are read-only; the viewers are what `config_sel`
-    /// selects, and the ones a `voro.toml` table backs are what edit/delete act
-    /// on — a built-in row is selectable but refuses both.
+    /// immediately. Agents are read-only; the settings and the viewers are what
+    /// `config_sel` runs over, through the flat `config_rows`, and ⏎ edits
+    /// whichever it lands on — a built-in viewer row is selectable but refuses.
     pub config_agents: Vec<ConfigAgentRow>,
+    pub config_settings: Vec<ConfigSettingRow>,
     pub config_viewers: Vec<ConfigViewerRow>,
+    /// The settings and the viewers as one selectable list, which is the space
+    /// `config_sel` counts in.
+    pub config_rows: Vec<ConfigRow>,
     /// The legacy anonymous `[viewer]` table's command, shown read-only.
     pub config_anon_viewer: Option<String>,
     /// A `voro.toml` that failed to parse, surfaced on the screen rather than
@@ -670,7 +712,9 @@ impl App {
             tasks_sel: 0,
             projects_sel: 0,
             config_agents: Vec::new(),
+            config_settings: Vec::new(),
             config_viewers: Vec::new(),
+            config_rows: Vec::new(),
             config_anon_viewer: None,
             config_error: None,
             config_sel: 0,
@@ -856,7 +900,7 @@ impl App {
         self.projects_sel = self.projects_sel.min(self.projects.len().saturating_sub(1));
         self.config_sel = self
             .config_sel
-            .min(self.config_viewers.len().saturating_sub(1));
+            .min(self.config_rows.len().saturating_sub(1));
         Ok(())
     }
 
@@ -934,7 +978,9 @@ impl App {
             Ok(config) => config,
             Err(e) => {
                 self.config_agents.clear();
+                self.config_settings.clear();
                 self.config_viewers.clear();
+                self.config_rows.clear();
                 self.config_anon_viewer = None;
                 self.config_error = Some(e.to_string());
                 return;
@@ -975,7 +1021,96 @@ impl App {
             })
             .collect();
         self.config_anon_viewer = config.anonymous_viewer_cmd().map(str::to_string);
+        self.config_settings = Self::settings_rows(&config, default_agent, default_viewer);
+        self.config_rows = (0..self.config_settings.len())
+            .map(ConfigRow::Setting)
+            .chain((0..self.config_viewers.len()).map(ConfigRow::Viewer))
+            .collect();
         self.config_error = None;
+    }
+
+    /// The settings rows in the order the screen lists them, each carrying the
+    /// value in force and where it came from (DESIGN.md §5). A value the file
+    /// names reads `voro.toml`; one it does not names the rule that resolved it,
+    /// so a fresh install can see that the cap and the defaults it is running
+    /// under are Voro's own rather than something it was never asked about.
+    fn settings_rows(
+        config: &AgentsConfig,
+        default_agent: Option<String>,
+        default_viewer: Option<String>,
+    ) -> Vec<ConfigSettingRow> {
+        // Nothing resolves at all: no agent on PATH, or no viewer anywhere.
+        const NONE: &str = "—";
+
+        let (agent_value, agent_source) = match config.default_agent_from_file() {
+            Some(name) => (name.to_string(), "voro.toml".to_string()),
+            None => match default_agent {
+                Some(name) => (name, "first agent found on PATH".to_string()),
+                None => (NONE.into(), "no agent found on PATH".to_string()),
+            },
+        };
+        // The same order `AgentsConfig::default_viewer_name` resolves in: the
+        // key, then the anonymous table, then a sole named viewer, then the
+        // built-ins probed against PATH.
+        let (viewer_value, viewer_source) = match config.default_viewer_from_file() {
+            Some(name) => (name.to_string(), "voro.toml".to_string()),
+            None if config.anonymous_viewer_cmd().is_some() => {
+                ("[viewer]".into(), "the anonymous table".to_string())
+            }
+            None => match default_viewer {
+                Some(name) if config.viewer_names().len() == 1 => {
+                    (name, "the only viewer configured".to_string())
+                }
+                Some(name) => (name, "first viewer found on PATH".to_string()),
+                None => (NONE.into(), "no viewer found on PATH".to_string()),
+            },
+        };
+        let cap_source = match config.max_running_from_file() {
+            Some(_) => "voro.toml",
+            None => "voro's default",
+        };
+        vec![
+            ConfigSettingRow {
+                name: "default agent",
+                value: agent_value,
+                source: agent_source,
+                kind: SettingKind::Default(DefaultKind::Agent),
+            },
+            ConfigSettingRow {
+                name: "default viewer",
+                value: viewer_value,
+                source: viewer_source,
+                kind: SettingKind::Default(DefaultKind::Viewer),
+            },
+            ConfigSettingRow {
+                name: "dispatch cap",
+                value: config.max_running().to_string(),
+                source: cap_source.to_string(),
+                kind: SettingKind::MaxRunning,
+            },
+        ]
+    }
+
+    /// What the Config screen's selection is on, if anything.
+    pub fn selected_config_row(&self) -> Option<ConfigRow> {
+        self.config_rows.get(self.config_sel).copied()
+    }
+
+    /// The selected viewer, `None` when the selection is on a setting — so the
+    /// viewer actions read the row they act on rather than indexing blind.
+    pub fn selected_viewer(&self) -> Option<&ConfigViewerRow> {
+        match self.selected_config_row()? {
+            ConfigRow::Viewer(i) => self.config_viewers.get(i),
+            ConfigRow::Setting(_) => None,
+        }
+    }
+
+    /// The selected setting, `None` when the selection is on a viewer.
+    pub fn selected_setting(&self) -> Option<&ConfigSettingRow> {
+        match self.selected_config_row()? {
+            ConfigRow::Setting(i) => self.config_settings.get(i),
+            ConfigRow::Viewer(_) => None,
+        }
     }
 
     pub fn selected_task_id(&self) -> Option<i64> {
@@ -1208,7 +1343,7 @@ impl App {
             Screen::Cockpit => (&mut self.cockpit_sel, self.cockpit_rows.len()),
             Screen::Tasks => (&mut self.tasks_sel, self.all.len()),
             Screen::Projects => (&mut self.projects_sel, self.projects.len()),
-            Screen::Config => (&mut self.config_sel, self.config_viewers.len()),
+            Screen::Config => (&mut self.config_sel, self.config_rows.len()),
         };
         if len == 0 {
             return;
@@ -1226,7 +1361,7 @@ impl App {
             Screen::Cockpit => (&mut self.cockpit_sel, self.cockpit_rows.len()),
             Screen::Tasks => (&mut self.tasks_sel, self.all.len()),
             Screen::Projects => (&mut self.projects_sel, self.projects.len()),
-            Screen::Config => (&mut self.config_sel, self.config_viewers.len()),
+            Screen::Config => (&mut self.config_sel, self.config_rows.len()),
         };
         if index >= len {
             return;
@@ -1321,11 +1456,16 @@ impl App {
     pub fn enter_hint(&self) -> Option<&'static str> {
         match self.screen {
             Screen::Projects => None,
-            Screen::Config => self
-                .config_viewers
-                .get(self.config_sel)
-                .filter(|v| v.editable)
-                .map(|_| "⏎ edit"),
+            // Every row with an editor behind it; a built-in viewer has none —
+            // it is overridden by `a`, not edited.
+            Screen::Config => match self.selected_config_row()? {
+                ConfigRow::Setting(_) => Some("⏎ edit"),
+                ConfigRow::Viewer(i) => self
+                    .config_viewers
+                    .get(i)
+                    .filter(|v| v.editable)
+                    .map(|_| "⏎ edit"),
+            },
             Screen::Tasks => self.all.get(self.tasks_sel).map(|_| "⏎ view"),
             Screen::Cockpit => match self.cockpit_rows.get(self.cockpit_sel)? {
                 CockpitRow::Queue(i) => match self.queue.rows.get(*i)? {
@@ -1419,6 +1559,7 @@ impl App {
                 buffer,
             } => self.key_prompt(key, task_id, kind, buffer),
             Mode::LinkPr { task_id, buffer } => self.key_link_pr(key, task_id, buffer),
+            Mode::EditMaxRunning { buffer } => self.key_max_running(key, buffer),
             Mode::QuickCreate { project_id, buffer } => {
                 self.key_quick_create(key, project_id, buffer)
             }
@@ -1477,7 +1618,7 @@ impl App {
             Hit::CockpitRow(i) if self.screen == Screen::Cockpit => self.select_index(i),
             Hit::TaskRow(i) if self.screen == Screen::Tasks => self.select_index(i),
             Hit::ProjectRow(i) if self.screen == Screen::Projects => self.select_index(i),
-            Hit::ViewerRow(i) if self.screen == Screen::Config => self.select_index(i),
+            Hit::ConfigRow(i) if self.screen == Screen::Config => self.select_index(i),
             Hit::PickerOption(i) => self.click_picker_option(i),
             _ => {}
         }
@@ -2809,6 +2950,61 @@ impl App {
         self.mode = Mode::LinkPr { task_id, buffer };
     }
 
+    /// Drive the dispatch-cap entry (DESIGN.md §5/§7). Enter saves, esc cancels,
+    /// backspace edits. Only the characters a whole number is spelled with are
+    /// taken, so a stray letter never lands in the field — what it cannot refuse
+    /// at the keystroke (a lone `-`, a count past `i64`, a negative cap) the
+    /// save refuses with the form still open.
+    fn key_max_running(&mut self, key: KeyEvent, mut buffer: String) {
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Enter => {
+                self.save_max_running(&buffer);
+                return;
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() || c == '-' => buffer.push(c),
+            _ => {}
+        }
+        self.mode = Mode::EditMaxRunning { buffer };
+    }
+
+    /// Write the dispatch cap and rebuild the queue on the same keypress, so a
+    /// raised cap restores the dispatch rows the capacity line had replaced
+    /// (DESIGN.md §7) rather than waiting for the next unrelated refresh. A
+    /// refusal — from the parse or from the writer — keeps the entry open with
+    /// what was typed intact, the way the link-a-PR prompt does.
+    fn save_max_running(&mut self, raw: &str) {
+        let trimmed = raw.trim();
+        let reopen = |app: &mut App, message: String| {
+            app.status = Some(message);
+            app.mode = Mode::EditMaxRunning {
+                buffer: raw.to_string(),
+            };
+        };
+        let Ok(n) = trimmed.parse::<i64>() else {
+            reopen(
+                self,
+                format!("'{trimmed}' is not a whole number — the dispatch cap counts tasks"),
+            );
+            return;
+        };
+        match voro_core::config_edit::set_max_running(&self.dispatch_ctx.agents_path, n) {
+            Ok(()) => {
+                self.status = Some(if n == 0 {
+                    "dispatch cap -> 0 — the queue will offer no dispatches".into()
+                } else {
+                    format!("dispatch cap -> {n}")
+                });
+                let result = self.refresh();
+                self.report(result);
+            }
+            Err(e) => reopen(self, e.to_string()),
+        }
+    }
+
     /// Drive the quick-create prompt (DESIGN.md §6/§8). Enter hands the typed
     /// line to a background agent, esc cancels. The buffer is one line — the
     /// terse intent the agent expands — so this stays a simple line editor.
@@ -3205,26 +3401,55 @@ impl App {
         };
     }
 
-    /// The Config screen's local keys (DESIGN.md §5): `a` adds a viewer, `e`/⏎
-    /// edits the selected one's command, `d` deletes it, `V`/`A` pick the default
-    /// viewer/agent. Movement and the alt-digit screen jumps are `key_normal`'s.
+    /// The Config screen's local keys (DESIGN.md §5): `e`/⏎ edits whatever the
+    /// selection is on — a setting or a viewer — while `a` adds a viewer and `d`
+    /// deletes one. The two list operations keep letters of their own because
+    /// neither is an edit of the selected value: `a` acts with nothing selected,
+    /// and `d` is destructive. `J`/`K` and the page keys scroll the agents pane,
+    /// which has no selection of its own. Movement and the alt-digit screen
+    /// jumps are `key_normal`'s.
     fn key_config(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('a') => self.open_viewer_form(None, None),
-            KeyCode::Char('e') | KeyCode::Enter => self.edit_selected_viewer(),
+            KeyCode::Char('e') | KeyCode::Enter => self.activate_config_row(),
             KeyCode::Char('d') => self.delete_selected_viewer(),
-            KeyCode::Char('V') => self.open_default_picker(DefaultKind::Viewer),
-            KeyCode::Char('A') => self.open_default_picker(DefaultKind::Agent),
             // The agents pane takes the cockpit card's scroll keys for the same
-            // reason it has there: `j`/`k` are the list's — here the viewers'
-            // — so the pane below them is driven by the shifted pair and the
-            // page keys (DESIGN.md §9).
+            // reason it has there: `j`/`k` are the list's — here the settings
+            // and the viewers' — so the pane above them is driven by the shifted
+            // pair and the page keys (DESIGN.md §9).
             KeyCode::Char('J') => self.scroll_config_agents(1),
             KeyCode::Char('K') => self.scroll_config_agents(-1),
             KeyCode::PageDown => self.scroll_config_agents(DETAIL_PAGE_STEP),
             KeyCode::PageUp => self.scroll_config_agents(-DETAIL_PAGE_STEP),
             _ => {}
         }
+    }
+
+    /// Edit whatever the Config screen's selection is on: a setting opens its
+    /// own editor — the picker for the two defaults, the numeric entry for the
+    /// dispatch cap — and a viewer row opens the viewer form.
+    fn activate_config_row(&mut self) {
+        match self.selected_config_row() {
+            Some(ConfigRow::Setting(i)) => match self.config_settings.get(i).map(|s| s.kind) {
+                Some(SettingKind::Default(kind)) => self.open_default_picker(kind),
+                Some(SettingKind::MaxRunning) => self.open_max_running_entry(),
+                None => {}
+            },
+            Some(ConfigRow::Viewer(_)) => self.edit_selected_viewer(),
+            None => self.status = Some("nothing selected — press a to add a viewer".into()),
+        }
+    }
+
+    /// Open the dispatch-cap entry pre-filled with the cap in force, so raising
+    /// or lowering it starts from the number the screen just showed.
+    fn open_max_running_entry(&mut self) {
+        let buffer = self
+            .config_settings
+            .iter()
+            .find(|s| s.kind == SettingKind::MaxRunning)
+            .map(|s| s.value.clone())
+            .unwrap_or_default();
+        self.mode = Mode::EditMaxRunning { buffer };
     }
 
     /// Open the add/edit-viewer form. `existing` pre-fills it for an edit (name
@@ -3268,7 +3493,7 @@ impl App {
     /// overriding it is an *add* of the same name — so it is refused with that
     /// named rather than opening a form whose write would fail.
     fn edit_selected_viewer(&mut self) {
-        match self.config_viewers.get(self.config_sel) {
+        match self.selected_viewer() {
             Some(v) if !v.editable => {
                 self.status = Some(format!(
                     "'{}' is built into voro — press a and name it '{}' to override it",
@@ -3287,7 +3512,16 @@ impl App {
     /// (DESIGN.md §5) — the same refusal as `voro viewer remove`, with
     /// the offending projects named. Deleting the default clears `default_viewer`.
     fn delete_selected_viewer(&mut self) {
-        let Some(viewer) = self.config_viewers.get(self.config_sel) else {
+        // A setting is changed, never removed: there is no state in which
+        // voro has no dispatch cap, so `d` on one has nothing to do.
+        if let Some(setting) = self.selected_setting() {
+            self.status = Some(format!(
+                "'{}' is a setting, not a list — press ⏎ to change it",
+                setting.name
+            ));
+            return;
+        }
+        let Some(viewer) = self.selected_viewer() else {
             self.status = Some("no viewer selected".into());
             return;
         };
@@ -3517,7 +3751,7 @@ impl App {
         // Land the selection on what was just written, so `e`/`d` act on it
         // rather than on whichever row the list happens to sort first.
         if let Some(i) = self.config_viewers.iter().position(|v| v.name == trimmed) {
-            self.config_sel = i;
+            self.config_sel = self.config_settings.len() + i;
         }
     }
 
@@ -5055,13 +5289,26 @@ mod tests {
         }
     }
 
-    /// The Config screen's row index for a viewer. The built-ins share the
-    /// list, so a test never assumes where a name sorts.
+    /// The Config screen's viewer-list index for a viewer. The built-ins share
+    /// the list, so a test never assumes where a name sorts.
     fn row(app: &App, name: &str) -> usize {
         app.config_viewers
             .iter()
             .position(|v| v.name == name)
             .unwrap_or_else(|| panic!("no viewer row named {name}"))
+    }
+
+    /// …and the selection that lands on it, past the settings rows above.
+    fn viewer_sel(app: &App, name: &str) -> usize {
+        app.config_settings.len() + row(app, name)
+    }
+
+    /// The selection that lands on a named setting.
+    fn setting_sel(app: &App, name: &str) -> usize {
+        app.config_settings
+            .iter()
+            .position(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no setting row named {name}"))
     }
 
     /// `o` with no viewer set up anywhere raises the add-viewer form rather
@@ -5238,7 +5485,7 @@ mod tests {
         assert!(app.config_viewers.iter().all(|v| !v.editable));
 
         // e/d on a built-in row refuse, naming the override that replaces it
-        app.config_sel = row(&app, "code");
+        app.config_sel = viewer_sel(&app, "code");
         for k in ['d', 'e'] {
             key(&mut app, KeyCode::Char(k));
             let status = app.status.clone().unwrap_or_default();
@@ -5260,9 +5507,12 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         assert!(matches!(app.mode, Mode::Normal));
         // the selection lands on what was just written
-        assert_eq!(app.config_viewers[app.config_sel].name, "mine");
-        assert_eq!(app.config_viewers[app.config_sel].cmd, "mine {path}");
-        assert_eq!(app.config_viewers[app.config_sel].provenance, "user");
+        let selected = app
+            .selected_viewer()
+            .expect("the selection lands on a viewer");
+        assert_eq!(selected.name, "mine");
+        assert_eq!(selected.cmd, "mine {path}");
+        assert_eq!(selected.provenance, "user");
         assert_eq!(
             AgentsConfig::load(&path)
                 .unwrap()
@@ -5284,10 +5534,11 @@ mod tests {
             "mine {path} --wait"
         );
 
-        // default: V opens the picker over every viewer, built-ins included;
-        // walk to the top and back down to `mine`, since where the cursor
-        // starts depends on what is installed
-        key(&mut app, KeyCode::Char('V'));
+        // default: ⏎ on the default-viewer setting opens the picker over every
+        // viewer, built-ins included; walk to the top and back down to `mine`,
+        // since where the cursor starts depends on what is installed
+        app.config_sel = setting_sel(&app, "default viewer");
+        key(&mut app, KeyCode::Enter);
         let names = match &app.mode {
             Mode::DefaultPicker { names, .. } => names.clone(),
             _ => panic!("expected the default picker to open"),
@@ -5311,7 +5562,7 @@ mod tests {
         );
 
         // delete: d removes it and clears the now-dangling default
-        app.config_sel = row(&app, "mine");
+        app.config_sel = viewer_sel(&app, "mine");
         key(&mut app, KeyCode::Char('d'));
         assert!(app.config_viewers.iter().all(|v| v.name != "mine"));
         let config = AgentsConfig::load(&path).unwrap();
@@ -5321,6 +5572,221 @@ mod tests {
                 .unwrap()
                 .contains("default_viewer")
         );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// One selection runs over both lists (DESIGN.md §5): `j`/`k` cross from the
+    /// settings into the viewers and back without a focus key, ⏎ edits whichever
+    /// kind it is on, and `d` — a list operation, not an edit — is refused on a
+    /// setting with what to press instead.
+    #[test]
+    fn one_selection_runs_over_the_settings_and_the_viewers() {
+        let toml = "[viewers.zed]\ncmd = \"zed {path}\"\n";
+        let (store, ctx, _project) = scratch_env("config-rows", Some(toml));
+        let path = ctx.agents_path.clone();
+        let mut app = App::new(store, ctx).unwrap();
+        alt_key(&mut app, KeyCode::Char('4'));
+
+        // the settings come first, in the order the screen lists them
+        let names: Vec<&str> = app.config_settings.iter().map(|s| s.name).collect();
+        assert_eq!(names, ["default agent", "default viewer", "dispatch cap"]);
+        assert_eq!(
+            app.config_rows.len(),
+            app.config_settings.len() + app.config_viewers.len()
+        );
+
+        // k at the top stays put; j walks off the last setting onto the first
+        // viewer and back
+        app.config_sel = 0;
+        key(&mut app, KeyCode::Char('k'));
+        assert_eq!(
+            app.selected_setting().map(|s| s.name),
+            Some("default agent")
+        );
+        for _ in 0..app.config_settings.len() {
+            key(&mut app, KeyCode::Char('j'));
+        }
+        assert_eq!(app.selected_config_row(), Some(ConfigRow::Viewer(0)));
+        key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.selected_setting().map(|s| s.name), Some("dispatch cap"));
+
+        // ⏎ routes by row kind: picker, picker, numeric entry, viewer form
+        for (setting, opens) in [
+            ("default agent", "agent picker"),
+            ("default viewer", "viewer picker"),
+            ("dispatch cap", "cap entry"),
+        ] {
+            app.config_sel = setting_sel(&app, setting);
+            key(&mut app, KeyCode::Enter);
+            match (&app.mode, opens) {
+                (Mode::DefaultPicker { kind, .. }, "agent picker") => {
+                    assert_eq!(*kind, DefaultKind::Agent)
+                }
+                (Mode::DefaultPicker { kind, .. }, "viewer picker") => {
+                    assert_eq!(*kind, DefaultKind::Viewer)
+                }
+                (Mode::EditMaxRunning { .. }, "cap entry") => {}
+                _ => panic!("{setting} did not open the {opens}"),
+            }
+            key(&mut app, KeyCode::Esc);
+        }
+        app.config_sel = viewer_sel(&app, "zed");
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            app.mode,
+            Mode::ViewerForm(ViewerFormState { editing: true, .. })
+        ));
+        key(&mut app, KeyCode::Esc);
+
+        // d on a setting is refused: a setting is changed, never removed
+        app.config_sel = setting_sel(&app, "dispatch cap");
+        key(&mut app, KeyCode::Char('d'));
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("dispatch cap"), "{status}");
+        assert!(status.contains("⏎"), "{status}");
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.config_viewers.iter().any(|v| v.name == "zed"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Each settings row says what is in force and where it came from
+    /// (DESIGN.md §5), so a fresh install can tell a value it chose from one
+    /// Voro fell back to — the distinction the resolved value alone cannot make
+    /// when the operator's number happens to equal the default.
+    #[test]
+    fn the_settings_rows_carry_their_value_and_its_provenance() {
+        let (store, ctx, _project) = scratch_env("config-provenance", None);
+        let path = ctx.agents_path.clone();
+        let mut app = App::new(store, ctx).unwrap();
+        alt_key(&mut app, KeyCode::Char('4'));
+
+        let source = |app: &App, name: &str| {
+            app.config_settings
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| (s.value.clone(), s.source.clone()))
+                .unwrap()
+        };
+        // with no file at all, every value is Voro's own and says so
+        let (value, from) = source(&app, "dispatch cap");
+        assert_eq!(value, scheduler::DEFAULT_MAX_RUNNING.to_string());
+        assert_eq!(from, "voro's default");
+        assert_ne!(source(&app, "default agent").1, "voro.toml");
+        assert_ne!(source(&app, "default viewer").1, "voro.toml");
+
+        // and once the file names them, they are the operator's
+        voro_core::config_edit::set_max_running(&path, 5).unwrap();
+        voro_core::config_edit::set_default_agent(&path, "codex").unwrap();
+        voro_core::config_edit::set_default_viewer(&path, "code").unwrap();
+        app.refresh().unwrap();
+        assert_eq!(
+            source(&app, "dispatch cap"),
+            ("5".into(), "voro.toml".into())
+        );
+        assert_eq!(
+            source(&app, "default agent"),
+            ("codex".into(), "voro.toml".into())
+        );
+        assert_eq!(
+            source(&app, "default viewer"),
+            ("code".into(), "voro.toml".into())
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The dispatch cap is edited where it is shown (DESIGN.md §5/§7): the entry
+    /// opens on the cap in force, a bad number is refused with the form still
+    /// open, and a saved one is written *and* re-gates the queue on the same
+    /// keypress — so raising it while the capacity line has replaced the
+    /// dispatch rows brings them back without restarting the TUI.
+    #[test]
+    fn saving_the_dispatch_cap_writes_it_and_re_gates_the_queue() {
+        let (mut store, ctx, _project) =
+            scratch_env("config-cap", Some("# mine\nmax_running = 1\n"));
+        let path = ctx.agents_path.clone();
+        let project = store.create_project("demo", "/tmp/demo").unwrap();
+        let mut ready = |title: &str| {
+            store
+                .create_task(NewTask {
+                    project_id: project.id,
+                    repo_id: None,
+                    title: title.into(),
+                    body: String::new(),
+                    priority: Priority::P1,
+                    state: TaskState::Ready,
+                    agent: None,
+                    human: false,
+                    deep: false,
+                })
+                .unwrap()
+        };
+        let running = ready("in flight");
+        let waiting = ready("waiting for room");
+        store.apply(running.id, Action::Start).unwrap();
+
+        let mut app = App::new(store, ctx).unwrap();
+        alt_key(&mut app, KeyCode::Char('4'));
+        // one running against a cap of one: the queue offers no dispatch
+        assert!(app.queue.at_capacity.is_some());
+        assert!(!app.queue_task_ids().contains(&waiting.id));
+
+        // ⏎ opens the entry on the cap in force
+        app.config_sel = setting_sel(&app, "dispatch cap");
+        key(&mut app, KeyCode::Enter);
+        match &app.mode {
+            Mode::EditMaxRunning { buffer } => assert_eq!(buffer, "1"),
+            _ => panic!("expected the cap entry"),
+        }
+
+        // a number it cannot save is refused with what was typed still there
+        key(&mut app, KeyCode::Backspace);
+        type_str(&mut app, "-2");
+        key(&mut app, KeyCode::Enter);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("cannot be negative"), "{status}");
+        match &app.mode {
+            Mode::EditMaxRunning { buffer } => assert_eq!(buffer, "-2"),
+            _ => panic!("the refusal should keep the entry open"),
+        }
+        assert_eq!(AgentsConfig::load(&path).unwrap().max_running(), 1);
+
+        // esc leaves the file exactly as it was
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(AgentsConfig::load(&path).unwrap().max_running(), 1);
+
+        // and a good one writes, keeps the operator's comment, and re-gates the
+        // queue on the same keypress
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Backspace);
+        type_str(&mut app, "4");
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(AgentsConfig::load(&path).unwrap().max_running(), 4);
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("# mine"),
+            "the writer preserves what was already in the file"
+        );
+        assert!(app.queue.at_capacity.is_none());
+        assert!(app.queue_task_ids().contains(&waiting.id));
+        assert_eq!(
+            app.config_settings
+                .iter()
+                .find(|s| s.name == "dispatch cap")
+                .map(|s| (s.value.as_str(), s.source.as_str())),
+            Some(("4", "voro.toml"))
+        );
+
+        // 0 is a cap, not an absence — the queue offers nothing at all
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Backspace);
+        type_str(&mut app, "0");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(AgentsConfig::load(&path).unwrap().max_running(), 0);
+        assert!(app.queue.at_capacity.is_some());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -5337,8 +5803,8 @@ mod tests {
         let mut app = App::new(store, ctx).unwrap();
 
         alt_key(&mut app, KeyCode::Char('4'));
-        app.config_sel = row(&app, "zed");
-        assert!(app.config_viewers[app.config_sel].editable);
+        app.config_sel = viewer_sel(&app, "zed");
+        assert!(app.selected_viewer().is_some_and(|v| v.editable));
         key(&mut app, KeyCode::Char('d'));
         assert!(
             app.status.as_deref().unwrap_or("").contains("demo2"),

@@ -28,7 +28,9 @@ pub enum Hit {
     CockpitRow(usize),
     TaskRow(usize),
     ProjectRow(usize),
-    ViewerRow(usize),
+    /// A Config screen row, settings list and viewers list alike: an index into
+    /// `App::config_rows`, the one space `config_sel` counts in.
+    ConfigRow(usize),
     /// An option of whichever modal picker is open.
     PickerOption(usize),
 }
@@ -196,6 +198,12 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
         Mode::LinkPr { buffer, .. } => draw_text_entry_popup(
             frame,
             "Link PR (URL or owner/repo#n) — ⏎ to submit, esc to cancel".to_string(),
+            buffer,
+        ),
+        Mode::EditMaxRunning { buffer } => draw_text_entry_popup(
+            frame,
+            "Dispatch cap — how many run at once, 0 for none — ⏎ to save, esc to cancel"
+                .to_string(),
             buffer,
         ),
         Mode::QuickCreate { project_id, buffer } => {
@@ -1760,12 +1768,20 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
         )));
     }
 
-    // The pane takes the height its rows need, yielding only what the viewers
-    // list below needs for a border and a row: both panes scroll, so the split
-    // is about which one is read whole without a keypress, and that is this one.
-    let agents_h = (agent_lines.len() as u16 + 2).clamp(3, main.height.saturating_sub(3).max(3));
-    let [agents_area, viewers_area] =
-        Layout::vertical([Constraint::Length(agents_h), Constraint::Min(3)]).areas(main);
+    // The pane takes the height its rows need, yielding to the settings list —
+    // which is exactly its rows, neither scrolling nor growing — and to what the
+    // viewers list below needs for a border and a row: every pane here is
+    // reachable whole, so the split is about which is read without a keypress,
+    // and that is this one.
+    let settings_h = app.config_settings.len() as u16 + 2;
+    let agents_h =
+        (agent_lines.len() as u16 + 2).clamp(3, main.height.saturating_sub(settings_h + 3).max(3));
+    let [agents_area, settings_area, viewers_area] = Layout::vertical([
+        Constraint::Length(agents_h),
+        Constraint::Length(settings_h),
+        Constraint::Min(3),
+    ])
+    .areas(main);
 
     // The rows the pane cannot fit are reached with `J`/`K` and the page keys,
     // the cockpit card's gesture: the pane carries no selection to scroll with,
@@ -1788,6 +1804,39 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     frame.render_widget(
         Paragraph::new(agent_lines).scroll((scroll, 0)).block(block),
         agents_area,
+    );
+
+    // Settings: the `voro.toml` values this screen edits, each with the value in
+    // force and where it came from — the file, or the rule Voro fell back to
+    // (DESIGN.md §5). They share the selection with the viewers below, so
+    // exactly one of the two lists ever shows a highlight.
+    let settings_items: Vec<ListItem> = app
+        .config_settings
+        .iter()
+        .map(|s| {
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("  {:<16}", s.name)),
+                Span::styled(format!("{:<14}", s.value), Style::new().bold()),
+                Span::styled(format!("({})", s.source), Style::new().dim()),
+            ]))
+        })
+        .collect();
+    let settings_count = app.config_settings.len();
+    let mut settings_state = ListState::default()
+        .with_selected((app.config_sel < settings_count).then_some(app.config_sel));
+    let settings = List::new(settings_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Settings — ⏎ edit"),
+        )
+        .highlight_style(SELECTED);
+    frame.render_stateful_widget(settings, settings_area, &mut settings_state);
+    hits.push_list(
+        settings_area,
+        settings_state.offset(),
+        settings_count,
+        Hit::ConfigRow,
     );
 
     // Viewers: every viewer `open` can run — the built-ins with the user's
@@ -1820,18 +1869,18 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             ),
         ])));
     }
-    // The selection only ever lands on a named viewer, never the anonymous note.
-    let selected = if named == 0 {
-        None
-    } else {
-        Some(app.config_sel)
+    // The selection only ever lands on a named viewer, never the anonymous note
+    // — and only while it is past the settings rows above.
+    let selected = match app.config_sel.checked_sub(settings_count) {
+        Some(i) if i < named => Some(i),
+        _ => None,
     };
     let mut state = ListState::default().with_selected(selected);
     let viewers = List::new(viewer_items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Viewers — a add · e edit · d delete · V default · A default agent")
+                .title("Viewers — a add · ⏎ edit · d delete")
                 .title_bottom(
                     Line::from(format!(" {} ", app.config_path().display())).right_aligned(),
                 ),
@@ -1840,7 +1889,9 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     frame.render_stateful_widget(viewers, viewers_area, &mut state);
     // Same rule as the selection: the anonymous note below the named viewers is
     // not selectable, so it is not clickable either.
-    hits.push_list(viewers_area, state.offset(), named, Hit::ViewerRow);
+    hits.push_list(viewers_area, state.offset(), named, |i| {
+        Hit::ConfigRow(settings_count + i)
+    });
 
     draw_status(frame, app, status);
 }
@@ -2045,7 +2096,12 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
             ("q", "quit", true),
         ],
         Screen::Config => {
-            let viewers = !app.config_viewers.is_empty();
+            // Deleting is the viewer list's own operation, so it appears only
+            // while the selection is in that list; editing is every row's.
+            let on_viewer = matches!(
+                app.selected_config_row(),
+                Some(crate::app::ConfigRow::Viewer(_))
+            );
             // While the gate holds (DESIGN.md §9) `tab` cycles the shorter
             // Projects ↔ Config ring, so the slot has to name where it lands.
             let next = if app.projects.is_empty() {
@@ -2054,11 +2110,9 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
                 "cockpit"
             };
             vec![
+                enter,
                 ("a", "add viewer", true),
-                ("e", "edit", viewers),
-                ("d", "delete", viewers),
-                ("V", "default viewer", viewers),
-                ("A", "default agent", true),
+                ("d", "delete", on_viewer),
                 ("?", "keys", true),
                 ("tab", next, true),
                 ("q", "quit", true),
@@ -2104,20 +2158,17 @@ const NEW_KEYS: [(&str, &str); 2] = [
 
 /// The uppercase keys DESIGN.md §9 names as standing outside the case
 /// convention, because none is the shifted half of a pair: `C` and the projects
-/// screen's `A` share a letter with an unrelated action, `J`/`K` scroll a pane
-/// that has no selection to scroll with — the cockpit's card and the Config
-/// screen's agents — and the Config screen's `V`/`A` pick defaults. Every other
-/// uppercase binding has to be the interactive half of a pair, which the test
-/// below enforces screen by screen.
+/// screen's `A` share a letter with an unrelated action, and `J`/`K` scroll a
+/// pane that has no selection to scroll with — the cockpit's card and the Config
+/// screen's agents. Every other uppercase binding has to be the interactive half
+/// of a pair, which the test below enforces screen by screen.
 #[cfg(test)]
-const CASE_EXCEPTIONS: [(Screen, &str); 9] = [
+const CASE_EXCEPTIONS: [(Screen, &str); 7] = [
     (Screen::Cockpit, "C"),
     (Screen::Cockpit, "J"),
     (Screen::Cockpit, "K"),
     (Screen::Tasks, "C"),
     (Screen::Projects, "A"),
-    (Screen::Config, "V"),
-    (Screen::Config, "A"),
     (Screen::Config, "J"),
     (Screen::Config, "K"),
 ];
@@ -2250,11 +2301,9 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
             (
                 "Actions",
                 vec![
+                    ("⏎/e", "edit the selected setting or viewer"),
                     ("a", "add a viewer"),
-                    ("⏎/e", "edit the selected viewer's command"),
                     ("d", "delete the selected viewer"),
-                    ("V", "pick the default viewer"),
-                    ("A", "pick the default agent"),
                 ],
             ),
             (
@@ -2995,8 +3044,10 @@ mod tests {
     }
 
     /// The agents pane sizes to the rows it has: an operator with several
-    /// model-carrying agents, each now three lines tall, still sees every one
-    /// of them, and the viewers list below keeps a row (DESIGN.md §9).
+    /// model-carrying agents, each now three lines tall, sees every one of them
+    /// without touching the scroll, and the lists below keep their rows
+    /// (DESIGN.md §9). What happens when even that is not enough is the scroll
+    /// test below.
     #[test]
     fn config_screen_shows_every_agent_it_has() {
         use crate::app::App;
@@ -3034,7 +3085,12 @@ mod tests {
         let mut app = App::new(store, ctx).unwrap();
         alt_screen(&mut app, '4');
 
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        // Tall enough for the settings pane the agents now share the screen
+        // with: it is a fixed height that neither scrolls nor grows, so it is
+        // subtracted before the paragraph takes what its rows need.
+        let mut terminal = Terminal::new(TestBackend::new(100, 29)).unwrap();
+        // …and it is what the pane fits, not what it can be scrolled to.
+        assert_eq!(app.config_agents_scroll, 0);
         terminal
             .draw(|f| {
                 draw(f, &app);
@@ -3148,12 +3204,129 @@ mod tests {
             "{rendered}"
         );
 
-        // `K` walks back, and the viewers list keeps its own `j`/`k`.
+        // `K` walks back, and the two lists below keep their own `j`/`k`.
         app.on_key(KeyEvent::from(KeyCode::PageUp));
         assert!(app.config_agents_scroll < hidden);
         let before = app.config_sel;
         app.on_key(KeyEvent::from(KeyCode::Char('j')));
-        assert_ne!(app.config_sel, before, "j still moves the viewer selection");
+        assert_ne!(app.config_sel, before, "j still moves the row selection");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The settings pane at an ordinary terminal (DESIGN.md §5/§9): every
+    /// setting shows its value and where it came from, the viewers list below
+    /// still has its border and a row, and the selection the two lists share
+    /// highlights exactly one line whichever list it is in.
+    #[test]
+    fn config_settings_pane_reads_at_80x24() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::Store;
+
+        let dir = std::env::temp_dir().join(format!(
+            "voro-ui-config-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agents_path = dir.join("voro.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        // the cap and the default agent are the operator's; the default viewer
+        // is whatever voro resolves, so the pane shows both provenances at once
+        std::fs::write(
+            &agents_path,
+            "default_agent = \"claude\"\nmax_running = 2\n\n[viewers.zed]\ncmd = \"zed {path}\"\n",
+        )
+        .unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+        let ctx = crate::dispatch::DispatchCtx {
+            db_path: dir.join("voro.db"),
+            agents_path,
+            runtime_dir: dir.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
+        };
+        let mut app = App::new(store, ctx).unwrap();
+        alt_screen(&mut app, '4');
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        // The lines of the frame, and the ones the selection has reversed.
+        let read = |terminal: &Terminal<TestBackend>| -> (Vec<String>, Vec<usize>) {
+            let buffer = terminal.backend().buffer();
+            let mut lines = Vec::new();
+            let mut highlighted = Vec::new();
+            for y in 0..buffer.area.height {
+                let mut line = String::new();
+                let mut reversed = false;
+                for x in 0..buffer.area.width {
+                    let cell = &buffer[(x, y)];
+                    line.push_str(cell.symbol());
+                    reversed |= cell.modifier.contains(Modifier::REVERSED);
+                }
+                if reversed {
+                    highlighted.push(y as usize);
+                }
+                lines.push(line);
+            }
+            (lines, highlighted)
+        };
+        let draw_now = |terminal: &mut Terminal<TestBackend>, app: &App| {
+            terminal
+                .draw(|f| {
+                    draw(f, app);
+                })
+                .unwrap();
+        };
+
+        draw_now(&mut terminal, &app);
+        let (lines, highlighted) = read(&terminal);
+        let find = |needle: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle}:\n{}", lines.join("\n")))
+                .clone()
+        };
+        assert!(find("Settings").contains("⏎ edit"));
+        let cap = find("dispatch cap");
+        assert!(cap.contains(" 2 ") && cap.contains("(voro.toml)"), "{cap}");
+        let agent = find("default agent");
+        assert!(
+            agent.contains("claude") && agent.contains("(voro.toml)"),
+            "{agent}"
+        );
+        // resolved rather than chosen: a sole `[viewers.*]` table is the default
+        let viewer = find("default viewer");
+        assert!(
+            viewer.contains("zed") && viewer.contains("(the only viewer configured)"),
+            "{viewer}"
+        );
+        // the viewers list keeps its border and a row of its own
+        assert!(find("Viewers").contains("a add · ⏎ edit · d delete"));
+        assert!(lines.iter().any(|l| l.contains("zed {path}")));
+
+        // the selection starts on the first setting, and moving it into the
+        // viewers list moves the one highlight there — never two at once
+        assert_eq!(highlighted.len(), 1, "{highlighted:?}");
+        let first = highlighted[0];
+        assert!(read(&terminal).0[first].contains("default agent"));
+
+        for _ in 0..app.config_settings.len() {
+            app.move_selection(1);
+        }
+        draw_now(&mut terminal, &app);
+        let (lines, highlighted) = read(&terminal);
+        assert_eq!(highlighted.len(), 1, "{highlighted:?}");
+        assert!(
+            lines[highlighted[0]].contains(&app.config_viewers[0].name),
+            "{}",
+            lines[highlighted[0]]
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -6204,7 +6377,17 @@ mod tests {
         let target = app.config_viewers[1].name.clone();
         let (x, y) = point_of(&terminal, &target);
         app.on_mouse(x, y, &hits);
-        assert_eq!(app.config_viewers[app.config_sel].name, target);
+        assert_eq!(
+            app.selected_viewer().map(|v| v.name.clone()),
+            Some(target.clone())
+        );
+
+        // The settings list above clicks the same way — the two lists share one
+        // row space, so a click in either lands the single selection.
+        let (x, y) = point_of(&terminal, "dispatch cap");
+        app.on_mouse(x, y, &hits);
+        assert_eq!(app.selected_setting().map(|s| s.name), Some("dispatch cap"));
+        assert!(app.selected_viewer().is_none());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

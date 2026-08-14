@@ -174,6 +174,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Config screen edits settings you select, starting with the dispatch
+  cap.** It used to bind a letter per value — `V` for the default viewer, `A`
+  for the default agent — and `max_running`, the one queue option with no TUI
+  surface at all, was next in line for a third. Instead the screen has grown a
+  **Settings** list above the viewers: the default agent, the default viewer,
+  and the dispatch cap, each showing the value in force and whether it came from
+  your `voro.toml` or is Voro's own default. One selection runs over the
+  settings and the viewers together, and ⏎ (or `e`) edits whatever it is on —
+  the same pickers `V` and `A` used to open, and a numeric entry for the cap.
+  Raising the cap while the queue reads `⏸ dispatch at capacity` brings the
+  dispatch rows back on that keypress. `a` adds a viewer and `d` deletes one as
+  before; `V` and `A` are unbound, and the `?` map no longer lists them. Every
+  write still goes through the comment-preserving writer, so your file's
+  formatting and comments survive it.
+
 - **A quick propose is named for its project, like the planning session beside
   it.** `n` used to launch its agent under `voro-propose-<project_id>` while `N`
   on the same project opened `voro-plan-<project>`, so the two read in
