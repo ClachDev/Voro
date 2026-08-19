@@ -2924,16 +2924,12 @@ mod tests {
         use ratatui::backend::TestBackend;
         use voro_core::Store;
 
-        let dir = std::env::temp_dir().join(format!(
-            "voro-ui-config-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = tempfile::Builder::new()
+            .prefix("voro-ui-config-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let agents_path = dir.join("voro.toml");
-        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&agents_path, "[viewers.zed]\ncmd = \"zed {path}\"\n").unwrap();
 
         let store = Store::open_in_memory().unwrap();
@@ -3004,16 +3000,12 @@ mod tests {
         use ratatui::backend::TestBackend;
         use voro_core::Store;
 
-        let dir = std::env::temp_dir().join(format!(
-            "voro-ui-config-many-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = tempfile::Builder::new()
+            .prefix("voro-ui-config-many-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let agents_path = dir.join("voro.toml");
-        std::fs::create_dir_all(&dir).unwrap();
         let mut toml = String::from("[viewers.zed]\ncmd = \"zed {path}\"\n");
         for n in 1..=4 {
             toml.push_str(&format!(
@@ -3071,16 +3063,12 @@ mod tests {
         use ratatui::crossterm::event::{KeyCode, KeyEvent};
         use voro_core::Store;
 
-        let dir = std::env::temp_dir().join(format!(
-            "voro-ui-config-scroll-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = tempfile::Builder::new()
+            .prefix("voro-ui-config-scroll-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let agents_path = dir.join("voro.toml");
-        std::fs::create_dir_all(&dir).unwrap();
         let mut toml = String::from("[viewers.zed]\ncmd = \"zed {path}\"\n");
         for n in 1..=6 {
             toml.push_str(&format!(
@@ -3333,15 +3321,11 @@ mod tests {
         use std::process::{Command, Stdio};
         use voro_core::{Action, NewTask, Store};
 
-        let project = std::env::temp_dir().join(format!(
-            "voro-ui-remoteless-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&project).unwrap();
+        let project = tempfile::Builder::new()
+            .prefix("voro-ui-remoteless-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let status = Command::new("git")
             .arg("-C")
             .arg(&project)
@@ -3415,15 +3399,11 @@ mod tests {
         use std::process::{Command, Stdio};
         use voro_core::{Action, NewTask, Store};
 
-        let project = std::env::temp_dir().join(format!(
-            "voro-ui-half-report-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&project).unwrap();
+        let project = tempfile::Builder::new()
+            .prefix("voro-ui-half-report-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let status = Command::new("git")
             .arg("-C")
             .arg(&project)
@@ -6159,15 +6139,11 @@ mod tests {
         use ratatui::crossterm::event::{KeyCode, KeyEvent};
         use voro_core::Store;
 
-        let dir = std::env::temp_dir().join(format!(
-            "voro-ui-mouse-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("voro-ui-mouse-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let agents_path = dir.join("voro.toml");
         std::fs::write(
             &agents_path,

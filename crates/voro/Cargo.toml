@@ -14,3 +14,6 @@ categories = ["command-line-utilities"]
 voro-core = { path = "../voro-core", version = "0.1.0" }
 ratatui.workspace = true
 clap = { version = "4.6.1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile.workspace = true

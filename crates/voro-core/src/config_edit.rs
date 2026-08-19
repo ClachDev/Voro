@@ -253,14 +253,11 @@ mod tests {
 
     /// A unique scratch path per test, cleaned up by the caller.
     fn scratch(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "voro-config-edit-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        tempfile::Builder::new()
+            .prefix(&format!("voro-config-edit-{tag}-"))
+            .tempdir()
+            .unwrap()
+            .keep()
     }
 
     #[test]

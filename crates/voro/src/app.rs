@@ -4145,14 +4145,11 @@ mod tests {
     ) -> (Store, crate::dispatch::DispatchCtx, std::path::PathBuf) {
         use std::process::{Command, Stdio};
 
-        let root = std::env::temp_dir().join(format!(
-            "voro-app-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = tempfile::Builder::new()
+            .prefix(&format!("voro-app-{name}-"))
+            .tempdir()
+            .unwrap()
+            .keep();
         let project_path = root.join("project");
         std::fs::create_dir_all(&project_path).unwrap();
         let status = Command::new("git")
@@ -4189,14 +4186,11 @@ mod tests {
     fn resuming_a_task_with_a_live_session_spawns_no_continuation() {
         use std::process::{Command, Stdio};
 
-        let root = std::env::temp_dir().join(format!(
-            "voro-app-resume-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = tempfile::Builder::new()
+            .prefix("voro-app-resume-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let project_path = root.join("project");
         std::fs::create_dir_all(&project_path).unwrap();
         let status = Command::new("git")
@@ -7334,15 +7328,11 @@ mod tests {
     /// decides whether that directory is a git repository at all, which is the
     /// whole of what the press-time gate reads (DESIGN.md §8).
     fn pr_ready_app(with_repo: bool) -> (App, i64, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "voro-review-key-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("voro-review-key-")
+            .tempdir()
+            .unwrap()
+            .keep();
         if with_repo {
             let status = std::process::Command::new("git")
                 .arg("-C")
@@ -7661,15 +7651,11 @@ mod tests {
     /// config and PATH.
     fn app_with_agents(agents_toml: &str) -> App {
         let mut app = app_with(&[TaskState::Ready]);
-        let dir = std::env::temp_dir().join(format!(
-            "voro-plan-key-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("voro-plan-key-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let agents_path = dir.join("voro.toml");
         std::fs::write(&agents_path, agents_toml).unwrap();
         app.dispatch_ctx = crate::dispatch::DispatchCtx {

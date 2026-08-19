@@ -32,15 +32,11 @@ fn voro(db: &Path, args: &[&str]) -> String {
 
 #[test]
 fn propose_ignores_ambient_voro_task_id() {
-    let root = std::env::temp_dir().join(format!(
-        "voro-it-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
+    let root = tempfile::Builder::new()
+        .prefix("voro-it-")
+        .tempdir()
+        .unwrap()
+        .keep();
     let db = root.join("voro.db");
 
     voro(&db, &["project", "add", "demo", root.to_str().unwrap()]);
