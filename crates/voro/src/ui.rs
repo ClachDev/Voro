@@ -3061,10 +3061,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The bug (task #450): where the pane cannot fit its rows, the ones past
-    /// the fold were simply not drawn and nothing said so. Now the bottom
-    /// border carries the overflow and the keys that move it, and `J` walks the
-    /// hidden agents into view — on a terminal no larger than 80x24.
+    /// Where the pane cannot fit its rows, the ones past the fold must not
+    /// silently go undrawn: the bottom border carries the overflow and the
+    /// keys that move it, and `J` walks the hidden agents into view — on a
+    /// terminal no larger than 80x24.
     #[test]
     fn config_agents_pane_scrolls_to_the_agents_it_cannot_fit() {
         use crate::app::App;
