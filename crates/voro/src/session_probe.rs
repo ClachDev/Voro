@@ -63,10 +63,10 @@ pub fn listing_says_live(entries: &[AgentSessionEntry], session_ref: &str) -> bo
 }
 
 /// Whether a listing shows this ref as a session whose turn has ended and which
-/// the agent is therefore still holding registered — the rest-stop's trigger
-/// (DESIGN.md §8). A ref that has dropped out of the listing answers no: it was
-/// never registered, or it has already been stopped, and either way there is
-/// nothing to release.
+/// the agent is therefore still holding registered — the send path's trigger to
+/// release it (DESIGN.md §8). A ref that has dropped out of the listing answers
+/// no: it was never registered, or it has already been stopped, and either way
+/// there is nothing to release.
 pub fn listing_says_at_rest(entries: &[AgentSessionEntry], session_ref: &str) -> bool {
     entries
         .iter()
@@ -204,7 +204,7 @@ pub struct SessionVerdict {
     /// Whether the session is still going, `None` when that is unknowable.
     pub live: Option<bool>,
     /// Whether the agent still holds it registered with its turn ended
-    /// ([`listing_says_at_rest`]). Unknowable reads as no, since the rest-stop
+    /// ([`listing_says_at_rest`]). Unknowable reads as no, since the release
     /// acts only on positive evidence.
     pub at_rest: bool,
 }
@@ -387,8 +387,8 @@ mod tests {
         assert!(apart <= 1, "{label} vs {minutes} minutes past midnight");
     }
 
-    /// The rest reading the send path and the reconciler act on: a session the
-    /// agent still holds registered with its turn ended. `blocked` — a
+    /// The rest reading the send path acts on: a session the agent still holds
+    /// registered with its turn ended. `blocked` — a
     /// permission prompt, a supervisor mid-turn — is the one that must not
     /// answer yes, and an entry that has left the listing has nothing to
     /// release.

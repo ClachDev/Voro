@@ -57,17 +57,14 @@
 //! — is not taken here at all: it is slow enough to need its own off-loop
 //! runner ([`crate::probe::CapProbe`]), and it changes nothing in the database.
 //!
-//! Whatever a pass finalises, it also stops: the agent's `stop` verb
-//! is fired at the closed session's reference so its own listing loses the entry
-//! along with the row, best-effort and unwaited-on.
-//!
-//! A session left *open* is stopped too, on a narrower test — the rest-stop
-//! ([`rest_stop`]). A task in `needs-input`, `review` or `waiting`
-//! has handed back, and once its listing entry agrees that the turn is over, the
-//! agent's hold on the session is released. Its row stays open and stays the
-//! task's conversation; only the registration goes, and with it the lock that
-//! made a headless quick message impossible to deliver in place. The operator
-//! still answers and rejects into that session, and `A` still opens it.
+//! A pass fires no `stop`. It writes to the database and reads through the
+//! agent's verbs, and it retires nothing on the agent's side: the sessions it
+//! finalises keep their listing entries, as do the ones it leaves open.
+//! Retiring an entry belongs to the paths the operator drives — the closing
+//! verdict, and the send that needs a hold released (DESIGN.md §8) — because a
+//! pass runs unprompted on every read, where a `stop` reaches into a session the
+//! operator may be working in. The cost is a listing that keeps entries for
+//! sessions Voro knows are over until a close clears them.
 //!
 //! There is no daemon watching for process exit. Reconciliation runs on read:
 //! `App::refresh` and every CLI verb call [`reconcile_live_sessions`] before
@@ -81,9 +78,9 @@ use voro_core::{
     AgentSessionEntry, AgentsConfig, LivenessSource, Result, Store, TaskState, read_cap,
 };
 
-use crate::dispatch::{DispatchCtx, stop_session};
+use crate::dispatch::DispatchCtx;
 use crate::session_probe::{
-    listing_says_at_rest, listing_says_live, pid_is_alive, read_session_cap, run_sessions_command,
+    listing_says_live, pid_is_alive, read_session_cap, run_sessions_command,
 };
 
 /// An agent's session listing for this pass, keyed by agent name. `None` against
@@ -117,14 +114,8 @@ pub fn reconcile_live_sessions(store: &mut Store, ctx: &DispatchCtx) -> Result<u
             // needs-input / review / waiting keep their session open
             // (reconcile_session returns None); a session on a closed task is
             // stale and finalised.
-            if let Some((closed, _)) = store.reconcile_session(session.id, false, false)? {
-                stop_finalised(ctx, config.as_ref(), &closed);
+            if store.reconcile_session(session.id, false, false)?.is_some() {
                 finalised += 1;
-            } else if matches!(
-                task_state,
-                TaskState::NeedsInput | TaskState::Review | TaskState::Waiting
-            ) {
-                rest_stop(ctx, config.as_ref(), &mut listings, &session);
             }
             continue;
         }
@@ -176,8 +167,10 @@ pub fn reconcile_live_sessions(store: &mut Store, ctx: &DispatchCtx) -> Result<u
                 .as_deref()
                 .is_some_and(log_tail_looks_capped),
         };
-        if let Some((closed, _)) = store.reconcile_session(session.id, false, likely_capped)? {
-            stop_finalised(ctx, config.as_ref(), &closed);
+        if store
+            .reconcile_session(session.id, false, likely_capped)?
+            .is_some()
+        {
             finalised += 1;
         }
     }
@@ -198,56 +191,6 @@ fn listing<'a>(
         .entry(agent.to_string())
         .or_insert_with(|| run_sessions_command(cmd, None))
         .as_deref()
-}
-
-/// Release a session that has handed back (DESIGN.md §8): a task at rest —
-/// `needs-input`, `review`, `waiting` — whose session the agent still holds
-/// registered with its turn ended is stopped, so the lock a headless message
-/// resumes through is already gone by the time the operator sends one.
-///
-/// The rest state is only half the test, because a task reaches it the moment
-/// the agent calls `voro done`/`ask` — from inside a turn still running, whose
-/// tail a stop would cut off. The listing supplies the other half: the entry
-/// must itself read `at_rest`, which it does only once that turn is over.
-/// Everything else is left alone — a `blocked` entry is mid-turn or waiting on a
-/// permission prompt, and an absent one was never registered or has been stopped
-/// already.
-///
-/// Nothing about the row changes: the session is still the task's conversation,
-/// `A` still reopens it with its full context, and only the agent-side
-/// registration goes. Which is also why firing this on every pass converges
-/// rather than repeating — a stopped session leaves the listing, so the next
-/// pass finds nothing at rest to stop.
-fn rest_stop(
-    ctx: &DispatchCtx,
-    config: Option<&AgentsConfig>,
-    listings: &mut Listings,
-    session: &voro_core::Session,
-) {
-    let Some(session_ref) = session.session_ref.as_deref() else {
-        return;
-    };
-    let handed_back = listing(config, listings, &session.agent)
-        .is_some_and(|entries| listing_says_at_rest(entries, session_ref));
-    if !handed_back {
-        return;
-    }
-    // `handed_back` can only be true with a config loaded, since the listing
-    // came out of one; the agent defining no `stop` verb is skipped in there.
-    if let Some(config) = config {
-        stop_session(ctx, config, session);
-    }
-}
-
-/// Retire the agent's registry entry for a session reconciliation has just
-/// finalised (DESIGN.md §8) — both flavours, the dead dispatch it stalls and the
-/// stale row it heals, since either way the session is over and Voro has said so.
-/// Skipped in silence when the config would not load, which is the same cost a
-/// missing config already carries here.
-fn stop_finalised(ctx: &DispatchCtx, config: Option<&AgentsConfig>, closed: &voro_core::Session) {
-    if let Some(config) = config {
-        stop_session(ctx, config, closed);
-    }
 }
 
 /// Best-effort usage-cap detector for an agent with no `logs` verb (DESIGN.md
@@ -770,12 +713,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- finalising a session stops it ---
+    // --- reconciliation stops nothing ---
 
     /// A `voro.toml` whose `claude` agent lists `listing` and whose `stop` verb
     /// records the reference it was fired at, plus that marker's path — so a
-    /// test can tell a stop that happened from one that did not, and read which
-    /// session it named.
+    /// test can tell a stop that happened from one that did not.
     fn stop_fixture_listing(name: &str, listing: &str) -> (DispatchCtx, PathBuf, PathBuf) {
         let dir =
             std::env::temp_dir().join(format!("voro-reconcile-stop-{name}-{}", std::process::id()));
@@ -799,33 +741,25 @@ mod tests {
         (ctx_at(agents_path), marker, dir)
     }
 
-    /// The same fixture with an empty listing, which is what every close-time
-    /// stop test wants: the session is finalised on its own terms and the
-    /// listing has nothing to say about it either way.
+    /// The same fixture with an empty listing, which is what the finalisation
+    /// tests want: the session is finalised on its own terms and the listing
+    /// has nothing to say about it either way.
     fn stop_fixture(name: &str) -> (DispatchCtx, PathBuf, PathBuf) {
         stop_fixture_listing(name, "[]")
     }
 
-    /// Wait for a detached stop to have written its marker, since nothing in the
-    /// reconcile path waits on it. Returns what it wrote, or `None` if it never
-    /// ran.
-    fn stopped_ref(marker: &std::path::Path) -> Option<String> {
-        for _ in 0..100 {
-            if let Ok(text) = std::fs::read_to_string(marker)
-                && !text.is_empty()
-            {
-                return Some(text);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }
-        None
+    /// Assert no stop was spawned. A stop would be detached, so its absence
+    /// only means anything once there has been time for one to write.
+    fn no_stop(marker: &std::path::Path, name: &str) {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(!marker.exists(), "{name}: the reconciler fired a stop");
     }
 
-    /// The dead-dispatch path: a session the reconciler finalises is also
-    /// retired from the agent's own listing, at the reference Voro captured for
-    /// it, so the entry goes when the row does.
+    /// The dead-dispatch path: a session the reconciler finalises keeps its
+    /// entry in the agent's own listing (DESIGN.md §8). The row closes and the
+    /// task stalls; retiring the entry waits for the operator's close.
     #[test]
-    fn a_finalised_dead_session_is_stopped() {
+    fn a_finalised_dead_session_is_not_stopped() {
         let (ctx, marker, dir) = stop_fixture("dead");
         let (mut s, task_id) = running_task();
         let session = s
@@ -841,15 +775,15 @@ mod tests {
 
         assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 1);
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
-        assert_eq!(stopped_ref(&marker).as_deref(), Some("full-uuid-1"));
+        no_stop(&marker, "dead");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The stale-row heal: a session still open on a task that has already
-    /// closed is finalised without a probe, and stopped on the same terms.
+    /// The stale-row heal, on the same terms: a session still open on a task
+    /// that has already closed is finalised without a probe and without a stop.
     #[test]
-    fn a_healed_stale_session_is_stopped() {
+    fn a_healed_stale_session_is_not_stopped() {
         let (ctx, marker, dir) = stop_fixture("stale");
         let (mut s, task_id) = running_task();
         let session = s
@@ -866,12 +800,10 @@ mod tests {
         s.set_session_ref(stranded.id, "stale-uuid").unwrap();
 
         assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 1);
-        assert_eq!(stopped_ref(&marker).as_deref(), Some("stale-uuid"));
+        no_stop(&marker, "stale");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    // --- the rest-stop releases a session that has handed back ---
 
     /// The transitions that put a task at rest with its session still open, and
     /// the name each test labels its fixture with.
@@ -902,172 +834,34 @@ mod tests {
         (s, task_id, session.id)
     }
 
-    /// The rule itself (DESIGN.md §8): a task that has handed back, whose
-    /// session's own listing entry agrees the turn is over, has that session
-    /// released — so the lock a headless quick message resumes through is gone
-    /// before the operator sends one. Every state the message key serves.
+    /// A task that has handed back keeps its session registered, listing entry
+    /// and all. `done` is the release trigger (DESIGN.md §8), but it is read on
+    /// the send path, on the keypress that needs the hold gone; a pass reading
+    /// the same entry acts on nothing. Every state the message key serves, and
+    /// nothing moves in the store either.
     #[test]
-    fn a_handed_back_session_at_rest_is_stopped() {
+    fn a_session_at_rest_is_left_registered() {
         for (name, actions) in rest_states() {
             let (ctx, marker, dir) =
                 stop_fixture_listing(name, r#"[{"sessionId": "full-uuid-1", "state": "done"}]"#);
             let (mut s, task_id, session_id) = task_at_rest(&actions);
             let before = s.task(task_id).unwrap().state;
+            let events = s.events_for(task_id).unwrap().len();
 
             assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0, "{name}");
-            assert_eq!(
-                stopped_ref(&marker).as_deref(),
-                Some("full-uuid-1"),
-                "{name}"
-            );
-            // Nothing about the task or the row moves: the session is still the
-            // task's conversation, and only the agent-side registration went.
+            no_stop(&marker, name);
             let session = s.session(session_id).unwrap();
             assert!(session.ended_at.is_none(), "{name}");
-            assert_eq!(session.outcome, None, "{name}");
             assert_eq!(
                 session.session_ref.as_deref(),
                 Some("full-uuid-1"),
                 "{name}"
             );
             assert_eq!(s.task(task_id).unwrap().state, before, "{name}");
+            assert_eq!(s.events_for(task_id).unwrap().len(), events, "{name}");
 
             let _ = std::fs::remove_dir_all(&dir);
         }
-    }
-
-    /// The guard that makes the rule safe in the other direction. A `blocked`
-    /// entry is a turn still under way — a permission prompt, a supervisor
-    /// mid-turn — and the handover verbs fire from *inside* the turn that
-    /// reports, so a task reaches `review` while its agent is still finishing
-    /// the sentence. Reading rest off the task state alone would cut that off.
-    /// An absent entry has nothing to release.
-    #[test]
-    fn a_session_not_at_rest_is_left_registered() {
-        for (name, listing, actions) in [
-            (
-                "blocked",
-                r#"[{"sessionId": "full-uuid-1", "state": "blocked"}]"#,
-                vec![Action::Complete(None)],
-            ),
-            (
-                "working",
-                r#"[{"sessionId": "full-uuid-1", "state": "working"}]"#,
-                vec![Action::Ask("A or B?".into())],
-            ),
-            ("absent", "[]", vec![Action::Complete(None)]),
-        ] {
-            let (ctx, marker, dir) = stop_fixture_listing(name, listing);
-            let (mut s, ..) = task_at_rest(&actions);
-
-            assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0, "{name}");
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            assert!(!marker.exists(), "{name}: stopped a session mid-turn");
-
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// A `running` task is mid-work by definition and is never released,
-    /// whatever its listing entry happens to say — the entry going `done` there
-    /// is a session that died without reporting, which the liveness arm
-    /// finalises and stops on its own terms rather than leaving the row open.
-    #[test]
-    fn a_running_task_is_not_rest_stopped() {
-        let (ctx, marker, dir) = stop_fixture_listing(
-            "running",
-            r#"[{"sessionId": "full-uuid-1", "state": "working"}]"#,
-        );
-        let (mut s, task_id) = running_task();
-        let session = s
-            .create_session(task_id, "claude", None, LivenessSource::Listing, None)
-            .unwrap();
-        s.set_session_ref(session.id, "full-uuid-1").unwrap();
-
-        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0);
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        assert!(!marker.exists());
-        assert_eq!(s.task(task_id).unwrap().state, TaskState::Running);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// An agent with no `stop` verb skips in silence, as it does at close time:
-    /// its sessions stay registered and nothing errors. `codex` needs none.
-    #[test]
-    fn a_stopless_agent_is_not_rest_stopped() {
-        // The same `done` listing the rule fires on — only the `stop` verb is
-        // missing, so this is the verb's absence deciding and nothing else.
-        let (ctx, dir) = sessions_fixture(
-            "rest-stopless",
-            r#"[{"sessionId": "full-uuid-1", "state": "done"}]"#,
-        );
-        let (mut s, task_id, session_id) = task_at_rest(&[Action::Complete(None)]);
-
-        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0);
-        assert!(s.session(session_id).unwrap().ended_at.is_none());
-        assert_eq!(s.task(task_id).unwrap().state, TaskState::Review);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A session with no captured reference has nothing to name in a stop, and
-    /// the rest-stop is skipped rather than guessed at.
-    #[test]
-    fn a_refless_session_at_rest_is_not_stopped() {
-        let (ctx, marker, dir) = stop_fixture_listing(
-            "rest-refless",
-            r#"[{"sessionId": "full-uuid-1", "state": "done"}]"#,
-        );
-        let (mut s, task_id) = running_task();
-        s.create_session(task_id, "claude", None, LivenessSource::Listing, None)
-            .unwrap();
-        s.apply(task_id, Action::Complete(None)).unwrap();
-
-        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0);
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        assert!(!marker.exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The rest-stop writes nothing, so a pass that makes one leaves the event
-    /// log exactly as it found it — the session's registration is agent-side
-    /// state, not Voro's.
-    #[test]
-    fn a_rest_stop_records_no_event() {
-        let (ctx, marker, dir) = stop_fixture_listing(
-            "rest-events",
-            r#"[{"sessionId": "full-uuid-1", "state": "done"}]"#,
-        );
-        let (mut s, task_id, _) = task_at_rest(&[Action::Complete(None)]);
-        let before = s.events_for(task_id).unwrap().len();
-
-        assert_eq!(reconcile_live_sessions(&mut s, &ctx).unwrap(), 0);
-        assert_eq!(stopped_ref(&marker).as_deref(), Some("full-uuid-1"));
-        assert_eq!(s.events_for(task_id).unwrap().len(), before);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// An agent naming no `stop` verb degrades to what Voro did before: the row
-    /// closes, the entry lingers, and nothing errors.
-    #[test]
-    fn a_stopless_agent_finalises_without_stopping() {
-        let (mut s, task_id) = running_task();
-        let session = s
-            .create_session(
-                task_id,
-                "manual",
-                Some(dead_pid()),
-                LivenessSource::Pid,
-                None,
-            )
-            .unwrap();
-        s.set_session_ref(session.id, "full-uuid-1").unwrap();
-
-        assert_eq!(reconcile_live_sessions(&mut s, &no_config()).unwrap(), 1);
-        assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
     }
 
     // --- capped deaths read the session's own output ---

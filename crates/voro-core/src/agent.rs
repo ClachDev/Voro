@@ -1659,7 +1659,7 @@ impl AgentSessionEntry {
     }
 
     /// Whether this entry says its session's turn has *ended* — the narrow
-    /// reading the rest-stop rule acts on (DESIGN.md §8), which is not the same
+    /// reading the rest rule acts on (DESIGN.md §8), which is not the same
     /// question as [`liveness`](Self::liveness). Only `done` answers yes.
     /// `blocked` is the case that makes the distinction load-bearing: it reads
     /// dead without a live pid, but it is also what a permission prompt and a
@@ -2348,9 +2348,9 @@ mod tests {
     }
 
     /// The built-in `claude` message verb resumes in place (DESIGN.md §8): the
-    /// supervisor that refuses a headless resume has been released by the
-    /// rest-stop before any send is made, so the send addresses the session's own
-    /// reference and the conversation stays under the name Voro composed for it.
+    /// supervisor that refuses a headless resume is released before the send is
+    /// made, so the send addresses the session's own reference and the
+    /// conversation stays under the name Voro composed for it.
     #[test]
     fn the_builtin_claude_message_verb_resumes_in_place() {
         let message = builtin_agents()["claude"].message().unwrap();
@@ -2663,7 +2663,7 @@ mod tests {
         assert_eq!(entry(r#""state": "idle""#), SessionLiveness::Dead);
     }
 
-    /// Rest is a narrower reading than death (DESIGN.md §8): the rest-stop acts
+    /// Rest is a narrower reading than death (DESIGN.md §8): the release acts
     /// on a turn that has *ended*, and only `done` says so. `blocked` is the
     /// separation that matters — dead to the liveness question, yet a turn still
     /// under way (a permission prompt, a supervisor mid-turn) that a stop would

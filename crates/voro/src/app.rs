@@ -378,8 +378,8 @@ struct CapTarget {
 struct MessageTarget {
     /// The session row the send updates once it is confirmed — its process, and
     /// its reference where the agent's verb forks (DESIGN.md §8). Carried whole
-    /// rather than as an id, because the inline rest-stop the send may have to
-    /// make first is addressed at the session itself.
+    /// rather than as an id, because the release the send may have to make
+    /// first is addressed at the session itself.
     session: voro_core::Session,
     /// The reference the send is addressed to: the row's, already established to
     /// be present.
@@ -2514,11 +2514,10 @@ impl App {
     }
 
     /// Release the agent's hold on a session, waiting for the answer (DESIGN.md
-    /// §8), so a headless resume into it can land. The reconciler's rest-stop
-    /// makes this call off the send path on every pass; the two senders make it
-    /// inline where that pass cannot have covered them — the quick-message key
-    /// for the window between an agent handing back and the next pass noticing,
-    /// the capped-session sweep because no pass will ever release its target.
+    /// §8), so a headless resume into it can land. Both senders call it inline,
+    /// immediately before the send it makes deliverable: the quick-message key
+    /// where the target's listing entry says the agent is holding a session
+    /// that has come to rest, the capped-session sweep unconditionally.
     ///
     /// Nothing about the row changes either way — the session stays the task's
     /// conversation — so a config that will not load costs the release and
@@ -2622,13 +2621,11 @@ impl App {
             ));
             return;
         }
-        // Normally reconcile has already released a handed-back session
-        // (DESIGN.md §8), and this finds nothing to do. It fires when the
-        // operator has outrun a pass — messaging within the same tick the agent
-        // reported in — and the hold that would refuse an in-place resume is
-        // still there. Failing to release it refuses the send outright rather
-        // than spawning one that cannot land, so the task is left exactly where
-        // it was.
+        // The agent still holds a session it has finished a turn on, and that
+        // hold refuses an in-place resume, so it is released here and waited on
+        // before the send goes out (DESIGN.md §8). Failing to release it
+        // refuses the send outright rather than spawning one that cannot land,
+        // so the task is left exactly where it was.
         if verdict.at_rest
             && let Err(e) = self.release_session(&target.session)
         {
@@ -7173,11 +7170,10 @@ mod tests {
         }
     }
 
-    /// The inline half of the rest rule (DESIGN.md §8). Normally reconcile has
-    /// already released a handed-back session and this finds nothing to do; when
-    /// the operator outruns a pass, the send releases the session itself, at its
-    /// own reference, and then resumes it in place. Without that the agent's hold
-    /// would refuse the resume and the feedback would go nowhere.
+    /// The rest rule (DESIGN.md §8): a session the agent is still holding with
+    /// its turn ended is released by the send itself, at its own reference, and
+    /// then resumed in place. Without that the hold would refuse the resume and
+    /// the feedback would go nowhere.
     #[test]
     fn a_send_releases_a_session_the_agent_still_holds_at_rest() {
         let (mut app, task_id, root, paths) = send_env(FINISHED_LISTING);
