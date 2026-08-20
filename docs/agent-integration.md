@@ -82,6 +82,7 @@ attach     = "claude attach {session}"
 resume     = "claude --resume {session}"
 message    = "claude -p --resume {session} --permission-mode auto \"$(cat {prompt_file})\""
 logs       = "claude logs \"$(printf %.8s {session})\" 2>/dev/null | tail -c 20000"
+cap        = '''timeout 120 claude -p --output-format stream-json --verbose --model {model} hi 2>/dev/null | grep -o '"status":"rejected"[^}]*"resetsAt":[0-9]*' | grep -o '[0-9][0-9]*$' | tail -1'''
 stop       = "claude stop \"$(printf %.8s {session})\""
 plan       = "claude --name \"{session_name}\" --permission-mode auto --model {model} \"$(cat {prompt_file})\""
 model      = "opus"
@@ -175,6 +176,39 @@ resume   = "codex resume {session}"
   the built-in does; Voro reads whatever it prints. Note the built-in's
   truncation: `claude logs` keys on the *job* id, the first eight characters of
   the session id, so `{session}` is trimmed rather than passed whole.
+- `cap` prints **when the account's usage window reopens**, as a Unix epoch in
+  seconds. It names no session — a cap belongs to the account rather than to any
+  one conversation (DESIGN.md §8) — and `{model}` is the only placeholder it may
+  carry. Its negative answer is silence: print the instant while the account is
+  *refused*, print nothing otherwise, so an account with room left, a command
+  that fails, and an agent naming no `cap` are all the same thing to Voro — the
+  reset time falls back to the clock time on the session's own screen. Print a
+  bare number; Voro reads the last plausible one and refuses anything that is
+  not a timestamp near the present.
+
+  Voro reads it for the two things a bare clock time cannot give: an unambiguous
+  answer to whether the window has already reopened (`6:40pm` carries no date), and
+  a reset time for a cap that never named one. The built-in `claude` spelling
+  filters `rate_limit_event` out of the CLI's own stream — `"status":"rejected"`
+  is what distinguishes a cap the account is *held at* from a note on the window
+  it is merely spending.
+
+  Carry `{model}` if your agent meters models separately, as a Claude
+  subscription does: the five-hour pool, the weekly one and each strong model's
+  own allowance are different windows, so which one refuses depends on which
+  model asks. Voro binds the model the session in question launched with, and
+  keys the answer by the rendered command — so a template naming `{model}` is
+  asked once per model in flight, one that names none is asked once for the
+  agent, and either way sessions asking the same thing share one reading.
+
+  This is the one verb that costs an agent real work to answer, so Voro asks
+  rarely: only while a session is already badged capped, once per capped episode,
+  and once more only if the instant it named has passed while the badge is still
+  up. Asking on the session's own model keeps the case that matters cheap — a
+  refused request is a rejection rather than a turn — so the only probe that
+  costs anything is one that finds the account healthy, and that one prints
+  nothing. It is spawned like any other verb, so a template that could hang
+  should bound itself; the built-in wraps its call in `timeout`.
 - `stop` retires a session from the agent's own registry, taking `{session}`
   alone. Voro fires it on three triggers (DESIGN.md §8), and all three must be
   safe before you define it.

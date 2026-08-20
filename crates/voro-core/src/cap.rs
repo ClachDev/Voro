@@ -32,6 +32,16 @@
 //! is held and the text that says it is mid-turn differ by the retry phrase
 //! alone, and everything else about the two is identical: `blocked` in the
 //! listing, supervisor alive, cap phrase on screen.
+//!
+//! *When* the window reopens has a second source, and a better one. The clock
+//! time on screen is a bare `6:40pm`: no date, so it is read as whichever
+//! occurrence is nearest and is ambiguous by half a day either way. An agent
+//! that can say the same thing as an instant — [`AccountCap`], read through its
+//! `cap` verb — says it exactly, and [`CapWindow`] is where the two, and the
+//! retry above, are resolved into the one answer the badge and the sweep both
+//! read. That reading is about the *account* rather than the session, so it
+//! serves every session asking the same of it; the parse stays for every agent
+//! and every moment that has none.
 
 /// Phrases that mean "held at a usage cap", checked case-insensitively.
 ///
@@ -154,6 +164,152 @@ impl CapReading {
         let delta = (i32::from(reset) - i32::from(now_minutes)).rem_euclid(1440);
         let delta = if delta > 720 { delta - 1440 } else { delta };
         delta <= 0
+    }
+}
+
+/// How far behind the present a reported reset may fall and still be believed:
+/// a window that reopened while the operator was away is exactly the reading
+/// the sweep is waiting for, so a day of slack costs nothing.
+const EPOCH_BEHIND: i64 = 24 * 60 * 60;
+
+/// How far ahead of the present a reported reset may fall and still be
+/// believed. The longest window an agent bills in is a week, so a month is
+/// generous — the bound is here to refuse a number that is not a timestamp at
+/// all, not to second-guess the agent.
+const EPOCH_AHEAD: i64 = 30 * 24 * 60 * 60;
+
+/// What an agent's `cap` verb says about the *account* it dispatches on: the
+/// instant its usage window reopens (DESIGN.md §8).
+///
+/// This is the same quantity the badge parses off a session's screen, without
+/// the parse. It is a fact the agent reports rather than a heuristic standing
+/// in for one, and it is account-wide, so a single reading answers for every
+/// session on the strip — where the screen reading has to be taken per session,
+/// costing a subprocess each.
+///
+/// The label is the agent's instant in the operator's own timezone, rendered
+/// where the reading is taken because that is off the render path and this
+/// crate has no clock. Absent when it could not be rendered, in which case the
+/// badge shows the cap without a time exactly as an unparsed one does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountCap {
+    /// When the window reopens, in seconds since the Unix epoch.
+    pub reset_epoch: i64,
+    /// That instant as a local `21:50`, for the badge.
+    pub reset_label: Option<String>,
+}
+
+/// Read an agent's `cap` verb output as the instant its window reopens, or
+/// `None` when it said nothing (DESIGN.md §8).
+///
+/// The verb's contract is one line of shell away from trivial on purpose: print
+/// a Unix epoch when the account is *currently* refused, print nothing
+/// otherwise. Silence is the whole of the negative answer — an account that is
+/// not capped, a verb that failed, an agent that defines none all read the same
+/// and all fall back to the screen parse — which is how every other reading in
+/// this module degrades.
+///
+/// A plausibility band around `now` is the only judgement applied: the output is
+/// under the agent template's control, and a stray number in it must not become
+/// a badge claiming the window reopens in 1970. The *last* plausible number
+/// wins, so a verb that prints a line per window ends with the one it means.
+pub fn parse_reset_epoch(out: &str, now_epoch: i64) -> Option<i64> {
+    out.split(|c: char| !c.is_ascii_digit())
+        .filter_map(|run| run.parse::<i64>().ok())
+        .rfind(|epoch| (now_epoch - EPOCH_BEHIND..=now_epoch + EPOCH_AHEAD).contains(epoch))
+}
+
+/// When a capped session's window reopens and whether it has: the one answer
+/// the badge and the nudge sweep both read, resolved from the two sources that
+/// can give it (DESIGN.md §8).
+///
+/// The account's own reading decides whenever there is one. It is the same
+/// quantity the screen states, minus the ambiguity: a bare `6:40pm` carries no
+/// date, so "has it passed?" is answered by nearest occurrence and is a
+/// half-day guess in both directions, while an instant is simply compared. The
+/// screen parse remains the answer for an agent with no `cap` verb, for an
+/// account that is not itself refused, and for every reading taken before the
+/// verb has run.
+///
+/// One caveat rides the precedence and is worth naming: an account is refused by
+/// *one* window while a session may be held by another — a weekly model limit
+/// behind a five-hour account cap — and the account reading names its own. The
+/// sweep is then early for that session, which §8 already prices as the cheap
+/// failure: the nudge lands, the turn re-caps at once, and the badge returns.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CapWindow {
+    /// The reset as a local `21:50`, absent when neither source named one.
+    pub label: Option<String>,
+    /// Whether the window has reopened.
+    pub passed: bool,
+    /// Whether anything named a reset at all. A cap with no time is the case
+    /// the operator's own judgement stands in for ([`CapWindow::due`]).
+    pub timed: bool,
+    /// Whether the session is retrying the rejected request rather than sitting
+    /// on it ([`CapReading::retrying`]). Carried through rather than resolved
+    /// away, because it is the one badged shape that wants nothing done about
+    /// it and the badge has to say so.
+    pub retrying: bool,
+}
+
+impl CapWindow {
+    /// Resolve the sources for one session, the account's reading first.
+    ///
+    /// A session that is *retrying* takes neither: the account's instant says
+    /// when the window reopens, and a retrying session is not waiting on the
+    /// window — it is mid-turn on a request of its own, and the time it names
+    /// is when that request goes out (§8). Reading an account instant onto it
+    /// would mark it due the moment the window opened, which is precisely the
+    /// session a nudge must not touch.
+    pub fn resolve(
+        reading: &CapReading,
+        account: Option<&AccountCap>,
+        now_minutes: Option<u16>,
+        now_epoch: Option<i64>,
+    ) -> CapWindow {
+        if reading.retrying {
+            return CapWindow {
+                label: reading.reset_label(),
+                passed: false,
+                timed: reading.reset_minutes.is_some(),
+                retrying: true,
+            };
+        }
+        if let Some(account) = account {
+            return CapWindow {
+                label: account
+                    .reset_label
+                    .clone()
+                    .or_else(|| reading.reset_label()),
+                passed: now_epoch.is_some_and(|now| account.reset_epoch <= now),
+                timed: true,
+                retrying: false,
+            };
+        }
+        CapWindow {
+            label: reading.reset_label(),
+            passed: now_minutes.is_some_and(|now| reading.reset_passed(now)),
+            timed: reading.reset_minutes.is_some(),
+            retrying: false,
+        }
+    }
+
+    /// Whether this session is waiting on a human rather than on the clock —
+    /// what the sweep nudges.
+    ///
+    /// An untimed cap counts, and that is the operator's judgement standing in
+    /// for the clock's: they pressed the key, and a nudge that turns out to be
+    /// early is refused by the agent rather than doing harm (§8). It is also
+    /// the gap the account reading closes — a cap whose time never parsed is
+    /// timed after all once the account has said when — which is what an
+    /// automatic sweep, with no keypress behind it, needs.
+    ///
+    /// A retrying session is never due, whatever it named: it is working, and
+    /// the sweep stops its target before resuming it, so a nudge there ends a
+    /// turn rather than adding one. That answer lives here rather than only in
+    /// the sweep, so a caller reading `due` alone cannot miss it.
+    pub fn due(&self) -> bool {
+        !self.retrying && (!self.timed || self.passed)
     }
 }
 
@@ -573,6 +729,171 @@ mod tests {
         assert_eq!(strip_ansi("a\nb\tc"), "a b c");
         assert_eq!(strip_ansi("\u{1b}]0;a title\u{7}kept"), "kept");
         assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    /// A day in seconds, for writing the epoch tests in units a reader can
+    /// hold.
+    const DAY: i64 = 24 * 60 * 60;
+
+    /// The `cap` verb's own output, which is one number: the instant the
+    /// account's window reopens, exactly as the agent reported it.
+    #[test]
+    fn the_cap_verb_reads_as_an_instant() {
+        let now = 1_786_722_000;
+        assert_eq!(parse_reset_epoch("1786758000\n", now), Some(1_786_758_000));
+        // Whitespace and a trailing newline are the shell's, not the agent's.
+        assert_eq!(
+            parse_reset_epoch("  1786758000  ", now),
+            Some(1_786_758_000)
+        );
+        // Silence is the negative answer: not capped, verb failed, no verb.
+        assert_eq!(parse_reset_epoch("", now), None);
+        assert_eq!(parse_reset_epoch("\n", now), None);
+    }
+
+    /// A number that cannot be a reset is not one. The verb's output is
+    /// whatever an agent template prints, so a stray count or id must not badge
+    /// a session with a window that reopens in 1970 — or in 2031.
+    #[test]
+    fn only_a_plausible_instant_is_believed() {
+        let now = 1_786_722_000;
+        assert_eq!(parse_reset_epoch("42", now), None);
+        assert_eq!(parse_reset_epoch("0", now), None);
+        assert_eq!(parse_reset_epoch(&(now + 400 * DAY).to_string(), now), None);
+        assert_eq!(parse_reset_epoch(&(now - 3 * DAY).to_string(), now), None);
+        // The bounds themselves, since a window that reopened while the
+        // operator slept is precisely the reading the sweep waits for.
+        assert_eq!(
+            parse_reset_epoch(&(now - DAY).to_string(), now),
+            Some(now - DAY)
+        );
+        assert_eq!(
+            parse_reset_epoch(&(now + 7 * DAY).to_string(), now),
+            Some(now + 7 * DAY)
+        );
+    }
+
+    /// A verb that prints more than one line ends with the one it means.
+    #[test]
+    fn the_last_plausible_instant_wins() {
+        let now = 1_786_722_000;
+        let out = format!("{}\n{}\n", now + 60, now + 3600);
+        assert_eq!(parse_reset_epoch(&out, now), Some(now + 3600));
+        // And an implausible number after a good one does not displace it.
+        assert_eq!(
+            parse_reset_epoch(&format!("{}\nattempt 2\n", now + 60), now),
+            Some(now + 60)
+        );
+    }
+
+    /// The precedence proper: the account's instant answers for a session
+    /// whose screen named a time, and it answers exactly — 21:50 read a minute
+    /// later has passed, where the parse would have to guess by nearest
+    /// occurrence.
+    #[test]
+    fn the_accounts_instant_decides_over_the_parsed_clock() {
+        let now = 1_786_722_000;
+        let reading = read_cap("Session limit reached · resets 9:50pm").expect("a cap");
+        let account = AccountCap {
+            reset_epoch: now + 3600,
+            reset_label: Some("21:50".into()),
+        };
+        let window = CapWindow::resolve(&reading, Some(&account), Some(20 * 60 + 50), Some(now));
+        assert_eq!(window.label.as_deref(), Some("21:50"));
+        assert!(!window.passed);
+        assert!(!window.due());
+
+        let account = AccountCap {
+            reset_epoch: now - 60,
+            ..account
+        };
+        let window = CapWindow::resolve(&reading, Some(&account), Some(20 * 60 + 50), Some(now));
+        assert!(window.passed);
+        assert!(window.due());
+    }
+
+    /// The gap the account reading closes, and the reason #437 wants it: a cap
+    /// whose time never parsed is not timed at all, so the sweep can only fire
+    /// on the operator's say-so. With the account's instant it is timed, and a
+    /// clock can decide.
+    #[test]
+    fn an_untimed_cap_is_timed_by_the_account() {
+        let now = 1_786_722_000;
+        let reading = read_cap("Weekly limit reached").expect("a cap");
+        let bare = CapWindow::resolve(&reading, None, Some(12 * 60), Some(now));
+        assert!(!bare.timed);
+        assert_eq!(bare.label, None);
+        assert!(bare.due(), "an untimed cap is the operator's call");
+
+        let account = AccountCap {
+            reset_epoch: now + 3600,
+            reset_label: Some("09:00".into()),
+        };
+        let timed = CapWindow::resolve(&reading, Some(&account), Some(12 * 60), Some(now));
+        assert!(timed.timed);
+        assert_eq!(timed.label.as_deref(), Some("09:00"));
+        assert!(!timed.due(), "the window is known to be shut");
+    }
+
+    /// A retrying session takes no account instant, whatever the account says.
+    /// It is not waiting on the window — it is mid-turn on its own request — so
+    /// an instant that has passed must not mark it due: that is the one badged
+    /// shape a nudge would interrupt rather than help (§8).
+    #[test]
+    fn a_retrying_session_takes_no_instant_and_is_never_due() {
+        let now = 1_786_722_000;
+        let reading = read_cap(
+            "429 Number of requests has exceeded your rate limit · Retrying in 30s · attempt 3/10",
+        )
+        .expect("a cap");
+        assert!(reading.retrying);
+        let account = AccountCap {
+            reset_epoch: now - 3600,
+            reset_label: Some("21:50".into()),
+        };
+        let window = CapWindow::resolve(&reading, Some(&account), Some(12 * 60), Some(now));
+        assert!(window.retrying);
+        assert!(!window.passed, "the window's instant does not speak for it");
+        assert!(!window.due());
+        // And the badge still shows what the session itself named, if anything.
+        let timed = read_cap("Session limit reached · Retrying in 5m (9:50pm) · attempt 2/10")
+            .expect("a cap");
+        let window = CapWindow::resolve(&timed, Some(&account), Some(12 * 60), Some(now));
+        assert_eq!(window.label.as_deref(), Some("21:50"));
+        assert!(!window.due());
+    }
+
+    /// With no account reading the badge is exactly what it was: the screen
+    /// parse, judged by nearest occurrence against the local clock.
+    #[test]
+    fn without_an_account_reading_the_parse_still_answers() {
+        let reading = read_cap("Session limit reached · resets 9:50pm").expect("a cap");
+        let ahead = CapWindow::resolve(&reading, None, Some(20 * 60 + 50), Some(0));
+        assert_eq!(ahead.label.as_deref(), Some("21:50"));
+        assert!(!ahead.passed);
+        assert!(ahead.timed);
+        assert!(CapWindow::resolve(&reading, None, Some(22 * 60 + 50), Some(0)).passed);
+    }
+
+    /// An account reading Voro could not render a label for still decides
+    /// whether the window is open — the instant is the load-bearing half, and
+    /// the session's own time fills the badge behind it.
+    #[test]
+    fn an_unrendered_instant_still_decides() {
+        let now = 1_786_722_000;
+        let reading = read_cap("Session limit reached · resets 9:50pm").expect("a cap");
+        let account = AccountCap {
+            reset_epoch: now - 60,
+            reset_label: None,
+        };
+        let window = CapWindow::resolve(&reading, Some(&account), Some(20 * 60 + 50), Some(now));
+        assert_eq!(window.label.as_deref(), Some("21:50"));
+        assert!(window.passed);
+
+        // And with no clock to compare against, nothing claims it has passed.
+        let window = CapWindow::resolve(&reading, Some(&account), Some(20 * 60 + 50), None);
+        assert!(!window.passed);
+        assert!(window.timed);
     }
 
     /// A signature landing at the very edge of the text windows the qualifier

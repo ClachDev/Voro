@@ -1531,6 +1531,49 @@ from a bare clock time, resolved to whichever occurrence is nearest — taking
 the *next* one would claim another day's wait a minute after the window
 reopened.
 
+That parse is the weak link in the chain, and there is a second source that is
+not a parse at all. A cap is a property of the **account**, not of a session,
+and an agent that can report its own can report it as an *instant*: Claude
+Code's stream transport emits a `rate_limit_event` carrying `resetsAt`, Unix
+epoch seconds. So the verb set gains an optional **`cap`**, an agent contract
+like the rest, naming no session because no session is what it is about. Its
+output is one number, and its negative answer is *silence*: print the instant
+while the account is refused, print nothing otherwise, so an uncapped account, a
+failed command and an agent that defines none all land identically on the screen
+parse. `codex` defines none. Where a reading exists it decides both halves of
+the badge — the time shown and whether the window has reopened — and the
+parse stays underneath it for everything else.
+
+An account, though, does not have *one* window. A Claude subscription meters the
+five-hour pool, the weekly one, and a separate allowance for each strong model
+— the CLI names them "session limit", "weekly limit", "Opus limit", "Sonnet
+limit" and "Fable 5 limit", and fast mode draws on its own pools again. Which
+window refuses therefore depends on which model asks, and a reading taken on the
+wrong one answers about the wrong window: worse, it answers *earlier* than the
+truth whenever a cheaper model's pool reopens first, which is exactly the error
+that would fire a nudge into a session still held. So `cap` may carry `{model}`
+— the only placeholder it may carry — and Voro asks it with the model the
+session in question launched under, resolved by the same rule the launch
+resolved it by. The reading is then keyed by the question asked rather than by
+the agent, which is what makes both shapes fall out without either being
+special: a template naming `{model}` is asked once per model in flight, one that
+names none is asked once for the agent, and either way every session asking the
+same thing shares one answer.
+
+The cost is priced rather than discovered. Unlike `logs`, this verb *spends an
+API call*: it is asked only while a session is already badged capped, once per
+capped episode — again once if the instant it named has since passed, since
+the account may have entered a new window. Asking on the session's own model is
+also what makes the case that matters free, since a refused request is a
+rejection rather than a turn and bills nothing; the only probe that costs is one
+that finds the account healthy, and that one prints nothing.
+
+The point of the exactness is not the badge, which reads the same either way. It
+is that a bare clock time is ambiguous by half a day and an instant is not, and
+that a cap the screen never timed is timed after all once the account has said
+when — the two properties an automatic sweep needs and a keypress-driven one
+can do without.
+
 Three properties keep that badge honest. It carries **no state change**:
 `stalled` means "dead dispatch, redispatch me", and a capped session is neither
 dead nor in need of redispatch, so the task stays `running` and the session
@@ -1543,10 +1586,12 @@ the render path may never wait on (see *What may block the TUI event loop*), so
 it runs on a background thread and is debounced to one reading per session per
 minute — the one probe in the TUI debounced against the clock rather than
 against the selection, since every in-flight session is a target on every tick.
-There is deliberately no cockpit-header quota gauge: the statusline JSON that
+There is deliberately no cockpit-header quota gauge. The statusline JSON that
 carries `rate_limits.five_hour.resets_at` is pushed *to* running Claude sessions
-and is not readable by Voro, so a gauge would need a data source that does not
-exist.
+and is not readable by Voro at all; the `cap` verb above could feed a gauge, but
+a gauge wants a *continuous* reading and that verb costs an API call every time
+it is asked, which is exactly the shape this design refuses — it is asked when
+something is already known to be stuck, never on a cadence.
 
 **Recovering a capped session** is then one key, `u`, which nudges *every*
 badged session whose reset has gone by. A cap does not retry — Claude Code
@@ -1578,7 +1623,12 @@ silence. Skipping is not a courtesy: because the send stops its target before
 resuming it (below), nudging a retrying session would not add a redundant turn
 to it but end the turn already running. The same reading also holds that
 session's badge back from `reset passed`, since the time such a line names is
-when its own request goes out and not when a human should step in.
+when its own request goes out and not when a human should step in — and it
+holds the account's instant back too, for the same reason: a retrying session is
+not waiting on the window, so the instant the window reopens says nothing about
+it, and reading one onto it would mark it due exactly when it is least safe to
+touch. It is not asked for either, which keeps the cost where the value is
+(above).
 
 It goes out through the existing `message` verb rather than through any new
 channel, and it is the one send that releases its target *unconditionally*

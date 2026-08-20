@@ -24,6 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still creates its database with no ceremony, and dev and scratch stores
   migrate on open exactly as before.
 
+- **The cap badge takes its reset time from the agent, not from its screen.**
+  Voro used to read "resets 6:40pm" off a capped session's output and guess
+  which 6:40pm was meant, because a bare clock time carries no date. Agents can
+  now report the same thing exactly, through a new optional `cap` verb that
+  prints when the account's usage window reopens as a Unix epoch. The badge
+  reads the same, but "reset passed" is now a fact rather than a
+  nearest-occurrence guess, and a cap whose wording named no time at all gets
+  one. A subscription meters more than one window — the five-hour pool, the
+  weekly one, and each strong model's own allowance — so the verb is asked with
+  the model the session launched under, and sessions asking the same thing share
+  one reading. The built-in `claude` agent defines it; `codex` does not, and
+  anything Voro cannot ask keeps the old parse. Because asking costs the agent
+  an API call rather than a screen replay, Voro asks only while a session is
+  already badged capped, and once per capped episode.
+
 - **One key gets every capped session working again.** A usage cap ends a
   session's turn and leaves it there — nothing retries — so recovering the fleet
   used to mean attaching to each capped session in turn and typing "continue",
