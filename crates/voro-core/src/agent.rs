@@ -947,6 +947,17 @@ impl RawCosts {
     }
 }
 
+/// Why a negative dispatch cap is refused, in one place: the file and the
+/// Config screen's editor (DESIGN.md §5) both write the cap, and an operator
+/// who meets the refusal at one surface should meet the same sentence at the
+/// other.
+pub(crate) fn negative_max_running(n: i64) -> String {
+    format!(
+        "max_running is {n} — it counts dispatches in flight, so it cannot be negative (0 stops \
+         the queue offering dispatches at all)"
+    )
+}
+
 /// Validate one agent's verb templates, shared by the built-ins and the user
 /// file. `dispatch` (or its alias `cmd`) must be present and carry the
 /// prompt-file placeholder; the session verbs carry their placeholders when
@@ -1212,8 +1223,11 @@ pub struct AgentsConfig {
     /// The attention price band the queue ranks by (DESIGN.md §7), defaults
     /// with any `[costs]` overrides layered on.
     costs: AttentionCosts,
-    /// How many dispatches ride at once before the queue stops offering more.
-    max_running: i64,
+    /// How many dispatches ride at once before the queue stops offering more,
+    /// as the file spells it — `None` when the key is absent, which is what
+    /// lets the Config screen say whether the cap in force is the operator's
+    /// or Voro's own (DESIGN.md §5).
+    max_running: Option<i64>,
     path: PathBuf,
 }
 
@@ -1269,7 +1283,7 @@ impl AgentsConfig {
             viewers: BTreeMap::new(),
             default_viewer: None,
             costs: AttentionCosts::default(),
-            max_running: DEFAULT_MAX_RUNNING,
+            max_running: None,
             path: path.to_path_buf(),
         }
     }
@@ -1300,19 +1314,14 @@ impl AgentsConfig {
             provenance.insert(name.clone(), prov);
             agents.insert(name, agent);
         }
-        let max_running = match raw.max_running {
-            None => DEFAULT_MAX_RUNNING,
-            Some(n) if n >= 0 => n,
-            Some(n) => {
-                return Err(Error::AgentConfigInvalid {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "max_running is {n} — it counts dispatches in flight, so it cannot be \
-                         negative (0 stops the queue offering dispatches at all)"
-                    ),
-                });
-            }
-        };
+        if let Some(n) = raw.max_running
+            && n < 0
+        {
+            return Err(Error::AgentConfigInvalid {
+                path: path.to_path_buf(),
+                message: negative_max_running(n),
+            });
+        }
         let costs = match raw.costs {
             Some(costs) => costs.resolve(path)?,
             None => AttentionCosts::default(),
@@ -1325,7 +1334,7 @@ impl AgentsConfig {
             viewers: raw.viewers,
             default_viewer: raw.default_viewer,
             costs,
-            max_running,
+            max_running: raw.max_running,
             path: path.to_path_buf(),
         })
     }
@@ -1338,7 +1347,27 @@ impl AgentsConfig {
     /// The dispatch WIP cap (DESIGN.md §7): how many tasks may be running
     /// before the queue stops offering dispatches.
     pub fn max_running(&self) -> i64 {
+        self.max_running.unwrap_or(DEFAULT_MAX_RUNNING)
+    }
+
+    /// The cap as `voro.toml` spells it, `None` when the file names none — the
+    /// provenance the Config screen's settings list shows beside the value
+    /// (DESIGN.md §5), which the resolved [`max_running`](Self::max_running)
+    /// alone cannot tell apart from a cap that happens to equal the default.
+    pub fn max_running_from_file(&self) -> Option<i64> {
         self.max_running
+    }
+
+    /// `default_agent` as the file spells it, before the PATH probe that
+    /// [`default_name`](Self::default_name) falls back to.
+    pub fn default_agent_from_file(&self) -> Option<&str> {
+        self.default.as_deref()
+    }
+
+    /// `default_viewer` as the file spells it, before the resolution rules
+    /// [`default_viewer_name`](Self::default_viewer_name) falls back to.
+    pub fn default_viewer_from_file(&self) -> Option<&str> {
+        self.default_viewer.as_deref()
     }
 
     /// Every agent name defined in the config, for the TUI's dispatch picker
