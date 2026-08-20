@@ -719,10 +719,8 @@ fn strip_pr_span() -> Span<'static> {
 /// alive but held at a cap, doing nothing until the window reopens.
 ///
 /// Yellow rather than red, and no state change behind it, because nothing has
-/// gone wrong — the session is intact and will pick up where it left off. It is
-/// the *absence* of this badge on a stuck row that used to mislead: capped work
-/// sat on the strip with a climbing elapsed time and no way to tell it from work
-/// in progress.
+/// gone wrong — the session is intact and will pick up where it left off.
+/// Without the badge a capped row is indistinguishable from work in progress.
 ///
 /// Three shapes, in decreasing order of what Voro managed to learn. With a
 /// parsed reset time still ahead, `⚠ capped ↻21:50` — the operator can decide

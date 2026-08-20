@@ -82,8 +82,8 @@ pub fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>>
         .collect()
 }
 
-/// The display width of one character, measured as ratatui measures it so the
-/// widths agree with the wrapping this replaces.
+/// The display width of one character, measured as ratatui measures it so
+/// this wrapping and ratatui's rendering agree on widths.
 fn char_width(ch: char) -> usize {
     let mut buf = [0u8; 4];
     Span::raw(&*ch.encode_utf8(&mut buf)).width()

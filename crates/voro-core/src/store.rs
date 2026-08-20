@@ -1716,7 +1716,7 @@ impl Store {
     /// `refining`, or `waiting` task, joined with its open session if it has
     /// one. The strip filters on task *state*, so `review`/`needs-input` tasks
     /// (session still open) do not appear, while a refine in flight and a
-    /// handed-off task both do — an open session no longer implies executing
+    /// handed-off task both do — an open session does not imply executing
     /// the task (§8), and what the strip shows is work in flight that someone
     /// else owns. A hand-started task with no session shows with `session_id`/
     /// `agent` `NULL`. The one-open-session invariant (§8) bounds the join to one

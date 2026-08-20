@@ -2223,14 +2223,6 @@ impl App {
     /// detach per session, which is why the reset hours go missing overnight.
     /// This is that walk as one key.
     ///
-    /// A keypress starts it, which is where this begins rather than where it is
-    /// meant to end: firing automatically once the window reopens is wanted, and
-    /// nothing here is shaped to prevent it. Automation needs a trigger, not a
-    /// channel — the same `reset_passed` test, read on the tick instead of on
-    /// the key — so it layers on top of this rather than replacing it. Manual
-    /// first only because a badge that false-positives costs one wasted keypress
-    /// today and an unwatched agent once it is automatic.
-    ///
     /// Both guards the quick-message key answers to are stood down here, and the
     /// cap reading is what earns that: [`state_accepts_message`] refuses a
     /// `running` task because its session is mid-turn, and `send_session_message`
@@ -7390,10 +7382,9 @@ mod tests {
     }
 
     /// `g` opens the confirmation without asking the network anything
-    /// (DESIGN.md §8). This checkout is not a GitHub repository at all — the
-    /// press-time `gh repo view` this replaces refused on exactly it — so the
-    /// modal appearing is what proves the keypress no longer waits on a
-    /// round-trip. The refusal has moved to the create itself, below.
+    /// (DESIGN.md §8): even on a checkout that is not a GitHub repository at
+    /// all, the modal appears — the refusal belongs to the create itself,
+    /// below.
     #[test]
     fn review_key_opens_the_confirmation_without_a_round_trip() {
         let (mut app, task_id, dir) = pr_ready_app(false);
