@@ -2601,14 +2601,11 @@ mod tests {
 
     #[test]
     fn agent_init_then_list_through_the_cli() {
-        let dir = std::env::temp_dir().join(format!(
-            "voro-cli-agents-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = tempfile::Builder::new()
+            .prefix("voro-cli-agents-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let agents_path = dir.join("voro/voro.toml");
         let ctx = DispatchCtx {
             db_path: dir.join("voro.db"),
@@ -2653,14 +2650,11 @@ mod tests {
 
     #[test]
     fn viewer_add_remove_round_trip_through_the_cli() {
-        let dir = std::env::temp_dir().join(format!(
-            "voro-cli-viewers-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = tempfile::Builder::new()
+            .prefix("voro-cli-viewers-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let agents_path = dir.join("voro/voro.toml");
         let ctx = DispatchCtx {
             db_path: dir.join("voro.db"),
@@ -3672,15 +3666,11 @@ mod tests {
     /// A throwaway checkout with no remotes — the shape of a first project
     /// (DESIGN.md §8), which advertises `open` rather than `pr`.
     fn remoteless_checkout(tag: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "voro-cli-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
+        let path = tempfile::Builder::new()
+            .prefix(&format!("voro-cli-{tag}-"))
+            .tempdir()
+            .unwrap()
+            .keep();
         git_in(&path, &["init", "-q"]);
         path
     }
@@ -4622,15 +4612,11 @@ mod tests {
     /// viewers. The default `ctx()` points at the developer's real config,
     /// which these tests must not depend on (or launch viewers from).
     fn ctx_with_toml(toml: &str) -> DispatchCtx {
-        let root = std::env::temp_dir().join(format!(
-            "voro-cli-viewer-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("voro-cli-viewer-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let agents_path = root.join("voro.toml");
         std::fs::write(&agents_path, toml).unwrap();
         DispatchCtx {
@@ -5104,14 +5090,11 @@ mod tests {
     fn a_dead_dispatched_session_is_finalised_and_stalled_on_read() {
         use std::process::{Command, Stdio};
 
-        let root = std::env::temp_dir().join(format!(
-            "voro-cli-reconcile-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = tempfile::Builder::new()
+            .prefix("voro-cli-reconcile-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
         let git = |args: &[&str]| {
@@ -5188,14 +5171,11 @@ mod tests {
     fn scratch_env(cmd: &str) -> (Store, DispatchCtx, std::path::PathBuf) {
         use std::process::{Command, Stdio};
 
-        let root = std::env::temp_dir().join(format!(
-            "voro-cli-answer-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = tempfile::Builder::new()
+            .prefix("voro-cli-answer-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
         let status = Command::new("git")

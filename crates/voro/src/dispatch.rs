@@ -1920,19 +1920,7 @@ fn default_base_branch(repo_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use voro_core::{LivenessSource, NewTask, Priority};
-
-    /// Distinguishes fixtures built within the same clock tick.
-    ///
-    /// A nanosecond stamp reads as though it could not repeat, and on one
-    /// thread it does not: consecutive `SystemTime::now()` calls always differ,
-    /// because each is ordered after the last. Across threads there is no such
-    /// ordering, and the clock does not advance a nanosecond at a time — it
-    /// steps roughly every 20-30ns, so any two threads reading inside one step
-    /// read the same number. Measured on this workstation: 4000 reads across
-    /// eight threads yielded 1493 duplicates.
-    static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
     /// A scratch database, a freshly-`git init`ed clean project, and an
     /// `voro.toml` whose one agent is a stub command that just reads the
@@ -1967,18 +1955,14 @@ mod tests {
     }
 
     /// A scratch directory no other fixture can name, however many are built
-    /// at once: the process id separates test binaries, the counter separates
-    /// fixtures within one, and the stamp keeps reruns of a recycled pid apart.
+    /// at once, because `tempfile` creates it exclusively and retries under a
+    /// different name on a clash. `keep` then leaves it behind for inspection.
     fn fixture_root() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "voro-dispatch-{}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed)
-        ))
+        tempfile::Builder::new()
+            .prefix("voro-dispatch-")
+            .tempdir()
+            .unwrap()
+            .keep()
     }
 
     #[test]
@@ -2001,35 +1985,6 @@ mod tests {
 
         let distinct: std::collections::HashSet<_> = roots.iter().collect();
         assert_eq!(distinct.len(), THREADS, "roots collided: {roots:?}");
-    }
-
-    /// Eight fixtures spend long enough in `git init` to drift apart on the
-    /// clock, so the test above can pass even on a name that has no counter in
-    /// it. This one names four thousand roots with nothing in between, where a
-    /// clock-only name collides tens of times over.
-    #[test]
-    fn roots_named_back_to_back_on_many_threads_are_all_distinct() {
-        const THREADS: usize = 8;
-        const EACH: usize = 500;
-        let gate = std::sync::Barrier::new(THREADS);
-
-        let roots: Vec<PathBuf> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..THREADS)
-                .map(|_| {
-                    scope.spawn(|| {
-                        gate.wait();
-                        (0..EACH).map(|_| fixture_root()).collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().unwrap())
-                .collect()
-        });
-
-        let distinct: std::collections::HashSet<_> = roots.iter().collect();
-        assert_eq!(distinct.len(), THREADS * EACH, "roots collided");
     }
 
     fn git(dir: &Path, args: &[&str]) {

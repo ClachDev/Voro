@@ -232,7 +232,6 @@ fn pr_is_merged(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use voro_core::{NewTask, Priority, Store, TaskState};
 
     fn git(dir: &Path, args: &[&str]) {
@@ -250,14 +249,11 @@ mod tests {
     /// A git repo at `<root>/project` with one commit on `main` and a
     /// `git`-configured identity, ready to grow worktrees.
     fn repo() -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "voro-worktree-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = tempfile::Builder::new()
+            .prefix("voro-worktree-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
         git(&project, &["init", "-q", "-b", "main"]);

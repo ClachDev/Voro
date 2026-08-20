@@ -34,6 +34,14 @@ and say so explicitly.
 `voro-core` requires tests; state-machine transitions and scheduler ordering are
 the highest-value targets. TUI code is tested where practical, not dogmatically.
 
+A test that needs a scratch directory names it one way, with `tempfile`:
+`tempfile::Builder::new().prefix("voro-<area>-").tempdir().unwrap().keep()`.
+Never build the name from the process id and a clock stamp — the clock does not
+advance a nanosecond at a time, so two threads reading inside one step read the
+same number and land on the same directory. `keep` leaves the directory behind
+deliberately, so a failing test's scratch state survives for inspection; nothing
+cleans the temp dir up yet.
+
 ## Git conventions
 
 - Feature branches, squash-merged to `main`. One logical change per PR.

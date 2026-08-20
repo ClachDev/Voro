@@ -2049,16 +2049,11 @@ mod schema_guard_tests {
 
     /// A unique scratch directory per test, cleaned up by the caller.
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "voro-store-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        tempfile::Builder::new()
+            .prefix(&format!("voro-store-{tag}-"))
+            .tempdir()
+            .unwrap()
+            .keep()
     }
 
     #[test]
@@ -4869,9 +4864,12 @@ mod tests {
 
     /// A unique scratch database path under the OS temp dir.
     fn scratch_db() -> PathBuf {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        std::env::temp_dir().join(format!("voro-dataversion-{}-{n}.db", std::process::id()))
+        tempfile::Builder::new()
+            .prefix("voro-dataversion-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("voro.db")
     }
 
     #[test]
