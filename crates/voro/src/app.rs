@@ -336,7 +336,7 @@ pub enum EditorRequest {
 }
 
 /// A request for main() to suspend the terminal and run an agent's
-/// `attach`/`resume` command in the foreground (task #75) — a full-screen
+/// `attach`/`resume` command in the foreground — a full-screen
 /// interactive program that owns the terminal until the user detaches.
 #[derive(Debug, Clone)]
 pub struct AttachRequest {
@@ -502,7 +502,7 @@ pub struct App {
     /// never have to notice an absence.
     pub refine_failed: std::collections::HashSet<i64>,
     /// Every dependency edge, both directions, keyed by task id — what the
-    /// detail views render as `blocked by #N` / `blocks #N` (task #103).
+    /// detail views render as `blocked by #N` / `blocks #N`.
     /// Loaded whole per refresh so the render path never queries the store.
     pub deps: std::collections::HashMap<i64, Vec<DepRef>>,
     pub dependents: std::collections::HashMap<i64, Vec<DepRef>>,
@@ -514,7 +514,7 @@ pub struct App {
     /// joined onto its checkout. Resolved once per refresh beside `docs`, so
     /// the render path can show the real location without querying the store.
     pub doc_locations: std::collections::HashMap<i64, String>,
-    /// Each task's newest session (tasks #73/#110), keyed by task id: what the
+    /// Each task's newest session, keyed by task id: what the
     /// detail views render — a stalled task's post-mortem (DESIGN.md §8), an
     /// open session's agent and log — and what gates the `l` log key. Loaded per
     /// refresh like the dependency maps, so the render path never queries the store.
@@ -1621,7 +1621,7 @@ impl App {
             KeyCode::Char('h') if self.screen == Screen::Cockpit => {
                 self.show_history = !self.show_history;
             }
-            // Scroll the focus card body (task #2): `j`/`k` already move the row
+            // Scroll the focus card body: `j`/`k` already move the row
             // selection, so shifted `J`/`K` and the page keys drive the pane.
             KeyCode::Char('J') if self.screen == Screen::Cockpit => self.scroll_detail(1),
             KeyCode::Char('K') if self.screen == Screen::Cockpit => self.scroll_detail(-1),
@@ -1708,7 +1708,7 @@ impl App {
         self.apply_and_refresh(task.id, Action::HandOff);
     }
 
-    /// Page through the selected task's newest session log (tasks #73/#110), in
+    /// Page through the selected task's newest session log, in
     /// any state that has a session on record. `$PAGER` (default `less`) owns
     /// the terminal, so this runs through `pending_attach` with the TUI torn
     /// down around it, like attach/resume. Missing pieces report via the status
@@ -2098,7 +2098,7 @@ impl App {
         }
     }
 
-    /// Jump into the selected task's agent session (task #75). Which verb that
+    /// Jump into the selected task's agent session. Which verb that
     /// takes is decided by the session itself where the agent can say: a live
     /// session is `attach`ed to, a finished one `resume`d — task state only
     /// standing in when liveness is unknowable. The two do not follow from each
@@ -2223,14 +2223,6 @@ impl App {
     /// detach per session, which is why the reset hours go missing overnight.
     /// This is that walk as one key.
     ///
-    /// A keypress starts it, which is where this begins rather than where it is
-    /// meant to end: firing automatically once the window reopens is wanted, and
-    /// nothing here is shaped to prevent it. Automation needs a trigger, not a
-    /// channel — the same `reset_passed` test, read on the tick instead of on
-    /// the key — so it layers on top of this rather than replacing it. Manual
-    /// first only because a badge that false-positives costs one wasted keypress
-    /// today and an unwatched agent once it is automatic.
-    ///
     /// Both guards the quick-message key answers to are stood down here, and the
     /// cap reading is what earns that: [`state_accepts_message`] refuses a
     /// `running` task because its session is mid-turn, and `send_session_message`
@@ -2340,9 +2332,9 @@ impl App {
     ///
     /// What that costs is worth naming. The stop is exactly as safe as the cap
     /// reading is right — the same bet the sweep already makes — but the
-    /// consequence of a wrong one is worse than it was: a send into a session
-    /// that turned out to be mid-turn used to be a redundant turn, and is now a
-    /// killed one. The reading can also be up to a probe interval stale, so a
+    /// consequence of a wrong one is severe: a send into a session
+    /// that turns out to be mid-turn kills the turn.
+    /// The reading can also be up to a probe interval stale, so a
     /// session an operator restarted by hand in the last minute is still badged
     /// and can still be stopped from under them. Both are why the sweep stays on
     /// a keypress rather than on the clock (DESIGN.md §8).
@@ -3820,7 +3812,7 @@ impl App {
         "nothing selected"
     }
 
-    /// Re-prioritise a task in place (task #88), the review-time fast path that
+    /// Re-prioritise a task in place, the review-time fast path that
     /// skips the edit form. Routes through `voro-core` so the change is logged,
     /// then refreshes to re-score and re-sort. The status line names the task,
     /// since the digit now fires on a row picked out of a queue rather than only
@@ -4780,7 +4772,7 @@ mod tests {
     }
 
     /// The event history the `h` toggle draws comes straight from the store,
-    /// oldest first — the data the retired popup used to load for itself.
+    /// oldest first.
     #[test]
     fn task_events_reads_history_oldest_first() {
         let app = app_with(&[TaskState::NeedsInput]);
@@ -4826,7 +4818,7 @@ mod tests {
         assert!(app.show_score && app.show_history);
     }
 
-    /// `!` is the same toggle wherever a task is selected (task #241): the
+    /// `!` is the same toggle wherever a task is selected: the
     /// cockpit queue, the tasks list, and the detail popup that opens over it.
     #[test]
     fn deep_key_toggles_the_flag_on_every_screen() {
@@ -5033,7 +5025,7 @@ mod tests {
         assert!(status.contains("P3"), "{status}");
     }
 
-    /// The popup's own `0`–`3` (task #88) still sets the viewed task's priority
+    /// The popup's own `0`–`3` still sets the viewed task's priority
     /// in place, through the same call the two screens now share.
     #[test]
     fn digit_in_the_detail_popup_sets_priority_without_closing_it() {
@@ -5073,7 +5065,7 @@ mod tests {
     }
 
     /// `o` with no viewer set up anywhere raises the add-viewer form rather
-    /// than only complaining (#405), and says why on the status line; every
+    /// than only complaining, and says why on the status line; every
     /// other way opening can fail still just reports. Driven through
     /// `report_open` rather than the key, since which arm a real keypress
     /// takes depends on what the developer has installed.
@@ -5119,7 +5111,7 @@ mod tests {
     }
 
     /// The command field writes itself from the name until the operator writes
-    /// one, and comes back when what they wrote is deleted (#405). The name is
+    /// one, and comes back when what they wrote is deleted. The name is
     /// the only thing they must know; the command is a suggestion they can
     /// watch, take over, or undo.
     #[test]
@@ -5188,7 +5180,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// Naming an editor is enough (#405): ⏎ through the command field records
+    /// Naming an editor is enough: ⏎ through the command field records
     /// `<name> {path}`, and a name that is a built-in's records that built-in's
     /// own line, so an override starts from what it replaces.
     #[test]
@@ -5236,7 +5228,7 @@ mod tests {
         alt_key(&mut app, KeyCode::Char('4'));
         assert_eq!(app.screen, Screen::Config);
         // the built-in agents and viewers are both listed, the viewers'
-        // built-in rows read-only (#405)
+        // built-in rows read-only
         assert!(app.config_agents.iter().any(|a| a.name == "claude"));
         assert!(
             app.config_viewers
@@ -5577,7 +5569,7 @@ mod tests {
         assert!(app.status.as_deref().unwrap_or("").contains("park"));
     }
 
-    // --- dispatch keybindings (task #28, DESIGN.md §8/§9) ---
+    // --- dispatch keybindings (DESIGN.md §8/§9) ---
 
     /// `d` on a ready task dispatches it with the resolved agent — the same
     /// mechanics `voro dispatch` uses — and reports the success summary.
@@ -5727,7 +5719,7 @@ mod tests {
     /// An invalid `voro.toml` is only discovered when the picker is
     /// opened — it is loaded fresh each time, never cached — and surfaces
     /// through the ordinary status-line error style instead of a stale or
-    /// empty modal. (A *missing* file is no longer a failure: the built-ins
+    /// empty modal. (A *missing* file is not a failure: the built-ins
     /// load, so the picker opens on them.)
     #[test]
     fn agent_picker_reports_a_config_load_failure_without_opening() {
@@ -5766,14 +5758,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }
 
-    // --- jump-in keybinding (task #75) ---
+    // --- jump-in keybinding ---
 
     /// A listing showing the fixture's session still going, and one showing it
-    /// finished — what decides the jump-in verb (task #332).
+    /// finished — what decides the jump-in verb.
     const LIVE_LISTING: &str = r#"[{"sessionId": "ref-1", "state": "working"}]"#;
     const FINISHED_LISTING: &str = r#"[{"sessionId": "ref-1", "state": "done"}]"#;
 
-    /// The zombie shape the pid rule exists for (task #376): an entry the
+    /// The zombie shape the pid rule exists for: an entry the
     /// agent's listing leaves at `blocked` long after the session died, with
     /// no pid to check. It read as live while not-`done` meant live, which
     /// sent `A` at `claude attach <uuid>` — "No job matching" — and made `a`
@@ -5814,7 +5806,7 @@ mod tests {
     /// liveness is the pid — keeps its task `running` through reconcile.
     ///
     /// The `message` verb lingers too: a send that exits non-zero inside its
-    /// grace window is a send that did not happen (task #390), so the stub has
+    /// grace window is a send that did not happen, so the stub has
     /// to be a command that survives. It says what it is in a trailing comment,
     /// which the launch log records verbatim — that is what the assertions
     /// below read the rendered `{session}` out of.
@@ -5882,7 +5874,7 @@ mod tests {
         &["sessions", "attach", "resume", "message", "stop"]
     }
 
-    // --- capped-but-alive sessions (task #415) ---
+    // --- capped-but-alive sessions ---
 
     /// A project with one live dispatch whose agent's `logs` verb prints
     /// `logs_output`, which is the whole of what the cap probe reads.
@@ -5906,7 +5898,7 @@ mod tests {
         } else {
             String::new()
         };
-        // The nudge sweep (task #416) goes out through the same `message` verb
+        // The nudge sweep goes out through the same `message` verb
         // the quick-message key uses, so the stub defines one that records what
         // it was told and exits — a delivered send, as far as the caller can see.
         let delivered = project_path.parent().unwrap().join("delivered.txt");
@@ -6033,7 +6025,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }
 
-    // --- nudging capped sessions back to work (task #416) ---
+    // --- nudging capped sessions back to work ---
 
     /// What a nudge was told, if anything.
     fn delivered(project_path: &std::path::Path) -> Option<String> {
@@ -6297,9 +6289,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }
 
-    /// The bug this key had (task #332): a `--bg` session commonly outlives
-    /// the `running` state, and `resume` refuses a session the supervisor
-    /// still holds. A review task whose session is listed live attaches.
+    /// A `--bg` session commonly outlives the `running` state, and `resume`
+    /// refuses a session the supervisor still holds. A review task whose
+    /// session is listed live attaches.
     #[test]
     fn attach_key_attaches_to_a_review_tasks_live_session() {
         let mut env = jump_in_env(all_verbs(), LIVE_LISTING);
@@ -6320,7 +6312,7 @@ mod tests {
 
     /// A review task whose entry is a pid-less zombie resumes: `blocked` with
     /// nothing behind it is not a claim that anything is still running, and
-    /// attaching to it fails at the agent (task #376).
+    /// attaching to it fails at the agent.
     #[test]
     fn attach_key_resumes_a_review_tasks_zombie_session() {
         let mut env = jump_in_env(all_verbs(), ZOMBIE_LISTING);
@@ -6667,7 +6659,7 @@ mod tests {
         set_verb(&env.ctx.agents_path, "message", template);
     }
 
-    /// The defect this ordering exists for (task #390): the send is what the
+    /// The send is what the
     /// rejection hangs off, so a message the agent refuses — a supervisor-held
     /// session, a stale reference — leaves the task in `review` with its body
     /// untouched and the refusal on the status line. Recording feedback the
@@ -6752,7 +6744,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // --- releasing a session the agent still holds (task #428) ---
+    // --- releasing a session the agent still holds ---
 
     /// A review task whose session verbs are all defined *except* `stop`, plus
     /// the config path a test adds one at afterwards. Withholding it until the
@@ -6958,12 +6950,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The refusal's other half (task #376): a pid-less `blocked` zombie is
+    /// The refusal's other half: a pid-less `blocked` zombie is
     /// not a session still running, so the message goes headlessly — and the
     /// send that lands is what the task then rides on. The reconcile that
     /// follows finds the same zombie in the listing but the send's own process
     /// on the row, so the task stays `running` rather than being stalled out
-    /// from under the agent now answering (task #390).
+    /// from under the agent now answering.
     #[test]
     fn message_sends_into_a_zombie_session() {
         let mut env = jump_in_env(all_verbs(), ZOMBIE_LISTING);
@@ -7014,12 +7006,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The reject edge's tail, corrected (task #390): a session the listing
-    /// reports finished used to be stalled by the very next reconcile, seconds
-    /// after the rejection was sent into it — the operator's feedback recorded,
-    /// the task queued for redispatch, and the agent that received it ignored.
-    /// The send's own process is now on the row, so the task rides `running`
-    /// for as long as the turn takes.
+    /// A session the listing reports finished must not be stalled by the next
+    /// reconcile seconds after a rejection was sent into it: the send's own
+    /// process is on the row, so the task rides `running` for as long as the
+    /// turn takes.
     #[test]
     fn message_to_a_finished_session_keeps_the_task_running() {
         let mut env = jump_in_env(all_verbs(), FINISHED_LISTING);
@@ -7134,7 +7124,7 @@ mod tests {
         );
     }
 
-    // --- last-session surfacing and the log key (tasks #73/#110) ---
+    // --- last-session surfacing and the log key ---
 
     /// Refresh captures each task's newest session, so the detail views
     /// render it without querying the store mid-draw.
@@ -7160,7 +7150,7 @@ mod tests {
         assert_eq!(request.cwd, "/tmp/demo");
     }
 
-    /// The key is not gated on state (task #110): a task whose session is
+    /// The key is not gated on state: a task whose session is
     /// still open — here parked mid-flight into needs-input — pages the same
     /// way, answering "what is this session doing?".
     #[test]
@@ -7253,7 +7243,7 @@ mod tests {
         );
     }
 
-    // --- open-in-viewer keybinding (task #24, DESIGN.md §11a) ---
+    // --- open-in-viewer keybinding (DESIGN.md §11a) ---
 
     /// `o` on a review row runs the configured `[viewer]` and reports the
     /// summary through the status line — the TUI half of `voro open`.
@@ -7392,10 +7382,9 @@ mod tests {
     }
 
     /// `g` opens the confirmation without asking the network anything
-    /// (DESIGN.md §8). This checkout is not a GitHub repository at all — the
-    /// press-time `gh repo view` this replaces refused on exactly it — so the
-    /// modal appearing is what proves the keypress no longer waits on a
-    /// round-trip. The refusal has moved to the create itself, below.
+    /// (DESIGN.md §8): even on a checkout that is not a GitHub repository at
+    /// all, the modal appears — the refusal belongs to the create itself,
+    /// below.
     #[test]
     fn review_key_opens_the_confirmation_without_a_round_trip() {
         let (mut app, task_id, dir) = pr_ready_app(false);
@@ -7665,7 +7654,7 @@ mod tests {
         );
     }
 
-    // --- planning sessions (task #112) ---
+    // --- planning sessions ---
 
     /// An app whose dispatch context reads a scratch `voro.toml`, so the
     /// planning keys resolve a known agent instead of the developer's real
@@ -7714,7 +7703,7 @@ mod tests {
         assert_eq!(launch.cwd, "/tmp/demo");
     }
 
-    // --- quick propose (task #315) ---
+    // --- quick propose ---
 
     /// An agents config whose `dispatch` verb only copies the prompt file, so a
     /// spawned expansion is observable through the prompt it wrote without

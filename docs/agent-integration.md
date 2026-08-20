@@ -33,7 +33,8 @@ points, run the matching command — Voro surfaces it in the operator's queue:
     voro resume "$VORO_TASK_ID"
     voro done "$VORO_TASK_ID" --branch "$(git rev-parse --abbrev-ref HEAD)" \
         --summary "<what changed and why, then how you verified it — a PR description>"
-    voro propose <project> "Follow-up title" --from "$VORO_TASK_ID" --body-file plan.md
+    voro propose <project> "Follow-up title" --from "$VORO_TASK_ID" \
+        --body-file plan.md
 
 - `ask` when you are blocked on a human decision and cannot proceed.
 - `resume` once that question is answered here in this session, to move the task
@@ -141,20 +142,16 @@ resume   = "codex resume {session}"
   the status line and the jump-in still works.
 - `message` may also carry `{new_session}`, replaced with a fresh v4 UUID Voro
   generates for the send. Use it when your agent's sessions cannot be resumed
-  headlessly but can be *forked*: the fork continues the same conversation under
-  the reference Voro named, and Voro records that reference on the session row
-  once the send is confirmed — so later messages, the jump-in keys, and
-  reconciliation all follow the conversation to where it continued. A `message`
-  template without the placeholder resumes in place and keeps the reference it
-  had, which is what the built-in `claude` one does: a `claude --bg` session
-  keeps a supervisor process that refuses a plain `--resume` while it lives, and
-  Voro removes that hold with the `stop` verb when the session comes to rest
-  rather than forking around it (DESIGN.md §8), so the conversation stays under
-  one id and one name for the task's whole life. `{new_session}` is refused on
-  every other verb: it names the session a send opens, and nothing else opens
-  one. Which of the two a configured agent got is visible without reading the
-  file back: `voro agent list` names a forking send `message(fork)` and a
-  resuming one `message`.
+  headlessly but can be *forked*: the fork continues the same conversation
+  under the reference Voro named, and Voro records that reference on the
+  session row once the send is confirmed — so later messages, the jump-in
+  keys, and reconciliation all follow the conversation to where it continued. A
+  `message` template without the placeholder resumes in place and keeps the
+  reference it had, which is what the built-in `claude` one does — Voro
+  releases the supervisor's hold with `stop` at rest rather than forking around
+  it (DESIGN.md §8). `{new_session}` is refused on every other verb: it names
+  the session a send opens, and nothing else opens one. `voro agent list` names
+  a forking send `message(fork)` and a resuming one `message`.
 - A `message` template should carry whatever permission flag its agent's
   `dispatch` carries — the built-in `claude` one carries `--permission-mode
   auto`. A resumed turn does real work, and on agents where the flag is per
@@ -278,23 +275,19 @@ launcher prints into the session log. The ref is stored on the session row
 (`session_ref`); if none shows up within a few seconds it stays NULL and the
 dispatch summary says so.
 
-**Liveness without pids.** A `--bg`-style launch is owned by a supervisor and its
-spawned pid exits at once, so for agents with a `sessions` verb the reconciler
-never checks the pid the session row recorded: liveness comes from the listing
-entry the ref appears on. That entry is read as dead once its `state` is `done`;
-failing that, a `pid` the *entry* names — the supervisor's, not the launcher's —
-decides it, the session being live exactly while that process exists; and failing
-both, only `state: "working"` reads live. Not-`done` deliberately does not mean
-live: a listing under no obligation to retire its entries (`claude agents --json`
-leaves dead sessions at `blocked` forever) would otherwise read as a fleet of
-running agents. A session that drops out, finishes, or zombies there without
-calling `voro done`/`ask` stalls its task, exactly as pid-death does for plain
-agents (DESIGN.md §8). When liveness is unknowable (no ref, listing failed) the
+**Liveness without pids.** A `--bg`-style launch is owned by a supervisor and
+its spawned pid exits at once, so for agents with a `sessions` verb the
+reconciler never checks the pid the session row recorded: liveness comes from
+the listing entry the ref appears on, read by the contract in DESIGN.md §8
+(`done` means dead; failing that an entry-named pid decides; failing both, only
+`state: "working"` reads live). A session that drops out, finishes, or zombies
+there without calling `voro done`/`ask` stalls its task, exactly as pid-death
+does for plain agents. When liveness is unknowable (no ref, listing failed) the
 session is left alone. The row's own pid is still read in one direction, for
 every agent: a pid that is *alive* proves the session is, whatever the listing
-says. That is what a quick message leaves behind — the process carrying its turn
-— and a headless send does not appear in the listing while it runs, so without
-this rule the next reconcile would stall a task whose agent is mid-answer.
+says — which is what a quick message leaves behind, and a headless send does
+not appear in the listing while it runs, so without this rule the next
+reconcile would stall a task whose agent is mid-answer.
 
 **Jump-in.** In the TUI, `A` on a running task runs the agent's `attach` command
 with the TUI suspended — the real session, full control, including answering
@@ -307,26 +300,21 @@ exchange lives in the session transcript (DESIGN.md §6/§8).
 
 **Quick message.** `a` is the same steering without the round-trip: it collects
 one line and fires it into the session through `message`, leaving the TUI
-standing. It applies to the three states whose session is open and between turns
-— `needs-input`, `review`, `waiting` — and refuses the rest: `running` and
-`refining` are mid-turn with no injection channel, and `stalled` has a dead
-session that redispatch, not a headless resume, is the honest answer for. Voro
-probes liveness first and refuses a session still running, since that one wants
-the terminal; if the same probe finds the session merely registered at rest, it
-releases it through `stop` before sending, which reconciliation has usually done
-already. Between them the two checks make one guarantee: a message only ever
-reaches a session that has explicitly handed back. On a `review` or `waiting`
-task the message *is* a
-reject-with-feedback: the send goes first and the transition follows it, so
-feedback is appended to the body and logged only once the message is known to
-have started, and a send the agent refuses leaves the task untouched. On a
-`needs-input` task nothing transitions — the answer lives in the transcript, and
-the agent's own `voro resume` moves the task back (DESIGN.md §6). Either way the
-session row follows the send: it records the process now carrying the turn, so
-reconciliation leaves the task `running` while the agent answers, and — for a
-verb that forks (`{new_session}`) — the reference the conversation continued
-under. An in-place verb changes no reference, which is the point: one session
-id and one name for the task's whole life.
+standing. It applies to the three states whose session is open and between
+turns — `needs-input`, `review`, `waiting` — and refuses the rest (DESIGN.md
+§8). Voro probes liveness first and refuses a session still running, since
+that one wants the terminal; if the same probe finds the session merely
+registered at rest, it releases it through `stop` before sending, which
+reconciliation has usually done already — so a message only ever reaches a
+session that has explicitly handed back. On a `review` or `waiting` task the
+message *is* a reject-with-feedback: the send goes first and the transition
+follows it, so a send the agent refuses leaves the task untouched. On a
+`needs-input` task nothing transitions — the answer lives in the transcript,
+and the agent's own `voro resume` moves the task back (DESIGN.md §6). Either
+way the session row follows the send: it records the process now carrying the
+turn, so reconciliation leaves the task `running` while the agent answers, and
+— for a verb that forks (`{new_session}`) — the reference the conversation
+continued under.
 
 The same jump-in resolves a **stale review branch**. A task can sit in `review`
 while other work merges, leaving its branch in conflict with the moved base
@@ -390,8 +378,8 @@ The hooks that matter here, and what each can honestly do:
 
 | Hook | Fires when | Fallback | Value it adds |
 |---|---|---|---|
-| `SessionEnd` | the session terminates normally | `voro done --branch <current branch> [--summary <final message>]` if the task is still `running` | upgrades a forgotten `done` from a `failed` reconcile that would stall the task to a real `review` — the operator sees the diff instead of a redispatch row — recording the branch the work landed on and, best-effort, the session's final assistant message as the summary so the fallback lands a complete report rather than a summary-less one |
-| `Notification` | Claude needs permission, or has idled waiting for input | `voro ask` with the notification message | the *only* signal for a session that is alive but stuck: its process is still running, so the pid-liveness reconciler never fires for it |
+| `SessionEnd` | the session terminates normally | `voro done --branch <current branch> [--summary <final message>]` if the task is still `running` | upgrades a forgotten `done` from a stall to a real `review`, recording the branch and, best-effort, the final assistant message as the summary |
+| `Notification` | Claude needs permission, or has idled waiting for input | `voro ask` with the notification message | the *only* signal for a session that is alive but stuck: its process still runs, so the pid-liveness reconciler never fires |
 | `Stop` | the main agent finishes responding | same as `SessionEnd` | an earlier anchor for the same completion case; redundant with `SessionEnd` and optional |
 
 Two honest limits shape this. There is no failure hook — a hard crash or a

@@ -1,73 +1,299 @@
 # Voro — Design Document
 
 **Binary:** `voro`
-**Status:** Draft — TUI-first, owned SQLite store, per-dispatch agent selection
 **Author:** Michael Johnson (with Claude)
-**Date:** 2026-07-08
+
+This document is the authoritative description of Voro's design: its concepts
+(§3), store schema (§5), task state machine (§6), scoring (§7), and dispatch
+semantics (§8). It describes the tool as it is; the version history lives in
+`CHANGELOG.md` and git.
 
 ## 1. Problem
 
-When developing with AI agents, the scarce resource is no longer typing speed or even code review bandwidth — it is directed human attention. Work is spread across many projects, each with its own repository, its own backlog (sometimes GitHub issues, sometimes nothing), and its own shifting importance. Existing tools each solve a fragment of this: GitHub issues hold tasks but are siloed per repo and unprioritised across them; Claude Code's Agent screen shows active sessions but nothing about what *should* be active; Jira and Linear model priority but are heavyweight, remote, and hostile to fast iteration; agent orchestrators (Vibe Kanban, Crystal, Gas Town and dozens of others) answer "what are my agents doing?" rather than "where should I look next?".
+When developing with AI agents, the scarce resource is no longer typing speed or
+even code review bandwidth — it is directed human attention. Work is spread
+across many projects, each with its own repository, its own backlog (sometimes
+GitHub issues, sometimes nothing), and its own shifting importance. Existing
+tools each solve a fragment of this: GitHub issues hold tasks but are siloed per
+repo and unprioritised across them; Claude Code's Agent screen shows active
+sessions but nothing about what *should* be active; Jira and Linear model
+priority but are heavyweight, remote, and hostile to fast iteration; agent
+orchestrators (Vibe Kanban, Crystal, Gas Town and dozens of others) answer "what
+are my agents doing?" rather than "where should I look next?".
 
-Voro is an operational command centre whose single organising question is: **given how much I care about each project today, what is the one thing most worth my attention right now?** It has one output: **the queue** — a single ranked list of next actions, where an action is *answer this question*, *review this diff*, *triage this proposal*, or *start this task*. Everything competes on the same attention score; splitting decisions and startable work into separate views would just hand the arbitration between them back to the human. The queue offers a handful of rows, not one, because the score ranks but does not dictate — the human keeps the autonomy to pick around the top item. It is capped at the ten highest-scoring next actions across every state, so it stays an answer rather than the whole backlog — the browser holds the rest (§7).
+Voro is an operational command centre whose single organising question is:
+**given how much I care about each project today, what is the one thing most
+worth my attention right now?** It has one output: **the queue** — a single
+ranked list of next actions, where an action is *answer this question*, *review
+this diff*, *triage this proposal*, or *start this task*. Everything competes
+on the same attention score; splitting decisions and startable work into
+separate views would just hand the arbitration between them back to the human.
+The queue offers a handful of rows, not one, because the score ranks but does
+not dictate — capped at the ten highest-scoring next actions across every
+state, it stays an answer rather than the whole backlog; the browser holds the
+rest (§7).
 
 ## 2. Goals and non-goals
 
-**Goals.** A local, text-first tool that aggregates tasks across an arbitrary set of projects, including third-party repositories where we have no write access to the upstream issue tracker. Tasks are fully described — a task body should be able to serve as a ready-to-run agent prompt, prepared in advance and held behind a dependency until it becomes actionable. Project priority is a first-class, cheaply editable quantity that can change daily. The tool can dispatch tasks to coding agents — Claude Code by default, others selected per dispatch — and receive "I need a decision" signals back from them, closing the loop between the queue and running work.
+**Goals.** A local, text-first tool that aggregates tasks across an arbitrary
+set of projects, including third-party repositories where we have no write
+access to the upstream issue tracker. Tasks are fully described — a task body
+should be able to serve as a ready-to-run agent prompt, prepared in advance and
+held behind a dependency until it becomes actionable. Project priority is a
+first-class, cheaply editable quantity that can change daily. The tool can
+dispatch tasks to coding agents — Claude Code by default, others selected per
+dispatch — and receive "I need a decision" signals back from them, closing the
+loop between the queue and running work.
 
-**Non-goals**, at least for v1. No automatic task generation — agents may *propose* tasks, but nothing enters the priority queues without explicit human triage. No team features, sync servers, or cloud components; this is a single-operator tool. No two-way sync with GitHub issues in v1 — issues can be imported as tasks, but Voro's store is the source of truth for priority and state. No terminal multiplexing: Voro tracks and steers sessions at the task level, but attaching to a live agent is the agent's own tooling's job.
+**Non-goals**, at least for v1. No automatic task generation — agents may
+*propose* tasks, but nothing enters the priority queues without explicit human
+triage. No team features, sync servers, or cloud components; this is a
+single-operator tool. No two-way sync with GitHub issues in v1 — issues can be
+imported as tasks, but Voro's store is the source of truth for priority and
+state. No terminal multiplexing: Voro tracks and steers sessions at the task
+level, but attaching to a live agent is the agent's own tooling's job.
 
 ## 3. Concepts
 
-A **project** is a unit of attention allocation: a name and a *weight* expressing today's importance. Note what a project is *not*: it carries no agent configuration, and — deliberately — no filesystem path. Projects allocate attention; **repos** locate checkouts.
+A **project** is a unit of attention allocation: a name and a *weight*
+expressing today's importance. Note what a project is *not*: it carries no agent
+configuration, and — deliberately — no filesystem path. Projects allocate
+attention; **repos** locate checkouts.
 
-A **repo** is an execution target: a name, unique within its project, and a filesystem path to a checkout. A project owns at least one, exactly one of which is its **default**. The two are separate concepts because they answer different questions and change on different timescales: a project is one stream of work competing for the operator's attention, while a checkout is consulted only at the moments something actually runs — dispatch, a planning session, worktree cleanup, `pr`/`open`, and `import`. Collapsing them into a single `projects.path` forced a 1-1 relationship that misprices real work: ODM is one stream of work spanning several repositories, and filing a task against a sibling repository meant registering a whole second project purely to get the right checkout — splitting one queue's attention in two to express a fact about a working directory. Nothing about a repo requires write access to any remote — a clone of a third-party repo is a perfectly good repo.
+A **repo** is an execution target: a name, unique within its project, and a
+filesystem path to a checkout. A project owns at least one, exactly one of which
+is its **default**. The two are separate concepts because they answer different
+questions and change on different timescales: a project is one stream of work
+competing for the operator's attention, while a checkout is consulted only at
+the moments something actually runs — dispatch, a planning session, worktree
+cleanup, `pr`/`open`, and `import`. A single `projects.path` would force a 1-1
+relationship that misprices real work: one stream of work can span several
+repositories, and a task against a sibling repository should not need a second
+project just to name the right checkout. Nothing about a repo requires write
+access to any remote — a clone of a third-party repo is a perfectly good repo.
 
-A **task** belongs to exactly one project and carries an identifier, a title, a markdown **body written as a dispatchable prompt** where possible, a priority (P0–P3), a state (§6), dependencies on other tasks, an optional **agent override** for tasks that inherently require a specific capability, an optional **repo** naming which of its project's checkouts it runs in, and an optional **question** field populated when the task is waiting on human input. A task naming no repo runs in its project's default, which is why a single-repo project needs no repo vocabulary at all: `voro project add` creates the default repo, `voro project path` re-points it, and nothing else ever has to mention repos.
+A **task** belongs to exactly one project and carries an identifier, a title, a
+markdown **body written as a dispatchable prompt** where possible, a priority
+(P0–P3), a state (§6), dependencies on other tasks, an optional **agent
+override** for tasks that inherently require a specific capability, an optional
+**repo** naming which of its project's checkouts it runs in, and an optional
+**question** field populated when the task is waiting on human input. A task
+naming no repo runs in its project's default, which is why a single-repo project
+needs no repo vocabulary at all: `voro project add` creates the default repo,
+`voro project path` re-points it, and nothing else ever has to mention repos.
 
-A task may additionally be flagged **human**, marking work no agent can execute at all — hands-on work at real hardware ("capture a bag on the robot"), an errand, a phone call. The queue is a list of human next-actions either way, and every task is already human-executable — the by-hand `start` exists for any task — so this is deliberately a flag and not an executor enum: the only fact the store needs is whether an agent can execute the task. `human` means it cannot; the default means dispatchable, with the human still free to grab it by hand as today. A human task is never dispatched, cannot carry an agent override (the override exists only to select a dispatch agent), and takes a shortened path through the state machine (§6).
+A task may additionally be flagged **human**, marking work no agent can execute
+at all — hands-on work at real hardware ("capture a bag on the robot"), an
+errand, a phone call. The queue is a list of human next-actions either way, and
+every task is already human-executable — the by-hand `start` exists for any
+task — so this is deliberately a flag and not an executor enum: the only fact
+the store needs is whether an agent can execute the task. `human` means it
+cannot; the default means dispatchable, with the human still free to grab it by
+hand as today. A human task is never dispatched, cannot carry an agent override
+(the override exists only to select a dispatch agent), and takes a shortened
+path through the state machine (§6).
 
-The queue being a list of human next-actions means every task has a **next action** — the one verb the human performs on it — derived fresh from task state, never stored. A single pure function in `voro-core` maps state × fields to the verb: `proposed` → *triage*, `needs-input` → *answer*, `review` → *review PR*, *pr*, or *accept* by what the task carries (below), `stalled` → *redispatch*, and `ready` → *do* for a human task or *dispatch* otherwise. `running` and `refining` rows belong to the running strip, not the queue, and derive no verb; `parked` and the closed states ask nothing of anyone. Every arm but `review`'s reads the state alone; `review`'s reads two further columns because a review task's move genuinely differs by what came back (§6), and a derivation that named a verb the task cannot perform would be worse than none. One verb depends on something the task does not carry — whether its checkout can take a pull request at all — so the derivation stays pure and a second pure function degrades *pr* to *open* for a caller that has looked (§8); the derivation itself never produces *open*.
+The queue being a list of human next-actions means every task has a **next
+action** — the one verb the human performs on it — derived fresh from task
+state, never stored. A single pure function in `voro-core` maps state × fields
+to the verb: `proposed` → *triage*, `needs-input` → *answer*, `review` →
+*review PR*, *pr*, or *accept* by what the task carries (below), `stalled` →
+*redispatch*, and `ready` → *do* for a human task or *dispatch* otherwise.
+`running` and `refining` rows belong to the running strip, not the queue, and
+derive no verb; `parked` and the closed states ask nothing of anyone. Every arm
+but `review`'s reads the state alone; `review`'s reads two further columns
+because a review task's move genuinely differs by what came back (§6), and a
+derivation that named a verb the task cannot perform would be worse than none.
+One verb depends on something the task does not carry — whether its checkout
+can take a pull request at all — so the derivation stays pure and a second
+pure function degrades *pr* to *open* for a caller that has looked (§8); the
+derivation itself never produces *open*.
 
-What the queue *row* shows, though, is the task's **state**, not that verb. The verb is a near-synonym of the state it was derived from, and rendering it in the one column the operator reads first cost more than it paid: it put a fifth vocabulary for the same fact beside the header counts, the browser, the state-change key, and every CLI listing, so scanning the cockpit meant translating back to the state one actually thinks in. The verb keeps the places where it earns its keep — spelled out in the detail pane, where there is room to pair it with a hint about how to perform it, and in `voro next`, which is asked the verb question directly. Nothing is lost in the column: the only pair of verbs the state cannot tell apart is *do* versus *dispatch*, and the row already distinguishes those with its `[human]` marker.
+What the queue *row* shows, though, is the task's **state**, not that verb: the
+verb is a near-synonym of the state it was derived from, and the state is the
+vocabulary the header counts, the browser, and every CLI listing already use.
+The verb appears where it earns its keep — in the detail pane, where there is
+room to pair it with a hint about how to perform it, and in `voro next`, which
+is asked the verb question directly. The only pair of verbs the state cannot
+tell apart is *do* versus *dispatch*, and the row already distinguishes those
+with its `[human]` marker.
 
-A **document** is the plan or design a body of work derives from — a strategy doc, a milestone breakdown, an RFC — registered against a project and linked to the tasks it spawned. It exists because a plan reliably outlives the session that read it: one strategy doc routinely fans out into a dozen or more tasks across several projects, and until now the only record of that derivation was prose inside each task body ("per docs/design/fleet.md…"). That prose drifts as the doc moves, cannot answer *which tasks came from this plan?*, and — worst of the three — never reaches the dispatched agent, which has to rediscover the source from hints. A document is deliberately *not* a task: it carries no state, no priority, and no dependency semantics, so nothing about it can block, be scored, or create a cycle. It is a pointer plus a name, and the link to a task is a plain many-to-many edge: a task may cite several documents, and a document backs many tasks.
+A **document** is the plan or design a body of work derives from — a strategy
+doc, a milestone breakdown, an RFC — registered against a project and linked
+to the tasks it spawned. It exists because a plan reliably outlives the session
+that read it: one strategy doc routinely fans out into a dozen or more tasks
+across several projects. Recording the derivation as prose inside each task
+body drifts as the doc moves, cannot answer *which tasks came from this plan?*,
+and never reaches the dispatched agent. A document is deliberately *not* a
+task: it carries no state, no priority, and no dependency semantics, so nothing
+about it can block, be scored, or create a cycle. It is a pointer plus a name,
+and the link to a task is a plain many-to-many edge: a task may cite several
+documents, and a document backs many tasks.
 
-Two properties of the link are chosen rather than incidental. First, a document is *owned* by one project — which is where a relative location resolves and where `doc list` finds it — but a task in **any** project may link to it, because constraining the edge to the owning project would defeat the case the feature exists for: the AugereAI strategy doc spawned work in three projects, and a per-project link would have recorded a third of it. Second, a path is stored relative to a checkout wherever it can be, so the link survives that checkout moving; an absolute path pasted in from inside one of the project's repos is relativised on registration, one outside every repo is kept whole as a legitimately external document, and a URL is stored verbatim. Which checkout a relative path is read from is the same question a task's repo answers and takes the same shape: a document names a repo of its project, or none for the default.
+Two properties of the link are chosen rather than incidental. First, a document
+is *owned* by one project — which is where a relative location resolves and
+where `doc list` finds it — but a task in **any** project may link to it,
+because constraining the edge to the owning project would defeat the case the
+feature exists for: one strategy doc spawning work in several projects would
+have only a fraction of it recorded. Second, a path is
+stored relative to a checkout wherever it can be, so the link survives that
+checkout moving; an absolute path pasted in from inside one of the project's
+repos is relativised on registration, one outside every repo is kept whole as a
+legitimately external document, and a URL is stored verbatim. Which checkout a
+relative path is read from is the same question a task's repo answers and takes
+the same shape: a document names a repo of its project, or none for the default.
 
-An **agent** is a named dispatch template — a command line into which the prompt and working directory are substituted. Agent selection is resolved at the moment of dispatch (§8), because the two real reasons to switch agent — a usage cap being hit, and a task needing a specific capability — are properties of the dispatch moment and the task respectively, never of the project.
+An **agent** is a named dispatch template — a command line into which the
+prompt and working directory are substituted. Agent selection is resolved at the
+moment of dispatch (§8), because the two real reasons to switch agent — a
+usage cap being hit, and a task needing a specific capability — are properties
+of the dispatch moment and the task respectively, never of the project.
 
-The **attention score** is the scalar that merges project weight and task priority; the scheduler sorts everything by it.
+The **attention score** is the scalar that merges project weight and task
+priority; the scheduler sorts everything by it.
 
 ## 4. Architecture
 
-Three layers, deliberately decoupled so each can be replaced without disturbing the others. All three ship as one Rust workspace: a `voro-core` library crate (store + scheduler) and thin binaries over it.
+Three layers, deliberately decoupled so each can be replaced without disturbing
+the others. All three ship as one Rust workspace: a `voro-core` library crate
+(store + scheduler) and thin binaries over it.
 
-The **store** is a single SQLite database owned by Voro (`~/.local/share/voro/voro.db`), holding projects, their repos, tasks, dependencies, and an event log. Schema in §5. SQLite because the access pattern is a single writer with trivial volumes, transactions matter (dispatch touches task state and session records together), and every future consumer — TUI, CLI verbs, a GUI, an ad-hoc `sqlite3` query when debugging — reads it natively.
+The **store** is a single SQLite database owned by Voro
+(`~/.local/share/voro/voro.db`), holding projects, their repos, tasks,
+dependencies, and an event log. Schema in §5. SQLite because the access pattern
+is a single writer with trivial volumes, transactions matter (dispatch touches
+task state and session records together), and every future consumer — TUI, CLI
+verbs, a GUI, an ad-hoc `sqlite3` query when debugging — reads it natively.
 
-The **scheduler** is pure logic: it pulls candidate tasks from the store, computes attention scores, and produces the two ordered views. It lives in `voro-core` with no I/O of its own — trivially testable, and identical beneath every interface.
+The **scheduler** is pure logic: it pulls candidate tasks from the store,
+computes attention scores, and produces the two ordered views. It lives in
+`voro-core` with no I/O of its own — trivially testable, and identical beneath
+every interface.
 
-The **cockpit** is the interface, and it is built first: a ratatui TUI rendering the queue, with in-place editing of tasks and project weights, and hosting the dispatch actions (§9). The agent-facing CLI verbs (§8) are a second, later consumer of `voro-core`; a GUI would be a third. Building the TUI first is safe precisely because the scheduler is a library — the interface risk is contained to rendering and keybindings, not logic.
+The **cockpit** is the interface, and it is built first: a ratatui TUI rendering
+the queue, with in-place editing of tasks and project weights, and hosting the
+dispatch actions (§9). The agent-facing CLI verbs (§8) are a second, later
+consumer of `voro-core`; a GUI would be a third. Building the TUI first is safe
+precisely because the scheduler is a library — the interface risk is contained
+to rendering and keybindings, not logic.
 
-**Dispatch** is the bridge to agents: given a task and a resolved agent, spawn a headless session in the task's resolved repo (§3) with the task body as the prompt, record the session, and observe its lifecycle. A thin verb surface lets the running agent write back to the store — most importantly, to raise a needs-input question.
+**Dispatch** is the bridge to agents: given a task and a resolved agent, spawn a
+headless session in the task's resolved repo (§3) with the task body as the
+prompt, record the session, and observe its lifecycle. A thin verb surface lets
+the running agent write back to the store — most importantly, to raise a
+needs-input question.
 
 ## 5. The store
 
-A single owned SQLite database, not a wrapper over a per-project tool: the ready-work detection Voro needs is one SQL query (below), without the git-native sync and multi-agent locking a per-repo tool would bring for contention problems a single-operator tool does not have. The dependency taxonomy and the discovered-from convention below are lifted directly from beads' design.
+A single owned SQLite database, not a wrapper over a per-project tool: the
+ready-work detection Voro needs is one SQL query (below), without the git-native
+sync and multi-agent locking a per-repo tool would bring for contention problems
+a single-operator tool does not have. The dependency taxonomy and the
+discovered-from convention below are lifted directly from beads' design.
 
-**Which database a build opens.** A build running out of a Cargo `target/` directory opens `dev.db` beside the operator's store rather than `voro.db` itself, seeded on first use with the fixture in `voro-core`'s `seed` module. `VORO_DB` is declined by such a build for the same reason: dispatch exports it so a session's return path finds the store its dispatcher was on (§8), which makes it a value a process *inherits* rather than one it asks for, and every agent working in a worktree therefore has the operator's database named in its environment. Naming a store with `--db` is deliberate and is honoured; inheriting one is not, and the rule is about that distinction rather than about which path the variable holds. Whichever of these a run lands on, the TUI names it in the footer unless it is the operator's own store (§9), keyed on that store's path rather than on the default this paragraph describes.
+**Which database a build opens.** A build running out of a Cargo `target/`
+directory opens `dev.db` beside the operator's store rather than `voro.db`
+itself, seeded on first use with the fixture in `voro-core`'s `seed` module.
+`VORO_DB` is declined by such a build for the same reason: dispatch exports it
+so a session's return path finds the store its dispatcher was on (§8), which
+makes it a value a process *inherits* rather than one it asks for, and every
+agent working in a worktree therefore has the operator's database named in its
+environment. Naming a store with `--db` is deliberate and is honoured;
+inheriting one is not. Whichever of these a run lands on, the TUI names it in
+the footer unless it is the operator's own store (§9), keyed on that store's
+path rather than on the default this paragraph describes.
 
-This is ergonomics, not protection, and the difference matters. The check is on where the running executable lives, and `cargo install --path` builds a working checkout — unreleased migrations and all — into an ordinary install location, where it reads as installed. So the default-chooser has a blind spot on precisely the route that is easiest to take, which is survivable only because nothing depends on it: what protects the schema is the journal, the counter, and the consent gate below, which reason about what a database actually contains rather than where a binary lives. A default-chooser may have blind spots; a guard may not.
+This is ergonomics, not protection, and the difference matters. The check is on
+where the running executable lives, and `cargo install --path` builds a working
+checkout — unreleased migrations and all — into an ordinary install
+location, where it reads as installed. So the default-chooser has a blind spot
+on precisely the route that is easiest to take, which is survivable only
+because nothing depends on it: what protects the schema is the journal, the
+counter, and the consent gate below, which reason about what a database
+actually contains rather than where a binary lives. A default-chooser may have
+blind spots; a guard may not.
 
-The dev store is deliberately one file shared by every worktree rather than one per worktree, which means a branch carrying a new migration does bump the shared dev store and every other dev build then finds it ahead of itself. That is a survivable trade — the dev store is disposable and rebuilt with `voro seed --force` — and it is why the guards below have to name their remedy rather than merely refuse. The fixture is generated through the ordinary store and transition APIs, never shipped as a `.db` file: a checked-in fixture freezes at the schema of the day it was made, and drifts from both the migrations and the state machine, which is exactly what the stale hand-copied demo database it replaces had done.
+The dev store is deliberately one file shared by every worktree rather than one
+per worktree, which means a branch carrying a new migration does bump the shared
+dev store and every other dev build then finds it ahead of itself. That is a
+survivable trade — the dev store is disposable and rebuilt with `voro seed
+--force` — and it is why the guards below have to name their remedy rather
+than merely refuse. The fixture is generated through the ordinary store and
+transition APIs, never shipped as a `.db` file: a checked-in fixture freezes at
+the schema of the day it was made, and drifts from both the migrations and the
+state machine.
 
-**What the schema is made of, not merely how much of it there is.** `user_version` is a counter, and counters collide: two branches that each author a migration 17 produce databases a counter cannot tell apart and a binary cannot read interchangeably. The binary carrying the other 17 sees `version == MIGRATIONS.len()`, applies nothing, refuses nothing, and fails at the first query naming a column its schema has and the database does not — the same missing-column error as an unmigrated store, arrived at by a route no version check can see. So the store keeps a `schema_migrations` journal recording each migration's SQL verbatim alongside the build that applied it, and every open verifies the recorded text against the migrations this binary carries. Text rather than a hash, and the reason is recovery rather than economy: a hash can say that migration 17 differs but never how, and the code that would answer that is exactly what tends to be unavailable — a worktree is disposable, a branch is deleted once merged. Journalling the statements makes a stranded database carry its own incident report, readable with `sqlite3` and sufficient to write the inverse without the build that applied it. The whole corpus is some twenty kilobytes against a store measured in megabytes, which is what makes that affordable; were it ever to stop being so, a hash with text kept only for recent migrations is the shape to fall back to. Rows predating the journal carry a NULL `sql` and are skipped as unverifiable, which is the honest treatment of history that was never recorded. The corollary is that **an applied migration is immutable** — editing one, comments included, is a divergence and is reported as one.
+**What the schema is made of, not merely how much of it there is.**
+`user_version` is a counter, and counters collide: two branches that each author
+a migration 17 produce databases a counter cannot tell apart and a binary cannot
+read interchangeably — the binary carrying the other 17 applies nothing,
+refuses nothing, and fails at the first query naming a column the database does
+not have. So the store keeps a `schema_migrations` journal recording each
+migration's SQL verbatim alongside the build that applied it, and every open
+verifies the recorded text against the migrations this binary carries. Text
+rather than a hash, for recovery rather than economy: a hash can say that
+migration 17 differs but never how, and the code that would answer that is
+exactly what tends to be unavailable — a worktree is disposable, a branch is
+deleted once merged. Journalling the statements makes a stranded database carry
+its own incident report, readable with `sqlite3` and sufficient to write the
+inverse without the build that applied it. Rows predating the journal carry a
+NULL `sql` and are skipped as unverifiable. The corollary is that **an applied
+migration is immutable** — editing one, comments included, is a divergence and
+is reported as one.
 
-**Two further guards on opening.** A store whose `user_version` exceeds the migration count this binary carries is *refused*, with an error naming the way out — reseed for the dev store, restore a snapshot for the operator's. Without it the extra version is silently skipped and the mismatch surfaces later as a missing column, an error that says nothing about what is actually wrong. And any open that is about to migrate copies the file to `backups/` beside it first, since a rename or a drop cannot be undone from the migrated file alone; that copy is what makes "restore a snapshot" advice the operator can act on rather than a suggestion. Both remedies lead with restoring rather than with running the build that migrated it, because for an unreleased migration that advice entrenches a schema no other build can open. A failure to write the snapshot is reported but not fatal — refusing to open over a full disk would be the worse outcome.
+**Two further guards on opening.** A store whose `user_version` exceeds the
+migration count this binary carries is *refused*, with an error naming the way
+out — reseed for the dev store, restore a snapshot for the operator's. Without
+it the extra version is silently skipped and the mismatch surfaces later as a
+missing column, an error that says nothing about what is actually wrong. And any
+open that is about to migrate copies the file to `backups/` beside it first,
+since a rename or a drop cannot be undone from the migrated file alone; that
+copy is what makes "restore a snapshot" advice the operator can act on rather
+than a suggestion. Both remedies lead with restoring rather than with running
+the build that migrated it, because for an unreleased migration that advice
+entrenches a schema no other build can open. A failure to write the snapshot is
+reported but not fatal — refusing to open over a full disk would be the worse
+outcome.
 
-**The mutation itself is gated on consent.** The journal and the counter detect damage and keep recovery cheap; what prevents it is that the operator's store never migrates as a side effect of being opened. The store is **protected**: a `protected` marker in a `store_meta` table, written on any open at the production path, so the property lives in the file and travels with it through a symlink, a moved data directory, or a restored copy rather than being re-inferred from where the file happens to sit. When a binary carrying more migrations than a protected store has opens it, who is asking decides what happens — and the two surfaces answer that without a heuristic, because the TUI is the human surface by construction. A bare `voro` puts the pending count and the schema range on plain stdout, before the terminal is taken, and asks; reading the `y` back is itself the proof a human is present, so a launch with no terminal to answer from — the incident's own shape was a `cargo run` inheriting `VORO_DB` in an agent's worktree, which would have reached this exact prompt — cannot consent and is refused. Every CLI verb refuses too, naming the explicit spelling: `voro migrate` asks the same question at a terminal, and `voro migrate --yes` consents from a script — on the operator's behalf, not an agent's, which the refusal says in as many words — with the consent recorded in the journal's `applied_by` either way, so even the override leaves a trace. Two openings stay silent because ceremony there would be noise: a store with no schema at all, since a fresh install creates its database on first run and there is nothing yet to protect, and every unprotected store — `dev.db`, a scratch `--db`, the in-memory stores tests use — which migrates on open exactly as before.
+**The mutation itself is gated on consent.** The journal and the counter detect
+damage and keep recovery cheap; what prevents it is that the operator's store
+never migrates as a side effect of being opened. The store is **protected**: a
+`protected` marker in a `store_meta` table, written on any open at the
+production path, so the property lives in the file and travels with it through a
+symlink, a moved data directory, or a restored copy rather than being
+re-inferred from where the file happens to sit. When a binary carrying more
+migrations than a protected store has opens it, who is asking decides what
+happens — and the two surfaces answer that without a heuristic, because the
+TUI is the human surface by construction. A bare `voro` puts the pending count
+and the schema range on plain stdout, before the terminal is taken, and asks;
+reading the `y` back is itself the proof a human is present, so a launch with no
+terminal to answer from — the incident's own shape was a `cargo run`
+inheriting `VORO_DB` in an agent's worktree, which would have reached this exact
+prompt — cannot consent and is refused. Every CLI verb refuses too, naming the
+explicit spelling: `voro migrate` asks the same question at a terminal, and
+`voro migrate --yes` consents from a script — on the operator's behalf, not an
+agent's, which the refusal says in as many words — with the consent recorded
+in the journal's `applied_by` either way, so even the override leaves a trace.
+Two openings stay silent because ceremony there would be noise: a store with no
+schema at all, since a fresh install creates its database on first run and there
+is nothing yet to protect, and every unprotected store — `dev.db`, a scratch
+`--db`, the in-memory stores tests use — which migrates on open exactly as
+before.
 
-An earlier shape of this gate routed by provenance instead of surface: a release artifact would keep migrating silently, so a crates.io upgrade stayed invisible, and the ceremony fell only on from-source builds. It was dropped for what it cost against what it bought. Telling a release build from a checkout reliably means stamping the binary in CI — an environment variable in a workflow cargo-dist regenerates, which the next `dist init` would silently drop, after which a release reads as from-source and puts prompts in front of exactly the users the machinery existed to spare. What the stamp bought was one keypress per release, at a frequency bounded by migrations landing rather than installs — a handful of times a year, at a moment worth pausing at anyway. The questions that design dragged in — whether a build installed from `main` counts as released, how to keep core free of the build-time plumbing — dissolve with it, and the dev-store default above keeps its job unchanged: it was always ergonomics about which data a build sees, and the consent gate is now the guard.
+An earlier shape of this gate routed by provenance instead of surface: a release
+artifact would keep migrating silently, so a crates.io upgrade stayed invisible,
+and the ceremony fell only on from-source builds. It was dropped for what it
+cost against what it bought. Telling a release build from a checkout reliably
+means stamping the binary in CI — an environment variable in a workflow
+cargo-dist regenerates, which the next `dist init` would silently drop, after
+which a release reads as from-source and puts prompts in front of exactly the
+users the machinery existed to spare. What the stamp bought was one keypress per
+release, at a frequency bounded by migrations landing rather than installs — a
+handful of times a year, at a moment worth pausing at anyway. The questions that
+design dragged in — whether a build installed from `main` counts as released,
+how to keep core free of the build-time plumbing — dissolve with it, and the
+dev-store default above keeps its job unchanged: it was always ergonomics about
+which data a build sees, and the consent gate is now the guard.
 
 ```sql
 CREATE TABLE projects (
@@ -169,21 +395,194 @@ CREATE TABLE events (            -- append-only audit: transitions, answers, rep
 );
 ```
 
-Ready-work detection — the thing beads would have provided — is one query: a task is *unblocked* when no `blocks` dependency points at a task not in `done`/`rejected`. Only `blocks` gates readiness; `discovered-from`, `parent`, and `related` are navigational metadata. When a task's last blocker closes, the store promotes it `parked → ready` and stamps `state_since`, which is what makes the prepared-prompt pattern work: tomorrow's task, written today and chained behind its blocker, surfaces fully loaded the moment it becomes actionable. Auto-promotion applies only to parked tasks that *have* blockers — a parked task with none is deliberately deferred and moves only by manual unpark. The reverse holds too: adding an open blocker to a `ready` or `stalled` task demotes it back to `parked` in the same write (a demoted stall re-promotes to `ready`, not `stalled` — the stall context is stale by the time the blocker closes), and any state transition that would land a task in `ready` or `stalled` while a blocker is still open — triage, abort, manual unpark, a reconciled stall — is reconciled the same way. The invariant is therefore total: `ready` always means genuinely actionable, so the scheduler can hide blocked work by hiding `parked` alone.
+Ready-work detection — the thing beads would have provided — is one query: a
+task is *unblocked* when no `blocks` dependency points at a task not in
+`done`/`rejected`. Only `blocks` gates readiness; `discovered-from`, `parent`,
+and `related` are navigational metadata. When a task's last blocker closes, the
+store promotes it `parked → ready` and stamps `state_since`, which is what
+makes the prepared-prompt pattern work: tomorrow's task, written today and
+chained behind its blocker, surfaces fully loaded the moment it becomes
+actionable. Auto-promotion applies only to parked tasks that *have* blockers —
+a parked task with none is deliberately deferred and moves only by manual
+unpark. The reverse holds too: adding an open blocker to a `ready` or `stalled`
+task demotes it back to `parked` in the same write (a demoted stall re-promotes
+to `ready`, not `stalled` — the stall context is stale by the time the blocker
+closes), and any state transition that would land a task in `ready` or `stalled`
+while a blocker is still open — triage, abort, manual unpark, a reconciled
+stall — is reconciled the same way. The invariant is therefore total: `ready`
+always means genuinely actionable, so the scheduler can hide blocked work by
+hiding `parked` alone.
 
-The edge's kind is part of its identity, which is why it sits inside the primary key rather than beside it. A pair of tasks routinely carries two edges at once — the commonest shape in this repository is a follow-up filed mid-session with `propose --from`, which is `discovered-from` its parent and, once someone notices the ordering, gated on it as well — and a key of the pair alone could hold only the first of them. Every write to `deps` is therefore keyed on all three columns and none of them silently discards a row: `add_dep` refuses an edge that already exists rather than reporting a success it did not perform, `set_blocks_deps` deduplicates the id list it is handed and then inserts plainly, and `block_tasks` alone stays idempotent, its conflict clause scoped to the identical edge so that re-blocking a task it already blocks is a no-op while an edge of another kind between the same pair is untouched. Removal is kind-aware for the same reason — dropping a blocker leaves the `discovered-from` edge beside it standing — and removing an edge that is not there is an error, not a quiet success. The operator reaches that removal as `voro set <id> --unlink <kind>:<other-id>`, naming the edge in the direction `show` prints it, since the alternative for every kind but `blocks` — whose whole set `--blocked-by` can replace — was raw SQL against the database.
+The edge's kind is part of its identity, which is why it sits inside the primary
+key rather than beside it. A pair of tasks routinely carries two edges at once
+— a follow-up filed mid-session with `propose --from` is `discovered-from` its
+parent and often gated on it as well — and a key of the pair alone could hold
+only the first of them. Every write to `deps` is keyed on all three columns and
+none of them silently discards a row: `add_dep` refuses an edge that already
+exists, `set_blocks_deps` deduplicates the id list it is handed and then inserts
+plainly, and `block_tasks` alone stays idempotent, its conflict clause scoped to
+the identical edge so that re-blocking is a no-op while an edge of another kind
+between the same pair is untouched. Removal is kind-aware for the same reason
+— dropping a blocker leaves the `discovered-from` edge beside it standing —
+and removing an edge that is not there is an error. The operator reaches that
+removal as `voro set <id> --unlink <kind>:<other-id>`, naming the edge in the
+direction `show` prints it.
 
-The **repos** table (§3) is where the checkout moved to, and splitting it out of `projects` was deliberately *not* additive — the one place this document's "additive where possible" rule yields. `projects.path` is dropped rather than left in place: the migration inserts one default repo per project (named after the project, path = the old `projects.path`) and then removes the column, so there is never a moment with two sources of truth for the same checkout. Leaving the column as a shadow copy would have been the additive move and the worse one, since every consumer would then have had to be trusted to prefer the repo, with no compiler to enforce it; dropping it turns the migration into a compile error at every call site instead. A single-operator local database with a numbered-migration runner makes that affordable — there are no other installs to coordinate with, and the conversion is verified in place by a test that opens a pre-0012 database and checks every project's old path reappears as its default repo.
+The **repos** table (§3) holds the checkouts; there is deliberately no
+`projects.path` column beside it — the migration that split repos out dropped
+the column rather than leaving a shadow copy, the one place this document's
+"additive where possible" rule yields, so there is never a second source of
+truth for a checkout.
 
-Only one of the repo invariants is schema-enforced — at most one default per project, via the partial unique index above. The rest live in the store API, the same place the state machine's invariants live, and for the same reason: they are conditional on other rows and each needs to explain itself. Creating a project inserts the project and its default repo in one transaction, so a repo-less project is never observable; deleting a project's *last* repo is refused (a project always has a checkout); deleting the *default* while others remain is refused, pointing at `repo default` (otherwise every task that names no repo would resolve to nothing); and deleting a repo any task still names is refused, pointing at `set --repo` (otherwise a task would resolve to a checkout that no longer exists). A task's `repo_id` must belong to the task's own project, checked on both create and re-point. One helper — `Store::repo_for_task` — resolves a task's checkout, its own repo when set and the project's default otherwise, and every consumer that wants a working directory goes through it rather than reading `repo_id` itself.
+Only one of the repo invariants is schema-enforced — at most one default per
+project, via the partial unique index above. The rest live in the store API, the
+same place the state machine's invariants live, and for the same reason: they
+are conditional on other rows and each needs to explain itself. Creating a
+project inserts the project and its default repo in one transaction, so a
+repo-less project is never observable; deleting a project's *last* repo is
+refused (a project always has a checkout); deleting the *default* while others
+remain is refused, pointing at `repo default` (otherwise every task that names
+no repo would resolve to nothing); and deleting a repo any task still names is
+refused, pointing at `set --repo` (otherwise a task would resolve to a checkout
+that no longer exists). A task's `repo_id` must belong to the task's own
+project, checked on both create and re-point. One helper —
+`Store::repo_for_task` — resolves a task's checkout, its own repo when set and
+the project's default otherwise, and every consumer that wants a working
+directory goes through it rather than reading `repo_id` itself.
 
-The **docs** tables (§3) are purely additive — no existing row changes shape — and the invariants that matter live in the store API beside the repo ones, for the same reason. Registration normalises the location before storing it: a URL goes in verbatim and refuses a `--repo`, since it resolves unaided; an absolute path inside one of the project's checkouts is stored relative to it, the longest containing checkout winning so a repo nested inside another is not swallowed by its parent; an absolute path outside every checkout stays whole; and an absolute path outside a checkout the operator *explicitly named* is refused rather than quietly stored whole, since naming the repo asserted where the file lives. One helper — `Store::resolve_doc` — turns a stored location back into where the document actually is, and every consumer that wants to open or name one goes through it rather than joining paths itself. Removing a document unlinks its tasks rather than being refused, which is where it parts company with a repo: a repo deletion is refused because a task would then resolve to no checkout at all, whereas a document is navigational and its absence costs a task nothing but the pointer. Both halves are logged on the append-only event log — each link and unlink against the task it changed, each registration and removal with a null `task_id`, the column being nullable for exactly this.
+The **docs** tables (§3) are purely additive — no existing row changes shape
+— and the invariants that matter live in the store API beside the repo ones,
+for the same reason. Registration normalises the location before storing it: a
+URL goes in verbatim and refuses a `--repo`, since it resolves unaided; an
+absolute path inside one of the project's checkouts is stored relative to it,
+the longest containing checkout winning so a repo nested inside another is not
+swallowed by its parent; an absolute path outside every checkout stays whole;
+and an absolute path outside a checkout the operator *explicitly named* is
+refused rather than quietly stored whole, since naming the repo asserted where
+the file lives. One helper — `Store::resolve_doc` — turns a stored location
+back into where the document actually is, and every consumer that wants to open
+or name one goes through it rather than joining paths itself. Removing a
+document unlinks its tasks rather than being refused, which is where it parts
+company with a repo: a repo deletion is refused because a task would then
+resolve to no checkout at all, whereas a document is navigational and its
+absence costs a task nothing but the pointer. Both halves are logged on the
+append-only event log — each link and unlink against the task it changed, each
+registration and removal with a null `task_id`, the column being nullable for
+exactly this.
 
-A project that has stopped mattering is **archived** rather than deleted: `voro project archive` (and the projects screen's `A` key) sets the flag, and every cockpit view — the queue, `voro next`, the state counts and `stats`, the running strip — excludes the project and *all* of its tasks, whatever state each holds. This is retirement, not a transition: no task is moved or closed, the event log is untouched, and unarchiving restores the pre-archive view exactly. It is deliberately distinct from weight 0, which is a snooze — a parked project is expected back and its row sits untagged among the rest — whereas an archived project remains only on the projects screen and `voro project list`, dimmed under an `[archived]` tag, so it can be found and unarchived. The flag also closes the side doors: dispatch and redispatch refuse a task in an archived project, and `add`/`propose`/import refuse to create new work there — the refusals live in `voro-core` beside the human-task guards, so no interface can smuggle work into a retired project. Deleting a project outright stays reserved for one with no tasks at all; removing a project *and* its history is a separate, deliberate purge.
+A project that has stopped mattering is **archived** rather than deleted: `voro
+project archive` (and the projects screen's `A` key) sets the flag, and every
+cockpit view — the queue, `voro next`, the state counts and `stats`, the
+running strip — excludes the project and *all* of its tasks, whatever state
+each holds. This is retirement, not a transition: no task is moved or closed,
+the event log is untouched, and unarchiving restores the pre-archive view
+exactly. It is deliberately distinct from weight 0, which is a snooze — a
+parked project is expected back and its row sits untagged among the rest —
+whereas an archived project remains only on the projects screen and `voro
+project list`, dimmed under an `[archived]` tag, so it can be found and
+unarchived. The flag also closes the side doors: dispatch and redispatch refuse
+a task in an archived project, and `add`/`propose`/import refuse to create new
+work there — the refusals live in `voro-core` beside the human-task guards, so
+no interface can smuggle work into a retired project. Deleting a project
+outright stays reserved for one with no tasks at all; removing a project *and*
+its history is a separate, deliberate purge.
 
-Agent definitions are command templates, not state, so they live outside the database. Voro *owns* the common ones — `claude` and `codex` are compiled into `voro-core`, so they version with the binary and every upgrade carries the current verb set (the session verbs of §8) to every install with no re-init. The user's `~/.config/voro/voro.toml` is then layered on top and is for extensions, overrides, and app options: it may add a new agent, replace a built-in wholesale (a `[agents.claude]` table overrides the built-in claude *entirely*, not per-verb — predictable over a partial merge), and set `default_agent` and the viewers. Viewers are command templates too, and live in the same file for the same reason — and Voro owns the common ones exactly as it owns the common agents: `code`, `cursor` and `zed` are compiled in and probed against PATH in that order, so a fresh install with any editor CLI installed opens a task's checkout with no configuration at all, which is what the review step of a first session needs. A user `[viewers.<name>]` table then layers on top: named for a built-in it replaces that built-in wholesale, named for anything else it adds a viewer. The built-ins take `{path}` alone rather than a diff range, because that is the shape they can honour — an editor cannot open `{base}...{branch}` from its command line — and because a viewer is spawned detached with no terminal (§8), which is also why no built-in is a pager-driven command like `git difftool -d`: it would have nothing to draw on. `default_viewer` names the one used when nothing picks a viewer by name, and the older single anonymous `[viewer]` table stays valid as that default (a sole named viewer also serves as the default without being named). Resolution therefore runs user-first and probe-last: with a name, the user's table for it, else the built-in of that name; without one, `default_viewer`, else the anonymous `[viewer]`, else the sole named table, else the first built-in found on PATH. When even that finds nothing, what the operator is asked for is to *register the viewer they already use* — `voro viewer add <name> '<cmd>'` — not to install one of Voro's; the probed built-ins follow as diagnosis, after the action, so what to do is what reads first (the status line wraps rather than truncating, §9, so the diagnosis is not paid for in lost advice). The failure never reports the config file as invalid, since on a fresh install there is no file to be invalid. In the TUI it is not reported at all but answered: `o` with nothing resolving raises the add-viewer form itself (§5), because the operator is two fields away from the diff they asked for and the Config screen would only ask for the same two. Saving does not then open the task — pressing `o` again does — so the key keeps doing one thing. Which viewer a *project* uses is state, so it lives in the database (`projects.viewer`, §8), naming one of these templates — which, since the review keys split (§8), is all that setting decides, and is why the column holds a viewer name and nothing else. A viewer command carries up to three optional placeholders (§8): `{path}` — the task's worktree, or the project checkout when it has none — plus `{branch}` (the task's branch, empty when it has none) and `{base}` (the checkout's default branch), so `{base}...{branch}` spells the review diff's range rather than opening a bare directory. An agent table may also carry a small **model map** beside its verbs — `model`, `model_deep`, and `model_plan` — whose values fill the `{model}` placeholder in the `dispatch` and `plan` templates (§8). They are plain strings, opaque to Voro, which is why they live in the same file as the templates they are pasted into rather than in the schema: the model is part of how a command is spelled, not state about a task. Two further placeholders in those templates are filled from the launch rather than from this file: `{session_name}`, the name Voro composes for the session a launch opens, and `{task_id}`, the task's numeric id. Like `{model}` they are meaningful only where a command starts work, so both are refused on the session verbs, and `{task_id}` on `plan` as well, whose target may be a project with no task to name (§8). It also carries the queue's two pricing options — `max_running`, the dispatch WIP cap, and a `[costs]` table overriding the per-action attention divisors (§7) — for the same reason the viewers live here: they are operator preference about how the tool behaves, not state about a task, and a divisor is meaningless to anything but the rendering of the queue. Both are optional and both are validated at load, since a non-positive divisor or a negative cap would produce a nonsense order rather than an obvious error. Because it carries app options like the viewers and not just agents, the file is named `voro.toml`. A missing file is not an error; the built-ins alone are a working config, so a fresh install with `claude` and an editor on PATH both dispatches and reviews without any TOML. `voro agent list` shows the effective set with each agent's provenance — built-in, user, or user-override — names the optional verbs each agent defines, and warns when a user override of a built-in drops verbs the built-in defined, the one staleness case layering cannot fix. The listing and that warning read one roster of the optional verbs, so no agent can be listed as lacking a verb the line below it says was dropped — the failure the two had while the listing named a hand-written subset of them. Where the row says more than presence it is because the verb's *spelling* changes what Voro can do with it: a `message` carrying `{new_session}` reads `message(fork)`, since forking is the difference between an agent Voro can steer while a supervisor holds the session and one it cannot, and it is what moves the session reference the row afterwards addresses (below). `voro viewer list` does the same for viewers, flagging the default.
+Agent definitions are command templates, not state, so they live outside the
+database. Voro *owns* the common ones — `claude` and `codex` are compiled into
+`voro-core`, so they version with the binary and every upgrade carries the
+current verb set (§8) to every install with no re-init. The user's
+`~/.config/voro/voro.toml` is layered on top and is for extensions, overrides,
+and app options: it may add a new agent, replace a built-in wholesale (a
+`[agents.claude]` table overrides the built-in claude *entirely*, not per-verb
+— predictable over a partial merge), and set `default_agent` and the viewers.
 
-The file is no longer read-only to Voro. The TUI's Config screen (§9) and the `voro viewer add`/`viewer remove` verbs *edit* it in place — adding, changing, and deleting `[viewers.<name>]` tables and setting `default_viewer`/`default_agent` — through a single write helper (`voro-core::config_edit`) built on `toml_edit`, so a machine write preserves the file's existing content, formatting, and comments and touches only the key it changes. A missing file is created on first edit. What a viewer *is* asks one thing of the operator that a first-time one cannot answer — the command line, `zed {path}` or `code -n {path}`, where the name of the editor is the easy half and the placeholder is not — so the command is optional at both surfaces and defaults to `<name> {path}`, which is what nearly every editor CLI wants. Naming a *built-in* defaults to that built-in's own command instead, so overriding one starts from what it replaces rather than from a worse guess at the same thing, which is what makes `a` the answer to `e` being refused on a built-in row. In the form the command does not merely default but *follows*: it is rewritten from the name on every keystroke, so the operator watches the line they are about to save assemble itself instead of reading a hint about it. Writing in the command field takes it over — the first character replaces the suggestion whole rather than landing on the end of a line nobody typed, and backspace leaves a suggestion alone, since there is nothing there the operator put — and deleting what they wrote back to empty hands it to the name again, which is the undo. The two states are told apart on sight rather than in words: a following command is dim, focused or not. An edit never follows; that command exists and is theirs. The user-owned surface is all that is writable this way: agents stay read-only in the TUI (editing a built-in means writing a wholesale override table, a sharper knife deferred here), and deleting a viewer that a project's `viewer` still names is refused with the projects named, while deleting the default viewer clears `default_viewer`. A built-in viewer is read-only for the same reason an agent is — it lives in the binary, not the file — so the Config screen lists the built-ins beside the user's tables with their provenance but refuses to edit or delete one, and `voro viewer remove code` says the same, naming the *add* of that name that overrides it. Choosing one is not writing one, so both a `default_viewer` and a project's own viewer may name a built-in with no table defining it.
+Viewers are command templates too, and live in the same file for the same
+reason. Voro owns the common ones exactly as it owns the common agents: `code`,
+`cursor` and `zed` are compiled in and probed against PATH in that order, so a
+fresh install with any editor CLI installed opens a task's checkout with no
+configuration at all. A user `[viewers.<name>]` table layers on top: named for
+a built-in it replaces that built-in wholesale, named for anything else it adds
+a viewer. The built-ins take `{path}` alone rather than a diff range, because
+that is the shape they can honour — an editor cannot open `{base}...{branch}`
+from its command line — and because a viewer is spawned detached with no
+terminal (§8), no built-in is a pager-driven command like `git difftool -d`. A
+viewer command carries up to three optional placeholders (§8): `{path}` — the
+task's worktree, or the project checkout when it has none — plus `{branch}`
+(the task's branch, empty when it has none) and `{base}` (the checkout's
+default branch), so `{base}...{branch}` spells the review diff's range rather
+than opening a bare directory.
+
+`default_viewer` names the viewer used when nothing picks one by name, and the
+older single anonymous `[viewer]` table stays valid as that default (a sole
+named viewer also serves as the default without being named). Resolution runs
+user-first and probe-last: with a name, the user's table for it, else the
+built-in of that name; without one, `default_viewer`, else the anonymous
+`[viewer]`, else the sole named table, else the first built-in found on PATH.
+When even that finds nothing, the operator is asked to *register the viewer
+they already use* — `voro viewer add <name> '<cmd>'` — with the probed
+built-ins following as diagnosis, after the action. The failure never reports
+the config file as invalid, since on a fresh install there is no file to be
+invalid. In the TUI it is not reported at all but answered: `o` with nothing
+resolving raises the add-viewer form itself, the operator being two fields away
+from the diff they asked for; saving does not then open the task — pressing
+`o` again does — so the key keeps doing one thing. Which viewer a *project*
+uses is state, so it lives in the database (`projects.viewer`, §8), naming one
+of these templates.
+
+An agent table may also carry a small **model map** beside its verbs —
+`model`, `model_deep`, and `model_plan` — whose values fill the `{model}`
+placeholder in the `dispatch` and `plan` templates (§8). They are plain
+strings, opaque to Voro: the model is part of how a command is spelled, not
+state about a task. Two further placeholders in those templates are filled from
+the launch rather than from this file: `{session_name}`, the name Voro composes
+for the session a launch opens, and `{task_id}`, the task's numeric id. Like
+`{model}` they are meaningful only where a command starts work, so both are
+refused on the session verbs, and `{task_id}` on `plan` as well, whose target
+may be a project with no task to name (§8).
+
+The file also carries the queue's two pricing options — `max_running`, the
+dispatch WIP cap, and a `[costs]` table overriding the per-action attention
+divisors (§7) — operator preference about how the tool behaves, not state
+about a task. Both are optional and both are validated at load, since a
+non-positive divisor or a negative cap would produce a nonsense order rather
+than an obvious error. Because it carries app options and not just agents, the
+file is named `voro.toml`. A missing file is not an error; the built-ins alone
+are a working config, so a fresh install with `claude` and an editor on PATH
+both dispatches and reviews without any TOML.
+
+`voro agent list` shows the effective set with each agent's provenance —
+built-in, user, or user-override — names the optional verbs each agent
+defines, and warns when a user override of a built-in drops verbs the built-in
+defined, the one staleness case layering cannot fix. Where a row says more than
+presence it is because the verb's *spelling* changes what Voro can do with it:
+a `message` carrying `{new_session}` reads `message(fork)`, forking being the
+difference between an agent Voro can steer while a supervisor holds the session
+and one it cannot (§8). `voro viewer list` does the same for viewers, flagging
+the default.
+
+The file is writable by Voro as well as read. The TUI's Config screen (§9) and
+the `voro viewer add`/`viewer remove` verbs edit it in place — adding,
+changing, and deleting `[viewers.<name>]` tables and setting
+`default_viewer`/`default_agent` — through a single write helper
+(`voro-core::config_edit`) built on `toml_edit`, so a machine write preserves
+the file's existing content, formatting, and comments and touches only the key
+it changes. A missing file is created on first edit. The command is optional at
+both surfaces and defaults to `<name> {path}`, which is what nearly every
+editor CLI wants; naming a *built-in* defaults to that built-in's own command
+instead, so overriding one starts from what it replaces. In the form the
+command does not merely default but *follows* the name field, rewritten on
+every keystroke and rendered dim until the operator types in it, at which point
+it is theirs; deleting it back to empty hands it to the name again. The
+user-owned surface is all that is writable this way: agents stay read-only in
+the TUI (editing a built-in means writing a wholesale override table, a sharper
+knife deferred here), and deleting a viewer that a project's `viewer` still
+names is refused with the projects named, while deleting the default viewer
+clears `default_viewer`. A built-in viewer is read-only for the same reason an
+agent is — it lives in the binary, not the file — so the Config screen lists
+the built-ins with their provenance but refuses to edit or delete one, and
+`voro viewer remove code` says the same, naming the *add* of that name that
+overrides it. Choosing one is not writing one, so both a `default_viewer` and a
+project's own viewer may name a built-in with no table defining it.
 
 ```toml
 # ~/.config/voro/voro.toml — all optional; extends/overrides the built-in claude
@@ -222,31 +621,218 @@ review = 1.4
 | `stalled` | In-flight work whose dispatch died (`failed`/`capped`) — the third attention state. In the queue for redispatch; never handed out by `voro next`. | reconcile on a dead session (§8) | redispatch or manual start → `running`; completion reported on the dead session's behalf → `review` (the misfire case, §8); park → `parked`; abandon → `rejected`. An open blocker demotes it to `parked`, from which it re-promotes to `ready`, not `stalled` — the stall context is stale by then. |
 | `done` / `rejected` | Closed. `done` prompts triage of any `discovered-from` proposals. | acceptance / triage | — |
 
-Three deliberate choices. Any triaged, non-terminal state can be *abandoned* straight to `rejected` — obsolete work must not need walking through the rest of the machine to close, and parking (`ready` → `parked`) has a manual inverse for the same reason. Second, `needs-input`, `review`, and `stalled` are all human-attention states but are kept distinct because they sort differently: at equal score an unanswered question outranks a completed diff, which outranks a dead dispatch, which outranks startable work, which outranks an untriaged proposal — a question stalls in-flight work; a proposal's priority is agent-asserted and untrusted until triage, so it wins nothing but ties it deserves. Third, `proposed` exists precisely so agent-generated tasks can be captured freely without granting them anything: each proposed task competes in the queue on the same score as everything else and cannot be dispatched until a human triages it. Surfacing proposals in the queue rather than behind an approval step keeps the generation pipeline honest without automating it — triage is one keypress away. Under the queue's uniform cap (§7) a low-scoring proposal can fall past the visible rows into the browser, so an always-visible untriaged count is what keeps the pipeline felt when the individual rows drop off.
+Three deliberate choices. Any triaged, non-terminal state can be *abandoned*
+straight to `rejected` — obsolete work must not need walking through the rest
+of the machine to close, and parking (`ready` → `parked`) has a manual inverse
+for the same reason. Second, `needs-input`, `review`, and `stalled` are all
+human-attention states but are kept distinct because they sort differently: at
+equal score an unanswered question outranks a completed diff, which outranks a
+dead dispatch, which outranks startable work, which outranks an untriaged
+proposal. Third, `proposed` exists precisely so agent-generated tasks can be
+captured freely without granting them anything: each proposed task competes in
+the queue on the same score as everything else and cannot be dispatched until a
+human triages it. Surfacing proposals in the queue rather than behind an
+approval step keeps the generation pipeline honest without automating it —
+triage is one keypress away, and the always-visible untriaged count keeps the
+pipeline felt when individual rows fall below the cap (§7).
 
-Triage has a fourth outcome that is deliberately *not* a verdict. A proposal whose body is sub-standard leaves the operator three bad options — accept it as it stands, reject it and lose the work, or pay the manual edit cost — and accepting wins by default, which exports the quality problem downstream to dispatch and review. **Refine** is the fourth: `voro triage <id> refine --note "..."` hands the body, the operator's one-line note, the task's linked documents (§3), and the body and completion summary of the task it was `discovered-from` to a headless agent, whose whole job is to rewrite the body as a dispatchable prompt honouring the note and apply it with `voro set <id> --body-file` — the CLI as the agent's interface, exactly as in dispatch and planning. A retitle rides that same command as an optional `--title`, for the round whose note asks for one or whose rewrite leaves the old title describing something the body no longer says; a title-only `set` is deliberately not offered, because it replaces no body and so concludes no round (below), and an agent stopping there would leave the task `refining` with nothing coming. That seed context is pulled in rather than left to the agent to hunt because it is usually precisely what a sloppy proposal is missing: the plan it was meant to implement, and the work it fell out of. A refine in flight is a **state**, `refining`, and not merely an event on a `proposed` one. The distinction is the difference between a rewrite the store knows about and one only the launching window does: while the agent works, the proposal sits in the triage queue advertising a body that is about to be replaced, and any window — the operator routinely keeps a second instance open on the same database — can hand down a verdict racing the agent's own `voro set --body-file`. Putting the fact in `tasks.state` closes that by construction rather than by a guard: the task leaves the queue in every window at once (the scheduler's next-action query simply does not list `refining`), and a triage verdict from there is an illegal transition the store refuses, with no guard code anywhere above it. The operator's note rides the transition into `refining` as a `refined` event, exactly as a completion summary rides `done` (§8). Nothing about the score changes — `refining` is unscored because it is not in the queue at all — and the improved version comes back round for a real verdict on the next pass.
+Triage has a fourth outcome that is deliberately *not* a verdict. A proposal
+whose body is sub-standard leaves the operator three bad options — accept it
+as it stands, reject it and lose the work, or pay the manual edit cost — and
+accepting wins by default, which exports the quality problem downstream.
+**Refine** is the fourth: `voro triage <id> refine --note "..."` hands the
+body, the operator's one-line note, the task's linked documents (§3), and the
+body and completion summary of the task it was `discovered-from` to a headless
+agent, whose whole job is to rewrite the body as a dispatchable prompt
+honouring the note and apply it with `voro set <id> --body-file` — the CLI as
+the agent's interface, exactly as in dispatch and planning. A retitle rides
+that same command as an optional `--title`; a title-only `set` is deliberately
+not offered, because it replaces no body and so concludes no round (below). The
+seed context is pulled in rather than left to the agent to hunt because it is
+usually precisely what a sloppy proposal is missing: the plan it was meant to
+implement, and the work it fell out of. A refine in flight is a **state**,
+`refining`, and not merely an event on a `proposed` one, because any window —
+the operator routinely keeps a second instance open on the same database —
+could otherwise hand down a verdict racing the agent's own `voro set
+--body-file`. Putting the fact in `tasks.state` closes that by construction:
+the task leaves the queue in every window at once (the scheduler's next-action
+query does not list `refining`), and a triage verdict from there is an illegal
+transition the store refuses, with no guard code anywhere above it. The
+operator's note rides the transition into `refining` as a `refined` event,
+exactly as a completion summary rides `done` (§8). `refining` is unscored
+because it is not in the queue at all, and the improved version comes back
+round for a real verdict on the next pass.
 
-A round starts from `ready` as readily as from `proposed`, because a thin body is as often noticed *after* triage as before it: the operator waves a proposal through on its title, dispatches nothing, and reads the brief properly a week later. Without this the only recourse is the manual `set --body-file` that refine exists to spare them. The state earns its keep here exactly as it does before triage, one race along: a `ready` task under refinement leaves the scheduler's input entirely, so neither `voro next` nor a second window's dispatch can hand an agent the body that is being replaced. Where the two origins might have parted company is the landing, and deliberately they do not — a round concludes to `proposed` however it began, and remembers nothing of where it started. The `ready` verdict was passed on a body that no longer exists, so it is not a verdict on what the task now says; returning the rewrite through triage costs one keypress and re-asks the question the rewrite has just reopened. `parked` stays out of this, not because refining a deferred brief is incoherent but because nothing has yet wanted it.
+A round starts from `ready` as readily as from `proposed`, because a thin body
+is as often noticed *after* triage as before it: the operator waves a proposal
+through on its title and reads the brief properly a week later. The state earns
+its keep here exactly as it does before triage: a `ready` task under refinement
+leaves the scheduler's input entirely, so neither `voro next` nor a second
+window's dispatch can hand an agent the body that is being replaced. A round
+concludes to `proposed` however it began: the `ready` verdict was passed on a
+body that no longer exists, and returning the rewrite through triage costs one
+keypress and re-asks the question the rewrite has just reopened. `parked` stays
+out of this, not because refining a deferred brief is incoherent but because
+nothing has yet wanted it.
 
-A round ends by returning to `proposed`, and *how* it ended is what the returned row says. Four triggers, all landing on the one transition. The rewritten body arriving is the first: a `voro set` carrying `--body`/`--body-file` on a `refining` task concludes the round, which needs no new agent obligation because the refine prompts already end in exactly that verb. A dead agent is the second, caught by the same reconcile-on-read that catches a dead dispatch (§8). The third is quitting an interactive session without concluding anything, which is a no-op rather than a failure. The fourth is the operator cancelling from the running strip, the escape hatch for an agent that is *hung* — still alive, so reconcile will never catch it — which kills the process as well as moving the state. The first marks the returned proposal `↻ refined` in the queue, task browser, `list`, and `show` until triage takes it out of `proposed`, so the operator can see which rows have moved since they last read them; the second marks it `⚠ refine failed`, and it must be a marker of its own rather than the absence of the first, since the operator would otherwise have to notice that a rewrite they asked for silently never happened. The third and fourth leave no marker, having changed nothing. In the queue, where proposals collapse into a per-project digest (§7), the constituent rows carry their markers once the digest is folded open and the digest itself carries the counts — `↻ 2 refined` — since a collapsed digest would otherwise hide the very fact that its bodies have improved. The markers are derived from the round that just concluded rather than from any `refined` event ever recorded, which is what makes the promise honest: what `↻ refined` says is that this body *is* the rewritten one, not merely that a rewrite was once asked for.
+A round ends by returning to `proposed`, and *how* it ended is what the returned
+row says. Four triggers, all landing on the one transition: the rewritten body
+arriving (a `voro set` carrying `--body`/`--body-file` on a `refining` task —
+the verb the refine prompts already end in); a dead agent, caught by the same
+reconcile-on-read that catches a dead dispatch (§8); quitting an interactive
+session without concluding anything, a no-op rather than a failure; and the
+operator cancelling from the running strip, the escape hatch for an agent that
+is *hung* — still alive, so reconcile will never catch it — which kills the
+process as well as moving the state. The first marks the returned proposal `↻
+refined` in the queue, task browser, `list`, and `show` until triage takes it
+out of `proposed`; the second marks it `⚠ refine failed`, a marker of its own
+rather than the absence of the first, since the operator would otherwise have
+to notice that a rewrite they asked for silently never happened. The third and
+fourth leave no marker, having changed nothing. In the queue, where proposals
+collapse into a per-project digest (§7), the constituent rows carry their
+markers once the digest is folded open and the digest itself carries the counts
+— `↻ 2 refined`. The markers are derived from the round that just concluded
+rather than from any `refined` event ever recorded: what `↻ refined` says is
+that this body *is* the rewritten one, not merely that a rewrite was once asked
+for.
 
-That honesty needs one backstop, because the second trigger can fire on a round that is not actually dead — a liveness probe reading a detached launcher's pid is exactly how (§8) — and the rewrite then arrives at a task already back in `proposed`, where the first trigger can no longer fire: the body lands under a marker saying no rewrite happened, which is the one failure that trains the operator to ignore the marker. So a `voro set` carrying `--body`/`--body-file` on a `proposed` task whose *last* round concluded `failed` corrects that round's recorded outcome to applied, and the row reads `↻ refined`. It is a correction, not a fifth trigger: nothing reopens, the task does not transition, and the round's session keeps the outcome the reconciler observed of its process, since what was observed and what the round achieved are different claims. The TUI's own body editor corrects nothing, because an operator rewriting a body in place is not a round landing late; the correction rides the CLI verb the refine prompts already end in, which is the agent's interface.
+That honesty needs one backstop, because the dead-agent trigger can fire on a
+round that is not actually dead — a liveness probe reading a detached
+launcher's pid is exactly how (§8) — and the rewrite then arrives at a task
+already back in `proposed`, landing under a marker saying no rewrite happened.
+So a `voro set` carrying `--body`/`--body-file` on a `proposed` task whose
+*last* round concluded `failed` corrects that round's recorded outcome to
+applied, and the row reads `↻ refined`. It is a correction, not a fifth
+trigger: nothing reopens, the task does not transition, and the round's session
+keeps the outcome the reconciler observed of its process. The TUI's own body
+editor corrects nothing, because an operator rewriting a body in place is not a
+round landing late; the correction rides the CLI verb, which is the agent's
+interface.
 
-Refine runs on the *default* agent whatever override the task carries, since an agent override picks who executes a task, not who writes its brief. It opens a `sessions` row like a dispatch — recorded with the same liveness source that agent's dispatch would carry, so reconcile probes the round exactly as it probes a dispatch (§8), the log is where the launcher's banner lands, and the strip reads both — which costs nothing against the one-open-session invariant (§8): a proposal has no other open session, and by the time it can be dispatched the refine round has concluded and closed its own. The session is *named* as well — `voro-<id>-refine` (§8) — so the operator can find it in the agent's own fleet listing and attach to it, which matters precisely because the launcher exits at birth and the log holds its banner rather than the rewrite.
+Refine runs on the *default* agent whatever override the task carries, since an
+agent override picks who executes a task, not who writes its brief. It opens a
+`sessions` row like a dispatch — recorded with the same liveness source that
+agent's dispatch would carry, so reconcile probes the round exactly as it probes
+a dispatch (§8), the log is where the launcher's banner lands, and the strip
+reads both — which costs nothing against the one-open-session invariant (§8):
+a proposal has no other open session, and by the time it can be dispatched the
+refine round has concluded and closed its own. The session is *named* as well
+— `voro-<id>-refine` (§8) — so the operator can find it in the agent's own
+fleet listing and attach to it, which matters precisely because the launcher
+exits at birth and the log holds its banner rather than the rewrite.
 
-Refine has a second, interactive intensity for the case where a note is not enough. Given no note it opens the planning session of §8 seeded with the task that already exists — the same `plan` verb and the same foreground round-trip as `N`, ending in `set --body-file` rather than `add`, so it edits in place and creates nothing. It opens a session row like the headless flavour, recorded once the foreground child's pid is known and marked pid-authoritative (§8), since that pid is the round itself rather than a launcher, so a Voro that dies mid-conversation leaves a round another window's reconcile can still finish; on return the round concludes as applied if the agent's own `set --body-file` already ended it, and as cancelled otherwise. Because it is a conversation with an agent it is TUI-only for the same reason planning sessions are: the CLI is how an LLM drives Voro, so a note-less `refine` there errors and points at the TUI. Both intensities answer over a selected row whose body is still a brief, proposal or `ready` alike — `r` collects a note, `R` opens the conversation — and *only* there, not from behind the triage menu, because that menu collects *verdicts* and refine is deliberately not one (above): a refined proposal comes back for a verdict rather than having received one, so putting refine there filed it under a decision it does not make, and hid it one keypress behind the very menu whose three bad options it exists to escape. The operator notices a sub-standard body while reading it in the queue, which is where the key is. The menu does not keep a second copy: one key in one place is the whole point of moving it, and a duplicate would reintroduce the claim that refine is something the verdict menu does. Refresh moves to `ctrl-r` to free the letter, the manual counterpart to the refresh every mutating action already performs. The two intensities share the note-driven path's guards — both are refused on anything but a `proposed` or `ready` task, before a prompt is written or a process spawned.
+Refine has a second, interactive intensity for the case where a note is not
+enough. Given no note it opens the planning session of §8 seeded with the task
+that already exists — the same `plan` verb and the same foreground round-trip
+as `N`, ending in `set --body-file` rather than `add`, so it edits in place and
+creates nothing. It opens a session row like the headless flavour, recorded
+once the foreground child's pid is known and marked pid-authoritative (§8),
+since that pid is the round itself rather than a launcher, so a Voro that dies
+mid-conversation leaves a round another window's reconcile can still finish; on
+return the round concludes as applied if the agent's own `set --body-file`
+already ended it, and as cancelled otherwise. Because it is a conversation with
+an agent it is TUI-only for the same reason planning sessions are: the CLI is
+how an LLM drives Voro, so a note-less `refine` there errors and points at the
+TUI. Both intensities answer over a selected row whose body is still a brief,
+proposal or `ready` alike — `r` collects a note, `R` opens the conversation
+— and *only* there, not from behind the triage menu, because that menu
+collects *verdicts* and refine is deliberately not one (above): a refined
+proposal comes back for a verdict rather than having received one. Refresh
+moves to `ctrl-r` to free the letter. The two intensities share the note-driven
+path's guards — both are refused on anything but a `proposed` or `ready`
+task, before a prompt is written or a process spawned.
 
-The note-driven path is one instance of a general shape: a terse human intent, expanded by an agent into a formal artefact, applied back through an ordinary CLI verb. Expanding a review rejection's one-line feedback the same way is the obvious next instance, so the seed-context-plus-note → agent → apply-via-verb plumbing is factored (`Expansion` in the `voro` crate) rather than written into refine alone. Its identity comes from the same `Launch` value every launch uses (§8), so the next instance inherits a session name, a prompt/log file slug and a launch-log label by adding a variant rather than computing each of them again.
+The note-driven path is one instance of a general shape: a terse human intent,
+expanded by an agent into a formal artefact, applied back through an ordinary
+CLI verb. Expanding a review rejection's one-line feedback the same way is the
+obvious next instance, so the seed-context-plus-note → agent →
+apply-via-verb plumbing is factored (`Expansion` in the `voro` crate) rather
+than written into refine alone. Its identity comes from the same `Launch` value
+every launch uses (§8), so the next instance inherits a session name, a
+prompt/log file slug and a launch-log label by adding a variant rather than
+computing each of them again.
 
-A **human task** (§3) walks a shortened path through the same machine rather than earning states of its own. Its executor is the human, which collapses two states: `needs-input` is unreachable because the executor cannot be blocked on their own decision — real-world verification of a human task's output is a downstream `blocks`-dependent task (often agent work), not a sub-state of this one — and `review` is unreachable because the human is both executor and acceptor, so completion goes `running → done` directly. The transition API enforces this: `ask` on a human task is refused, `complete` lands in `done`, and dispatch and redispatch both refuse to open an agent session on one — the same shape as dispatch's refusal of a non-git checkout, an error saying why rather than a silent skip. Setting an agent override on a human task (or flagging human a task that carries one) is refused too, since the override exists only to pick a dispatch agent. To keep the unreachability total, a task currently sitting in `needs-input` or `review`, or one with an agent session still open, cannot be flagged human as it stands — such a task is demonstrably agent-executed; resolve it first.
+A **human task** (§3) walks a shortened path through the same machine rather
+than earning states of its own. Its executor is the human, which collapses two
+states: `needs-input` is unreachable because the executor cannot be blocked on
+their own decision — real-world verification of a human task's output is a
+downstream `blocks`-dependent task (often agent work), not a sub-state of this
+one — and `review` is unreachable because the human is both executor and
+acceptor, so completion goes `running → done` directly. The transition API
+enforces this: `ask` on a human task is refused, `complete` lands in `done`, and
+dispatch and redispatch both refuse to open an agent session on one — the same
+shape as dispatch's refusal of a non-git checkout, an error saying why rather
+than a silent skip. Setting an agent override on a human task (or flagging human
+a task that carries one) is refused too, since the override exists only to pick
+a dispatch agent. To keep the unreachability total, a task currently sitting in
+`needs-input` or `review`, or one with an agent session still open, cannot be
+flagged human as it stands — such a task is demonstrably agent-executed;
+resolve it first.
 
-`review` carries a *sub-state* in its fields rather than splitting into two states: a review task with no `pr_url` is awaiting a PR (the `pr` verb opens one from its completion summary, §8), and one with `pr_url` set has its PR open. The next-action derivation (§3) renders this as the verb *pr* versus *review PR* — the presence of a tracked PR is the sub-state, so no new task state is needed and `review` stays the single "awaiting human acceptance" state.
+`review` carries a *sub-state* in its fields rather than splitting into two
+states: a review task with no `pr_url` is awaiting a PR (the `pr` verb opens one
+from its completion summary, §8), and one with `pr_url` set has its PR open.
+The next-action derivation (§3) renders this as the verb *pr* versus *review
+PR* — the presence of a tracked PR is the sub-state, so no new task state is
+needed and `review` stays the single "awaiting human acceptance" state.
 
-There is a third shape, and it is the one where a verb read off the state alone goes wrong: a review task that carries *no branch either*. Not every task produces code — an investigation, a triage, an audit answers with its completion summary and nothing else — and for one of those the operator's move is simply *accept*. Recommending *pr* there is a recommendation that can only fail, since `pr` refuses to build a plan without a branch to push (§8); it is the same failure the `open` degrade exists to prevent (§8), arriving from the other direction, so it gets the same treatment. The derivation therefore reads the branch as well: `pr_url` set → *review PR*, else a recorded branch → *pr*, else *accept*. A blank branch counts as none, matching what `pr` itself does with one. The summary is deliberately not consulted — it lives in the event log rather than on the task row, and a review task with nothing to push has no other move whether or not the agent reported well; a *missing* summary on a task that does have a branch is the separate `[incomplete report]` flag (§8), which is not a verb at all. The queue row reads `next: accept` and prices as a review (§7), because reading what came back and deciding on it is the same operator move whichever medium it arrives in. Nothing about the checkout is consulted for this arm — a task with no branch has no forge question to ask, so the `pr` → *open* degrade (§8) never fires on it and no `git remote` is run.
+There is a third shape, and it is the one where a verb read off the state alone
+goes wrong: a review task that carries *no branch either*. Not every task
+produces code — an investigation, a triage, an audit answers with its
+completion summary and nothing else — and for one of those the operator's move
+is simply *accept*; recommending *pr* there could only fail, since `pr` refuses
+to build a plan without a branch to push (§8). The derivation therefore reads
+the branch as well: `pr_url` set → *review PR*, else a recorded branch →
+*pr*, else *accept*. A blank branch counts as none, matching what `pr` itself
+does with one. The summary is deliberately not consulted — it lives in the
+event log rather than on the task row, and a review task with nothing to push
+has no other move whether or not the agent reported well; a *missing* summary
+on a task that does have a branch is the separate `[incomplete report]` flag
+(§8), which is not a verb at all. The queue row reads `next: accept` and
+prices as a review (§7), because reading what came back and deciding on it is
+the same operator move whichever medium it arrives in. Nothing about the
+checkout is consulted for this arm — a task with no branch has no forge
+question to ask, so the `pr` → *open* degrade (§8) never fires on it and no
+`git remote` is run.
 
-`waiting` is the state for work in flight on *someone else's* move. Once the operator has run `pr` and the PR is up awaiting another person's review or merge, there is nothing the operator can do, yet `review` is an attention state that would keep the task occupying a queue row (with a state bonus, §7) indefinitely. `waiting` says "in flight, but not my move": it earns no state bonus and is excluded from the queue entirely, like `parked`. It derives no next-action verb (§3). Being out of the queue is not the same as being out of sight, though, and it was originally both: a handed-off task surfaced only in the task browser and the state counts, so merged PRs sat unaccepted for days and work gated behind a `blocks` edge stayed gated with nothing saying so — `waiting` earns no score, so not even the `unblock_bonus` (§7) could lift it back into view. It therefore rides the cockpit's running strip (§9), which is where the operator already reads what is in flight: to them a handed-off task is the same fact as a dispatched one — something else owns the work — and the strip filters on state rather than on sessions, so carrying it costs no new machinery. The row is badged with what the hand-off is holding up (`blocks N`, counted by the `unblock_bonus` rule) and with whether a PR tracks it, and its elapsed time counts from the hand-off rather than from the session underneath, which opened when the agent started work and says nothing about how long the PR has been sitting there. It is reached only from `review`, via the *hand off* transition (`voro wait`), and leaves by four manual moves: *accept* (the PR merged) → `done`, *reject with feedback* (changes requested) → `running` — reusing the review→running feedback path, which keeps the same agent session open (§8) — *reclaim* (it is the operator's move again) → `review`, and *abandon* → `rejected`. Entering `waiting` only from `review` is deliberate: waiting on a person *before* work starts is what `parked` plus a blocker already expresses, so the more general "blocked on an external party at any point" state is deferred until a concrete need for it appears. Return-path automation — a reconcile that polls `gh pr view` and pulls a merged PR to `done` or a change-requested one back to `review` — is likewise deferred; today every exit is a manual operator move.
+`waiting` is the state for work in flight on *someone else's* move. Once the
+operator has run `pr` and the PR is up awaiting another person's review or
+merge, there is nothing the operator can do, yet `review` is an attention state
+that would keep the task occupying a queue row (with a state bonus, §7)
+indefinitely. `waiting` says "in flight, but not my move": it earns no state
+bonus and is excluded from the queue entirely, like `parked`, and it derives no
+next-action verb (§3). Being out of the queue is not the same as being out of
+sight: a handed-off task rides the cockpit's running strip (§9), which is where
+the operator already reads what is in flight — to them a handed-off task is
+the same fact as a dispatched one, something else owns the work, and the strip
+filters on state rather than on sessions. The row is badged with what the
+hand-off is holding up (`blocks N`, counted by the `unblock_bonus` rule) and
+with whether a PR tracks it, and its elapsed time counts from the hand-off
+rather than from the session underneath. It is reached only from `review`, via
+the *hand off* transition (`voro wait`), and leaves by four manual moves:
+*accept* (the PR merged) → `done`, *reject with feedback* (changes requested)
+→ `running` — reusing the review→running feedback path, which keeps the
+same agent session open (§8) — *reclaim* (it is the operator's move again)
+→ `review`, and *abandon* → `rejected`. Entering `waiting` only from
+`review` is deliberate: waiting on a person *before* work starts is what
+`parked` plus a blocker already expresses, so the more general "blocked on an
+external party at any point" state is deferred until a concrete need for it
+appears. Return-path automation — a reconcile that polls `gh pr view` and
+pulls a merged PR to `done` or a change-requested one back to `review` — is
+likewise deferred; today every exit is a manual operator move.
 
-**Every message to a review or waiting task is a rejection.** The `review → running` feedback edge is the only way a sentence from the operator reaches work already reported done, so the cockpit's quick message (§8) routes through it rather than beside it: a send confirmed to have started is followed by the `RejectWork` transition, appending the feedback to the body under `## Feedback` and logging the `feedback` event, and a send the agent refuses transitions nothing (§8). There is deliberately no "just asking" mode — a second channel that said something to the agent without recording it would put the task's body and its session out of step, which is precisely the drift the return-path verbs exist to prevent. A `needs-input` task is the mirror and transitions not at all: the answer belongs to the transcript, and the agent's own `voro resume` is what moves the task back to `running`.
+**Every message to a review or waiting task is a rejection.** The `review →
+running` feedback edge is the only way a sentence from the operator reaches work
+already reported done, so the cockpit's quick message (§8) routes through it
+rather than beside it: a send confirmed to have started is followed by the
+`RejectWork` transition, appending the feedback to the body under `## Feedback`
+and logging the `feedback` event, and a send the agent refuses transitions
+nothing (§8). There is deliberately no "just asking" mode — a second channel
+that said something to the agent without recording it would put the task's body
+and its session out of step, which is precisely the drift the return-path verbs
+exist to prevent. A `needs-input` task is the mirror and transitions not at all:
+the answer belongs to the transcript, and the agent's own `voro resume` is what
+moves the task back to `running`.
 
 ## 7. Scoring
 
@@ -262,98 +848,797 @@ unblock_bonus:  1 × open_dependents, capped at 2
 age_bonus:      0.1 × days_in_current_state, capped at 2
 ```
 
-Project weight is an integer 0–5, where 0 means "parked — hide entirely" (this is how a project is snoozed without deleting anything); an archived project (§5) is excluded from scoring the same way, at any weight. The geometric priority values ensure a P0 in a weight-2 project (16) still beats a P2 in a weight-5 project (10) — priorities within a project should mean something absolute, not just relative.
+Project weight is an integer 0–5, where 0 means "parked — hide entirely"
+(this is how a project is snoozed without deleting anything); an archived
+project (§5) is excluded from scoring the same way, at any weight. The
+geometric priority values ensure a P0 in a weight-2 project (16) still beats a
+P2 in a weight-5 project (10) — priorities within a project should mean
+something absolute, not just relative.
 
-The `state_bonus` folds task state into the priority term rather than leaving it a pure tiebreaker, because the states are not just labels — they say *what a delay costs*. `needs-input` blocks an idle agent, so unblocking it keeps work flowing and earns the largest bonus; `review` only blocks a finished task from closing, so it earns half as much; `stalled` earns the same as `review` — a dead dispatch blocks no live agent context (unlike a question), but it wants redispatching the moment quota resets; `ready` and `proposed` earn nothing — startable work rides its own priority, and an untriaged proposal's priority is agent-asserted and untrusted, so it wins nothing but the ties its raw score already deserves. Folding the bonus *inside* the weight multiply (rather than adding a flat constant) keeps project weight the single master gain and the whole formula head-computable: a question is worth "one extra P1's worth" of priority in its own project, no more. The chosen magnitudes mean an attention item floats above routine startable work but a genuine emergency still wins — a P0 ready task (weight×8) still outranks a P2 question (weight×6) in the same project.
+The `state_bonus` folds task state into the priority term rather than leaving it
+a pure tiebreaker, because the states are not just labels — they say *what a
+delay costs*. `needs-input` blocks an idle agent, so unblocking it keeps work
+flowing and earns the largest bonus; `review` only blocks a finished task from
+closing, so it earns half as much; `stalled` earns the same as `review` — a
+dead dispatch blocks no live agent context (unlike a question), but it wants
+redispatching the moment quota resets; `ready` and `proposed` earn nothing —
+startable work rides its own priority, and an untriaged proposal's priority is
+agent-asserted and untrusted, so it wins nothing but the ties its raw score
+already deserves. Folding the bonus *inside* the weight multiply (rather than
+adding a flat constant) keeps project weight the single master gain and the
+whole formula head-computable: a question is worth "one extra P1's worth" of
+priority in its own project, no more. The chosen magnitudes mean an attention
+item floats above routine startable work but a genuine emergency still wins —
+a P0 ready task (weight×8) still outranks a P2 question (weight×6) in the same
+project.
 
-The `unblock_bonus` is the one place the dependency graph (§5) reaches the score. A task three others are parked behind is not the same task as an identical one blocking nothing: finishing it releases work, and the queue should say so before the operator has to reconstruct the graph in their head. It counts only *direct* open dependents — tasks with a `blocks` edge onto this one whose state is neither `done` nor `rejected` — deliberately refusing the transitive closure: a recursive count would let a long chain manufacture an arbitrarily large number out of a graph nobody drew with weighting in mind, and the fact worth surfacing is "work is waiting on this", which the direct count already carries. Only `blocks` edges count; `discovered-from`, `parent`, and `related` record provenance and structure, not obstruction. It sits *inside* the weight multiply and is priced like the `state_bonus` — blocking one task is worth half a priority level in its own project, two or more is one P2's worth — so project weight stays the single master gain and the arithmetic stays head-computable. The cap at 2 keeps it a nudge rather than a priority level: it peaks at the `review`/`stalled` bonus and half the `needs-input` one, so a P2 blocking a queue of five never outranks a genuine P0. And it applies uniformly to every scored state, `proposed` included — unlike an agent-asserted priority, a dependency edge is an operator/graph fact, so a proposal that other work already waits on earns it on the same terms as a `ready` task, exactly as the age bonus does.
+The `unblock_bonus` is the one place the dependency graph (§5) reaches the
+score. A task three others are parked behind is not the same task as an
+identical one blocking nothing: finishing it releases work, and the queue should
+say so before the operator has to reconstruct the graph in their head. It counts
+only *direct* open dependents — tasks with a `blocks` edge onto this one whose
+state is neither `done` nor `rejected` — deliberately refusing the transitive
+closure: a recursive count would let a long chain manufacture an arbitrarily
+large number out of a graph nobody drew with weighting in mind, and the fact
+worth surfacing is "work is waiting on this", which the direct count already
+carries. Only `blocks` edges count; `discovered-from`, `parent`, and `related`
+record provenance and structure, not obstruction. It sits *inside* the weight
+multiply and is priced like the `state_bonus` — blocking one task is worth
+half a priority level in its own project, two or more is one P2's worth — so
+project weight stays the single master gain and the arithmetic stays
+head-computable. The cap at 2 keeps it a nudge rather than a priority level: it
+peaks at the `review`/`stalled` bonus and half the `needs-input` one, so a P2
+blocking a queue of five never outranks a genuine P0. And it applies uniformly
+to every scored state, `proposed` included — unlike an agent-asserted
+priority, a dependency edge is an operator/graph fact, so a proposal that other
+work already waits on earns it on the same terms as a `ready` task, exactly as
+the age bonus does.
 
-Human tasks (§3/§6) change nothing here: they structurally never reach `needs-input` or `review`, so they never earn a `state_bonus` — which is the correct pricing, since that bonus prices the cost of delaying blocked *agent* work, a cost a human task does not have. A `ready` human task rides its priority and age like any other row.
+Human tasks (§3/§6) change nothing here: they structurally never reach
+`needs-input` or `review`, so they never earn a `state_bonus` — which is the
+correct pricing, since that bonus prices the cost of delaying blocked *agent*
+work, a cost a human task does not have. A `ready` human task rides its priority
+and age like any other row.
 
-`waiting` (§6) is not scored at all. Like `parked` — and unlike the three attention states — it is blocked on someone else's move and asks nothing of the operator, so it earns no `state_bonus` and is excluded from the queue and from `next` entirely. Excluding it rather than scoring it low is the point: a handed-off PR should not occupy an attention row at all while it is not the operator's move. Where it does surface is the task browser, the state counts, and the running strip (§9) — the strip being a statement about what is in flight rather than a ranked demand on the operator, which is why carrying `waiting` there changes nothing here.
+`waiting` (§6) is not scored at all. Like `parked` — and unlike the three
+attention states — it is blocked on someone else's move and asks nothing of
+the operator, so it earns no `state_bonus` and is excluded from the queue and
+from `next` entirely. Excluding it rather than scoring it low is the point: a
+handed-off PR should not occupy an attention row at all while it is not the
+operator's move. Where it does surface is the task browser, the state counts,
+and the running strip (§9) — the strip being a statement about what is in
+flight rather than a ranked demand on the operator, which is why carrying
+`waiting` there changes nothing here.
 
-The age bonus is a gentle anti-starvation nudge so old P2s eventually surface, capped so it can never masquerade as a priority level. It applies uniformly to every scored state — `ready`, `needs-input`, `review`, and `proposed` alike — because a week-old unanswered question is a smell worth amplifying, not just an old task. Taskwarrior's experience suggests urgency formulae accrete coefficients until nobody trusts the number; resist that — this is the one and only additive state term. The `unblock_bonus` is the considered exception to that stance, and is worth naming as one: it was admitted because it prices a fact the operator would otherwise have to reconstruct by hand from the dependency graph, it is bounded and direct-only so it cannot inflate, and it introduces no coefficient to tune beyond the cap. Any further term must clear the same bar. Any tuning should be observable via a score-decomposition view in the TUI (and later `voro explain <task>`).
+The age bonus is a gentle anti-starvation nudge so old P2s eventually surface,
+capped so it can never masquerade as a priority level. It applies uniformly to
+every scored state — `ready`, `needs-input`, `review`, and `proposed` alike
+— because a week-old unanswered question is a smell worth amplifying, not just
+an old task. Taskwarrior's experience suggests urgency formulae accrete
+coefficients until nobody trusts the number; resist that — this is the one and
+only additive state term. The `unblock_bonus` is the considered exception to
+that stance, and is worth naming as one: it was admitted because it prices a
+fact the operator would otherwise have to reconstruct by hand from the
+dependency graph, it is bounded and direct-only so it cannot inflate, and it
+introduces no coefficient to tune beyond the cap. Any further term must clear
+the same bar. Any tuning should be observable via a score-decomposition view in
+the TUI (and later `voro explain <task>`).
 
-Ordering of the queue: the ten highest-scoring rows across every actionable state — `needs-input`, `review`, `stalled`, `proposed`, and `ready` alike — in one list sorted by score, or more precisely by the *attention price* below, which divides that score by what each row asks of the operator. There is a single cap over the whole list rather than a per-state rule: each row is one next action, they all compete on the same score, and ten is enough to keep the autonomy to pick around the top item while few enough that the queue stays an answer rather than the whole backlog. The cap is uniform, so a low-scoring row of *any* state can fall below it — a stale P3 question in a snoozed project does not hold a slot ahead of ten more pressing actions.
+Ordering of the queue: the ten highest-scoring rows across every actionable
+state — `needs-input`, `review`, `stalled`, `proposed`, and `ready` alike —
+in one list sorted by score, or more precisely by the *attention price* below,
+which divides that score by what each row asks of the operator. There is a
+single cap over the whole list rather than a per-state rule: each row is one
+next action, they all compete on the same score, and ten is enough to keep the
+autonomy to pick around the top item while few enough that the queue stays an
+answer rather than the whole backlog. The cap is uniform, so a low-scoring row
+of *any* state can fall below it — the deliberate cost is that the queue does
+not *guarantee* every question, review, or proposal a visible row, but a score
+low enough to fall past row ten means, by construction, that ten more valuable
+actions exist. The one guarantee kept is the untriaged-proposal guard rail
+(§12), carried by an always-visible untriaged count (`proposed_count`) rather
+than by reserved rows, so the triage backlog stays felt even when individual
+proposals drop below the cap.
 
-The single whole-list cap needs no per-state carve-outs precisely because the score already folds priority, weight, state, the dependency graph, and age into one comparable number — and the attention price below divides that number by what the row asks of the operator, so the rows compete on one comparable quantity throughout. The deliberate cost is that the queue no longer *guarantees* every question, review, or proposal a visible row — but a score low enough to fall past row ten means, by construction, that ten more valuable actions exist. The one guarantee kept is the untriaged-proposal guard rail (§12), carried by an always-visible untriaged count (`proposed_count`) rather than by reserved rows, so the triage backlog stays felt even when individual proposals drop below the cap.
+Because the state bonus lives in the score, state usually settles itself; the
+state precedence (§6) only breaks genuinely equal totals. `voro next` still
+answers with the single top ready task — what an agent asking for work should
+be handed, and the dispatch default. `stalled` is deliberately excluded from
+`next`: an agent asking for fresh work should not be handed a stall that needs
+redispatching with its prior session's context.
 
-Because the state bonus lives in the score, state usually settles itself; the state precedence (§6) only breaks genuinely equal totals. `voro next` still answers with the single top ready task — what an agent asking for work should be handed, and the dispatch default. `stalled` is deliberately excluded from `next`: an agent asking for fresh work should not be handed a stall that needs redispatching with its prior session's context.
+**Attention price.** The score above answers "how much is this row worth?" and
+nothing else, which prices the queue backwards for a tool whose scarce resource
+is attention rather than value: a PR review is fifteen to sixty minutes of a
+human being, triaging a proposal is one, and ranking them on worth alone puts
+the expensive row on top and starves the cheap one. So the queue ranks by
+`effective_score = score / cost(action)`,
+where the action is the row's own next-action verb (§3) and the cost is the
+operator's, not the machine's. This is display-layer only: the stored score, the
+state machine, and every transition are untouched, and `explain` gains one line
+showing the division. The band is deliberately narrow — *answer* and *triage*
+at 0.8, *dispatch* at 1.0, *pr*/*review PR*/*accept* at 1.4, *do* at 1.8 — so
+the pricing is a nudge, not a re-ranking: a P2 review (8.4 ÷ 1.4 ≈ 6.0) falls
+below a P2 triage (8.4 ÷ 0.8 ≈ 10.5) but stays above a P3 one (≈ 5.1), and
+one priority level is worth more than the whole band. *Redispatch* prices as
+*dispatch*, because it is one — the operator's move is the same keypress and
+it opens the same session, differing only in the context the successor inherits
+— and *pr*, *review PR*, and *accept* share a price for the same reason, since
+they are one review in three media — a diff to open, a diff already open, and
+a report that is the whole deliverable (§6, §8). Widening the band is how this
+stops being trustworthy; the defaults live in code and are overridable per
+action in a `[costs]` table in `voro.toml` (§5), which is where an operator who
+reviews faster than they triage says so. Learned or auto-calibrated costs are
+deliberately out: the transition timestamps measure elapsed wall-clock, not
+operator attention, so they cannot tell a review from an idle afternoon.
 
-**Attention price.** The score above answers "how much is this row worth?" and nothing else, which prices the queue backwards for a tool whose scarce resource is attention rather than value: a PR review is fifteen to sixty minutes of a human being, triaging a proposal is one, and ranking them on worth alone puts the expensive row on top and starves the cheap one — proposals, which earn no state bonus, sat below the visible rows even when the operator knew they were the next work. So the queue ranks by `effective_score = score / cost(action)`, where the action is the row's own next-action verb (§3) and the cost is the operator's, not the machine's. This is display-layer only: the stored score, the state machine, and every transition are untouched, and `explain` gains one line showing the division. The band is deliberately narrow — *answer* and *triage* at 0.8, *dispatch* at 1.0, *pr*/*review PR*/*accept* at 1.4, *do* at 1.8 — so the pricing is a nudge, not a re-ranking: a P2 review (8.4 ÷ 1.4 ≈ 6.0) falls below a P2 triage (8.4 ÷ 0.8 ≈ 10.5) but stays above a P3 one (≈ 5.1), and one priority level is worth more than the whole band. *Redispatch* prices as *dispatch*, because it is one — the operator's move is the same keypress and it opens the same session, differing only in the context the successor inherits — and *pr*, *review PR*, and *accept* share a price for the same reason, since they are one review in three media — a diff to open, a diff already open, and a report that is the whole deliverable (§6, §8). Widening the band is how this stops being trustworthy; the defaults live in code and are overridable per action in a `[costs]` table in `voro.toml` (§5), which is where an operator who reviews faster than they triage says so. Learned or auto-calibrated costs are deliberately out: the transition timestamps measure elapsed wall-clock, not operator attention, so they cannot tell a review from an idle afternoon.
+Dispatch is the one action the divisor prices wrongly, and it is shaped rather
+than priced. Handing a task to an agent costs the operator a keypress, so on
+attention alone it would outrank everything — but every dispatch manufactures
+a future review and loads the fleet, so its real cost is a *concurrency slot*.
+It is therefore metered: `max_running` (`voro.toml`, default 5) caps how many
+dispatches ride at once, and once `running >= max_running` every row whose
+action would open a session — *dispatch* and *redispatch* alike — leaves the
+queue, replaced by a single capacity line naming the counts (`⏸ dispatch at
+capacity (5/5 running)`). The running tally is the one `stats` already reports.
+Suppressing the rows rather than demoting them is the point: at the cap they are
+not cheap actions, they are unavailable ones, and the capacity line says so
+where an empty queue would have implied there was nothing to start. A `do` row
+is untouched by the gate — a human task spends the operator's hands, not a
+slot — and the counts (§12) keep the suppressed backlog felt.
 
-Dispatch is the one action the divisor prices wrongly, and it is shaped rather than priced. Handing a task to an agent costs the operator a keypress, so on attention alone it would outrank everything — but every dispatch manufactures a future review and loads the fleet, so its real cost is a *concurrency slot*. It is therefore metered: `max_running` (`voro.toml`, default 5) caps how many dispatches ride at once, and once `running >= max_running` every row whose action would open a session — *dispatch* and *redispatch* alike — leaves the queue, replaced by a single capacity line naming the counts (`⏸ dispatch at capacity (5/5 running)`). The running tally is the one `stats` already reports. Suppressing the rows rather than demoting them is the point: at the cap they are not cheap actions, they are unavailable ones, and the capacity line says so where an empty queue would have implied there was nothing to start. A `do` row is untouched by the gate — a human task spends the operator's hands, not a slot — and the counts (§12) keep the suppressed backlog felt.
-
-Cheap actions need one further guard, or the pricing swaps one swamping for another: forty proposals at 0.8 would fill the queue with triage. Proposals therefore no longer render individual rows at all. They collapse into **one digest row per project** — `▲ 9 proposals awaiting triage (mote)` — scored as the *maximum* effective score among its children, so the digest survives the cut exactly when its best child would have and sits exactly where that child would have sat. In the TUI the digest folds open on Enter, listing its constituents as ordinary selectable rows for rapid triage; on the CLI the row is informational and `list --state proposed` is where the constituents are read. This subsumes rather than replaces the untriaged-count guard rail above: the count stays, and the digest is now a second, ranked way the backlog stays felt.
+Cheap actions need one further guard, or the pricing swaps one swamping for
+another: forty proposals at 0.8 would fill the queue with triage. Proposals
+therefore no longer render individual rows at all. They collapse into **one
+digest row per project** — `▲ 9 proposals awaiting triage (mote)` — scored
+as the *maximum* effective score among its children, so the digest survives the
+cut exactly when its best child would have and sits exactly where that child
+would have sat. In the TUI the digest folds open on Enter, listing its
+constituents as ordinary selectable rows for rapid triage; on the CLI the row is
+informational and `list --state proposed` is where the constituents are read.
+This subsumes rather than replaces the untriaged-count guard rail above: the
+count stays, and the digest is now a second, ranked way the backlog stays felt.
 
 ## 8. Dispatch and agent integration
 
-**The boundary** between Voro and the agent is task state versus session state. Orchestrators — Vibe Kanban, Claude Squad, Claude Code's own agent view — answer "what is my agent doing?" by observing the process: streaming logs, multiplexing terminals, polling a supervisor. Voro does not observe; it is told. The return-path verbs push task-level transitions (`done` → review, `ask` → needs-input), which are exactly the attention states the queue exists to surface and which cannot be reliably inferred from process observation anyway — a session exiting cleanly says nothing about whether the task is finished, blocked, or half-abandoned. The session row's pid and log_path are receipts, not management handles: the log so redispatch can hand a successor the predecessor's trail, the pid to detect the one failure the return path cannot report — a session that died without calling anything. This is what keeps dispatch agent-agnostic. Voro never parses an agent's internals, so anything that can run a shell command integrates through a command template, and an agent's own session tooling (attach, resume, fleet views) remains available underneath without Voro knowing about it.
+**The boundary** between Voro and the agent is task state versus session state.
+Orchestrators — Vibe Kanban, Claude Squad, Claude Code's own agent view —
+answer "what is my agent doing?" by observing the process: streaming logs,
+multiplexing terminals, polling a supervisor. Voro does not observe; it is told.
+The return-path verbs push task-level transitions (`done` → review, `ask` →
+needs-input), which are exactly the attention states the queue exists to surface
+and which cannot be reliably inferred from process observation anyway — a
+session exiting cleanly says nothing about whether the task is finished,
+blocked, or half-abandoned. The session row's pid and log_path are receipts, not
+management handles: the log so redispatch can hand a successor the predecessor's
+trail, the pid to detect the one failure the return path cannot report — a
+session that died without calling anything. This is what keeps dispatch
+agent-agnostic. Voro never parses an agent's internals, so anything that can run
+a shell command integrates through a command template, and an agent's own
+session tooling (attach, resume, fleet views) remains available underneath
+without Voro knowing about it.
 
-**Agent resolution**, in order: the task's `agent` override if set (the capability case — a task that needs image generation is inherently a task for the agent that has it, so the choice is worth persisting on the task); otherwise the global default. The default itself resolves layered too: the user's `default_agent` in `voro.toml` when set, otherwise a PATH probe of the built-ins in a fixed order (claude, then codex) picking the first installed — so a fresh install needs no `default_agent` line. Only when nothing resolves is it an error, with guidance to install an agent or set `default_agent`. The TUI offers two dispatch actions: dispatch-with-resolved-agent on one key, dispatch-via-picker on another — the picker existing mostly for the cap case, where the default is temporarily unusable but nothing about the task has changed. Because the built-ins make a fresh install dispatchable, `voro agent init` is demoted to an optional convenience that writes a commented extension/override skeleton (refusing to clobber an existing one); `voro agent list` shows the effective set with provenance and the default flagged, and `voro agent path` prints where the user file is read from.
+**Agent resolution**, in order: the task's `agent` override if set (the
+capability case — a task that needs image generation is inherently a task for
+the agent that has it, so the choice is worth persisting on the task); otherwise
+the global default. The default itself resolves layered too: the user's
+`default_agent` in `voro.toml` when set, otherwise a PATH probe of the built-ins
+in a fixed order (claude, then codex) picking the first installed — so a fresh
+install needs no `default_agent` line. Only when nothing resolves is it an
+error, with guidance to install an agent or set `default_agent`. The TUI offers
+two dispatch actions: dispatch-with-resolved-agent on one key,
+dispatch-via-picker on another — the picker existing mostly for the cap case,
+where the default is temporarily unusable but nothing about the task has
+changed. Because the built-ins make a fresh install dispatchable, `voro agent
+init` is an optional convenience that writes a commented extension/override
+skeleton (refusing to clobber an existing one); `voro agent list` shows the
+effective set with provenance and the default flagged, and `voro agent path`
+prints where the user file is read from.
 
-**Model selection** rides the same template mechanism rather than a parallel one, and keeps Voro model-blind. A verb template may carry a `{model}` placeholder, filled from a small map of keys on the agent's own table — `model`, `model_deep`, `model_plan` — whose values are opaque strings Voro pastes in and never interprets, so nothing in the tool knows what a model *is* or which is stronger; the operator's config asserts the ordering. A task carries a persistent boolean `deep` (schema §5) that chooses between them at dispatch: `dispatch` renders `model_deep` for a deep task and `model` otherwise, with `model_deep` falling back to `model` when an agent names only one, and `plan` renders `model_plan` (falling back the same way) whatever the queue holds, since a planning session belongs to no task and so has no depth to read. The placeholder is meaningful only on those two verbs — the ones that launch work — and is refused on the session verbs, where a session already runs on whatever model started it. The flag is orthogonal to both of its neighbours: ordering is priority's job and `deep` never touches the score (§7), and the per-task agent override picks *which* agent runs while `deep` picks only how hard it runs. It degrades exactly as the optional verbs do: an agent whose templates carry no `{model}` — the built-in `codex` — takes no model direction, and a deep task dispatches with it identically to any other, no error and no warning beyond the flag `voro show` already prints. The one config error is the inverse pairing, a template carrying `{model}` on an agent that names no model, caught at load; model keys *without* the placeholder are inert rather than an error, so a wholesale override written before this existed keeps loading unchanged. The flag is set with `--deep`/`--no-deep` on `add` and `set`, and toggled in the TUI with `!` on the cockpit and the task browser, where a deep task's row carries a `!` beside its priority. `{session_name}` is governed by the same rule as `{model}` — meaningful on the two verbs that launch work and refused on the session verbs — and it expresses the naming invariant: **every session Voro launches into the background carries a Voro-composed name** — `voro-<id>-<slug>` for a dispatch, `voro-<id>-<kind>` for anything else pointed at that task, `voro-plan-<project>` for a planning session and `voro-propose-<project>` for a quick propose — so nothing Voro starts shows up anonymous or duplicately named in the agent's own listing, and a refine of task 42 cannot collide with its dispatch, which `attach` and the `/resume` picker are read by. The stable part of every name is its `voro-<id>` opening, which is what prefix reading and per-task uniqueness rest on; the dispatch continues into a slug of the task's *title*, because the name is the operator's only handle everywhere Voro is not — the agent's fleet listing, the `/resume` picker, and the phone, which shows nothing but the name — and `voro-428` can only be decoded with the queue open in another pane, where `voro-428-deliver-quick-messages` says what it is. The slug takes whole words from the front of the title, lowercased, stopping before it runs past about twenty characters and always taking at least one, since both listings truncate and a word cut in half reads as a different task; a title that sanitizes away to nothing — punctuation, or a script outside the permitted characters — leaves the bare `voro-<id>` rather than a row of dashes. One collision is possible and is guarded: a task titled "Refine …" whose slug came out as exactly `refine` would take the name that task's own refine round holds, so such a slug takes one further word instead, over the budget if it has to, and falls back to the bare name when the title has no further word to give. A launch that belongs to no task names its project by its *name*, not its id, because the id would be a bare number in the same position a task id occupies and so read as one: `voro-plan-mote`, never `voro-plan-2`, and `voro-propose-mote` beside it — the two task-less launches, planning and the quick propose, follow one convention, so a bare number anywhere in a Voro-composed name is always a task id. Project names are unique (§5), so no two projects contend for a name; since the composed name is substituted into a shell command line and its slug becomes a filename, every character outside `[A-Za-z0-9._-]` is replaced with `-` first, case preserved for a project name, which is already a handle, and dropped for a title slug, which is a sentence. The prompt and log filenames are unaffected by any of this: they are stemmed `task-<id>`, `refine-<id>`, `plan-<project>` as they were, so nothing on disk moved when the session names grew. `{task_id}` remains substituted on `dispatch`, for a template that wants the id somewhere other than the name, but is refused on `plan`, which serves a target that has no task id to bind — a template must render for every target its verb serves. Behind all three is one rule: no launch placeholder may survive to a command line. Each is either bound by the single renderer below or refused at config load, never left to reach the shell as literal braces — which is not hypothetical, since a note-driven refine once borrowed the dispatch template without substituting `{task_id}` and so launched every refine of every task under one literal name, `voro-{task_id}`.
+**Model selection** rides the same template mechanism rather than a parallel
+one, and keeps Voro model-blind. A verb template may carry a `{model}`
+placeholder, filled from a small map of keys on the agent's own table —
+`model`, `model_deep`, `model_plan` — whose values are opaque strings Voro
+pastes in and never interprets; the operator's config asserts the ordering. A
+task carries a persistent boolean `deep` (schema §5) that chooses between them
+at dispatch: `dispatch` renders `model_deep` for a deep task and `model`
+otherwise, with `model_deep` falling back to `model` when an agent names only
+one, and `plan` renders `model_plan` (falling back the same way) whatever the
+queue holds, since a planning session belongs to no task and so has no depth to
+read. The placeholder is meaningful only on those two verbs — the ones that
+launch work — and is refused on the session verbs, where a session already
+runs on whatever model started it. The flag is orthogonal to both of its
+neighbours: ordering is priority's job and `deep` never touches the score
+(§7), and the per-task agent override picks *which* agent runs while `deep`
+picks only how hard it runs. It degrades exactly as the optional verbs do: an
+agent whose templates carry no `{model}` — the built-in `codex` — takes no
+model direction, and a deep task dispatches with it identically to any other.
+The one config error is the inverse pairing, a template carrying `{model}` on
+an agent that names no model, caught at load; model keys *without* the
+placeholder are inert rather than an error. The flag is set with
+`--deep`/`--no-deep` on `add` and `set`, and toggled in the TUI with `!` on the
+cockpit and the task browser, where a deep task's row carries a `!` beside its
+priority.
 
-**Redispatch** is a first-class action born of the same cap case: a dispatch that dies `capped` or `failed` lands its task in `stalled` (the reconciler performs `running → stalled` itself — see *Observing the end of a session* below), and redispatching it offers the agent picker plus the previous session's notes/log so the successor agent does not start cold; dispatch's precondition accepts `stalled → running` beside `ready → running`. `stalled` is a first-class state, not a flag derived from session history: the state machine carries it, the scheduler scores it (§7), and a stalled row's *redispatch* verb comes from the same next-action derivation (§3) as every other row's, reading the state alone.
+`{session_name}` is governed by the same rule as `{model}` — meaningful on
+the two verbs that launch work and refused on the session verbs — and it
+expresses the naming invariant: **every session Voro launches into the
+background carries a Voro-composed name** — `voro-<id>-<slug>` for a
+dispatch, `voro-<id>-<kind>` for anything else pointed at that task,
+`voro-plan-<project>` for a planning session and `voro-propose-<project>` for a
+quick propose — so nothing Voro starts shows up anonymous or duplicately
+named in the agent's own listing, which `attach` and the `/resume` picker are
+read by. The stable part of every name is its `voro-<id>` opening, which is
+what prefix reading and per-task uniqueness rest on; the dispatch continues
+into a slug of the task's *title*, because the name is the operator's only
+handle everywhere Voro is not — the agent's fleet listing, the `/resume`
+picker, and the phone, which shows nothing but the name. The slug takes whole
+words from the front of the title, lowercased, stopping before it runs past
+about twenty characters and always taking at least one, since both listings
+truncate and a word cut in half reads as a different task; a title that
+sanitizes away to nothing leaves the bare `voro-<id>` rather than a row of
+dashes. One collision is guarded: a task whose slug came out as exactly
+`refine` would take the name that task's own refine round holds, so such a slug
+takes one further word instead, over the budget if it has to, and falls back to
+the bare name when the title has no further word to give. A launch that belongs
+to no task names its project by its *name*, not its id: `voro-plan-mote`, never
+`voro-plan-2`, and `voro-propose-mote` beside it, so a bare number anywhere in
+a Voro-composed name is always a task id. Project names are unique (§5), so no
+two projects contend for a name; since the composed name is substituted into a
+shell command line and its slug becomes a filename, every character outside
+`[A-Za-z0-9._-]` is replaced with `-` first, case preserved for a project name,
+which is already a handle, and dropped for a title slug, which is a sentence.
+The prompt and log filenames are unaffected: they are stemmed `task-<id>`,
+`refine-<id>`, `plan-<project>`. `{task_id}` is substituted on `dispatch`, for
+a template that wants the id somewhere other than the name, but is refused on
+`plan`, which serves a target that has no task id to bind — a template must
+render for every target its verb serves. Behind all three is one rule: **no
+launch placeholder may survive to a command line.** Each is either bound by the
+single renderer below or refused at config load, never left to reach the shell
+as literal braces.
 
-**Answering a question happens in the session, not through Voro.** When an agent hits a blocker it calls `voro ask`, landing the task in `needs-input` with its `question` set. Voro's job from there is to be an accurate *signpost* — which task is blocked, on what question, surfaced on the inbox row and in the detail pane — not the door into the conversation. The operator opens the agent's own session directly (the `voro-<id>-<slug>` session it runs under, in a `claude agents` pane or the equivalent) and answers there, where the agent still has its full context; Voro records no answer text, since the exchange lives in the session transcript, addressable through the session ref already captured on the session row. Once answered, `voro resume <task-id>` moves the task `needs-input → running` and nothing more: the dispatch preamble tells the agent to run it in-session after its question is answered (the primary path), and Enter on a `needs-input` inbox row is the operator's backstop for the same transition. This replaces an earlier headless-continuation design — a fresh session re-sent the whole task body carrying the appended answer — whose only reliable path for the built-in `claude`, which has no headless *continue* verb, was to *restart* the task rather than resume the conversation; a human already watching the session is a strictly better place to answer than a text box in Voro. `voro reject` is the symmetric move on the `review → running` (and `waiting → running`) edge: it appends the feedback to the task body under a `## Feedback` heading and returns the task to `running`. Because `review`/`waiting` keep the session open (see *Session lifecycle* below), the feedback lands back on the *same* agent session when its process is still alive — the operator having stayed attached — and otherwise the task stalls on the next reconcile and is redispatched with the feedback now in its body (the redispatch prompt carries it). Both `resume` and `reject` route through the transition API and change only state, so neither can smuggle a task into `running` outside the machine; a task never dispatched still answers or rejects as a plain transition, since nothing about them depends on a prior session.
+**Redispatch** is a first-class action born of the same cap case: a dispatch
+that dies `capped` or `failed` lands its task in `stalled` (the reconciler
+performs `running → stalled` itself — see *Observing the end of a session*
+below), and redispatching it offers the agent picker plus the previous session's
+notes/log so the successor agent does not start cold; dispatch's precondition
+accepts `stalled → running` beside `ready → running`. `stalled` is a
+first-class state, not a flag derived from session history: the state machine
+carries it, the scheduler scores it (§7), and a stalled row's *redispatch* verb
+comes from the same next-action derivation (§3) as every other row's, reading
+the state alone.
 
-**Steering a session without entering it** is the cheap half of that door. Answering in the session is right, but suspending the whole cockpit for a full attach round-trip to say one sentence is not, so the agent verb set gains an optional `message`: a *headless* send carrying both `{session}` and `{prompt_file}`, which appends one turn to an existing session's transcript and returns without owning the terminal. It is the only session verb Voro backgrounds, and — once its delivery is confirmed, below — the only one that is fire-and-forget: Voro reads no reply, so what the agent says afterwards lands in the launch log rather than in the UI, and the exchange is simply there on any later attach. The built-in `claude` spells it as its `resume` plus `-p`, resuming the session in place; the near-duplication between verb bodies is accepted rather than factored, because a verb is an opaque per-agent contract, and that opacity is exactly what lets an agent define a subset of the verbs and degrade one at a time. It applies to the three states whose session is open and between turns — `needs-input`, `review`, `waiting` — and is refused on the rest: `running` and `refining` are mid-turn with no injection channel, and `stalled` has a dead session, where a headless resume would restart the work with no tracked pid and no session row, invisible to the reconciler. Redispatch is the honest path there. A liveness probe refuses a session still running for the same reason the state gate does, and the send opens no session row: it joins a conversation Voro already knows about rather than starting one. In the cockpit this is `a`, with the interactive jump-in moving to `A` — the lowercase-quick, uppercase-interactive pairing the `r`/`R` refine keys already use (§9).
+**Answering a question happens in the session, not through Voro.** When an agent
+hits a blocker it calls `voro ask`, landing the task in `needs-input` with its
+`question` set. Voro's job from there is to be an accurate *signpost* — which
+task is blocked, on what question, surfaced on the inbox row and in the detail
+pane — not the door into the conversation. The operator opens the agent's own
+session directly (the `voro-<id>-<slug>` session it runs under, in a `claude
+agents` pane or the equivalent) and answers there, where the agent still has its
+full context; Voro records no answer text, since the exchange lives in the
+session transcript, addressable through the session ref already captured on the
+session row. Once answered, `voro resume <task-id>` moves the task `needs-input
+→ running` and nothing more: the dispatch preamble tells the agent to run it
+in-session after its question is answered (the primary path), and Enter on a
+`needs-input` inbox row is the operator's backstop for the same transition. A
+human already watching the session is a strictly better place to answer than a
+text box in Voro. `voro reject` is the symmetric move on the `review →
+running` (and `waiting →
+running`) edge: it appends the feedback to the task body under a `## Feedback`
+heading and returns the task to `running`. Because `review`/`waiting` keep the
+session open (see *Session lifecycle* below), the feedback lands back on the
+*same* agent session when its process is still alive — the operator having
+stayed attached — and otherwise the task stalls on the next reconcile and is
+redispatched with the feedback now in its body (the redispatch prompt carries
+it). Both `resume` and `reject` route through the transition API and change only
+state, so neither can smuggle a task into `running` outside the machine; a task
+never dispatched still answers or rejects as a plain transition, since nothing
+about them depends on a prior session.
 
-**A send that is refused must change nothing, so delivery is confirmed before the rejection commits.** A headless send can be refused outright, and the case that matters is not exotic: a `claude --bg` session that has finished its turn is still owned by a live supervisor process, and that supervisor refuses `--resume` for as long as it lives. Fire-and-forget hid it — the refusal exited in under a second into the launch log while the transition had already appended the feedback and returned the task to `running`, leaving a task nobody was working on, a body claiming otherwise, and a reconcile pass that stalled it for redispatch a moment later. So the ordering is inverted: the send is spawned first and watched for a short grace window, an early non-zero exit is reported as a message that did not happen — with the agent's own last log line quoted on the status line — and the task stays exactly where it was, feedback unwritten. Only a send still running past the window is followed by the session-row update and the `RejectWork` transition, together, so no other window's reconcile reads one without the other. A clean exit inside the window is a delivery, not a failure: a verb that says its piece and returns has done its job. This trades a lost transition for a lost send in the rare case where the store write fails after the spawn — and that case takes the agent down with it (the process group is killed) rather than leaving it working on feedback nothing records.
+**Steering a session without entering it** is the cheap half of that door.
+Answering in the session is right, but suspending the whole cockpit for a full
+attach round-trip to say one sentence is not, so the agent verb set has an
+optional `message`: a *headless* send carrying both `{session}` and
+`{prompt_file}`, which appends one turn to an existing session's transcript and
+returns without owning the terminal. It is the only session verb Voro
+backgrounds, and — once its delivery is confirmed, below — the only one that
+is fire-and-forget: Voro reads no reply, so what the agent says afterwards
+lands in the launch log rather than in the UI, and the exchange is simply there
+on any later attach. The built-in `claude` spells it as its `resume` plus `-p`;
+the near-duplication between verb bodies is accepted rather than factored,
+because a verb is an opaque per-agent contract, and that opacity is exactly
+what lets an agent define a subset of the verbs and degrade one at a time. It
+applies to the three states whose session is open and between turns —
+`needs-input`, `review`, `waiting` — and is refused on the rest: `running`
+and `refining` are mid-turn with no injection channel, and `stalled` has a dead
+session, where a headless resume would restart the work invisible to the
+reconciler — redispatch is the honest path there. A liveness probe refuses a
+session still running for the same reason the state gate does, and the send
+opens no session row: it joins a conversation Voro already knows about rather
+than starting one. In the cockpit this is `a`, with the interactive jump-in on
+`A` — the lowercase-quick, uppercase-interactive pairing the `r`/`R` refine
+keys already use (§9).
 
-**A message resumes the session in place, and what makes that possible is releasing the session at rest.** Every agent session, foreground or background, is a server process registered with a daemon, and `-p --resume` bypasses that daemon to own the transcript file — which is why the registry refuses it while a supervisor lives. Voro's answer is not to route around that hold but to remove it: the built-in `claude` message verb is a plain `claude -p --resume {session}`, and the session is stopped, through the same optional `stop` verb the close path uses, as soon as it comes to rest — so the hold is already gone by the time any message is sent. One session id, one Voro-composed name, one linear transcript for the task's whole life, and no kill step anywhere near a send.
+**A send that is refused must change nothing, so delivery is confirmed before
+the rejection commits.** A headless send can be refused outright, and the case
+that matters is not exotic: a `claude --bg` session that has finished its turn
+is still owned by a live supervisor process, and that supervisor refuses
+`--resume` for as long as it lives; a fire-and-forget send would append the
+feedback and return the task to `running` while the refusal exited quietly into
+the launch log. So the send is spawned first and watched for a short grace
+window: an early non-zero exit is reported as a message that did not happen —
+with the agent's own last log line quoted on the status line — and the task
+stays exactly where it was, feedback unwritten. Only a send still running past
+the window is followed by the session-row update and the `RejectWork`
+transition, together, so no other window's reconcile reads one without the
+other. A clean exit inside the window is a delivery, not a failure: a verb that
+says its piece and returns has done its job. This trades a lost transition for
+a lost send in the rare case where the store write fails after the spawn —
+and that case takes the agent down with it (the process group is killed) rather
+than leaving it working on feedback nothing records.
 
-Fork delivery was the previous answer to the same problem, and mechanically it worked. The `message` template may still carry a third, optional placeholder, `{new_session}`, which Voro binds to a freshly generated v4 UUID: an agent declares by using it that its sessions are joined by forking rather than resumed in place, the fork continues the same conversation under a reference the caller names up front, and the session row follows it — Voro records that reference once the send is confirmed, so the next message, the next jump-in and the reconciler all address the conversation where it actually continued. It shipped, lived briefly, and was reverted for the built-in, because the *name* is the operator's addressing scheme: the cockpit is a tmux split with Voro on one side and the agent's own session list on the other, `voro-<id>` is the join key between them and the only handle away from the desktop, and a fork moves the conversation out from under that name on every send — the live continuation never appears in the agent's session view, the row that does appear is the stale parent, and the picker accumulates one same-named transcript per message. Naming the fork patches the symptom; the disease is the fork. The placeholder stays for agents whose sessions genuinely can only be joined that way, and for them the row still follows; the built-in simply no longer uses it.
+**A message resumes the session in place, and what makes that possible is
+releasing the session at rest.** Every agent session, foreground or background,
+is a server process registered with a daemon, and `-p --resume` bypasses that
+daemon to own the transcript file — which is why the registry refuses it
+while a supervisor lives. Voro's answer is not to route around that hold but to
+remove it: the built-in `claude` message verb is a plain `claude -p --resume
+{session}`, and the session is stopped, through the same optional `stop` verb
+the close path uses, as soon as it comes to rest — so the hold is already
+gone by the time any message is sent. One session id, one Voro-composed name,
+one linear transcript for the task's whole life, and no kill step anywhere near
+a send.
 
-Both stop and fork are back doors around the same ownership model, and stop is the back door that preserves session identity, which is why it is the one Voro takes. The sanctioned front door exists — cross-session messaging wakes an idle background session in place — but has no supported external entry today: no CLI send verb, an in-session-only SDK send, an undocumented inbox-socket frame, and *channels*, the designed push mechanism whose contract and permission relay fit Voro exactly, gated behind a research preview whose dev-flag bypass the background launch path strips. When an external injection path lands, the `message` verb swaps to it and the stop machinery below stops being necessary — a config-sized change under the agent contract, because a verb is an opaque per-agent contract and nothing above it knows how a message is carried.
+Fork delivery is the alternative, kept for agents that need it. The `message`
+template may carry a third, optional placeholder, `{new_session}`, which Voro
+binds to a freshly generated v4 UUID: an agent declares by using it that its
+sessions are joined by forking rather than resumed in place, the fork continues
+the same conversation under a reference the caller names up front, and the
+session row follows it — Voro records that reference once the send is
+confirmed, so the next message, the next jump-in and the reconciler all address
+the conversation where it actually continued. The built-in `claude` does not
+use it, because the *name* is the operator's addressing scheme: the cockpit is
+a tmux split with Voro on one side and the agent's own session list on the
+other, `voro-<id>` is the join key between them, and a fork moves the
+conversation out from under that name on every send — the live continuation
+never appears in the agent's session view, and the picker accumulates one
+same-named transcript per message. The placeholder stays for agents whose
+sessions genuinely can only be joined that way, and for them the row still
+follows.
 
-One consequence of a headless send reaches reconciliation either way: a `-p` turn does not appear in the agent's own session listing while it runs, so the listing would report the session gone while the message it was just sent is still being answered. The row's recorded pid settles it, in one direction only — a *live* pid proves the session is live whatever the listing says, since the quick message replaces that pid with the process carrying its turn, while a dead pid still proves nothing (a dispatch's pid is a launcher that exits at birth) and falls back to the listing verdict.
+Both stop and fork are back doors around the same ownership model, and stop is
+the back door that preserves session identity, which is why it is the one Voro
+takes. The sanctioned front door exists — cross-session messaging wakes an
+idle background session in place — but has no supported external entry today:
+no CLI send verb, an in-session-only SDK send, an undocumented inbox-socket
+frame, and *channels*, the designed push mechanism whose contract and permission
+relay fit Voro exactly, gated behind a research preview whose dev-flag bypass
+the background launch path strips. When an external injection path lands, the
+`message` verb swaps to it and the stop machinery below stops being necessary
+— a config-sized change under the agent contract, because a verb is an opaque
+per-agent contract and nothing above it knows how a message is carried.
 
-**The release happens at rest, not at the transition that hands back.** The handover verbs fire mid-turn: `voro done` and `voro ask` run inside the agent's still-executing turn, so stopping at the transition itself would kill the tail of the very turn that is reporting. The trigger is therefore *rest*, judged from the two sources reconciliation already reads — a task in a between-turns state (`needs-input`, `review`, `waiting`) whose open session's listing entry reports its turn ended (state `done`) is stopped, best-effort, exactly as a closing row is. The guard is load-bearing in both directions. A session at `blocked` — a permission prompt, a supervisor mid-turn — never reads `done`, so it is never stopped; an entry that is absent was never registered or has already been stopped, so there is nothing to do, and the stop is idempotent and safe on a dead session. Nothing about the row changes: it stays open, it stays the task's conversation, and no event and no transition is recorded. Only the agent-side registration goes, which is also why firing the rule on every pass converges rather than repeating — a stopped session leaves the listing, so the next pass finds nothing at rest to stop.
+One consequence of a headless send reaches reconciliation either way: a `-p`
+turn does not appear in the agent's own session listing while it runs, so the
+listing would report the session gone while the message it was just sent is
+still being answered. The row's recorded pid settles it, in one direction only
+— a *live* pid proves the session is live whatever the listing says, since the
+quick message replaces that pid with the process carrying its turn, while a dead
+pid still proves nothing (a dispatch's pid is a launcher that exits at birth)
+and falls back to the listing verdict.
 
-What emerges is an invariant worth stating on its own: **a message can only ever be delivered to a session that has explicitly handed back to Voro.** Mid-turn, the liveness gate refuses the send honestly; between turns, the rest-stop has already released the hold. Consecutive messages fall under the same rule, and it does not matter whether a finished `-p` turn puts the session back in the agent's registry: where it does, the entry reads `done` again and the next pass releases it again before anything can be sent; where it does not, there was never a hold to release. Either way, after one message the task is back at rest — the agent called `voro done` — or `running` with a dead pid, which reconciliation already stalls. Stacked mid-turn sends are structurally impossible rather than merely discouraged. The send path carries no unconditional stop of its own: it gates on liveness as before, and only where the target's listing entry still reads `done` — the operator outrunning a reconcile tick, messaging within the same moment the agent reported in — does it make the same release inline and waited-on, refusing the send outright if that release fails. A message that could not be made deliverable commits nothing and leaves the task exactly where it was, which is the rule a refused send already answers to.
+**The release happens at rest, not at the transition that hands back.** The
+handover verbs fire mid-turn: `voro done` and `voro ask` run inside the agent's
+still-executing turn, so stopping at the transition itself would kill the tail
+of the very turn that is reporting. The trigger is therefore *rest*, judged from
+the two sources reconciliation already reads — a task in a between-turns state
+(`needs-input`, `review`, `waiting`) whose open session's listing entry reports
+its turn ended (state `done`) is stopped, best-effort, exactly as a closing row
+is. The guard is load-bearing in both directions. A session at `blocked` — a
+permission prompt, a supervisor mid-turn — never reads `done`, so it is never
+stopped; an entry that is absent was never registered or has already been
+stopped, so there is nothing to do, and the stop is idempotent and safe on a
+dead session. Nothing about the row changes: it stays open, it stays the task's
+conversation, and no event and no transition is recorded. Only the agent-side
+registration goes, which is also why firing the rule on every pass converges
+rather than repeating — a stopped session leaves the listing, so the next pass
+finds nothing at rest to stop.
 
-The trade, recorded rather than discovered later: releasing at rest retires the session's entry from the agent's own view at *handover* rather than at close, so a review task's named row lives in Voro's queue and not in the agent's session list. Attach still opens the stopped session with its full context — a stop keeps the conversation — so jumping in, answering in-session and reading the output are all unaffected.
+What emerges is an invariant worth stating on its own: **a message can only
+ever be delivered to a session that has explicitly handed back to Voro.**
+Mid-turn, the liveness gate refuses the send honestly; between turns, the
+rest-stop has already released the hold. Consecutive messages fall under the
+same rule whether or not a finished `-p` turn puts the session back in the
+agent's registry: where it does, the entry reads `done` again and the next pass
+releases it again; where it does not, there was never a hold to release.
+Stacked mid-turn sends are structurally impossible rather than merely
+discouraged. The send path carries no unconditional stop of its own: it gates
+on liveness as before, and only where the target's listing entry still reads
+`done` — the operator outrunning a reconcile tick — does it make the same
+release inline and waited-on, refusing the send outright if that release fails.
+A message that could not be made deliverable commits nothing and leaves the
+task exactly where it was.
 
-**A permission mode is a property of a launch, not of a verb.** `--permission-mode` is per invocation rather than something the session remembers, so every built-in template that hands an agent a prompt and expects it to *act* carries it — `dispatch`, `plan` and `message` alike — and a turn launched without it runs in the default ask mode, stopping on approvals against a stdin at `/dev/null`. The built-in `claude` `resume` is the deliberate exception rather than an oversight: it carries no prompt and starts no work of its own, handing the operator a terminal in which the ask-mode default is answerable by the person sitting in front of it. Omitting the flag on a prompted launch fails in the way that is hardest to read back. The session thinks, is refused its edits and its commands, and so cannot run `voro done` — it exits having done real work Voro never hears about, the reconciler finds the process gone, and the task lands in `stalled`. A missing flag therefore surfaces as a *dead agent*, sending the operator to liveness (which is working) rather than to the launch that could not act, which is why the property is asserted over the built-in templates by a test instead of being left to each verb's spelling.
+The trade, recorded rather than discovered later: releasing at rest retires the
+session's entry from the agent's own view at *handover* rather than at close, so
+a review task's named row lives in Voro's queue and not in the agent's session
+list. Attach still opens the stopped session with its full context — a stop
+keeps the conversation — so jumping in, answering in-session and reading the
+output are all unaffected.
 
-**Session lifecycle.** A session's life follows the *task*, not the agent's process listing. An open session therefore no longer implies the task is *executing*: a refine round (§6) opens one too, in the same transaction as `proposed → refining`, and closes it on the transition back — `completed` when the rewritten body landed, `failed` when the agent died, `aborted` when the round was quit or cancelled. What a session means is "an agent Voro launched is working on this task", and which kind of work it is comes from the task's state, which is why every session-consuming query reads that state rather than the session's existence: the running strip lists `running` and `refining` (§9), reconciliation probes those two and leaves the rest alone, and dispatch's preconditions never look at sessions at all. The dispatch half of that life is unchanged: a session is opened at dispatch (in the same transaction as `ready → running`), stays open across `running → needs-input → review` — `needs-input` keeps it open so the operator answers in that same session, and `review` keeps it open so a reject-with-feedback returns the work to it — and is closed by the terminal transition that tears the running work down, stamped with the matching outcome in the same transaction: `Accept` closes it `completed`, `Abort` and `Abandon` close it `aborted`. `Resume` and `RejectWork` deliberately leave it open (the task returns to `running` on the session it already had). `waiting` (§6) behaves exactly as `review` here: the hand-off keeps the session open, so a change-requested `RejectWork` from `waiting` returns to the same agent session, and `Accept`/`Abandon` from `waiting` close it (`completed`/`aborted`) precisely as they do from `review`. Reconciliation therefore leaves a `waiting` task's open session untouched regardless of process liveness, the same treatment it gives `needs-input` and `review`. A task holds **at most one open session** as an invariant: opening a redispatch first closes any predecessor still open in the same transaction, enforced by a partial unique index on `sessions(task_id) WHERE ended_at IS NULL`. Rows stay one-per-attempt — each keeps its own pid, log, and outcome, and the redispatch flag still derives from the latest one — but two can never be open at once, so a task can never render twice in the running strip.
+**A permission mode is a property of a launch, not of a verb.**
+`--permission-mode` is per invocation rather than something the session
+remembers, so every built-in template that hands an agent a prompt and expects
+it to *act* carries it — `dispatch`, `plan` and `message` alike — and a turn
+launched without it runs in the default ask mode, stopping on approvals against
+a stdin at `/dev/null`. The built-in `claude` `resume` is the deliberate
+exception: it carries no prompt and starts no work of its own, handing the
+operator a terminal in which the ask-mode default is answerable by the person
+sitting in front of it. Omitting the flag on a prompted launch fails in the way
+that is hardest to read back — the session is refused its edits, cannot run
+`voro done`, exits having done real work Voro never hears about, and the task
+lands in `stalled`: a missing flag surfaces as a *dead agent*, sending the
+operator to liveness rather than to the launch that could not act. That is why
+the property is asserted over the built-in templates by a test instead of being
+left to each verb's spelling.
 
-A session's entry in the *agent's own* registry follows its row in the same way: closing the row stops the session, so the agent's listing converges on work actually in flight. The listing is how the operator finds a session to attach to and how Voro reads liveness, and both get worse the longer it grows — a `claude --bg` session outlives its work twice over, keeping its entry in `claude agents` and a supervisor process that runs until the machine reboots, so an operator who dispatches all week reads their session list through a wall of finished ones. The stop rides an *optional* `stop` verb (below), fired at the closing session's reference, detached, its output going to the launch log: an agent that defines none — or one whose `stop` fails — degrades to exactly what Voro did before, a lingering listing entry and nothing broken. The transition never waits on it and never rolls back for it. Which closes stop is deliberately narrower than which closes happen: the operator's closing verdicts (`Accept`, `Abort`, `Abandon`) stop, and so do the reconciler's finalisations, both the dead-dispatch stall and the stale-row heal, since by then the session is over and Voro has said so. Sessions that stay open — `needs-input`, `review`, `waiting` — are not stopped by a *close*, because there is no close; they are released by the rest-stop above instead, on its own narrower test, and that release takes the registration without taking the row, so the operator still answers and rejects into them. A refine round's conclusion is the one close that does not stop, because its commonest trigger is the rewriting agent's own `voro set --body-file`, a call made from inside the session and mid-turn: stopping there would kill the agent that just reported. `voro-core` decides *whether* a close stops (`Store::apply_closing` hands back the session a verdict retired, `Store::reconcile_session` the one a pass finalised); the `voro` crate supplies the spawn, beside the other process seams.
+**Session lifecycle.** A session's life follows the *task*, not the agent's
+process listing. An open session does not imply the task is
+*executing*: a refine round (§6) opens one too, in the same transaction as
+`proposed → refining`, and closes it on the transition back — `completed`
+when the rewritten body landed, `failed` when the agent died, `aborted` when the
+round was quit or cancelled. What a session means is "an agent Voro launched is
+working on this task", and which kind of work it is comes from the task's state,
+which is why every session-consuming query reads that state rather than the
+session's existence: the running strip lists `running` and `refining` (§9),
+reconciliation probes those two and leaves the rest alone, and dispatch's
+preconditions never look at sessions at all. The dispatch half of that life is
+unchanged: a session is opened at dispatch (in the same transaction as `ready
+→ running`), stays open across `running → needs-input → review` —
+`needs-input` keeps it open so the operator answers in that same session, and
+`review` keeps it open so a reject-with-feedback returns the work to it — and
+is closed by the terminal transition that tears the running work down, stamped
+with the matching outcome in the same transaction: `Accept` closes it
+`completed`, `Abort` and `Abandon` close it `aborted`. `Resume` and `RejectWork`
+deliberately leave it open (the task returns to `running` on the session it
+already had). `waiting` (§6) behaves exactly as `review` here: the hand-off
+keeps the session open, so a change-requested `RejectWork` from `waiting`
+returns to the same agent session, and `Accept`/`Abandon` from `waiting` close
+it (`completed`/`aborted`) precisely as they do from `review`. Reconciliation
+therefore leaves a `waiting` task's open session untouched regardless of process
+liveness, the same treatment it gives `needs-input` and `review`. A task holds
+**at most one open session** as an invariant: opening a redispatch first closes
+any predecessor still open in the same transaction, enforced by a partial unique
+index on `sessions(task_id) WHERE ended_at IS NULL`. Rows stay one-per-attempt
+— each keeps its own pid, log, and outcome, and the redispatch flag still
+derives from the latest one — but two can never be open at once, so a task can
+never render twice in the running strip.
 
-**Worktree lifecycle.** A dispatched agent does its work in a throwaway git worktree of the project checkout it creates itself — the dispatch preamble instructs this, and Voro runs no git during dispatch (below), so the branch and its worktree are the agent's to make. *How* it makes one is the agent's own business, and the preamble prefers the harness's mechanism to a hand-rolled `git worktree add` where one exists: Claude Code refuses file edits until its `EnterWorktree` tool has run, and aiming that tool at an already-made worktree raises an approval prompt a headless session cannot answer, so an agent following the manual instruction literally hangs at the first edit. Such a tool names the branch itself, so the preamble also spells out the `git switch -c <branch>` that puts the work on the branch Voro tracks. Where that worktree lands is immaterial to everything downstream — `open` and the cleanup below find it through `git worktree list` on the checkout, which sees a worktree nested under the checkout (Claude Code puts them in `.claude/worktrees/`) exactly as it sees a sibling one. Nothing else prunes those, so a worktree's lifetime is tied to the *session's*: it lives as long as the session does, and is torn down when the session closes — that is, at the terminal transition that closes the task. The teardown is owned by Voro rather than the agent because by then the agent has exited, and because it is an operator action: "Voro runs no git" governs branch *management during dispatch*, not operator-invoked git at task close. Only the closing transitions that discard or accept the work clean up — `Accept` and `Abandon`; `Abort` deliberately does not, since it returns the task to the queue and its in-progress worktree may be wanted on redispatch. Given a task with a branch, Voro finds the worktree of the project checkout on that branch (never the primary checkout) and removes it with a plain, non-forced `git worktree remove`: a dirty worktree makes git refuse, which is reported and left in place rather than force-removed, and the transition stands regardless. With the worktree gone the branch is checked out nowhere and can be deleted too — but only when its work is verifiably upstream, since squash-merging (this repo's convention) leaves the branch tip a non-ancestor of `main` that `git branch -d` will not recognise: a merged PR (checked via the task's `pr_url` with `gh pr view`) authorises a `git branch -D`, and without one a plain `git branch -d` is attempted and the branch left alone if git refuses. An unverified branch is never force-deleted. This on-close cleanup is a CLI-only affair: only `voro accept`/`abandon` perform it, announcing every destructive step before it runs — the operator is shown the worktree path, the branch, and why it is judged safe, and confirms at a `y/N` prompt (with `--yes` to skip it for scripting); declining skips the cleanup but still completes the transition. Closing a task in the TUI does no cleanup at all — the transition applies and the worktree and branch are left in place, to be removed later on the CLI or by hand. The git/`gh` I/O lives in the `voro` crate beside dispatch, so `voro-core` stays free of process and filesystem I/O.
+A session's entry in the *agent's own* registry follows its row in the same way:
+closing the row stops the session, so the agent's listing converges on work
+actually in flight. The listing is how the operator finds a session to attach to
+and how Voro reads liveness, and both get worse the longer it grows — a
+`claude --bg` session outlives its work twice over, keeping its entry in `claude
+agents` and a supervisor process that runs until the machine reboots, so an
+operator who dispatches all week reads their session list through a wall of
+finished ones. The stop rides an *optional* `stop` verb (below), fired at the
+closing session's reference, detached, its output going to the launch log: an
+agent that defines none — or one whose `stop` fails — degrades to exactly
+what Voro did before, a lingering listing entry and nothing broken. The
+transition never waits on it and never rolls back for it. Which closes stop is
+deliberately narrower than which closes happen: the operator's closing verdicts
+(`Accept`, `Abort`, `Abandon`) stop, and so do the reconciler's finalisations,
+both the dead-dispatch stall and the stale-row heal, since by then the session
+is over and Voro has said so. Sessions that stay open — `needs-input`,
+`review`, `waiting` — are not stopped by a *close*, because there is no close;
+they are released by the rest-stop above instead, on its own narrower test, and
+that release takes the registration without taking the row, so the operator
+still answers and rejects into them. A refine round's conclusion is the one
+close that does not stop, because its commonest trigger is the rewriting agent's
+own `voro set --body-file`, a call made from inside the session and mid-turn:
+stopping there would kill the agent that just reported. `voro-core` decides
+*whether* a close stops (`Store::apply_closing` hands back the session a verdict
+retired, `Store::reconcile_session` the one a pass finalised); the `voro` crate
+supplies the spawn, beside the other process seams.
 
-**Observing the end of a session** is the other half of the loop, and has to answer a wrinkle: the `voro` invocation that dispatched a session may not outlive it — a one-shot `voro dispatch` returns immediately, and a TUI session watching it can simply be closed before the agent finishes. Because healthy sessions are now closed by the transitions above, reconciliation no longer has to be the thing that eventually closes them; it keeps only the job it is uniquely able to do — catch a session whose process died without reporting, on a `running` task or a `refining` one — plus tidy a row left stranded on a task that has already closed. There is no daemon or waiter; instead Voro reconciles on read. Every code path that consults live session or task state — `App::refresh` in the TUI, and every CLI verb — first calls a reconciler that walks `sessions` where `ended_at` is still null and, per session, acts on its task's state:
+**Worktree lifecycle.** A dispatched agent does its work in a throwaway git
+worktree of the project checkout it creates itself — the dispatch preamble
+instructs this, and Voro runs no git during dispatch (below), so the branch and
+its worktree are the agent's to make. *How* it makes one is the agent's own
+business, and the preamble prefers the harness's mechanism to a hand-rolled
+`git worktree add` where one exists: Claude Code refuses file edits until its
+`EnterWorktree` tool has run, and aiming that tool at an already-made worktree
+raises an approval prompt a headless session cannot answer. Such a tool names
+the branch itself, so the preamble also spells out the `git switch -c <branch>`
+that puts the work on the branch Voro tracks. Where that worktree lands is
+immaterial to everything downstream — `open` and the cleanup below find it
+through `git worktree list` on the checkout, which sees a worktree nested under
+the checkout (Claude Code puts them in `.claude/worktrees/`) exactly as it sees
+a sibling one. Nothing else prunes those, so a worktree's lifetime is tied to
+the *session's*: it is torn down at the terminal transition that closes the
+task. The teardown is owned by Voro rather than the agent because by then the
+agent has exited, and because it is an operator action: "Voro runs no git"
+governs branch *management during dispatch*, not operator-invoked git at task
+close. Only the closing transitions that discard or accept the work clean up —
+`Accept` and `Abandon`; `Abort` deliberately does not, since it returns the
+task to the queue and its in-progress worktree may be wanted on redispatch.
+Given a task with a branch, Voro finds the worktree of the project checkout on
+that branch (never the primary checkout) and removes it with a plain,
+non-forced `git worktree remove`: a dirty worktree makes git refuse, which is
+reported and left in place rather than force-removed, and the transition stands
+regardless. With the worktree gone the branch can be deleted too — but only
+when its work is verifiably upstream, since squash-merging leaves the branch
+tip a non-ancestor of `main` that `git branch -d` will not recognise: a merged
+PR (checked via the task's `pr_url` with `gh pr view`) authorises a `git branch
+-D`, and without one a plain `git branch -d` is attempted and the branch left
+alone if git refuses. An unverified branch is never force-deleted. This
+on-close cleanup is a CLI-only affair: only `voro accept`/`abandon` perform it,
+announcing every destructive step before it runs — the operator is shown the
+worktree path, the branch, and why it is judged safe, and confirms at a `y/N`
+prompt (with `--yes` to skip it for scripting); declining skips the cleanup but
+still completes the transition. Closing a task in the TUI does no cleanup at
+all — the worktree and branch are left in place, to be removed later on the
+CLI or by hand. The git/`gh` I/O lives in the `voro` crate beside dispatch, so
+`voro-core` stays free of process and filesystem I/O.
 
-- task still `running`: check whether the session's process is alive — by the agent's own `sessions` listing, or by `kill -0` on the pid the session row holds, whichever that row's `liveness_source` names (both run from the `voro` crate; `voro-core` never touches a process, it classifies a listing entry from its fields alone and takes the liveness result as a plain bool to decide what it means). What a listing entry *says* about liveness is the contract every consumer of the listing reads it by, here and in the two below. An entry is dead once its `state` is `done`; failing that, a `pid` it names is authoritative — the session is live exactly while that process exists — and only failing *both* does the state stand alone, where `working` reads live and everything else, an unrecognised state or none at all, reads dead. Not-`done` cannot mean live, because an agent's listing is under no obligation to retire an entry: `claude agents --json` leaves long-dead sessions sitting at `blocked` indefinitely, so the earlier not-`done` rule read a listing of mostly zombies as a fleet of running agents, and the operator's `A` reached for `attach` on a session the agent no longer had. Reading the pid rather than the state vocabulary is what keeps the *other* direction right at the same time: a session genuinely stuck mid-turn — blocked on a permission prompt, supervisor alive — is exactly what the operator wants to attach to, and a rule that trusted only a state word would have thrown it out with the zombies. An entry carrying neither field claims nothing, and a listing whose entries never carry either is one Voro cannot read liveness from at all — which is a defect in that agent's `sessions` verb, not a state Voro guesses around. If the process has gone, the agent ended without calling `done` or `ask`: the session outcome is recorded (`capped` if the log tail matches a short list of known usage-limit phrases, else `failed`) and the task lands **`running → stalled`** in the same transaction, tagged with a distinct `reconcile` event. A vanished session is indistinguishable from a normal completion whose `voro done` has not yet landed, which is what makes `stalled` — an attention state — the safe landing: even the misfire case surfaces as a queue row a human looks at rather than work `voro next` hands out, and because a stalled task is only ever redispatched by hand, a late `done` cannot race a fresh dispatch. That safety does not require refusing the `done` itself: completion is accepted from `stalled` directly (`stalled → review`, §6), reporting the dead session's finished work on its behalf — the operator having read the log, or the missing report finally landing. The session is already closed, so no lifecycle work rides the edge. From `stalled` the human redispatches (with the predecessor's notes/log), completes it into review, parks, or abandons. An orphaned `running` row (§9) means only a task started by hand or one whose liveness could not be determined; the one-open-session invariant means a reconciled session is always the task's current one, so a lingering listing entry for an earlier, already-closed session can never keep the task counted as live.
-- task `refining`: the same probe, with a different landing, and read by the same recorded source. A headless round renders the agent's own `dispatch` template (§6), so it inherits that template's caveat whole: under a `--bg` launcher the pid Voro spawns is a launcher that exits at birth, and pid-checking it declares the round dead seconds after it starts, while the agent works on — which mismarks the rewrite that then lands, and so teaches the operator to disbelieve the very marker that exists to say a rewrite silently never happened. A headless round is therefore listing-authoritative like the dispatch it renders, and captures a session ref at launch from the same listing. The interactive round is the genuine own-pid case: a foreground `plan` child, no supervisor and no ref by construction, so it records itself pid-authoritative and is pid-checked — as is any round of an agent defining no `sessions` verb, where the spawned pid is the only source there is. If the round has gone, the rewrite never landed: the session is finalised `failed` and the task returns **`refining → proposed`**, marked `⚠ refine failed` so the operator reads the old body knowing so (§6).
-- task `needs-input`, `review`, or `waiting`: the session is meant to stay open — the operator answers in it, or a reject-with-feedback returns the work to it — so reconciliation leaves it untouched regardless of process liveness. A lingering `blocked`/`null` listing entry that never says `done` therefore no longer matters: nothing here depends on the listing eventually retiring the session.
-- task already closed, or otherwise off the active path (`done`/`rejected`): a still-open session is stale — the terminal transition should have closed it — so it is finalised now (`completed` for `done`, else `aborted`), with no event. This is what heals a legacy stranded row (a `done` task still carrying an open session) on the next pass, without manual SQL.
+**Observing the end of a session** is the other half of the loop, and has to
+answer a wrinkle: the `voro` invocation that dispatched a session may not
+outlive it — a one-shot `voro dispatch` returns immediately, and a TUI session
+watching it can simply be closed before the agent finishes. Healthy sessions
+are closed by the transitions above, so reconciliation keeps only the job it is
+uniquely able to do — catch a session whose process died without reporting, on
+a `running` task or a `refining` one — plus tidy a row left stranded on a task
+that has already closed. There is no daemon or waiter; instead Voro reconciles
+on read. Every code path that consults live session or task state —
+`App::refresh` in the TUI, and every CLI verb — first calls a reconciler that
+walks `sessions` where `ended_at` is still null and, per session, acts on its
+task's state:
 
-**Which of the two sources owns a session** is a property of the launch, not of anything else the row happens to carry, so it is recorded at the spawn (`sessions.liveness_source`, §5) by the code that performed it rather than inferred at reconciliation. Dispatch and the headless refine record the flavour of the agent's `dispatch` template — `listing` where the agent defines a `sessions` verb, since such a launch may hand the work to a supervisor and the listing is then the only source that can answer, `pid` where it defines none and the spawned pid is all there is — and the interactive refine records `pid`, being a foreground `plan` child Voro owns. The recorded source names which probe answers, not whether the row's pid is read at all: a live pid still proves the session live whichever source owns it (above). The rule this replaces read the flavour off the absence of a session ref: a `refining` session with no ref was taken for the interactive round. That was right for the flavour it was written for and wrong for the one it could not tell apart, because a headless round whose ref capture timed out has no ref either, and pid-checking it finalised the round `failed` within a second of launch while its agent went on rewriting the body. The late-rewrite backstop (§6) corrects the *marker* when the rewrite finally lands, but not the early exit from `refining` — and leaving that state early is what lets a second window hand a verdict to a proposal whose body is about to be replaced, the race the state exists to close. Recorded rather than guessed, such a round is simply unprobeable until its ref appears or its listing answers, and is left alone exactly as a ref-less dispatch already was: liveness Voro cannot determine is never grounds for finalising a session. The column is additive, and sessions already open when it lands default to `listing` — what every dispatch under an agent with a `sessions` verb already was, and the direction that leaves a session alone rather than killing a live one.
+- task still `running`: check whether the session's process is alive — by the
+  agent's own `sessions` listing, or by `kill -0` on the pid the session row
+  holds, whichever that row's `liveness_source` names (both run from the `voro`
+  crate; `voro-core` never touches a process, it classifies a listing entry from
+  its fields alone and takes the liveness result as a plain bool to decide what
+  it means). What a listing entry *says* about liveness is the contract every
+  consumer of the listing reads it by, here and in the two below. An entry is
+  dead once its `state` is `done`; failing that, a `pid` it names is
+  authoritative — the session is live exactly while that process exists —
+  and only failing *both* does the state stand alone, where `working` reads live
+  and everything else, an unrecognised state or none at all, reads dead.
+  Not-`done` cannot mean live, because an agent's listing is under no obligation
+  to retire an entry: `claude agents --json` leaves long-dead sessions sitting
+  at `blocked` indefinitely, so a not-`done` rule would read a listing of mostly
+  zombies as a fleet of running agents. Reading the pid rather than the state
+  vocabulary keeps the *other* direction right at the same time: a session
+  genuinely stuck mid-turn — blocked on a permission prompt, supervisor alive
+  — is exactly what the operator wants to attach to, and a rule that trusted
+  only a state word would throw it out with the zombies. An entry carrying
+  neither field claims nothing, and a listing whose entries never carry either
+  is one Voro cannot read liveness from at all — a defect in that agent's
+  `sessions` verb, not a state Voro guesses around. If
+  the process has gone, the agent ended without calling `done` or `ask`: the
+  session outcome is recorded (`capped` if the log tail matches a short list of
+  known usage-limit phrases, else `failed`) and the task lands **`running →
+  stalled`** in the same transaction, tagged with a distinct `reconcile` event.
+  A vanished session is indistinguishable from a normal completion whose `voro
+  done` has not yet landed, which is what makes `stalled` — an attention state
+  — the safe landing: even the misfire case surfaces as a queue row a human
+  looks at rather than work `voro next` hands out, and because a stalled task is
+  only ever redispatched by hand, a late `done` cannot race a fresh dispatch.
+  That safety does not require refusing the `done` itself: completion is
+  accepted from `stalled` directly (`stalled → review`, §6), reporting the
+  dead session's finished work on its behalf — the operator having read the
+  log, or the missing report finally landing. The session is already closed, so
+  no lifecycle work rides the edge. From `stalled` the human redispatches (with
+  the predecessor's notes/log), completes it into review, parks, or abandons. An
+  orphaned `running` row (§9) means only a task started by hand or one whose
+  liveness could not be determined; the one-open-session invariant means a
+  reconciled session is always the task's current one, so a lingering listing
+  entry for an earlier, already-closed session can never keep the task counted
+  as live.
+- task `refining`: the same probe, with a different landing, and read by the
+  same recorded source. A headless round renders the agent's own `dispatch`
+  template (§6), so it inherits that template's caveat whole: under a `--bg`
+  launcher the pid Voro spawns is a launcher that exits at birth, and
+  pid-checking it declares the round dead seconds after it starts, while the
+  agent works on — which mismarks the rewrite that then lands, and so teaches
+  the operator to disbelieve the very marker that exists to say a rewrite
+  silently never happened. A headless round is therefore listing-authoritative
+  like the dispatch it renders, and captures a session ref at launch from the
+  same listing. The interactive round is the genuine own-pid case: a foreground
+  `plan` child, no supervisor and no ref by construction, so it records itself
+  pid-authoritative and is pid-checked — as is any round of an agent defining
+  no `sessions` verb, where the spawned pid is the only source there is. If the
+  round has gone, the rewrite never landed: the session is finalised `failed`
+  and the task returns **`refining → proposed`**, marked `⚠ refine failed`
+  so the operator reads the old body knowing so (§6).
+- task `needs-input`, `review`, or `waiting`: the session is meant to stay open
+  — the operator answers in it, or a reject-with-feedback returns the work to
+  it — so reconciliation leaves it untouched regardless of process liveness. A
+  lingering `blocked`/`null` listing entry that never says `done` therefore no
+  longer matters: nothing here depends on the listing eventually retiring the
+  session.
+- task already closed, or otherwise off the active path (`done`/`rejected`): a
+  still-open session is stale — the terminal transition should have closed it
+  — so it is finalised now (`completed` for `done`, else `aborted`), with no
+  event. This is what heals a legacy stranded row (a `done` task still carrying
+  an open session) on the next pass, without manual SQL.
 
-**Usage-cap detection** stays a substring match over a few KB of text for phrases like "usage limit" — deliberately narrow, and asymmetric on purpose: a cap worded in a way the list does not know is reported `failed` rather than `capped`, a labelling gap and not a functional one since both outcomes stall the task for redispatch identically, whereas a *false* cap would badge healthy work as stuck and teach the operator to disbelieve the marker. The list is therefore qualified rather than merely widened: "approaching", "80% of your", "not your" each take a match back, because an agent says all three about a limit it has not hit. What the list must cover is what agents actually write, which is not what the original three phrases assumed — Claude Code words a five-hour cap "Session limit reached" and a weekly one "Weekly limit reached", neither of which contains "usage limit", "rate limit" or "quota exceeded", so the generic phrases matched almost no real cap. A real cap also *ends* with an upgrade prompt — "/upgrade to increase your usage limit" — which carries a signature of its own, and that prompt is read as boilerplate rather than as a report: it is skipped when deciding which signature speaks. Left in, it decides every genuine cap, since it comes last; and because it is the one signature with no reset time after it, the badge lost the time the agent had actually named on every real cap. It would also let a mere warning badge as a cap on any screen where the same prompt trailed it. Skipping is not the same as qualifying it: a qualifier means "this one is not a cap" and would let an earlier, superseded cap speak past the warning that had replaced it.
+**Which of the two sources owns a session** is a property of the launch, not of
+anything else the row happens to carry, so it is recorded at the spawn
+(`sessions.liveness_source`, §5) by the code that performed it rather than
+inferred at reconciliation. Dispatch and the headless refine record the flavour
+of the agent's `dispatch` template — `listing` where the agent defines a
+`sessions` verb, since such a launch may hand the work to a supervisor and the
+listing is then the only source that can answer, `pid` where it defines none
+and the spawned pid is all there is — and the interactive refine records
+`pid`, being a foreground `plan` child Voro owns. The recorded source names
+which probe answers, not whether the row's pid is read at all: a live pid still
+proves the session live whichever source owns it (above). Recording it at spawn
+rather than inferring it matters because a listing-owned round whose ref
+capture timed out is simply unprobeable until its ref appears or its listing
+answers, and is left alone exactly as a ref-less dispatch is: liveness Voro
+cannot determine is never grounds for finalising a session.
 
-*Which text* is scanned is the substantive question, and Voro's own launch log is the wrong answer for the launches that matter. Under a supervisor-owned launch (`claude --bg`) the launcher exits at birth having written nothing but the backgrounding banner, so scanning that log could essentially never report `capped` however the session died. The agent's verb set therefore gains an optional **`logs`**: a session in (`{session}`), that session's recent output out. It is an opaque per-agent contract like the rest and degrades like the rest — an agent that defines none is classified from the launch-log tail exactly as before, and the built-in `codex` defines none. The text it returns may be a terminal capture rather than a log, so escape sequences are stripped before matching, with cursor movement becoming a space (it stands for the gap between two words) and colour vanishing (it does not, and would otherwise split the phrase it styles).
+**Usage-cap detection** is a substring match over a few KB of text —
+deliberately narrow, and asymmetric on purpose: a cap worded in a way the list
+does not know is reported `failed` rather than `capped`, a labelling gap and
+not a functional one since both outcomes stall the task for redispatch
+identically, whereas a *false* cap would badge healthy work as stuck and teach
+the operator to disbelieve the marker. The list is qualified rather than merely
+widened: "approaching", "80% of your", "not your" each take a match back,
+because an agent says all three about a limit it has not hit. What the list
+must cover is what agents actually write — Claude Code words a five-hour cap
+"Session limit reached" and a weekly one "Weekly limit reached", neither of
+which contains "usage limit". A real cap also *ends* with an upgrade prompt —
+"/upgrade to increase your usage limit" — which carries a signature of its
+own, and that prompt is read as boilerplate rather than as a report: it is
+skipped when deciding which signature speaks. Left in, it would decide every
+genuine cap, since it comes last, and being the one signature with no reset
+time after it the badge would lose the time the agent actually named; it would
+also let a mere warning badge as a cap on any screen where the same prompt
+trailed it. Skipping is not the same as qualifying it: a qualifier means "this
+one is not a cap" and would let an earlier, superseded cap speak past the
+warning that had replaced it.
 
-That same channel answers a question the reconciler could not previously ask at all. **A usage cap does not kill a supervisor-owned session**: the supervisor stays alive and the session sits waiting for the window to reset, so a capped dispatch is never *dead*, never reconciled, and rides the running strip looking healthy for hours. Reading `logs` for a *live* `running`/`refining` session with a captured ref closes that hole, and the result is rendered as a badge on the strip row — `⚠ capped ↻21:50` with the reset time where the agent named one, `⚠ capped` where it did not, `⚠ capped · reset passed` once that time has gone by, which is a different situation (the window is open; the session wants a nudge) and so says so, and `⚠ capped · retrying ↻21:50` where the agent said it is retrying the rejected request, which is the one shape that wants nothing done about it at all (below). The reset time is parsed best-effort from a bare clock time, resolved to whichever occurrence is nearest — taking the *next* one would claim another day's wait a minute after the window reopened.
+*Which text* is scanned is the substantive question, and Voro's own launch log
+is the wrong answer for the launches that matter. Under a supervisor-owned
+launch (`claude --bg`) the launcher exits at birth having written nothing but
+the backgrounding banner, so scanning that log could essentially never report
+`capped` however the session died. The agent's verb set therefore gains an
+optional **`logs`**: a session in (`{session}`), that session's recent output
+out. It is an opaque per-agent contract like the rest and degrades like the rest
+— an agent that defines none is classified from the launch-log tail exactly as
+before, and the built-in `codex` defines none. The text it returns may be a
+terminal capture rather than a log, so escape sequences are stripped before
+matching, with cursor movement becoming a space (it stands for the gap between
+two words) and colour vanishing (it does not, and would otherwise split the
+phrase it styles).
 
-Three properties keep that badge honest. It carries **no state change**: `stalled` means "dead dispatch, redispatch me", and a capped session is neither dead nor in need of redispatch, so the task stays `running` and the session stays open. It is **not schema**: the reading is held in memory, recomputed, and never written, which is what makes it self-clearing — the operator continues the session, its next output no longer says "limit reached", and the badge is gone on the following pass rather than needing to be retracted. And it is **off the event loop**: the verb costs the better part of a second per session, which the render path may never wait on (see *What may block the TUI event loop*), so it runs on a background thread and is debounced to one reading per session per minute — the one probe in the TUI debounced against the clock rather than against the selection, since every in-flight session is a target on every tick. There is deliberately no cockpit-header quota gauge: the statusline JSON that carries `rate_limits.five_hour.resets_at` is pushed *to* running Claude sessions and is not readable by Voro, so a gauge would need a data source that does not exist.
+That same channel answers a question the reconciler could not previously ask at
+all. **A usage cap does not kill a supervisor-owned session**: the supervisor
+stays alive and the session sits waiting for the window to reset, so a capped
+dispatch is never *dead*, never reconciled, and rides the running strip looking
+healthy for hours. Reading `logs` for a *live* `running`/`refining` session with
+a captured ref closes that hole, and the result is rendered as a badge on the
+strip row — `⚠ capped ↻21:50` with the reset time where the agent named
+one, `⚠ capped` where it did not, `⚠ capped · reset passed` once that time
+has gone by, which is a different situation (the window is open; the session
+wants a nudge) and so says so, and `⚠ capped · retrying ↻21:50` where the
+agent said it is retrying the rejected request, which is the one shape that
+wants nothing done about it at all (below). The reset time is parsed best-effort
+from a bare clock time, resolved to whichever occurrence is nearest — taking
+the *next* one would claim another day's wait a minute after the window
+reopened.
 
-**Recovering a capped session** is then one key, `u`, which nudges *every* badged session whose reset has gone by. A cap does not retry — Claude Code declines to retry a usage-limit rejection at all, a rule read out of the agent itself rather than assumed: a 429 carrying the usage-limit headers is classified non-retryable under a subscription login, and the one path that would wait a cap out and resume by itself is gated on an environment flag the agent's remote runner sets and a local `--bg` launch does not. So the cap ends the session's turn and leaves it sitting there, and work waits for a human however long ago the window reopened — and walking the strip by hand costs an attach, a typed word and a detach per session, which is how the overnight reset hours get lost. The sweep is that walk as a single keystroke, and it reports what it did: how many it nudged, how many are still before their reset, and any the agent refused. The message it sends is one word, *continue*, because the session already holds the whole task — its transcript, its worktree, its half-written work — and anything longer would be Voro restating a brief the agent can already read.
+Three properties keep that badge honest. It carries **no state change**:
+`stalled` means "dead dispatch, redispatch me", and a capped session is neither
+dead nor in need of redispatch, so the task stays `running` and the session
+stays open. It is **not schema**: the reading is held in memory, recomputed, and
+never written, which is what makes it self-clearing — the operator continues
+the session, its next output no longer says "limit reached", and the badge is
+gone on the following pass rather than needing to be retracted. And it is **off
+the event loop**: the verb costs the better part of a second per session, which
+the render path may never wait on (see *What may block the TUI event loop*), so
+it runs on a background thread and is debounced to one reading per session per
+minute — the one probe in the TUI debounced against the clock rather than
+against the selection, since every in-flight session is a target on every tick.
+There is deliberately no cockpit-header quota gauge: the statusline JSON that
+carries `rate_limits.five_hour.resets_at` is pushed *to* running Claude sessions
+and is not readable by Voro, so a gauge would need a data source that does not
+exist.
 
-The one badged session the sweep walks past is one whose output says it is *retrying*. That a cap never retries is a fact about the agent, not about the badge, and the risk runs the other way: a rate limit carrying none of the usage-limit headers *is* retried, and the agent labels that retry with the API's own wording, which has "rate limit" in it — so the matcher sees a cap on a session that is mid-turn and will resume itself. Nothing else tells the two apart, both reading `blocked` with a live supervisor and both wearing a cap phrase, so the reading carries whether the output named a retry and the sweep skips those, counting them in what it reports rather than passing over them in silence. Skipping is not a courtesy: because the send stops its target before resuming it (below), nudging a retrying session would not add a redundant turn to it but end the turn already running. The same reading also holds that session's badge back from `reset passed`, since the time such a line names is when its own request goes out and not when a human should step in.
+**Recovering a capped session** is then one key, `u`, which nudges *every*
+badged session whose reset has gone by. A cap does not retry — Claude Code
+declines to retry a usage-limit rejection at all, a rule read out of the agent
+itself rather than assumed: a 429 carrying the usage-limit headers is classified
+non-retryable under a subscription login, and the one path that would wait a cap
+out and resume by itself is gated on an environment flag the agent's remote
+runner sets and a local `--bg` launch does not. So the cap ends the session's
+turn and leaves it sitting there, and work waits for a human however long ago
+the window reopened — and walking the strip by hand costs an attach, a typed
+word and a detach per session, which is how the overnight reset hours get lost.
+The sweep is that walk as a single keystroke, and it reports what it did: how
+many it nudged, how many are still before their reset, and any the agent
+refused. The message it sends is one word, *continue*, because the session
+already holds the whole task — its transcript, its worktree, its half-written
+work — and anything longer would be Voro restating a brief the agent can
+already read.
 
-It goes out through the existing `message` verb rather than through any new channel, and it is the one send that releases its target *unconditionally* first. A supervisor-owned session refuses a plain headless `--resume` for as long as its supervisor lives, and a capped session's supervisor is alive by definition, so something has to remove that hold. The rest-stop above never will: it fires on a listing entry that reads `done`, and a capped session reads `blocked` — the same word a permission prompt earns — for as long as it sits there. Nor can the sweep wait for the rule, because the rule's `done` test is only *sufficient* by virtue of the liveness gate refusing everything it does not cover, and the sweep has already walked past that gate. Having stood down the guard that makes the test enough, it cannot then lean on the test; the bypass has to be complete or the nudge does not land. So the sweep stops the session itself, waits for the answer, and resumes it in place, abandoning the nudge if the release fails rather than spawning a send that could only be refused. No `tmux send-keys` channel or supervisor IPC is needed, and none is built. The send is otherwise recorded exactly as a quick message is, with the pid now carrying the turn, so a nudged session stays as visible to the reconciler as a messaged one; the badge is dropped the moment the send lands, so a second press cannot put a second agent on the same worktree, and it returns on the next reading if the session is still held.
+The one badged session the sweep walks past is one whose output says it is
+*retrying*. That a cap never retries is a fact about the agent, not about the
+badge, and the risk runs the other way: a rate limit carrying none of the
+usage-limit headers *is* retried, and the agent labels that retry with the API's
+own wording, which has "rate limit" in it — so the matcher sees a cap on a
+session that is mid-turn and will resume itself. Nothing else tells the two
+apart, both reading `blocked` with a live supervisor and both wearing a cap
+phrase, so the reading carries whether the output named a retry and the sweep
+skips those, counting them in what it reports rather than passing over them in
+silence. Skipping is not a courtesy: because the send stops its target before
+resuming it (below), nudging a retrying session would not add a redundant turn
+to it but end the turn already running. The same reading also holds that
+session's badge back from `reset passed`, since the time such a line names is
+when its own request goes out and not when a human should step in.
 
-Two costs come with that unconditional stop, priced rather than discovered. The stop is exactly as safe as the cap reading is right — the same bet the sweep already makes when it skips the guards — but the *consequence* of a wrong reading is worse than it was under a forked send: a nudge into a session that turned out to be mid-turn was once a redundant turn and is now a killed one. And the reading is debounced to one probe per session per minute, so it can be that stale: a session an operator restarted by hand a moment ago is still badged, and can be stopped from under them. Neither is a reason to route around the release — a fork would land, but at the price the whole delivery model was changed to avoid — and both are reasons the sweep stays on a keypress rather than on the clock.
+It goes out through the existing `message` verb rather than through any new
+channel, and it is the one send that releases its target *unconditionally*
+first. A supervisor-owned session refuses a plain headless `--resume` for as
+long as its supervisor lives, and a capped session's supervisor is alive by
+definition, so something has to remove that hold. The rest-stop above never
+will: it fires on a listing entry that reads `done`, and a capped session reads
+`blocked` — the same word a permission prompt earns — for as long as it
+sits there. So the sweep stops the session itself, waits for the answer, and
+resumes it in place, abandoning the nudge if the release fails rather than
+spawning a send that could only be refused. No `tmux send-keys` channel or
+supervisor IPC is needed, and none is built. The send is otherwise recorded
+exactly as a quick message is, with the pid now carrying the turn, so a nudged
+session stays as visible to the reconciler as a messaged one; the badge is
+dropped the moment the send lands, so a second press cannot put a second agent
+on the same worktree, and it returns on the next reading if the session is
+still held.
 
-Two guards are deliberately stood down for it, and the cap reading is what earns that. A quick message is refused on a `running` task because its session is mid-turn, and refused again when the session is listed live — but a capped session is `running`, listed live, and *not* mid-turn, which is the one combination nothing else in the cockpit can recognise. Nothing else may skip those guards, and standing them down is what obliges the sweep to release its own target rather than trusting the rest rule to have done it (above). The sweep fires only when pressed, and that is a staging decision rather than a principle: automatic resumption once the window reopens is wanted, and this is deliberately the half it can be built on top of. Manual first buys the evidence automation needs — that a nudge reliably lands, and that the badge it would key on does not false-positive — while a wrong reading still costs one keypress instead of an unwatched agent. What automation adds is a trigger, not a channel: the reset-passed test the badge already computes, evaluated on the tick rather than on the key, plus a bound so a session that will not restart is not nudged around the clock. A cap whose reset time never parsed is swept too — the operator pressing the key is the judgement the clock could not supply, and a send that turns out to be early costs a released session and a turn that re-caps at once rather than doing lasting harm, the conversation surviving the release either way — and that is precisely a case automation must decide differently, since no keypress would stand behind it. Because the nudged turn does real work, it depends on the `message` verb's permission mode (above) exactly as a dispatch does: without it the refusals land in the launch log and the send appears delivered while quietly doing nothing, which is the one failure a fire-and-forget channel cannot report.
+Two costs come with that unconditional stop, priced rather than discovered. The
+stop is exactly as safe as the cap reading is right: a nudge into a session
+that turns out to be mid-turn kills the turn. And the reading is debounced to
+one probe per session per minute, so it can be that stale: a session an
+operator restarted by hand a moment ago is still badged, and can be stopped
+from under them. Both are reasons the sweep stays on a keypress rather than on
+the clock.
 
-A dispatched process must also be reaped once it exits, or it sits as a zombie for the life of the spawning `voro` process — and `kill -0` on a zombie still reports it alive, which would silently defeat this whole mechanism in a long-lived TUI session. Dispatch therefore hands the child to a detached reaper thread the moment the session is recorded, rather than leaving it to `Drop`.
+Two guards are deliberately stood down for it, and the cap reading is what
+earns that. A quick message is refused on a `running` task because its session
+is mid-turn, and refused again when the session is listed live — but a capped
+session is `running`, listed live, and *not* mid-turn, which is the one
+combination nothing else in the cockpit can recognise. Nothing else may skip
+those guards, and standing them down is what obliges the sweep to release its
+own target rather than trusting the rest rule to have done it (above). The
+sweep fires only when pressed — a staging decision rather than a principle:
+automatic resumption once the window reopens is wanted, and manual first buys
+the evidence automation needs, that a nudge reliably lands and that the badge
+does not false-positive, while a wrong reading still costs one keypress instead
+of an unwatched agent. A cap whose reset time never parsed is swept too — the
+operator pressing the key is the judgement the clock could not supply, and an
+early send costs a released session and a turn that re-caps at once rather than
+lasting harm, the conversation surviving the release either way. Because the
+nudged turn does real work, it depends on the `message` verb's permission mode
+(above) exactly as a dispatch does: without it the refusals land in the launch
+log and the send appears delivered while quietly doing nothing.
 
-**The return path** is a small verb surface agents call from within their sessions. Dispatch advertises it by injecting a preamble at the top of every prompt it writes, ahead of the task body — the dispatcher already owns the prompt file, so prepending a known-good preamble reaches any agent runtime with no per-project install and no reliance on a CLAUDE.md/AGENTS.md snippet or a loaded skill. The preamble is rendered per dispatch from a single template in the `voro` crate — so its wording still cannot drift — with the task's concrete id and, where needed, its database written *into the verb commands themselves* rather than left to inherited environment variables:
+A dispatched process must also be reaped once it exits, or it sits as a zombie
+for the life of the spawning `voro` process — and `kill -0` on a zombie still
+reports it alive, which would silently defeat this whole mechanism in a
+long-lived TUI session. Dispatch therefore hands the child to a detached reaper
+thread the moment the session is recorded, rather than leaving it to `Drop`.
+
+**The return path** is a small verb surface agents call from within their
+sessions. Dispatch advertises it by injecting a preamble at the top of every
+prompt it writes, ahead of the task body — the dispatcher already owns the
+prompt file, so prepending a known-good preamble reaches any agent runtime with
+no per-project install and no reliance on a CLAUDE.md/AGENTS.md snippet or a
+loaded skill. The preamble is rendered per dispatch from a single template in
+the `voro` crate — so its wording still cannot drift — with the task's
+concrete id and, where needed, its database written *into the verb commands
+themselves* rather than left to inherited environment variables:
 
 ```
 voro ask 62 --question "Schema A or B? Trade-offs: ..."   # → needs-input
@@ -361,98 +1646,958 @@ voro done 62 --branch feat/x --summary "Implemented X, tests pass"   # → revie
 voro propose <project> "title" --from 62 --body-file plan.md   # → proposed (discovered-from)
 ```
 
-Naming the id literally is what makes the return path survive the launch style the starter config ships. `claude --bg` hands the real session to a supervisor daemon: the process Voro spawns is a launcher that exits at birth, and the handed-off session does not inherit that launcher's environment, so a preamble that said `voro ask "$VORO_TASK_ID"` would reach the agent with the variable unset. The rendered command carries the id (`62`) with no environment dependency. The same applies to the database: when the dispatching Voro is not on the default store at `~/.local/share/voro/voro.db` (as under `--db`), the preamble renders `--db <path>` onto every verb; a default-db dispatch renders no flag, since that is what the verbs resolve to unaided. Dispatch still exports `VORO_TASK_ID` and `VORO_DB` onto the spawned process — the shell hook scripts in [`agent-integration.md`](agent-integration.md) expand `$VORO_TASK_ID` into explicit verb arguments — but `voro`'s own logic reads neither: the rendered commands carry the id literally. `propose` is no exception. It renders with a literal `--from 62`, exactly as `ask`/`done` render the id, so mid-session proposals link back to the task that spawned them with no environment dependency, and it always creates tasks in `proposed`. `voro` reading no `VORO_TASK_ID` is what keeps its own CLI tests hermetic against a dispatched session's exported id — a bare `propose` in a scratch database no longer picks up an ambient id that database does not contain. The preamble documents exactly these verbs and nothing about `voro start`, since dispatch has already performed the `ready → running` transition.
+Naming the id literally is what makes the return path survive the launch style
+the starter config ships. `claude --bg` hands the real session to a supervisor
+daemon: the process Voro spawns is a launcher that exits at birth, and the
+handed-off session does not inherit that launcher's environment, so a preamble
+that said `voro ask "$VORO_TASK_ID"` would reach the agent with the variable
+unset. The rendered command carries the id (`62`) with no environment
+dependency. The same applies to the database: when the dispatching Voro is not
+on the default store at `~/.local/share/voro/voro.db` (as under `--db`), the
+preamble renders `--db <path>` onto every verb; a default-db dispatch renders
+no flag, since that is what the verbs resolve to unaided. Dispatch still
+exports `VORO_TASK_ID` and `VORO_DB` onto the spawned process — the shell
+hook scripts in [`agent-integration.md`](agent-integration.md) expand
+`$VORO_TASK_ID` into explicit verb arguments — but `voro`'s own logic reads
+neither: `propose` renders a literal `--from 62` exactly as `ask`/`done` render
+the id, and always creates tasks in `proposed`. `voro` reading no
+`VORO_TASK_ID` also keeps its own CLI tests hermetic against a dispatched
+session's exported id. The preamble documents exactly these verbs and nothing
+about `voro start`, since dispatch has already performed the `ready →
+running` transition.
 
-`done`'s optional `--summary` (or `--summary-file`, for a multi-line one) is the agent's own account of what it did: it rides the `running → review` transition and is recorded as a `summary` event on the append-only log — not written into the task body, which stays the human's brief — so the review queue and detail view open on it rather than a bare state change, and `pr` opens the pull request straight from it (below), which is why it is written to read as a PR description. It stays optional throughout — a planning or task-generation task produces no code and no summary — so `done` *warns* rather than fails when a task reaches `review` without a branch or summary. That warning only reaches the caller's stdout — the agent's own log — so the durable surface is an **incomplete-report flag**: a `review` task carrying a branch and *no* summary is rendered with an `[incomplete report]` marker in the queue, task browser, detail pane, and `show`/`list`, read fresh from task and event state, never stored. That shape is a half-written report — the session produced code and then never said what it did, leaving a branch with nothing to speak for it. The mirror shape is not an anomaly at all: an investigation that concludes the bug was already fixed elsewhere, a triage that concludes won't-fix, a research or audit task whose whole product is findings — each ends with a summary and no branch, and that summary is the most valuable thing the session produced. Flagging it would leave the operator one way to clear the marker, deleting the deliverable, so the flag stays silent on it as it does on the task carrying neither half. Dropping that half costs less than it looks: `pr` (below) refuses to build a plan unless the `review` task carries *both* a branch and a summary, naming whichever is absent, so a code-producing session that forgot to register its branch is caught again the moment the operator reaches for the pull request — what the durable flag added there was earliness and queue visibility, not the detection. And branch registration is convention rather than enforcement (below): dispatch asks the agent to record the branch and Voro never reads the checkout to infer one, so a `review` task without a branch says as much about an agent's bookkeeping as about the work, and the half rarely fired for the right reason. The `done` warning is deliberately *not* narrowed to match: it still names either missing half on the caller's stdout, so an agent that produced code and forgot its branch is nudged at the one moment the fix is free. An ephemeral note in the agent's own log costs the operator no attention and leaves no false marker behind; only the durable, operator-facing flag is narrowed. The flag names the report rather than promising a `pr` failure because the anomaly holds on *every* review medium (below): the summary is still what the review queue and reject-with-feedback read, and the branch still ties the task to its work, so it applies unchanged across media. What did not hold across media was where the marker was *placed*: on a surface that names a next action in a single line — the detail card, the browser row, the `list` suffix — it stood in that line's place, which is right only where the recommendation it displaced was `pr`. A checkout with no remote advertises `open` instead (below), and there the marker was replacing a verb the operator could press today with a prerequisite for a pull request nobody was going to open — the same misdirection the degraded advertisement exists to fix. So the marker withholds exactly one verb, and for the reason the flag is named after the report rather than after `pr`: a pull request is *built from* the summary, so `pr` cannot be recommended without one, while every other verb the row could advertise is indifferent to it. `open` reads a diff, which the missing summary does not block, so the recommendation stands and the marker sits beside it. Room for both lines settles where the marker goes, not whether the verb is advertised. `show` has that room — its marker is a full explanatory sentence rather than a terse tag, and it printed both from the start, displacing nothing — but printing both meant recommending `pr` on one line and explaining on the next that the summary a pull request is built from is missing, which is the recommendation-that-could-only-fail the rule exists to prevent, merely spelled out rather than hidden. So `show` withholds the verb exactly as the single-line surfaces do and keeps its sentence beneath. Untouched are the surfaces that name no recommendation at all: the `inbox` verb column, whose verb is the row's identity, and the cockpit queue row, which shows state rather than a verb. Surfacing it is what makes the dispatch guarantee hold: every dispatched session ends either with a complete report or with a *visible* anomaly the operator can act on — the `stalled` state for a session that died without reporting (below), or this marker for one that produced code and never described it. The summary is not write-once: `voro set <id> --summary TEXT` (or `--summary-file PATH`) appends a fresh `summary` event, and because every reader takes the *newest*, the new account supersedes the old on the next read while the log keeps both — amending a thin summary before `pr`, or supplying the missing half of an `[incomplete report]` in place instead of churning through `reject` → re-`done`. It is allowed on a `running` task (a resumed agent recording its account before `done`) or a `review` one (fixing the report after), and it only ever writes the event, never `tasks.state`.
+`done`'s optional `--summary` (or `--summary-file`, for a multi-line one) is
+the agent's own account of what it did: it rides the `running → review`
+transition and is recorded as a `summary` event on the append-only log — not
+written into the task body, which stays the human's brief — so the review
+queue and detail view open on it rather than a bare state change, and `pr`
+opens the pull request straight from it (below), which is why it is written to
+read as a PR description. It stays optional throughout — a planning or
+task-generation task produces no code and no summary — so `done` *warns*
+rather than fails when a task reaches `review` without a branch or summary.
+That warning only reaches the caller's stdout — the agent's own log — so the
+durable surface is an **incomplete-report flag**: a `review` task carrying a
+branch and *no* summary is rendered with an `[incomplete report]` marker in the
+queue, task browser, detail pane, and `show`/`list`, read fresh from task and
+event state, never stored. That shape is a half-written report — the session
+produced code and then never said what it did. The mirror shape, a summary and
+no branch, is not an anomaly at all: an investigation, a won't-fix triage, an
+audit whose whole product is findings each end that way, and the summary is the
+most valuable thing the session produced, so the flag stays silent on it —
+flagging it would leave the operator one way to clear the marker, deleting the
+deliverable. `pr` independently refuses to build a plan unless the `review`
+task carries *both* a branch and a summary, naming whichever is absent. On the
+surfaces that name a next action, the marker withholds exactly one verb: a pull
+request is *built from* the summary, so `pr` cannot be recommended without one,
+while `open` reads a diff the missing summary does not block, so that
+recommendation stands and the marker sits beside it; `show` withholds the verb
+the same way and keeps its explanatory sentence beneath. Untouched are the
+surfaces that name no recommendation at all: the `inbox` verb column, whose
+verb is the row's identity, and the cockpit queue row, which shows state.
+Surfacing it is what makes the dispatch guarantee hold: every dispatched
+session ends either with a complete report or with a *visible* anomaly the
+operator can act on — the `stalled` state for a session that died without
+reporting (below), or this marker for one that produced code and never
+described it. The summary is not write-once: `voro set <id> --summary TEXT` (or
+`--summary-file PATH`) appends a fresh `summary` event, and because every
+reader takes the *newest*, the new account supersedes the old while the log
+keeps both. It is allowed on a `running` task (a resumed agent recording its
+account before `done`) or a `review` one (fixing the report after), and it only
+ever writes the event, never `tasks.state`.
 
-**The task body** is the mirror image of the summary, and needs the opposite treatment. A summary is superseded rather than overwritten — every reader takes the newest event and the log keeps them all — but `set --body-file` swaps the whole brief for whatever the file holds, in place, with nothing left behind: the one field an edit destroys outright and the one whose loss cannot be reconstructed from state elsewhere. Two things make that safe without making it ceremonial. First, every edit that changes a non-empty body records the text it replaced as a `body` event on the append-only log — whatever wrote it, a CLI flag, a refine agent (§6), or the TUI's editor, since all three pass through the single store call — so the log covers the body as it already covers transitions and summaries. That detail is bulk kept for recovery rather than for reading, so the history listings render it as a one-line marker naming the event that holds it (`replaced body kept (37 lines) — voro show 62 --event 512`) instead of unrolling a superseded brief into the log, and `voro show <id> --event <event-id>` prints one event's detail alone and undecorated, so recovering a body is a redirect back through `set --body-file` rather than a verb of its own. Second, a replacement that would leave a non-empty body *empty* is refused unless `--allow-empty` says so. Nothing legitimate reads as "blank the brief", and the way one actually arrives is a slip — `--body-file /dev/null` typed as a no-op, an editor saved empty, a generated file that came out blank — which is exactly the case a guard can distinguish and an undo can only clean up after; emptying an already-empty body destroys nothing and passes unremarked. Beside the replacing pair sits an additive one, `--append-body`/`--append-body-file`, which adds to the existing body after a blank line: the "record a finding on the task" case that otherwise gets spelled as a replacement and takes the brief with it.
+**The task body** is the mirror image of the summary, and needs the opposite
+treatment. A summary is superseded rather than overwritten — every reader
+takes the newest event and the log keeps them all — but `set --body-file`
+swaps the whole brief for whatever the file holds, in place, with nothing left
+behind: the one field an edit destroys outright and the one whose loss cannot be
+reconstructed from state elsewhere. Two things make that safe without making it
+ceremonial. First, every edit that changes a non-empty body records the text it
+replaced as a `body` event on the append-only log — whatever wrote it, a CLI
+flag, a refine agent (§6), or the TUI's editor, since all three pass through
+the single store call — so the log covers the body as it already covers
+transitions and summaries. That detail is bulk kept for recovery rather than for
+reading, so the history listings render it as a one-line marker naming the event
+that holds it (`replaced body kept (37 lines) — voro show 62 --event 512`)
+instead of unrolling a superseded brief into the log, and `voro show <id>
+--event <event-id>` prints one event's detail alone and undecorated, so
+recovering a body is a redirect back through `set --body-file` rather than a
+verb of its own. Second, a replacement that would leave a non-empty body *empty*
+is refused unless `--allow-empty` says so. Nothing legitimate reads as "blank
+the brief", and the way one actually arrives is a slip — `--body-file
+/dev/null` typed as a no-op, an editor saved empty, a generated file that came
+out blank — which is exactly the case a guard can distinguish and an undo can
+only clean up after; emptying an already-empty body destroys nothing and passes
+unremarked. Beside the replacing pair sits an additive one,
+`--append-body`/`--append-body-file`, which adds to the existing body after a
+blank line: the "record a finding on the task" case that otherwise gets spelled
+as a replacement and takes the brief with it.
 
-**Linked documents** (§3) ride the same preamble mechanism as branch names, and for the same reason: the dispatcher already owns the prompt file, so the plan a task derives from can be handed over rather than left to be rediscovered from hints in the body. A task carrying document links renders an extra block naming each one at its *resolved* location, ahead of the body separator so it is read before the task itself — absolute for a path, because a linked document may live in another project's checkout entirely and a location relative to the session's working directory would point at nothing. A task with no links renders no block at all, so an unlinked dispatch's prompt is byte-for-byte what it was before documents existed. Voro neither reads nor parses the document: it names it, exactly as it names a branch, and what the agent does with it is the agent's business. Registering a document stays a CLI affair (`doc add`/`remove`, plus `--doc` on `add` and `set`, where it replaces the whole list as `--blocked-by` does), but *linking* one does not: `c` on a selected task — on the cockpit, in the task browser, and inside the browser's detail popup — opens a picker over every registered document with the ones the task already cites ticked, and ⏎ links or unlinks the highlighted one in place through the same store calls `doc link`/`doc unlink` make, leaving the picker open so several can be toggled in one visit. Linking earns the key that registration does not because the moment a link most wants making is while triaging a proposal in the queue, which is exactly where the operator already is, whereas registration is a rarer and wordier act — a location, a title, sometimes a repo — with no such pull. The picker spans every project's documents rather than the task's own, since a task in any project may cite any plan (§3), with the owning project's name on the ones that are not the task's and the task's own listed first. That picker is the whole of the TUI's librarianship: there is no documents screen, and a document's own row — its title, its location, the tasks it backs — remains `doc list`/`doc show`, which keeps the cockpit about attention.
+**Linked documents** (§3) ride the same preamble mechanism as branch names, and
+for the same reason: the dispatcher already owns the prompt file, so the plan a
+task derives from can be handed over rather than left to be rediscovered from
+hints in the body. A task carrying document links renders an extra block naming
+each one at its *resolved* location, ahead of the body separator so it is read
+before the task itself — absolute for a path, because a linked document may
+live in another project's checkout entirely and a location relative to the
+session's working directory would point at nothing. A task with no links renders
+no block at all. Voro neither reads nor parses the document: it names it,
+exactly as it names a branch, and what the agent does with it is the agent's
+business. Registering a document is a CLI affair (`doc add`/`remove`, plus
+`--doc` on `add` and `set`, where it replaces the whole list as `--blocked-by`
+does), but *linking* one is not: `c` on a selected task — on the cockpit, in
+the task browser, and inside the browser's detail popup — opens a picker over
+every registered document with the ones the task already cites ticked, and ⏎
+links or unlinks the highlighted one in place through the same store calls `doc
+link`/`doc unlink` make, leaving the picker open so several can be toggled in
+one visit. Linking earns the key that registration does not because the moment
+a link most wants making is while triaging a proposal in the queue, which is
+exactly where the operator already is, whereas registration is a rarer and
+wordier act with no such pull. The picker spans every project's documents
+rather than the task's own, since a task in any project may cite any plan
+(§3), with the owning project's name on the ones that are not the task's and
+the task's own listed first. That picker is the whole of the TUI's
+librarianship: there is no documents screen, and a document's own row remains
+`doc list`/`doc show`, which keeps the cockpit about attention.
 
-**Branch names** flow through dispatch in both directions, and Voro runs no git in either — it only passes a name in and records one back. A task carries an optional `branch` (schema §5): the *intended* name a human sets with `voro set --branch`, which is the mechanism for attaching a task to an existing branch as much as for naming a fresh one. When set, dispatch renders it into the prompt preamble — telling the agent to create or check out that branch itself before working, since the agent knows the checkout's state better than the dispatcher and Voro deliberately never touches the working tree. Either way — whether a human named the branch or the agent chooses its own — the preamble tells the agent to register that branch with `voro set <id> --branch NAME` the moment it creates or checks it out, so Voro records the real branch while the task is still `running` (letting reconcile, attach, `voro pr`, and the UI reflect it, and capturing it even if the agent never reaches a clean `done`) rather than only learning it at completion. The reverse direction is the *reported* name: `voro done --branch NAME` (and, belt-and-braces, the `SessionEnd` hook in [`agent-integration.md`](agent-integration.md)) records the branch the work actually landed on, overwriting any intended name — and re-confirms the early-registered name for the assigned case. The intended name is a suggestion the agent may follow or override; the reported name is the source of truth. Storing it on the task rather than the session means it survives redispatch and reads naturally beside `pr_url`, so a task correlates with its PR and its branch at a glance; Voro never reads the checkout's HEAD to infer it, consistent with the task-state-versus-session-state boundary above.
+**Branch names** flow through dispatch in both directions, and Voro runs no git
+in either — it only passes a name in and records one back. A task carries an
+optional `branch` (schema §5): the *intended* name a human sets with `voro set
+--branch`, which is the mechanism for attaching a task to an existing branch as
+much as for naming a fresh one. When set, dispatch renders it into the prompt
+preamble — telling the agent to create or check out that branch itself before
+working, since the agent knows the checkout's state better than the dispatcher
+and Voro deliberately never touches the working tree. Either way — whether a
+human named the branch or the agent chooses its own — the preamble tells the
+agent to register that branch with `voro set <id> --branch NAME` the moment it
+creates or checks it out, so Voro records the real branch while the task is
+still `running` (letting reconcile, attach, `voro pr`, and the UI reflect it,
+and capturing it even if the agent never reaches a clean `done`) rather than
+only learning it at completion. The reverse direction is the *reported* name:
+`voro done --branch NAME` (and, belt-and-braces, the `SessionEnd` hook in
+[`agent-integration.md`](agent-integration.md)) records the branch the work
+actually landed on, overwriting any intended name — and re-confirms the
+early-registered name for the assigned case. The intended name is a suggestion
+the agent may follow or override; the reported name is the source of truth.
+Storing it on the task rather than the session means it survives redispatch and
+reads naturally beside `pr_url`, so a task correlates with its PR and its branch
+at a glance; Voro never reads the checkout's HEAD to infer it, consistent with
+the task-state-versus-session-state boundary above.
 
-**Opening the PR** is `pr`'s second job. On a `review` task with a tracked `pr_url` it is unchanged — jump to the PR in a browser (§11c). On one with *none* it *creates* the PR from the done-time state the two directions above capture: it asserts the task is in `review` and carries both a branch and a completion summary (erroring, network-free, on whichever is missing), pushes the branch to `origin`, opens a ready-for-review (non-draft) GitHub PR whose title is the task title and whose body is that summary, and records the URL through the same `set --pr` write path. No state change — the task stays `review` until a human accepts. The description is captured at `done` while the agent's context is hot, and the rest is mechanical. Crucially `pr` is operator-invoked, so Voro pushing on the operator's behalf preserves the trust model — the *dispatched agent* still cannot publish work (the one deliberate rule), the human running `pr` is the gate, and the PR page is where the diff gets reviewed. The CLI confirms interactively before pushing (`--yes` skips it); the TUI shows the same confirmation as a modal, and on confirming it *also* jumps to the new PR in the browser, since creating one is all but always followed by looking at it and the operator would otherwise press the key twice. That chained open is cosmetic, not part of the create: the URL is recorded either way, so a browser that will not launch is reported beside the URL rather than as a failed create. The CLI leaves the chain to the operator, who is already at a shell. The forge-specific half — push plus `gh pr create` — sits behind one seam in the `voro` crate, and that seam is where the two review media part. Getting a task's diff in front of the human has two spellings, and **each one is static**: `pr` (the verb, and the TUI's `g`) is always GitHub, `open` (the verb, and the TUI's `o`) is always a local viewer. The polymorphic version — one action resolving per project to whichever medium the project was configured for — made sense while only one of the two was advertised, and stopped making sense once both were: a key whose meaning depends on a setting the operator last touched months ago is a key that has to be thought about before it is pressed, and there is nothing to gain from the indirection when the other key is right there. So `g`/`pr` on a `review` task with no tracked PR runs the create-PR flow whatever the project says, and refuses on a checkout that cannot take a pull request — status line in the TUI, stderr at the shell — naming the other key (`o`, `voro open <id>`) as the thing to press instead. Everything answerable without the network is answered before the confirmation: the `review` state, the branch, the summary, and whether the checkout has a git remote at all, so each of those gaps is named without a `gh` round-trip. The sharper refusal — a checkout `gh` cannot address as a GitHub repository — is worded identically wherever it lands, but the two spellings put it at different moments. The shell blocks by design and so asks before confirming. The TUI no longer waits on `gh` to raise the modal (see *What may block the TUI event loop*), so there the refusal arrives with the create's result: the same dead end a moment later rather than a moment earlier. `open`/`o` is unchanged and is now the only local-diff spelling: allowed on `review` and `running`, demanding no branch or summary and confirming nothing, since nothing is pushed.
+**Opening the PR** is `pr`'s second job. On a `review` task with a tracked
+`pr_url` it is unchanged — jump to the PR in a browser (§11c). On one with
+*none* it *creates* the PR from the done-time state the two directions above
+capture: it asserts the task is in `review` and carries both a branch and a
+completion summary (erroring, network-free, on whichever is missing), pushes the
+branch to `origin`, opens a ready-for-review (non-draft) GitHub PR whose title
+is the task title and whose body is that summary, and records the URL through
+the same `set --pr` write path. No state change — the task stays `review`
+until a human accepts. The description is captured at `done` while the agent's
+context is hot, and the rest is mechanical. Crucially `pr` is operator-invoked,
+so Voro pushing on the operator's behalf preserves the trust model — the
+*dispatched agent* still cannot publish work (the one deliberate rule), the
+human running `pr` is the gate, and the PR page is where the diff gets reviewed.
+The CLI confirms interactively before pushing (`--yes` skips it); the TUI shows
+the same confirmation as a modal, and on confirming it *also* jumps to the new
+PR in the browser, since creating one is all but always followed by looking at
+it and the operator would otherwise press the key twice. That chained open is
+cosmetic, not part of the create: the URL is recorded either way, so a browser
+that will not launch is reported beside the URL rather than as a failed create.
+The CLI leaves the chain to the operator, who is already at a shell. The
+forge-specific half — push plus `gh pr create` — sits behind one seam in the
+`voro` crate, and that seam is where the two review media part. Getting a
+task's diff in front of the human has two spellings, and **each one is
+static**: `pr` (the verb, and the TUI's `g`) is always GitHub, `open` (the
+verb, and the TUI's `o`) is always a local viewer — a key whose meaning
+depended on a per-project setting would have to be thought about before it is
+pressed, and there is nothing to gain from the indirection when the other key
+is right there. So `g`/`pr` on a `review` task with no tracked PR runs the
+create-PR flow whatever the project says, and refuses on a checkout that cannot
+take a pull request — status line in the TUI, stderr at the shell — naming
+the other key (`o`, `voro open <id>`) as the thing to press instead.
+Everything answerable without the network is answered before the confirmation:
+the `review` state, the branch, the summary, and whether the checkout has a git
+remote at all, so each of those gaps is named without a `gh` round-trip. The
+sharper refusal — a checkout `gh` cannot address as a GitHub repository — is
+worded identically wherever it lands, but the two spellings put it at different
+moments: the shell blocks by design and so asks before confirming, while the
+TUI does not wait on `gh` to raise the modal (see *What may block the TUI event
+loop*), so there the refusal arrives with the create's result. `open`/`o` is
+the only local-diff spelling: allowed on `review` and `running`, demanding no
+branch or summary and confirming nothing, since nothing is pushed.
 
-**What the row advertises follows the checkout, even though the keys do not.** Static keys settle what `g` and `o` *do*; they say nothing about which of the two a row should recommend, and a review row in a project with nowhere to push was recommending `pr` — an action whose only possible outcome there is the refusal above. A first project is very often a bare `git init`, so the operator most likely to trust the recommendation is the one it fails for. The advertised verb therefore degrades: on a `review` task with no tracked PR whose checkout has no git remote, every surface that names a next action — the cockpit's detail card, the browser and `list` suffixes, `show`, and the `inbox` verb column — reads `open` instead of `pr`, and the card's hint names `o` rather than `g`. Only the advertisement moves; the keys, the create-PR flow, and its refusal are exactly as above, and the attention price is unchanged because reading a diff costs the same whatever medium it arrives on (§7). The question the advertisement asks is deliberately blunter than the one the create asks. It rides a rendered row, so it must be network-free and cheap, and it asks git alone whether the checkout has *any* remote — a repository with nowhere to push has no forge to open a pull request on, whichever forge that would have been. The sharper question — whether `gh` can address the checkout as a GitHub repository — costs a round-trip, so in the TUI the keypress reads the same memoised remote answer the row does, and the round-trip is paid by the background create instead; the advertised verb and the key that serves it therefore cannot disagree about what a checkout can take. The answers can only differ one way: a checkout whose remote is not GitHub still advertises `pr`, still opens the confirmation, and is still refused, which is the dead end that already existed rather than a new one. Anything git cannot answer reads as "yes", so no row moves on a guess. One `git remote` per distinct checkout is memoised per render pass, and in the TUI it is derived in the same refresh that derives the `[incomplete report]` flag rather than on the draw path.
+**What the row advertises follows the checkout, even though the keys do not.**
+Static keys settle what `g` and `o` *do*; they say nothing about which of the
+two a row should recommend, and a review row in a project with nowhere to push
+would recommend `pr` — an action whose only possible outcome there is the
+refusal above. A first project is very often a bare `git init`, so the operator
+most likely to trust the recommendation is the one it fails for. The advertised
+verb therefore degrades: on a `review` task with no tracked PR whose checkout
+has no git remote, every surface that names a next action — the cockpit's
+detail card, the browser and `list` suffixes, `show`, and the `inbox` verb
+column — reads `open` instead of `pr`, and the card's hint names `o` rather
+than `g`. Only the advertisement moves; the keys, the create-PR flow, and its
+refusal are exactly as above, and the attention price is unchanged because
+reading a diff costs the same whatever medium it arrives on (§7). The question
+the advertisement asks is deliberately blunter than the one the create asks. It
+rides a rendered row, so it must be network-free and cheap, and it asks git
+alone whether the checkout has *any* remote — a repository with nowhere to
+push has no forge to open a pull request on, whichever forge that would have
+been. The sharper question — whether `gh` can address the checkout as a GitHub
+repository — costs a round-trip, so in the TUI the keypress reads the same
+memoised remote answer the row does, and the round-trip is paid by the
+background create instead; the advertised verb and the key that serves it
+therefore cannot disagree about what a checkout can take. The answers can only
+differ one way: a checkout whose remote is not GitHub still advertises `pr`,
+still opens the confirmation, and is still refused, which is the dead end that
+already existed rather than a new one. Anything git cannot answer reads as
+"yes", so no row moves on a guess. One `git remote` per distinct checkout is
+memoised per render pass, and in the TUI it is derived in the same refresh that
+derives the `[incomplete report]` flag rather than on the draw path.
 
-The **project's viewer** (`projects.viewer`, §5) is what survives this, and it is now shaped like what it does: it names *which viewer* a project's local diffs open in, so the stored value is a viewer name — a `[viewers.<name>]` table (§11a) — or nothing at all, which is the default viewer. The pre-split spellings collapsed into that (an additive migration, §5): `viewer:<name>` kept its name, while `auto`, `pr`, and a bare `viewer` were three ways of saying "name no viewer" and are now NULL. Nothing was lost in the collapse, because the medium decision had already gone with the keys, and the `gh repo view` probe behind `auto` with it — what remained was a type carrying three spellings of one behaviour, which is a type that has to be read twice before a value can be trusted. The surface it keeps is the whole surface — the schema column, `voro project viewer`, the projects screen's `v` picker — because naming a per-project viewer is worth keeping. Because a dispatched agent works in a throwaway worktree on the task's branch (§11), the diff lives there, not in the primary checkout, so `open` runs the viewer in that worktree when the task's branch has a live one, falling back to the task's resolved repo (§3) when it has no branch or no worktree. The viewer template is filled with `{path}` (that resolved directory), `{branch}` (the task's branch, empty when none), and `{base}` (the checkout's default branch, read from `refs/remotes/origin/HEAD` with a `main` fallback) so it can express a diff range like `{base}...{branch}` rather than a bare directory; a template using none of these is substituted unchanged. The viewer is set per project with `voro project viewer` — naming none falls back to the config's `default_viewer` — or the projects screen's picker (`v`), and viewers are the built-in `code`/`cursor`/`zed` (§11a) plus any `[viewers.<name>]` tables in `voro.toml` (§5), all surfaced by `voro viewer list` with their provenance. A project naming no viewer, on a config defining none, still opens: `open` falls back to the first built-in on PATH, so the review step works on a fresh install rather than failing on the first `o` a new operator presses. The pure precondition check and plan assembly live in `voro-core` (tested); the seam supplies only the git/`gh` I/O, in the `voro` crate.
+The **project's viewer** (`projects.viewer`, §5) names *which viewer* a
+project's local diffs open in, so the stored value is a viewer name — a
+`[viewers.<name>]` table (§11a) — or nothing at all, which is the default
+viewer. The medium decision belongs to the keys, so the column decides nothing
+else. Its surface is the schema column, `voro project viewer`, and the projects
+screen's `v` picker. Because a dispatched agent works in a
+throwaway worktree on the task's branch (§11), the diff lives there, not in the
+primary checkout, so `open` runs the viewer in that worktree when the task's
+branch has a live one, falling back to the task's resolved repo (§3) when it
+has no branch or no worktree. The viewer template is filled with `{path}` (that
+resolved directory), `{branch}` (the task's branch, empty when none), and
+`{base}` (the checkout's default branch, read from `refs/remotes/origin/HEAD`
+with a `main` fallback) so it can express a diff range like `{base}...{branch}`
+rather than a bare directory; a template using none of these is substituted
+unchanged. The viewer is set per project with `voro project viewer` — naming
+none falls back to the config's `default_viewer` — or the projects screen's
+picker (`v`), and viewers are the built-in `code`/`cursor`/`zed` (§11a) plus
+any `[viewers.<name>]` tables in `voro.toml` (§5), all surfaced by `voro viewer
+list` with their provenance. A project naming no viewer, on a config defining
+none, still opens: `open` falls back to the first built-in on PATH, so the
+review step works on a fresh install rather than failing on the first `o` a new
+operator presses. The pure precondition check and plan assembly live in
+`voro-core` (tested); the seam supplies only the git/`gh` I/O, in the `voro`
+crate.
 
-**Re-reviewing after a rejection** is `pr`'s third job, and exists because rejection was priced wrongly. Sending work back cost the operator a second full review: `pr` and `open` reopened the whole diff, and the context of *what they had asked for* was gone by the time the rework came back, so they rediscovered their own feedback from the code. A rejection that expensive is a rejection not made — the operator accepts marginal work rather than pay for the round trip — which is the opposite of what the review state is for. So a re-review is made proportional to the fix rather than to the branch, on Gerrit's patchset model: show the diff *since the revision that was rejected*. The revision is captured at the one moment it is unambiguous — the rejection itself, where the branch head is exactly what the operator just judged — and recorded as a `reviewed` event. The event log carries it because the log is already the record of every mutation and this is one more; it needs no column and no migration, and a second rejection supersedes the first the way a second summary supersedes the first. Deliberately *not* recorded when a task merely enters `review`: the head at that moment is the head the operator is about to look at, so a delta against it would be empty, and a first review has nothing to compare against anyway. Which revision gets recorded depends on where the review happened — a tracked PR's head (`gh pr view --json headRefOid`), since that is literally what was on the screen, falling back to the local tip of the task's branch for a task without one. The whole capture is best-effort: an unreadable revision costs a full diff next time, never a failed reject. Where it runs from decides whether it blocks, by the rule below: `voro reject` is a one-shot CLI verb, so it resolves the revision and records it synchronously, while both of the TUI's rejections — the transition menu and the quick-message key — hand the `gh` call to a background thread and record what it sends back a tick or two later. The rejected task is therefore briefly in `running` with no revision recorded against it, which nothing reads (both read paths consult it only for a task in `review`, and the rework comes back minutes or hours later), and quitting the TUI before the capture lands simply loses it for the full diff that failure already degrades to.
+**Re-reviewing after a rejection** is `pr`'s third job. A rejection that costs
+the operator a second full review — reopening the whole diff and
+rediscovering their own feedback from the code — is a rejection not made: the
+operator accepts marginal work rather than pay for the round trip, the
+opposite of what the review state is for. So a re-review is made proportional
+to the fix rather than to the branch, on Gerrit's patchset model: show the diff
+*since the revision that was rejected*. The revision is
+captured at the one moment it is unambiguous — the rejection itself, where the
+branch head is exactly what the operator just judged — and recorded as a
+`reviewed` event. The event log carries it because the log is already the record
+of every mutation and this is one more; it needs no column and no migration, and
+a second rejection supersedes the first the way a second summary supersedes the
+first. Deliberately *not* recorded when a task merely enters `review`: the head
+at that moment is the head the operator is about to look at, so a delta against
+it would be empty, and a first review has nothing to compare against anyway.
+Which revision gets recorded depends on where the review happened — a tracked
+PR's head (`gh pr view --json headRefOid`), since that is literally what was on
+the screen, falling back to the local tip of the task's branch for a task
+without one. The whole capture is best-effort: an unreadable revision costs a
+full diff next time, never a failed reject. Where it runs from decides whether
+it blocks, by the rule below: `voro reject` is a one-shot CLI verb, so it
+resolves the revision and records it synchronously, while both of the TUI's
+rejections — the transition menu and the quick-message key — hand the `gh`
+call to a background thread and record what it sends back a tick or two later.
+The rejected task is therefore briefly in `running` with no revision recorded
+against it, which nothing reads (both read paths consult it only for a task in
+`review`, and the rework comes back minutes or hours later), and quitting the
+TUI before the capture lands simply loses it for the full diff that failure
+already degrades to.
 
-What the recorded revision buys is one narrowed URL per medium. On GitHub, `pr` opens `…/pull/N/files/<reviewed>..<head>` — the compare-within-a-PR view, which keeps the review comments and the merge button where they were, so the full diff is one click away in the PR's own "changes from" control. On the viewer medium nothing new is needed: `{base}` already exists to express a diff range, so it simply binds to the reviewed revision instead of the checkout's default branch, and a template spelling `git diff {base}` opens the rework alone. Every gap degrades to the full diff with a notice on the status line rather than an error, which is the property that makes the feature safe to leave on: nothing new since the last review, a head that cannot be read (no network, no `gh`), and — the case that matters — a reviewed revision that is no longer on the branch because the rework rebased or force-pushed it away. That last one is answered per medium by asking whether the revision is still reachable: on GitHub, whether it is one of the PR's commits; locally, `git merge-base --is-ancestor`. The narrowing applies only to a `review` task that carries a recorded revision, so a first review is unchanged down to the network calls it makes — no extra round-trip is paid by a task nobody has rejected.
+What the recorded revision buys is one narrowed URL per medium. On GitHub, `pr`
+opens `…/pull/N/files/<reviewed>..<head>` — the compare-within-a-PR view,
+which keeps the review comments and the merge button where they were, so the
+full diff is one click away in the PR's own "changes from" control. On the
+viewer medium nothing new is needed: `{base}` already exists to express a diff
+range, so it simply binds to the reviewed revision instead of the checkout's
+default branch, and a template spelling `git diff {base}` opens the rework
+alone. Every gap degrades to the full diff with a notice on the status line
+rather than an error, which is the property that makes the feature safe to leave
+on: nothing new since the last review, a head that cannot be read (no network,
+no `gh`), and — the case that matters — a reviewed revision that is no
+longer on the branch because the rework rebased or force-pushed it away. That
+last one is answered per medium by asking whether the revision is still
+reachable: on GitHub, whether it is one of the PR's commits; locally, `git
+merge-base --is-ancestor`. The narrowing applies only to a `review` task that
+carries a recorded revision, so a first review is unchanged down to the network
+calls it makes — no extra round-trip is paid by a task nobody has rejected.
 
-The diff is only half of a re-review. The other half is the rework's own account of itself, so **a post-rejection summary answers the feedback point by point**. Voro asks for that shape rather than hoping for it, and asks in both places a rejection can reach an agent: the quick-message key, which says the rejection into the session that is still open, wraps the operator's points in the instruction to answer them item by item at `done`; and the dispatch preamble carries the same instruction when the task has been rejected before, which is the path that matters for a *redispatch*, where a fresh session has none of the rejected round's context and only the body's `## Feedback` section to work from. Both spellings render from one shared sentence so they cannot drift, and the feedback itself is bound verbatim through the single-pass template renderer, since it is operator prose that may well quote a placeholder. The summary that comes back is then rendered against the feedback it answers — in the TUI detail pane and in `voro show` — so the operator reads what the agent says it changed beside the diff of what actually changed. That rendering is not confined to a rework, because **the completion summary is what a verdict is given against** and every task awaiting one shows it on the card, above the body: the body is the instruction that has already been carried out, and the summary is the agent's account of carrying it out. Leaving a first review's summary to be read as the PR body assumed both that there is a PR — which a project with no GitHub remote has not — and that a diff is a keypress away, which a fresh install with no viewer configured has not, so the newcomer the Quickstart walks to the review step had no account of the work anywhere in the interface. The block therefore renders on `review` and `waiting`, the two states whose verdict is still pending, and only its heading turns on whether there is feedback to answer; past the verdict the summary is history and the card is read for its body. A rework still in flight renders nothing rather than the summary of the round that was already judged. **The block is rendered as the agent's prose, not as a coloured slab.** It parses as markdown exactly as a body does — bold, inline code, bullets — since a summary written to read as a PR description is written in the same notation the body is, and printing its markers beside a body that parses them was the tell that the two were being rendered by different rules. The agent's voice is then carried structurally, by a cyan `│` gutter down the left of every visual line of the block, with the heading (`completion summary:`, or its rework variant) cyan and bold inside that gutter. Carrying it that way rather than by washing the text cyan leaves the colour meaning exactly one thing in the card's prose — inline code — and the `question:` block on a `needs-input` card takes the identical treatment, being the same thing: the agent speaking. Because the card is one wrapping paragraph and ratatui repeats no prefix when it breaks a long line, a gutter block is word-wrapped to the pane's inner width *before* the bar is prefixed, so the bar survives at any pane width. Whenever such a block renders, the body beneath it is headed `task:` — plain and un-guttered, the operator's own voice — so the reader always knows which of the two they are in; a card with no agent-voice block leaves its body unlabelled, a heading over the only content on the card being noise. As with `pr`, the decisions are pure and live in `voro-core` with tests (what to show given a recorded revision, a head, and reachability; pairing the newest feedback with the summary that answers it; parsing `gh`'s revision JSON), and the `voro` crate supplies only the `gh` and `git` calls that answer them.
+The diff is only half of a re-review. The other half is the rework's own account
+of itself, so **a post-rejection summary answers the feedback point by point**.
+Voro asks for that shape rather than hoping for it, in both places a rejection
+can reach an agent: the quick-message key wraps the operator's points in the
+instruction to answer them item by item at `done`, and the dispatch preamble
+carries the same instruction when the task has been rejected before — the
+path that matters for a *redispatch*, where a fresh session has only the body's
+`## Feedback` section to work from. Both spellings render from one shared
+sentence so they cannot drift, and the feedback itself is bound verbatim
+through the single-pass template renderer, since it is operator prose that may
+well quote a placeholder. The summary that comes back is rendered against the
+feedback it answers — in the TUI detail pane and in `voro show` — so the
+operator reads what the agent says it changed beside the diff of what actually
+changed. That rendering is not confined to a rework, because **the completion
+summary is what a verdict is given against** and every task awaiting one shows
+it on the card, above the body: the body is the instruction that has already
+been carried out, and the summary is the agent's account of carrying it out —
+an account that cannot be left to the PR body, since a project with no GitHub
+remote has no PR and a fresh install may have no viewer either. The block
+renders on `review` and `waiting`, the two states whose verdict is still
+pending, and only its heading turns on whether there is feedback to answer;
+past the verdict the summary is history and the card is read for its body. A
+rework still in flight renders nothing rather than the summary of the round
+that was already judged. **The block is rendered as the agent's prose, not as a
+coloured slab.** It parses as markdown exactly as a body does, since a summary
+written to read as a PR description is written in the same notation. The
+agent's voice is carried structurally, by a cyan `│` gutter down the left of
+every visual line of the block, with the heading (`completion summary:`, or its
+rework variant) cyan and bold inside that gutter; that leaves the colour
+meaning exactly one thing in the card's prose — inline code — and the
+`question:` block on a `needs-input` card takes the identical treatment, being
+the same thing: the agent speaking. Because the card is one wrapping paragraph
+and ratatui repeats no prefix when it breaks a long line, a gutter block is
+word-wrapped to the pane's inner width *before* the bar is prefixed, so the bar
+survives at any pane width. Whenever such a block renders, the body beneath it
+is headed `task:` — plain and un-guttered, the operator's own voice; a card
+with no agent-voice block leaves its body unlabelled, a heading over the only
+content on the card being noise. As with `pr`, the decisions are pure and live
+in `voro-core` with tests, and the `voro` crate supplies only the `gh` and
+`git` calls that answer them.
 
-**Detecting a stale review branch.** A task can sit in `review` while other work merges, leaving its branch in conflict with the moved base. The operator usually learns this from the PR page; Voro surfaces it too, cheaply, for a `review` task with a tracked `pr_url`. GitHub already computes the answer: `gh pr view --json mergeable` returns `MERGEABLE`, `CONFLICTING`, or `UNKNOWN` (the last while GitHub recomputes — no signal, never a conflict). A `CONFLICTING` verdict is surfaced as an informational `[branch conflicts]` marker, read fresh and never stored — the same rendered-not-stored shape as the `[incomplete report]` flag. It only *tells* the operator the branch needs resolving before it can merge; Voro takes no action on it (there is no automatic rebase), and the next-action derivation is untouched (a conflicting branch still asks for the same review verb it asked for before). Because the probe is network I/O it must not run per rendered row the way that flag does, so it is on demand and single-task: `voro show <id>` and the TUI detail pane each probe only the one task in view, leaving the queue and `list` unannotated. `voro show` simply blocks on the call, which is what a one-shot CLI verb should do. The TUI cannot: a half-second `gh` round-trip on the render path freezes the event loop on every selection that lands on a review task, so the probe runs *off* the loop and *behind* the selection. Off the loop means a background thread runs the `gh` call and sends `(task id, verdict)` back over a channel the loop drains each tick; while a probe is in flight the pane shows nothing, which needs no pending state of its own because a missing signal is already never a conflict, and a verdict whose task is no longer selected is discarded rather than shown against the wrong row. Behind the selection means the probe starts only once the selection has *rested* on a row for a short settle interval (400ms), so scrolling the queue spawns nothing for the rows passed over and resting on a review task spawns exactly one probe — at most one in flight at a time. The verdict is held in memory against the selected id and dropped when the selection moves, so re-selecting a row still re-probes for a fresh answer. The "is a probe due" decision (selection, held verdict, in-flight probe, rest duration → start or not) is a pure function with tests; the thread and channel are the untested shell around it. `MERGEABLE`, `UNKNOWN`, and a missing or unauthenticated `gh` all show nothing — a missing signal is never a conflict. The `gh` shell-out lives in the `voro` crate beside the other seams; the verdict decision (`MERGEABLE`/`CONFLICTING`/`UNKNOWN` → marker or not) is pure and lives in `voro-core` with tests, the same task-state-versus-session-state split `pr` follows.
+**Detecting a stale review branch.** A task can sit in `review` while other work
+merges, leaving its branch in conflict with the moved base. The operator usually
+learns this from the PR page; Voro surfaces it too, cheaply, for a `review` task
+with a tracked `pr_url`. GitHub already computes the answer: `gh pr view --json
+mergeable` returns `MERGEABLE`, `CONFLICTING`, or `UNKNOWN` (the last while
+GitHub recomputes — no signal, never a conflict). A `CONFLICTING` verdict is
+surfaced as an informational `[branch conflicts]` marker, read fresh and never
+stored — the same rendered-not-stored shape as the `[incomplete report]` flag.
+It only *tells* the operator the branch needs resolving before it can merge;
+Voro takes no action on it (there is no automatic rebase), and the next-action
+derivation is untouched (a conflicting branch still asks for the same review
+verb it asked for before). Because the probe is network I/O it must not run per
+rendered row the way that flag does, so it is on demand and single-task: `voro
+show <id>` and the TUI detail pane each probe only the one task in view, leaving
+the queue and `list` unannotated. `voro show` simply blocks on the call, which
+is what a one-shot CLI verb should do. The TUI cannot: a half-second `gh`
+round-trip on the render path freezes the event loop on every selection that
+lands on a review task, so the probe runs *off* the loop and *behind* the
+selection. Off the loop means a background thread runs the `gh` call and sends
+`(task id, verdict)` back over a channel the loop drains each tick; while a
+probe is in flight the pane shows nothing, which needs no pending state of its
+own because a missing signal is already never a conflict, and a verdict whose
+task is no longer selected is discarded rather than shown against the wrong row.
+Behind the selection means the probe starts only once the selection has *rested*
+on a row for a short settle interval (400ms), so scrolling the queue spawns
+nothing for the rows passed over and resting on a review task spawns exactly one
+probe — at most one in flight at a time. The verdict is held in memory against
+the selected id and dropped when the selection moves, so re-selecting a row
+still re-probes for a fresh answer. The "is a probe due" decision (selection,
+held verdict, in-flight probe, rest duration → start or not) is a pure
+function with tests; the thread and channel are the untested shell around it.
+`MERGEABLE`, `UNKNOWN`, and a missing or unauthenticated `gh` all show nothing
+— a missing signal is never a conflict. The `gh` shell-out lives in the `voro`
+crate beside the other seams; the verdict decision
+(`MERGEABLE`/`CONFLICTING`/`UNKNOWN` → marker or not) is pure and lives in
+`voro-core` with tests, the same task-state-versus-session-state split `pr`
+follows.
 
-**What may block the TUI event loop** is the general rule the probe above is one instance of, since every `gh` call the TUI makes puts the same question. Nothing on the render path may block on the network, ever — a probe per rendered row would freeze the loop on every draw, which is why the stale-branch verdict is single-task, off the loop, and behind the selection. A *keypress* may block only when the operator is waiting on the very answer that keypress asks for *and* that answer is one lookup away: `pr` on a task with a tracked PR looks up the head to narrow the URL, and there is nothing to show until the call returns — the browser cannot open on a URL that is not yet known. Everything else goes off the loop, on the same thread-and-channel shape as the probe. A keypress whose `gh` call only feeds a *later* read is the easy case: the reviewed-revision capture above, where the operator's next act is reading the redrawn queue and the revision is not read again until the rework returns.
+**What may block the TUI event loop** is the general rule the probe above is one
+instance of, since every `gh` call the TUI makes puts the same question. Nothing
+on the render path may block on the network, ever — a probe per rendered row
+would freeze the loop on every draw, which is why the stale-branch verdict is
+single-task, off the loop, and behind the selection. A *keypress* may block only
+when the operator is waiting on the very answer that keypress asks for *and*
+that answer is one lookup away: `pr` on a task with a tracked PR looks up the
+head to narrow the URL, and there is nothing to show until the call returns —
+the browser cannot open on a URL that is not yet known. Everything else goes off
+the loop, on the same thread-and-channel shape as the probe. A keypress whose
+`gh` call only feeds a *later* read is the easy case: the reviewed-revision
+capture above, where the operator's next act is reading the redrawn queue and
+the revision is not read again until the rework returns.
 
-**Creating a pull request is the hard case, and it goes off the loop too.** `pr` on a task with no tracked PR pushes a branch and opens a PR — two calls and seconds of network, the slowest thing the TUI does — and the earlier reading, that the operator is waiting on the URL and so may be made to wait for it, confuses two waiters. The *browser* cannot open until the URL is known; the *operator* has nothing left to decide the moment the confirmation is taken. So the modal closes on the keypress, the status line says the create is running, and the push and `gh pr create` run on a background thread whose result the loop records, opens the browser on, and reports — the create-then-open promise kept, a few seconds later, against a queue that stayed interactive throughout. The keypress itself is network-free either side of the modal: `g` raises it on the store and the memoised `git remote` reading alone, and the GitHub-specific refusal comes back with the failed create. One create per task may be in flight — a second `g` or a second confirmation starts nothing and says what it is waiting on, since two creates for one branch would mean two pull requests — while creates for *different* tasks may overlap. What lands is recorded whatever the task has become in the meantime: a tracked PR is a fact about the branch, not about a state.
+**Creating a pull request is the hard case, and it goes off the loop too.** `pr`
+on a task with no tracked PR pushes a branch and opens a PR — two calls and
+seconds of network, the slowest thing the TUI does — and the earlier reading,
+that the operator is waiting on the URL and so may be made to wait for it,
+confuses two waiters. The *browser* cannot open until the URL is known; the
+*operator* has nothing left to decide the moment the confirmation is taken. So
+the modal closes on the keypress, the status line says the create is running,
+and the push and `gh pr create` run on a background thread whose result the loop
+records, opens the browser on, and reports — the create-then-open promise
+kept, a few seconds later, against a queue that stayed interactive throughout.
+The keypress itself is network-free either side of the modal: `g` raises it on
+the store and the memoised `git remote` reading alone, and the GitHub-specific
+refusal comes back with the failed create. One create per task may be in flight
+— a second `g` or a second confirmation starts nothing and says what it is
+waiting on, since two creates for one branch would mean two pull requests —
+while creates for *different* tasks may overlap. What lands is recorded whatever
+the task has become in the meantime: a tracked PR is a fact about the branch,
+not about a state.
 
-Off the loop is not free — an answer can be lost to a quit, and it lands against a world a moment older than the keypress — so each such capture states what it accepts rather than growing machinery to prevent it. A lost create costs more than a lost revision and is still accepted: quitting before one lands leaves a pull request open on GitHub and untracked in Voro. It is recoverable because the create refuses rather than duplicates — `gh pr create` for a branch that already has one names the pull request it found — so the next attempt hands the operator the URL to record with `set --pr`.
+Off the loop is not free — an answer can be lost to a quit, and it lands
+against a world a moment older than the keypress — so each such capture states
+what it accepts rather than growing machinery to prevent it. A lost create costs
+more than a lost revision and is still accepted: quitting before one lands
+leaves a pull request open on GitHub and untracked in Voro. It is recoverable
+because the create refuses rather than duplicates — `gh pr create` for a
+branch that already has one names the pull request it found — so the next
+attempt hands the operator the URL to record with `set --pr`.
 
-**Resolving a stale review branch** stays a prompt convention rather than a Voro action, matching the "Voro runs no git during dispatch" boundary above: the task's agent session is still open, so the operator attaches to it (the same jump-in as answering `needs-input`) and asks the agent to rebase. The dispatch preamble already tells the agent how — if its branch conflicts with the base, it runs `git fetch origin <base>` from inside its own worktree and rebases or merges onto `origin/<base>` there. Fetching only updates remote-tracking refs in the shared ref store and never touches a working tree, including the primary checkout, so it leaves the one trust rule — a dispatched agent cannot push — intact. The task never leaves `review`; the PR simply updates. Voro performs no git for any of this, and automating it away (an operator-git rebase behind a CLI verb and a review → running round trip) was rejected as machinery for a situation that is not a rejection — the work is fine, the branch is merely stale. Detection of the staleness is the `[branch conflicts]` marker above (#138).
+**Resolving a stale review branch** stays a prompt convention rather than a Voro
+action, matching the "Voro runs no git during dispatch" boundary above: the
+task's agent session is still open, so the operator attaches to it (the same
+jump-in as answering `needs-input`) and asks the agent to rebase. The dispatch
+preamble already tells the agent how — if its branch conflicts with the base,
+it runs `git fetch origin <base>` from inside its own worktree and rebases or
+merges onto `origin/<base>` there. Fetching only updates remote-tracking refs in
+the shared ref store and never touches a working tree, including the primary
+checkout, so it leaves the one trust rule — a dispatched agent cannot push —
+intact. The task never leaves `review`; the PR simply updates. Voro performs no
+git for any of this, and automating it away (an operator-git rebase behind a CLI
+verb and a review → running round trip) was rejected as machinery for a
+situation that is not a rejection — the work is fine, the branch is merely
+stale. Detection of the staleness is the `[branch conflicts]` marker above.
 
-The prompt is the task's title and body written to a file outside the checkout, and the agent's command template — the `{prompt_file}` line from `voro.toml` — is run through `sh -c` in the task's resolved repo with the process detached into its own process group and its output captured to a per-session log. Spawning happens only after every check that can fail (task is `ready`, agent resolves, path is a git repository, prompt writes); the `ready → running` transition and the session insert then land together in one transaction, so a running task always has a session and a session always names a live dispatch. Every template Voro fills — those command lines, the dispatch preamble, the planning and refine prompts — goes through one substitution routine that makes a single left-to-right pass and emits each bound value verbatim, never re-scanning what it has already written. Chained replacements cannot promise that: whichever untrusted value goes in last, the ones before it were searched for the placeholders that came after, so a task body, branch name, document title or project name that *discusses* `{task_id}` or `{db}` was silently rewritten before the agent read it — the one thing a body-rewriting flow must not do. A launch's identity is likewise computed once, from a single `Launch` value naming what is being started, and used for the session name, the stem of the prompt and log files, and the launch-log label together, so a new flavour of launch inherits all three rather than deriving each ad hoc and forgetting one. A path that is not a git repository is refused, since the dispatched agent does its work in a git worktree of the checkout; a checkout with uncommitted changes is *not* refused, because `git worktree add` snapshots HEAD rather than the working tree, so the operator's in-progress work never enters the agent's diff.
+The prompt is the task's title and body written to a file outside the checkout,
+and the agent's command template — the `{prompt_file}` line from `voro.toml`
+— is run through `sh -c` in the task's resolved repo with the process detached
+into its own process group and its output captured to a per-session log.
+Spawning happens only after every check that can fail (task is `ready`, agent
+resolves, path is a git repository, prompt writes); the `ready → running`
+transition and the session insert then land together in one transaction, so a
+running task always has a session and a session always names a live dispatch.
+Every template Voro fills — those command lines, the dispatch preamble, the
+planning and refine prompts — goes through one substitution routine that
+makes a single left-to-right pass and emits each bound value verbatim, never
+re-scanning what it has already written: under chained replacements, a task
+body, branch name, document title or project name that *discusses* `{task_id}`
+or `{db}` would be silently rewritten before the agent read it — the one
+thing a body-rewriting flow must not do. A launch's identity is likewise
+computed once, from a single `Launch` value naming what is being started, and
+used for the session name, the stem of the prompt and log files, and the
+launch-log label together, so a new flavour of launch inherits all three rather
+than deriving each ad hoc and forgetting one. A path that is not a git
+repository is refused, since the dispatched agent does its work in a git
+worktree of the checkout; a checkout with uncommitted changes is *not* refused,
+because `git worktree add` snapshots HEAD rather than the working tree, so the
+operator's in-progress work never enters the agent's diff.
 
-Because these are plain CLI calls writing to a local SQLite file, they work identically for Claude Code, Codex, or anything that can run a shell command — no per-agent integration beyond the command template in `voro.toml`. An MCP server wrapping the same three verbs is a later nicety, not a requirement. Note these verbs are a thin second consumer of `voro-core`, not a prerequisite for the TUI — they arrive in the milestone that closes the agent loop.
+Because these are plain CLI calls writing to a local SQLite file, they work
+identically for Claude Code, Codex, or anything that can run a shell command —
+no per-agent integration beyond the command template in `voro.toml`. An MCP
+server wrapping the same three verbs is a later nicety, not a requirement. The
+verbs are a thin second consumer of `voro-core`, not a prerequisite for the
+TUI.
 
-The return path depends on the agent remembering to call it, and for Claude Code — the one agent with richer integration points than a shell command — its lifecycle hooks are a belt-and-braces layer under that discipline, calling `voro done`/`ask` on a session that forgets. This needs no new machinery: hooks inherit the session's `VORO_TASK_ID`/`VORO_DB`, and the transition API's rejection of any illegal second transition — writing nothing, committing nothing — is the whole of the double-transition protection, so a hook and the reconciler cannot corrupt each other whichever lands first (a hook's late `done` on a reconciled task completes it `stalled → review`, the same place the other order reaches). There is deliberately no failure hook: a crash or usage-cap `SIGKILL` bypasses `SessionEnd`, so hard failure stays with the reconciler by design. The concrete hooks, wrapper scripts, and sample `.claude/settings.json` — with the `CLAUDE.md`/`AGENTS.md` return-path snippet — are per-agent glue, not core, and live in [`agent-integration.md`](agent-integration.md).
+The return path depends on the agent remembering to call it, and for Claude Code
+— the one agent with richer integration points than a shell command — its
+lifecycle hooks are a belt-and-braces layer under that discipline, calling `voro
+done`/`ask` on a session that forgets. This needs no new machinery: hooks
+inherit the session's `VORO_TASK_ID`/`VORO_DB`, and the transition API's
+rejection of any illegal second transition — writing nothing, committing
+nothing — is the whole of the double-transition protection, so a hook and the
+reconciler cannot corrupt each other whichever lands first (a hook's late `done`
+on a reconciled task completes it `stalled → review`, the same place the other
+order reaches). There is deliberately no failure hook: a crash or usage-cap
+`SIGKILL` bypasses `SessionEnd`, so hard failure stays with the reconciler by
+design. The concrete hooks, wrapper scripts, and sample `.claude/settings.json`
+— with the `CLAUDE.md`/`AGENTS.md` return-path snippet — are per-agent glue,
+not core, and live in [`agent-integration.md`](agent-integration.md).
 
-Dispatch runs in the **task's resolved repo** (§3/§5) — its own repo when it names one, the project's default otherwise — which must be a git repository; the dispatched agent does its work in a throwaway worktree it creates (the preamble instructs this), so the operator's uncommitted changes never enter its diff. Everything downstream of the dispatch resolves the same way, through the same helper: the git guard and the spawn's cwd, the session-ref capture, `pr`'s push and `gh pr create`, `open`'s worktree lookup and `{base}` branch, and the accept-time worktree cleanup all read the *task's* repo rather than the project's default, because a task dispatched into a second repo has its branch, its worktree, and its PR there. The per-project viewer (`projects.viewer`) is untouched by this: it names a viewer for the project, and the task's checkout is what that viewer is pointed at, so a multi-repo project needs nothing configured twice. The GitHub check `pr` now makes unconditionally — "can this checkout take a pull request at all?" — runs against the task's checkout for the same reason. Two consumers deliberately stay on the default repo, because neither executes a task: a planning session (`N`) runs in the default checkout and the task it drafts picks its own repo with `voro add --repo`, and `voro import` defaults there while taking `--repo <name>` to import from another (the tasks it creates then carry that repo, so an imported issue dispatches where it lives). Voro-managed per-dispatch worktrees are deferred until parallel dispatch within one project is actually wanted (§11).
+Dispatch runs in the **task's resolved repo** (§3/§5) — its own repo when it
+names one, the project's default otherwise — which must be a git repository;
+the dispatched agent does its work in a throwaway worktree it creates (the
+preamble instructs this), so the operator's uncommitted changes never enter its
+diff. Everything downstream of the dispatch resolves the same way, through the
+same helper: the git guard and the spawn's cwd, the session-ref capture, `pr`'s
+push and `gh pr create`, `open`'s worktree lookup and `{base}` branch, and the
+accept-time worktree cleanup all read the *task's* repo rather than the
+project's default, because a task dispatched into a second repo has its branch,
+its worktree, and its PR there. The per-project viewer (`projects.viewer`) is
+untouched by this: it names a viewer for the project, and the task's checkout is
+what that viewer is pointed at, so a multi-repo project needs nothing configured
+twice. The GitHub check `pr` makes unconditionally — "can this checkout
+take a pull request at all?" — runs against the task's checkout for the same
+reason. Two consumers deliberately stay on the default repo, because neither
+executes a task: a planning session (`N`) runs in the default checkout and the
+task it drafts picks its own repo with `voro add --repo`, and `voro import`
+defaults there while taking `--repo <name>` to import from another (the tasks it
+creates then carry that repo, so an imported issue dispatches where it lives).
+Voro-managed per-dispatch worktrees are deferred until parallel dispatch within
+one project is actually wanted (§11).
 
-**Planning sessions** are the same machinery pointed at the *front* of a task's life: agent-assisted task creation, where the operator plans a task interactively with an agent and the deliverable of the session is a Voro task, not a PR. This is TUI-only by design — the CLI is how an LLM drives Voro, so an LLM-drafting verb there would be circular. It was once *interactive*-only by design too: a one-shot variant, an agent expanding a typed description instead of interviewing the operator, was considered and rejected on the grounds that task planning is usually a back-and-forth an interactive session subsumes. That position is reversed, because two things changed underneath it. The Expansion shape (§6) made a one-shot expansion cheap — a prompt template and a `Launch` variant, applied through a verb the CLI already has — where at the time it would have meant a bespoke path parsing an agent's output back into a pre-filled form, which is most of what made it the poorer trade. And the foreground/background key convention (§9) gave the lowercase key a job the interactive session cannot do: act immediately, in the background, without leaving the TUI. The back-and-forth argument was never that a one-shot is *worse*, only that it is *less* — and less is what the common case wants, which is precisely the case the default key serves. So `n` is now the **quick propose**: a one-line modal whose text is handed to a headless agent that expands it into a title and a dispatchable body and files the task itself with `voro add`, landing in `proposed` for ordinary triage. The TUI never suspends and nothing waits on the agent. It is the third instance of the Expansion shape, and the thinnest: no task exists while the agent writes, so there is no session row, no state to move, and nothing to hang a pending indicator on — the proposal appears in the untriaged count and the queue on a later refresh exactly as one filed with `voro propose` does, and a launch that fails leaves its trace in `launches.log` and the stamped session log rather than in the UI. It runs the **`dispatch` verb**, not `plan`, which looks wrong until one remembers that the roster splits on mode of interaction rather than purpose (below): `plan` is the command that owns the terminal, and a quick propose is detached, exactly as the headless refine is — neither is executing a task, and both are launched by the detached verb because that is what the verb names. That crossing of the two axes is where it costs something. The rule that no launch placeholder may reach a command line is enforced for `plan` at config load, which refuses `{task_id}` on the grounds that a planning session drafts a task rather than naming one — the same property a quick propose has. Load-time enforcement works there only because `plan` serves exactly one kind of target, so the verb and the property coincide; the quick propose is the first launch that is task-less *and* headless, and it breaks the coincidence, since `dispatch` now serves both kinds. No load-time check can decide it — a template carrying `{task_id}` is correct for the task-carrying dispatches the same verb still serves — so the check moves to launch time: a quick propose whose resolved agent spells `{task_id}` in its `dispatch` template is refused up front, naming the template to fix, rather than rendering literal braces into a shell command. The general form is that the property belongs to the *launch*, not to the verb, and refusing at config load is available only while a verb serves one kind of target. `N` keeps the interactive session, for the case a one-shot genuinely cannot serve, and `ctrl-n` keeps the manual `$EDITOR` form — still the only path that sets state, priority, agent, `human` and blockers at creation time, and now the rare one. From the TUI, `N` picks a project and suspends the terminal in the same round-trip used for `$EDITOR` and attach/resume, launching the default agent's **`plan` verb** in the project's default repo (§3): an optional agent template alongside dispatch/sessions/attach/resume/message — an interactive *foreground* command carrying `{prompt_file}`, built in for `claude` — that degrades like the other optional verbs, an agent without one yielding a status line saying what to configure. The prompt seeds the session with its job: it is drafting a task for that project; interview the operator as needed; write the body as a self-contained dispatchable prompt (named files, acceptance criteria); and when the operator confirms, create the task with `voro add` — the CLI is the agent's interface exactly as in dispatch, down to the rendered `--db` flag for a non-default store, so Voro gains no new store write path and parses no agent output. When the session exits the TUI refreshes, and the new task appears in the queue as `proposed` for ordinary triage — the human already saw the content, but triage stays uniform. A session that exits without creating a task is a no-op, not an error; no session row is recorded and none of dispatch's guards apply, since planning only reads the checkout and writes nothing to it. The built-in claude verbs reach their per-purpose models through the `{model}` map above — a stronger reasoning model on `plan` and on a deep dispatch, a workhorse on an ordinary one — naming the `claude` model aliases (`fable`, `opus`) rather than pinned ids so they track the current model of each class without churning; an operator overrides the agent wholesale in `voro.toml` to change them (docs/agent-integration.md). The same session serves the *middle* of a proposal's life as well: an interactive refine (§6) is this exact machinery pointed at a task that already exists — same `plan` verb, same foreground round-trip — seeded with the current body and ending in `voro set --body-file` instead of `voro add`, so it rewrites in place rather than creating anything. Where the two part company is bookkeeping, and the reason is that one has a task and the other does not: a refine is a round on an existing proposal, so it moves that task's state and records a session, which is why the round-trip *spawns* its child rather than simply running it to completion — the pid it learns is what the session row carries and what another window's reconcile probes if this Voro dies mid-conversation. A `Create` session has no task to transition and so records nothing at all. A planning session runs in the project's default repo because the task it drafts has not chosen one; a refine runs in the task's *resolved* repo, since the code its body must name is there. The verb roster stops at `dispatch`/`sessions`/`attach`/`resume`/`message`/`logs`/`stop`/`plan`: an `expand` verb for the headless refine was considered and rejected, because it would have differed from `dispatch` only in the session name and the model — arguments, not verbs — and every third-party agent defining only `dispatch` would have stopped refining until its config gained one. A launch flavour is an argument. The two launching verbs that do stay distinct differ by *mode of interaction*, detached versus owning the terminal, which is a real difference in the process contract rather than a difference of label.
+**Planning sessions** are the same machinery pointed at the *front* of a task's
+life: agent-assisted task creation, where the operator plans a task with an
+agent and the deliverable of the session is a Voro task, not a PR. This is
+TUI-only by design — the CLI is how an LLM drives Voro, so an LLM-drafting
+verb there would be circular. It comes in two intensities on the §9 case
+convention. `n` is the **quick propose**: a one-line modal whose text is handed
+to a headless agent that expands it into a title and a dispatchable body and
+files the task itself with `voro add`, landing in `proposed` for ordinary
+triage. The TUI never suspends and nothing waits on the agent. It is the
+thinnest instance of the Expansion shape (§6): no task exists while the agent
+writes, so there is no session row, no state to move, and nothing to hang a
+pending indicator on — the proposal appears in the untriaged count and the
+queue on a later refresh exactly as one filed with `voro propose` does, and a
+launch that fails leaves its trace in `launches.log` and the stamped session
+log rather than in the UI. It runs the **`dispatch` verb**, not `plan`, because
+the roster splits on mode of interaction rather than purpose (below): `plan` is
+the command that owns the terminal, and a quick propose is detached, exactly as
+the headless refine is. That crossing of the two axes is where it costs
+something. The no-placeholder-survives rule is enforced for `plan` at config
+load, which refuses `{task_id}` because a planning session drafts a task rather
+than naming one; the quick propose is task-less *and* headless, and `dispatch`
+serves both kinds of target, so no load-time check can decide it — a template
+carrying `{task_id}` is correct for the task-carrying dispatches the same verb
+still serves. The check moves to launch time: a quick propose whose resolved
+agent spells `{task_id}` in its `dispatch` template is refused up front, naming
+the template to fix. The general form is that the property belongs to the
+*launch*, not to the verb, and refusing at config load is available only while
+a verb serves one kind of target.
 
-The prompt asks the drafted body to settle two things beyond that, because a body that leaves them open is what fills a project's repo with cruft: where the task's evidence and outputs land — the pull request description, a decision record, a gitignored results directory, whatever the project's own conventions call for — rather than the agent defaulting to committing verification write-ups and work logs as new files, with the planner asking the operator when the project states no convention; and what the task makes obsolete, whose retirement belongs in the scope of the same change. The conventions themselves stay in each project's own instructions to its agents: the prompt asks the question and never answers it.
+`N` is the interactive session, for the case a one-shot cannot serve, and
+`ctrl-n` is the manual `$EDITOR` form — the only path that sets state,
+priority, agent, `human` and blockers at creation time. `N` picks a project and
+suspends the terminal in the same round-trip used for `$EDITOR` and
+attach/resume, launching the default agent's **`plan` verb** in the project's
+default repo (§3): an optional agent template — an interactive *foreground*
+command carrying `{prompt_file}`, built in for `claude` — that degrades like
+the other optional verbs, an agent without one yielding a status line saying
+what to configure. The prompt seeds the session with its job: it is drafting a
+task for that project; interview the operator as needed; write the body as a
+self-contained dispatchable prompt; and when the operator confirms, create the
+task with `voro add` — the CLI is the agent's interface exactly as in
+dispatch, down to the rendered `--db` flag for a non-default store, so Voro
+gains no new store write path and parses no agent output. When the session
+exits the TUI refreshes, and the new task appears in the queue as `proposed`
+for ordinary triage — the human already saw the content, but triage stays
+uniform. A session that exits without creating a task is a no-op, not an error;
+no session row is recorded and none of dispatch's guards apply, since planning
+only reads the checkout and writes nothing to it. The built-in claude verbs
+reach their per-purpose models through the `{model}` map above — a stronger
+reasoning model on `plan` and on a deep dispatch, a workhorse on an ordinary
+one — naming the `claude` model aliases (`fable`, `opus`) rather than pinned
+ids so they track the current model of each class without churning; an operator
+overrides the agent wholesale in `voro.toml` to change them
+(docs/agent-integration.md).
 
-The subprocesses Voro launches that are neither dispatches nor refine rounds — the viewer open (§11a), the attach/resume round-trip (§11a), and the `Create` planning session above — do not each earn a session row and its per-session log, but their failures are just as easily swallowed: a detached viewer's output would otherwise go to `/dev/null`, and an attach failure is painted over the instant the TUI reinitialises. They share one append-only `launches.log` beside the per-session logs, recording each launch's command, cwd, and exit status. A failing attach or planning launch additionally holds its own error output on screen until a keypress before the TUI redraws over it. Single rolling file, no rotation — the same single-operator argument as the per-session logs above.
+The same session serves the *middle* of a proposal's life as well: an
+interactive refine (§6) is this exact machinery pointed at a task that already
+exists — same `plan` verb, same foreground round-trip — seeded with the
+current body and ending in `voro set --body-file` instead of `voro add`, so it
+rewrites in place rather than creating anything. Where the two part company is
+bookkeeping, because one has a task and the other does not: a refine moves its
+task's state and records a session, which is why the round-trip *spawns* its
+child rather than simply running it to completion — the pid it learns is what
+the session row carries and what another window's reconcile probes if this Voro
+dies mid-conversation. A `Create` session has no task to transition and so
+records nothing at all. A planning session runs in the project's default repo
+because the task it drafts has not chosen one; a refine runs in the task's
+*resolved* repo, since the code its body must name is there. The verb roster
+stops at
+`dispatch`/`sessions`/`attach`/`resume`/`message`/`logs`/`stop`/`plan`: a
+launch flavour is an argument, not a verb — an `expand` verb for the headless
+refine would differ from `dispatch` only in the session name and the model, and
+every third-party agent defining only `dispatch` would stop refining until its
+config gained one. The two launching verbs that do stay distinct differ by
+*mode of interaction*, detached versus owning the terminal, which is a real
+difference in the process contract rather than a difference of label.
+
+The prompt asks the drafted body to settle two things beyond that, because a
+body that leaves them open is what fills a project's repo with cruft: where the
+task's evidence and outputs land — the pull request description, a decision
+record, a gitignored results directory, whatever the project's own conventions
+call for — rather than the agent defaulting to committing verification
+write-ups and work logs as new files, with the planner asking the operator when
+the project states no convention; and what the task makes obsolete, whose
+retirement belongs in the scope of the same change. The conventions themselves
+stay in each project's own instructions to its agents: the prompt asks the
+question and never answers it.
+
+The subprocesses Voro launches that are neither dispatches nor refine rounds —
+the viewer open (§11a), the attach/resume round-trip (§11a), and the `Create`
+planning session above — do not each earn a session row and its per-session
+log, but their failures are just as easily swallowed: a detached viewer's output
+would otherwise go to `/dev/null`, and an attach failure is painted over the
+instant the TUI reinitialises. They share one append-only `launches.log` beside
+the per-session logs, recording each launch's command, cwd, and exit status. A
+failing attach or planning launch additionally holds its own error output on
+screen until a keypress before the TUI redraws over it. Single rolling file, no
+rotation — the same single-operator argument as the per-session logs above.
 
 ## 9. Cockpit
 
-The TUI is built first and is the primary interface throughout. Ratatui, three regions: the **queue** (top), a **detail** pane showing the full body of whichever row is selected (middle), and a **running** strip showing work in flight that someone else owns, agent or human — its agents, its states, and how long each has been going (bottom). Most queue rows are one task, but two are not: a project's untriaged proposals ride as a single digest row that Enter folds open into selectable rows for triage, and when the dispatch gate is closed a capacity line sits on the pane's own header in place of the rows it suppressed (§7). The strip filters on task *state* — every `running`, `refining`, and `waiting` task, joined with its open session if it has one — not on "has an open session", which no longer implies executing anything (§8). What the three states share is the operator's own reading of them: someone other than the operator holds the work, whether that someone is an agent mid-turn or the person a PR was handed to. A `review` or `needs-input` task keeps its session open behind the scenes so the operator can address feedback or answer the question in it (§8), but it belongs to the queue, so it never appears in the strip — as does a `stalled` task, whose dead dispatch reconcile has already moved to the queue; conversely a `running` task with no open session (started by hand, so nothing was ever dispatched) still shows, as an orphan needing attention. Because a task holds at most one open session (§8), it renders in the strip exactly once — no stale rows for tasks that have closed, and no duplicates.
+The TUI is the primary interface. Ratatui, three
+regions: the **queue** (top), a **detail** pane showing the full body of
+whichever row is selected (middle), and a **running** strip showing work in
+flight that someone else owns, agent or human — its agents, its states, and
+how long each has been going (bottom). Most queue rows are one task, but two are
+not: a project's untriaged proposals ride as a single digest row that Enter
+folds open into selectable rows for triage, and when the dispatch gate is closed
+a capacity line sits on the pane's own header in place of the rows it suppressed
+(§7). The strip filters on task *state* — every `running`, `refining`, and
+`waiting` task, joined with its open session if it has one — not on "has an
+open session", which does not imply executing anything (§8). What the three
+states share is the operator's own reading of them: someone other than the
+operator holds the work, whether that someone is an agent mid-turn or the person
+a PR was handed to. A `review` or `needs-input` task keeps its session open
+behind the scenes so the operator can address feedback or answer the question in
+it (§8), but it belongs to the queue, so it never appears in the strip — as
+does a `stalled` task, whose dead dispatch reconcile has already moved to the
+queue; conversely a `running` task with no open session (started by hand, so
+nothing was ever dispatched) still shows, as an orphan needing attention.
+Because a task holds at most one open session (§8), it renders in the strip
+exactly once — no stale rows for tasks that have closed, and no duplicates.
 
-A refine round (§6) rides the strip as its own kind of row — `⟳ refining`, with the elapsed time since its session opened — because it is the same fact the strip exists to carry: an agent Voro launched is working, and the operator wants to know for how long. It is *named* differently because the keys differ: the strip's detail pane and its cancel key act on it, while the dispatch-oriented keys (attach, jump-in, open the diff) no-op with an explanation, as they do on any row they do not fit. Cancelling is the only action a refining row offers — the transition API offers no other from `refining` — and it is bound to its own key on the strip rather than reached through the verdict menu, since it kills the agent's process as well as moving the state, which is what makes it the escape hatch for a hung round rather than a duplicate of a transition.
+A refine round (§6) rides the strip as its own kind of row — `⟳ refining`,
+with the elapsed time since its session opened — because it is the same fact
+the strip exists to carry: an agent Voro launched is working, and the operator
+wants to know for how long. It is *named* differently because the keys differ:
+the strip's detail pane and its cancel key act on it, while the
+dispatch-oriented keys (attach, jump-in, open the diff) no-op with an
+explanation, as they do on any row they do not fit. Cancelling is the only
+action a refining row offers — the transition API offers no other from
+`refining` — and it is bound to its own key on the strip rather than reached
+through the verdict menu, since it kills the agent's process as well as moving
+the state, which is what makes it the escape hatch for a hung round rather than
+a duplicate of a transition.
 
-A hand-off (§6) rides it the same way — `⏳ waiting`, elapsed from the hand-off rather than from the session, badged `blocks N` when open dependents are gated behind it and marked when a PR tracks it (presence only; Voro polls no PR state). Its row sorts below the work an agent is driving, and it carries no orphan warning, since a hand-off has nothing left to be live. The verdicts `waiting` offers — accept, reject with feedback, reclaim, abandon — are reached from the strip row through the same transition menu every other row uses, and the two session keys work on it as they do anywhere else: `a` sends a line into the still-open session, which *is* the rejection (§6), and `A` jumps into it, `waiting` keeping its session on exactly `review`'s terms (§8). The dispatch-oriented keys no-op with an explanation, as they do on a refine.
+A hand-off (§6) rides it the same way — `⏳ waiting`, elapsed from the
+hand-off rather than from the session, badged `blocks N` when open dependents
+are gated behind it and marked when a PR tracks it (presence only; Voro polls no
+PR state). Its row sorts below the work an agent is driving, and it carries no
+orphan warning, since a hand-off has nothing left to be live. The verdicts
+`waiting` offers — accept, reject with feedback, reclaim, abandon — are
+reached from the strip row through the same transition menu every other row
+uses, and the two session keys work on it as they do anywhere else: `a` sends a
+line into the still-open session, which *is* the rejection (§6), and `A` jumps
+into it, `waiting` keeping its session on exactly `review`'s terms (§8). The
+dispatch-oriented keys no-op with an explanation, as they do on a refine.
 
-The cockpit is where the TUI opens, with one exception: a database with no projects registered opens on the projects screen instead, because that is where the first step is — nothing can be created until a project exists, and the cockpit has nothing to show until one does. The check runs once, at startup, against the project list the app already loads; every screen change after that is a key the operator pressed, so a refresh, a poll, or deleting the last project never moves them. **That landing is held by a gate rather than left to the first keypress:** until a project exists the TUI is a two-screen tool, Projects and Config, and the cockpit and the task browser cannot be entered at all. Pointing the operator at Projects and then letting Tab walk them straight off it bought nothing — the cockpit and the browser each had a full screen of content whose entire message was "not here", and two screens that exist only to say that are worse than two screens that cannot be reached. Config stays reachable throughout because it edits the `voro.toml` viewers and agents, which needs no project and is a legitimate place to be before registering one; the gate is about screens with nothing to show, not about a rule that nothing may be done first. Because the gate is expressed as a shorter Tab ring (Projects ↔ Config) and the projects screen binds no screen jumps, the only place a refusal can fire is the alt-digit jump to the cockpit or the browser, which no-ops with a status line naming the route to a project — the same shape as `n`'s own zero-project refusal. The `?` key map follows suit and stops advertising `alt-1` and `alt-2` while the gate holds, since a map that listed them would be promising a refusal. Adding the first project does not move the operator off the projects screen, but every screen is reachable from the next keypress on. The gate also settles what the two empty states used to say: with the cockpit and the browser unreachable without a project, each has exactly one case left to explain — a drained queue and a project with no tasks — and both point at `n`. The create keys ask *which* project only when there is a choice to be made, and they offer only projects that can take the task: an archived project refuses new work (§5), so it is dropped from the picker rather than listed there to fail — late, in the `$EDITOR` and planning flows, after the operator has already written the task out. What remains is ordered weightiest first, each row carrying the weight it sorts on, because project weight is the one per-project priority Voro holds (§7) and it is what the operator sets every morning, where alphabetical order says nothing about which project this week's work is in. A parked project stays on the list and simply sorts last, weight 0 being a snooze rather than a retirement. So a single unarchived project beside archived ones skips the picker entirely and creates straight into the live one, and a store whose every project is archived opens no picker at all, refusing with a status line pointing at the projects screen — the same shape as the zero-project refusal above.
+The cockpit is where the TUI opens, with one exception: a database with no
+projects registered opens on the projects screen instead, because that is where
+the first step is. The check runs once, at startup, against the project list
+the app already loads; every screen change after that is a key the operator
+pressed, so a refresh, a poll, or deleting the last project never moves them.
+**That landing is held by a gate rather than left to the first keypress:**
+until a project exists the TUI is a two-screen tool, Projects and Config, and
+the cockpit and the task browser cannot be entered at all — a screen whose
+entire message is "not here" is worse than a screen that cannot be reached.
+Config stays reachable throughout because it edits the `voro.toml` viewers and
+agents, which needs no project; the gate is about screens with nothing to show,
+not about a rule that nothing may be done first. Because the gate is expressed
+as a shorter Tab ring (Projects ↔ Config) and the projects screen binds no
+screen jumps, the only place a refusal can fire is the alt-digit jump to the
+cockpit or the browser, which no-ops with a status line naming the route to a
+project — the same shape as `n`'s own zero-project refusal. The `?` key map
+stops advertising `alt-1` and `alt-2` while the gate holds, since a map that
+listed them would be promising a refusal. Adding the first project does not
+move the operator off the projects screen, but every screen is reachable from
+the next keypress on. With the cockpit and the browser unreachable without a
+project, each empty state has exactly one case left to explain — a drained
+queue and a project with no tasks — and both point at `n`. The create keys
+ask *which* project only when there is a choice to be made, and they offer only
+projects that can take the task: an archived project refuses new work (§5), so
+it is dropped from the picker rather than listed there to fail. What remains is
+ordered weightiest first, each row carrying the weight it sorts on, because
+project weight is what the operator sets every morning, where alphabetical
+order says nothing about which project this week's work is in. A parked project
+stays on the list and simply sorts last, weight 0 being a snooze rather than a
+retirement. So a single unarchived project beside archived ones skips the
+picker entirely and creates straight into the live one, and a store whose every
+project is archived opens no picker at all, refusing with a status line
+pointing at the projects screen.
 
-Beyond the cockpit, the TUI cycles (Tab, or `alt-1`–`alt-4`, subject to the gate above while no project is registered) through three further full-screen views: the **task browser**, the **projects screen** (weights, archive, and the per-project viewer), and a **Config screen** that renders and edits the `voro.toml` surface (§5) — the effective agents read-only with provenance and the default marked, and the named viewers editable in place (add, change command, delete, and pick `default_viewer`/`default_agent`) through the comment-preserving write helper. An agent occupies more than a row there: under its name, provenance and verb list sit dim continuation lines carrying the dispatch command it runs and, where it names one, what `{model}` resolves to. The model map is a line of its own rather than a tail on the name row because that row already lists every optional verb the agent defines (§8), which is long enough that the built-in `claude` ran past an ordinary terminal's width and clipped the annotation off the end — and the annotation exists precisely to be read beside the placeholder in the command above it, so it is the half that cannot be allowed to fall off. The pane then sizes to the rows it has rather than to a fixed cap, yielding height only where the viewers list below would otherwise lose its last row. Where even that is not enough — a short terminal, several agents — the pane **scrolls** rather than silently dropping what falls past its border, which is the failure it had: an operator on a 60x10 terminal saw two of six agents and nothing on the screen said the other four existed. It scrolls with `J`/`K` and the page keys, the cockpit card's gesture and for the same reason: the pane carries no selection of its own, `j`/`k` on this screen belonging to the viewers list below, and a second selection is a heavier thing to add to a screen than a scroll. Like the card it advertises the scroll only when there is one, on its bottom border, so a pane holding everything says nothing and a pane hiding rows says how many and which keys move them. That the *viewers* list keeps the height it needs is now a question of which pane is read whole without a keypress rather than which one can be read at all. DB-backed configuration (projects, weights, viewers) stays on the projects screen; the Config screen is the voro.toml view. The projects screen's viewer picker also offers a "new viewer…" entry that opens the same add-viewer form and selects the new viewer for that project, so first-time viewer setup needs no detour through the Config screen.
+Beyond the cockpit, the TUI cycles (Tab, or `alt-1`–`alt-4`, subject to the
+gate above while no project is registered) through three further full-screen
+views: the **task browser**, the **projects screen** (weights, archive, and the
+per-project viewer), and a **Config screen** that renders and edits the
+`voro.toml` surface (§5) — the effective agents read-only with provenance and
+the default marked, and the named viewers editable in place (add, change
+command, delete, and pick `default_viewer`/`default_agent`) through the
+comment-preserving write helper. An agent occupies more than a row there: under
+its name, provenance and verb list sit dim continuation lines carrying the
+dispatch command it runs and, where it names one, what `{model}` resolves to —
+a line of its own rather than a tail on the name row, since the verb list is
+long enough to clip a tail off an ordinary terminal's width, and the annotation
+exists precisely to be read beside the placeholder in the command above it. The
+pane sizes to the rows it has rather than to a fixed cap, yielding height only
+where the viewers list below would otherwise lose its last row. Where even that
+is not enough — a short terminal, several agents — the pane **scrolls**
+rather than silently dropping what falls past its border. It scrolls with
+`J`/`K` and the page keys, the cockpit card's gesture and for the same reason:
+the pane carries no selection of its own, `j`/`k` on this screen belonging to
+the viewers list below, and a second selection is a heavier thing to add to a
+screen than a scroll. Like the card it advertises the scroll only when there is
+one, on its bottom border, so a pane holding everything says nothing and a pane
+hiding rows says how many and which keys move them. DB-backed configuration
+(projects, weights, viewers) stays on the projects screen; the Config screen is
+the voro.toml view. The projects screen's viewer picker also offers a "new
+viewer…" entry that opens the same add-viewer form and selects the new viewer
+for that project, so first-time viewer setup needs no detour through the Config
+screen.
 
-**A bare digit sets the number on the selected row, and screen jumps carry the modifier.** The digit's meaning follows the selection rather than the screen: `0`–`3` set the selected *task's* priority on the cockpit, in the task browser, and in the browser's detail popup, and `0`–`5` set the selected *project's* weight on the projects screen. Screen switching is the thing that gave way, because it is not the frequent act — Tab already cycles all four screens — while re-prioritising is: the daily move is "this project matters more today" and "this task matters more than that one", and both should cost one keystroke on the row already under the cursor. The rule also settles a collision the two meanings had while they shared the digits, where `1` pressed on the projects screen to reach the cockpit silently re-weighted the selected project instead, reordering every project's tasks in the queue (§7) with nothing said and nothing to undo it. The modifier is `alt` rather than `shift` because shift cannot serve: crossterm reports no SHIFT modifier for a digit — a shifted digit arrives as its bare symbol — those symbols are layout-dependent (`shift-2` is `@` on a US keyboard and `"` on a UK one), and `!`, shift-1, is already the deep toggle. `ctrl-<digit>` produces no distinct sequence in a legacy terminal, so `alt-1`–`alt-4` are the jumps, layout-independent and testable. Some terminal emulators claim `alt-<digit>` for themselves, and where they do the jump simply never arrives and Tab still cycles; nothing else is bound to the chord, so nothing changes hands. A digit that resolves to no task — a collapsed proposal digest, which names no single task, or an empty queue — says so on the status line rather than doing nothing quietly, as does a `4` or `5` pressed on a task, priority stopping at P3 where weight runs to 5.
+**A bare digit sets the number on the selected row, and screen jumps carry the
+modifier.** The digit's meaning follows the selection rather than the screen:
+`0`–`3` set the selected *task's* priority on the cockpit, in the task
+browser, and in the browser's detail popup, and `0`–`5` set the selected
+*project's* weight on the projects screen. Screen switching is the thing that
+gave way, because it is not the frequent act — Tab already cycles all four
+screens — while re-prioritising is: the daily move is "this project matters
+more today" and "this task matters more than that one", and both should cost one
+keystroke on the row already under the cursor. Giving the bare digit one
+meaning also removes the collision the two meanings would otherwise have on the
+projects screen. The modifier is `alt` rather than `shift` because shift cannot
+serve: crossterm reports no SHIFT modifier for a digit — a shifted digit
+arrives as its bare symbol — those symbols are layout-dependent, and `!`,
+shift-1, is already the deep toggle. `ctrl-<digit>` produces no distinct
+sequence in a
+legacy terminal, so `alt-1`–`alt-4` are the jumps, layout-independent and
+testable. Some terminal emulators claim `alt-<digit>` for themselves, and where
+they do the jump simply never arrives and Tab still cycles; nothing else is
+bound to the chord, so nothing changes hands. A digit that resolves to no task
+— a collapsed proposal digest, which names no single task, or an empty queue
+— says so on the status line rather than doing nothing quietly, as does a `4`
+or `5` pressed on a task, priority stopping at P3 where weight runs to 5.
 
-**Keys are advertised in two places, and the split between them is deliberate.** A contextual key line sits under every screen, listing the actions that apply to the current screen and selection — and only those that change a task's state or destiny, since a line the operator has to read twice has stopped being contextual. Where a lowercase key and its shifted sibling are two ways of doing *one* action, they take a single slot keyed on the pair and labelled with the base verb (`d/D dispatch`, `r/R refine`, `n/N new`, `a/A message`); keys that merely share a letter without sharing an action — the cockpit's `c` link documents and `C` cancel a refine, the projects screen's `a` add and `A` archive, the Config screen's `a` add viewer and `A` default agent — keep their own slots, because pairing them would claim a kinship that is not there. What each uppercase variant does differently is spelled out one level down, in the **`?` key map**: a peek-style overlay, dismissed by any key but `tab`, listing the current screen's *complete* bindings grouped into actions, navigation, and screen switching. The overlay is sized to the terminal rather than to its content, because the alternative is a map that quietly stops being complete: an overlay that assumed it fit dropped whatever fell past its bottom border and clipped the navigation column mid-word whenever a gloss on the left grew, which meant new glosses were being written to a length budget nobody had stated. So the Actions column gives up width — its glosses ellipsised — before the column beside it loses a character, and a map too tall for the terminal splits into evenly filled pages that `tab` turns, which is the one key the overlay keeps for itself. `tab` rather than a scroll key because paging is the peek-sized gesture: the map is read, not navigated. Glosses are still written short, but that is now a matter of prose rather than of layout, and a test renders every screen's map at 80x24 and pages through it asserting each entry appears whole, so the map outgrowing its overlay fails the build instead of silently shedding its last rows. The map is what licenses the line's brevity — navigation, display toggles like `x`/`h`, and browsing conveniences like `l` are reachable and documented without ever crowding the line — so `?` itself is the one key every screen's line always carries. The two review keys are the deliberate exception to "state or destiny only": `o` (the local diff) and `g` (the PR) change nothing, but on a task that has just come back for review, looking at the diff *is* the operator's next action, and the line is where the moment is announced. They earn the slots by being tightly gated on that moment, and the moment is a state *plus* something to show: `o` on a `review` or `running` task that carries a branch, since the diff it opens is built from that branch, and `g` on a `review` task that carries a branch or a tracked PR, since with neither there is no pull request to jump to and none that `pr` could open — `plan_pr` refuses without a branch. The state alone is not enough, because a task whose whole product is its summary — an investigation, a triage, an audit — reaches `review` having never made a branch, and the line would then advertise two keys that cannot act beside a card whose recommended verb, for that very reason, is *accept* rather than *pr* (§3). So they are absent from the line everywhere the argument for them does not hold, even though both keys stay bound in every state (§8: `g` also jumps to a tracked PR, and links one). The lesson generalises in both directions: a read-only key belongs on the line when the selection's state makes it the obvious next press, and a state-changing one drops off it when that state has passed. `!` (deep) is the second half of that — it picks the model of the *next* dispatch, so on a task under review, handed off, or closed it toggles something the operator is not about to see, and the review row reclaims the slot. Neither narrowing touches what the keys *do*: `!`, `o`, and `g` stay bound in every state, and it is only the advertisement that follows the selection. The line's budget is eleven slots, one more than it held before the review cluster arrived, and a `review` row with a branch — `⏎ review`, `w wait`, `o open`, `g PR`, and the unconditional rest — is the row that spends them all; the branchless one hands two of them back.
+**Keys are advertised in two places, and the split between them is deliberate.**
+A contextual key line sits under every screen, listing the actions that apply to
+the current screen and selection — and only those that change a task's state
+or destiny, since a line the operator has to read twice has stopped being
+contextual. Where a lowercase key and its shifted sibling are two ways of doing
+*one* action, they take a single slot keyed on the pair and labelled with the
+base verb (`d/D dispatch`, `r/R refine`, `n/N new`, `a/A message`); keys that
+merely share a letter without sharing an action — the cockpit's `c` link
+documents and `C` cancel a refine, the projects screen's `a` add and `A`
+archive, the Config screen's `a` add viewer and `A` default agent — keep their
+own slots, because pairing them would claim a kinship that is not there. What
+each uppercase variant does differently is spelled out one level down, in the
+**`?` key map**: a peek-style overlay, dismissed by any key but `tab`, listing
+the current screen's *complete* bindings grouped into actions, navigation, and
+screen switching. The overlay is sized to the terminal rather than to its
+content, because the alternative is a map that quietly stops being complete.
+The Actions column gives up width — its glosses ellipsised — before the
+column beside it loses a character, and a map too tall for the terminal splits
+into evenly filled pages that `tab` turns, which is the one key the overlay
+keeps for itself. `tab` rather than a scroll key because paging is the
+peek-sized gesture: the map is read, not navigated. A test renders every
+screen's map at 80x24 and pages through it asserting each entry appears whole,
+so the map outgrowing its overlay fails the build instead of silently shedding
+its last rows. The map is what licenses the line's brevity —
+navigation, display toggles like `x`/`h`, and browsing conveniences like `l` are
+reachable and documented without ever crowding the line — so `?` itself is the
+one key every screen's line always carries. The two review keys are the
+deliberate exception to "state or destiny only": `o` (the local diff) and `g`
+(the PR) change nothing, but on a task that has just come back for review,
+looking at the diff *is* the operator's next action, and the line is where the
+moment is announced. They earn the slots by being tightly gated on that moment,
+and the moment is a state *plus* something to show: `o` on a `review` or
+`running` task that carries a branch, since the diff it opens is built from that
+branch, and `g` on a `review` task that carries a branch or a tracked PR, since
+with neither there is no pull request to jump to and none that `pr` could open
+— `plan_pr` refuses without a branch. The state alone is not enough, because a
+task whose whole product is its summary — an investigation, a triage, an audit
+— reaches `review` having never made a branch, and the line would then
+advertise two keys that cannot act beside a card whose recommended verb, for
+that very reason, is *accept* rather than *pr* (§3). So they are absent from
+the line everywhere the argument for them does not hold, even though both keys
+stay bound in every state (§8: `g` also jumps to a tracked PR, and links one).
+The rule generalises in both directions: a read-only key belongs on the line
+when the selection's state makes it the obvious next press, and a
+state-changing one drops off it when that state has passed — `!` (deep) picks
+the model of the *next* dispatch, so on a task under review, handed off, or
+closed it toggles something the operator is not about to see, and the review
+row reclaims the slot. Neither narrowing touches what the keys *do*; only the
+advertisement follows the selection. The line's budget is eleven slots, and a
+`review` row with a branch — `⏎ review`, `w wait`, `o open`, `g PR`, and the
+unconditional rest — is the row that spends them all; the branchless one
+hands two of them back.
 
-**The same row is where Voro answers back, and it grows to fit what it has to say.** A status message — a refusal, or the summary of something that just happened — takes the key line's row until the next keystroke, and it is *wrapped* across as many rows as it needs rather than truncated at the pane width. The reason is a property of the messages themselves: Voro's refusals are written to end on the way out, naming the key to press instead (§8's `g` on a checkout that is not GitHub points at `o`, and does it in the caller's own idiom), so a line cut at the right margin loses precisely the half worth reading, and loses it at whatever width the operator's terminal happens to be. The region is therefore sized from the wrapped message before the screen's panes divide the rows, and the panes above give up the space — an error the operator is being asked to act on outranks a row of the list they were browsing. It stops growing at half the screen, since a message that cannot be said in half a terminal is not going to be fixed by burying the lists under it, and it is one row again — for the key line, and for the short messages that fit — the moment there is nothing long to say.
+**The same row is where Voro answers back, and it grows to fit what it has to
+say.** A status message — a refusal, or the summary of something that just
+happened — takes the key line's row until the next keystroke, and it is
+*wrapped* across as many rows as it needs rather than truncated at the pane
+width. The reason is a property of the messages themselves: Voro's refusals are
+written to end on the way out, naming the key to press instead (§8's `g` on a
+checkout that is not GitHub points at `o`, and does it in the caller's own
+idiom), so a line cut at the right margin loses precisely the half worth
+reading, and loses it at whatever width the operator's terminal happens to be.
+The region is therefore sized from the wrapped message before the screen's panes
+divide the rows, and the panes above give up the space — an error the operator
+is being asked to act on outranks a row of the list they were browsing. It stops
+growing at half the screen, since a message that cannot be said in half a
+terminal is not going to be fixed by burying the lists under it, and it is one
+row again — for the key line, and for the short messages that fit — the
+moment there is nothing long to say.
 
-**The right end of that row says which store is open, and only when it is not the operator's own.** Nothing else on screen answers "which database am I looking at?" — the one place it was ever said is the startup warning a `target/` build prints when it declines an inherited `VORO_DB` (§5), and the alternate screen paints over it before anyone reads it. So the footer carries the store's path, right-aligned against the key line the way the header right-aligns its counts, dim, on every screen rather than on the cockpit alone, since the question is not cockpit-specific. What decides whether it appears is the comparison against the *production* path (§5) rather than against whichever store the running binary defaults to, and that is the whole of the point: the default for a `target/` build **is** `dev.db`, so an indicator keyed on it would fall silent in exactly the case that raises the question. An installed `voro` on the operator's store therefore shows nothing at all, and the key line has the row entire, exactly as before; a dev build says `dev.db`, and a run under `--db` or an honoured `VORO_DB` says where it landed. It is the rule dispatch's `--db` flag and `voro seed`'s refusal already follow, for the same reason. What the row is sized against is the key line's slot budget, not the path: the line is measured first and the indicator takes only the columns left over, because the budget is fixed and documented and a store path's length is not, so the occupant that cannot be bounded is the one that yields. It shortens into whatever it is given — `~` for the home directory, then leading directories surrendered whole for a `…`, since the filename and its parent are the half that names the store — and the ladder ends at the bare filename, `dev.db` saying "not your store" in six columns. Below that the indicator disappears rather than push a single slot off the line, and it never cuts a name mid-word: a fragment identifies no store, and those columns belong to the keys. That last rung is a real, deliberate loss — a filename longer than the leftover leaves the row silent about a store that is not the operator's — and it is preferable to spending the line's recovery keys on half a name. The row never grows a line for any of this either: an indicator that costs a row whenever it is absent would have to earn its place, and this one earns its place by costing nothing. When a status message is up it owns the row alone and the indicator is suppressed rather than right-aligned against wrapped text; the message is gone on the next keystroke and the store is not going anywhere.
+**The right end of that row says which store is open, and only when it is not
+the operator's own.** Nothing else on screen answers "which database am I
+looking at?" — the one place it was ever said is the startup warning a
+`target/` build prints when it declines an inherited `VORO_DB` (§5), and the
+alternate screen paints over it before anyone reads it. So the footer carries
+the store's path, right-aligned against the key line the way the header
+right-aligns its counts, dim, on every screen rather than on the cockpit alone,
+since the question is not cockpit-specific. What decides whether it appears is
+the comparison against the *production* path (§5) rather than against whichever
+store the running binary defaults to, and that is the whole of the point: the
+default for a `target/` build **is** `dev.db`, so an indicator keyed on it would
+fall silent in exactly the case that raises the question. An installed `voro` on
+the operator's store therefore shows nothing at all, and the key line has the
+row entire, exactly as before; a dev build says `dev.db`, and a run under `--db`
+or an honoured `VORO_DB` says where it landed. It is the rule dispatch's `--db`
+flag and `voro seed`'s refusal already follow, for the same reason. What the row
+is sized against is the key line's slot budget, not the path: the line is
+measured first and the indicator takes only the columns left over, because the
+budget is fixed and documented and a store path's length is not, so the occupant
+that cannot be bounded is the one that yields. It shortens into whatever it is
+given — `~` for the home directory, then leading directories surrendered whole
+for a `…`, since the filename and its parent are the half that names the store
+— and the ladder ends at the bare filename, `dev.db` saying "not your store"
+in six columns. Below that the indicator disappears rather than push a single
+slot off the line, and it never cuts a name mid-word: a fragment identifies no
+store, and those columns belong to the keys. That last rung is a real,
+deliberate loss — a filename longer than the leftover leaves the row silent
+about a store that is not the operator's — and it is preferable to spending
+the line's recovery keys on half a name. The row never grows a line for any of
+this either: an indicator that costs a row whenever it is absent would have to
+earn its place, and this one earns its place by costing nothing. When a status
+message is up it owns the row alone and the indicator is suppressed rather than
+right-aligned against wrapped text; the message is gone on the next keystroke
+and the store is not going anywhere.
 
-**What the case of a key means: lowercase acts, uppercase opens.** Where a lowercase key and its shifted sibling are two ways of doing one action, the case says *where the work happens*. The lowercase key acts immediately and headlessly and the operator never leaves the TUI; the uppercase key opens an interactive surface — an agent session the terminal is handed over to, or a picker answered before anything happens. So `d` dispatches to the resolved agent where `D` picks the agent first, `r` refines a brief from a typed note where `R` refines it in a session, `n` files a task from a typed line where `N` plans it in a session, and `a` sends a line into the task's session where `A` attaches to it. Taking a line of text inline is not "opening a surface" — a one-line input in the queue is how a lowercase key takes its argument, and the operator's hands never leave the queue to supply it. The convention earns its keep at the moment of pressing: the unshifted key is the one that costs nothing but the keystroke, and the shift is the operator saying they are willing to be taken somewhere.
+**What the case of a key means: lowercase acts, uppercase opens.** Where a
+lowercase key and its shifted sibling are two ways of doing one action, the case
+says *where the work happens*. The lowercase key acts immediately and headlessly
+and the operator never leaves the TUI; the uppercase key opens an interactive
+surface — an agent session the terminal is handed over to, or a picker
+answered before anything happens. So `d` dispatches to the resolved agent where
+`D` picks the agent first, `r` refines a brief from a typed note where `R`
+refines it in a session, `n` files a task from a typed line where `N` plans it
+in a session, and `a` sends a line into the task's session where `A` attaches to
+it. Taking a line of text inline is not "opening a surface" — a one-line input
+in the queue is how a lowercase key takes its argument, and the operator's hands
+never leave the queue to supply it. The convention earns its keep at the moment
+of pressing: the unshifted key is the one that costs nothing but the keystroke,
+and the shift is the operator saying they are willing to be taken somewhere.
 
-The rule binds *pairs*, and only pairs, which is the same line the key line already draws between a shifted sibling and a mere letter-sharer. It therefore has nothing to say about a key whose uppercase is a different action — the cockpit's `c` link documents and `C` cancel a refine, the projects screen's `a` add and `A` archive, the Config screen's `a` add viewer and `A` default agent — nor about an uppercase key with no lowercase sibling at all: `J`/`K` and the page keys scroll the pane the screen's selection cannot reach — the cockpit's focus card, the Config screen's agents — which is one binding wearing one meaning twice rather than two, and is why the second use took those letters rather than fresh ones, and the Config screen's `V` picks the default viewer. Those are the exceptions, named here so the convention is not read wider than it is, and none is worth rebinding: the letters they share carry no kinship, and moving a key the operator's fingers already know would buy a consistency nobody reads. What the rule binds instead is the future — a heavier, interactive variant of an existing action takes that action's shifted key rather than a fresh letter, and a new uppercase binding that is neither of those needs a line here saying why.
+The rule binds *pairs*, and only pairs, which is the same line the key line
+already draws between a shifted sibling and a mere letter-sharer. It therefore
+has nothing to say about a key whose uppercase is a different action — the
+cockpit's `c` link documents and `C` cancel a refine, the projects screen's `a`
+add and `A` archive, the Config screen's `a` add viewer and `A` default agent
+— nor about an uppercase key with no lowercase sibling at all: `J`/`K` and the
+page keys scroll the pane the screen's selection cannot reach — the cockpit's
+focus card, the Config screen's agents — which is one binding wearing one
+meaning twice rather than two, and is why the second use took those letters
+rather than fresh ones, and the Config screen's `V` picks the default viewer.
+Those are the exceptions, named here so the convention is not read wider than it
+is, and none is worth rebinding: the letters they share carry no kinship, and
+moving a key the operator's fingers already know would buy a consistency nobody
+reads. What the rule binds instead is the future — a heavier, interactive
+variant of an existing action takes that action's shifted key rather than a
+fresh letter, and a new uppercase binding that is neither of those needs a line
+here saying why.
 
-The first milestone deliberately restricts scope to three lists and a handful of keybindings — the risk of TUI-first is polishing panes before the workflow is validated, and the mitigation is scope, not sequence. Core interactions, roughly in order of implementation: create a task by typing one line and letting a background agent expand it into a proposal (§8's quick propose, on the default key, as the case convention above asks) — or plan one interactively with an agent (§8's planning sessions, on the sibling key), or write it out by hand in `$EDITOR` (title, body, priority, deps, agent override via frontmatter or a form), which stays the only path that sets all of those at creation time; edit a task in `$EDITOR`; edit project weights on a dedicated projects screen — one row per project, weight set by a single keystroke (*this must be fast — it happens every morning*); resume a queued question once it is answered in the agent's session; dispatch a ready task (default agent) and dispatch-via-picker; accept/reject a review item; triage `proposed` tasks from the queue; redispatch a stalled task; a score-decomposition view folded inline into any task's detail (toggled with `x`, not a popup).
+Core interactions: create a task by typing one line and letting a
+background agent expand it into a proposal (§8's quick propose, on the default
+key, as the case convention above asks) — or plan one interactively with an
+agent (§8's planning sessions, on the sibling key), or write it out by hand in
+`$EDITOR` (title, body, priority, deps, agent override via frontmatter or a
+form), which stays the only path that sets all of those at creation time; edit a
+task in `$EDITOR`; edit project weights on a dedicated projects screen — one
+row per project, weight set by a single keystroke (*this must be fast — it
+happens every morning*); resume a queued question once it is answered in the
+agent's session; dispatch a ready task (default agent) and dispatch-via-picker;
+accept/reject a review item; triage `proposed` tasks from the queue; redispatch
+a stalled task; a score-decomposition view folded inline into any task's detail
+(toggled with `x`, not a popup).
 
-The mouse is a secondary input over the same keys: a left click on any list row or picker option moves the selection there, exactly as `j`/`k` would, and a second click on an option already under the cursor picks it, as ⏎ would — a click never fires a row's action, and mouse reporting stays on for the whole session, which trades away the terminal's own text selection (shift-drag still bypasses it).
+The mouse is a secondary input over the same keys: a left click on any list row
+or picker option moves the selection there, exactly as `j`/`k` would, and a
+second click on an option already under the cursor picks it, as ⏎ would — a
+click never fires a row's action, and mouse reporting stays on for the whole
+session, which trades away the terminal's own text selection (shift-drag still
+bypasses it).
 
-Every action ultimately gets a CLI equivalent so the whole tool is scriptable and agent-legible, but the human-facing CLI trails the TUI rather than preceding it.
+Every action ultimately gets a CLI equivalent so the whole tool is scriptable
+and agent-legible, but the human-facing CLI trails the TUI rather than preceding
+it.
 
 ## 10. Delivery plan
 
-Ordered by dependency and by time-to-useful, not by calendar — with agents doing the implementation, phases are checkpoints for *validation*, not estimates.
+The tool was built in staged milestones, ordered by dependency and by
+time-to-useful, not by calendar — with agents doing the implementation, the
+phases were checkpoints for *validation*, not estimates. The structure is kept
+here because later sections refer to it.
 
-**Milestone A — usable command centre.** `voro-core` (schema, state machine, scheduler, scoring) plus the TUI with manual task management: create/edit tasks, weights modal, the queue and its detail pane, mark states by hand. No dispatch yet — dispatching is copy-the-body-into-Claude-Code by hand. This is already the tool you are missing: cross-project prioritised attention. Live in it immediately; everything after this is judged against real use.
+**Milestone A — usable command centre.** `voro-core` (schema, state machine,
+scheduler, scoring) plus the TUI with manual task management: create/edit
+tasks, weights modal, the queue and its detail pane, mark states by hand. No
+dispatch — cross-project prioritised attention alone, lived in immediately so
+everything after it is judged against real use.
 
-**Milestone B — the loop.** Dispatch with agent resolution, the session table, the `voro ask/done/propose` verbs, the return-path preamble injected into every dispatched prompt, needs-input flowing back into the queue, redispatch. The command centre now commands.
+**Milestone B — the loop.** Dispatch with agent resolution, the session table,
+the `voro ask/done/propose` verbs, the return-path preamble injected into every
+dispatched prompt, needs-input flowing back into the queue, redispatch.
 
-**Milestone C — refinement from usage.** Review UX (inline diff pane vs. open-in-Zed), triage ergonomics, GitHub issue *import* for owned repos, the human CLI surface, worktrees if parallel dispatch has become real.
+**Milestone C — refinement from usage.** Review UX, triage ergonomics, GitHub
+issue *import* for owned repos, the human CLI surface, worktrees if parallel
+dispatch has become real.
 
-**Milestone D — maybe.** GUI cockpit over the same core, richer session steering, two-way issue sync, smarter proposal triage.
+**Milestone D — maybe.** GUI cockpit over the same core, richer session
+steering, two-way issue sync, smarter proposal triage.
 
 ## 11. Open questions
 
-Voro-managed worktrees per dispatch, or let the agent make its own? The dispatched agent creates its own throwaway worktree (the dispatch preamble instructs it, §8), and Voro-owned per-dispatch worktrees are deferred until parallel dispatch within a single project is genuinely wanted. How `review` gets its diff in front of you is resolved as layered surfacing folded into the per-project viewer (§8), not an inline diff pane. Three complementary paths, none exclusive: (a) a configurable viewer command run on `review`/`running` rows — the `[viewers.*]` templates and `open`, the editor-agnostic baseline; (b) a `git diff --stat` summary in the detail pane so the queue carries a completed diff's size without leaving the TUI (the git call lives in the `voro` crate, keeping `voro-core` process-free); (c) optional tracking of a GitHub PR on the task (`pr_url`), so `pr` can jump to where the diff and its review comments already live, and a tracked PR's comments can become the reject-with-feedback body (§6) without retyping. The mechanics live in §8; the inline diff pane and a live IDE-connect spike stay deferred to Milestone D behind that baseline. Session-log retention is settled for now at keeping the full log at `log_path` indefinitely — a single-user session's log is a few MB at most, and the tail is already read back for usage-cap detection and a redispatch's predecessor notes (§8), so trimming would only have to be reversed; revisit if logs ever grow enough to cost something. Do human tasks (§3) eventually need context/availability tags — `@robot`, `@errands`-style GTD contexts marking *where* or *when* the human can execute them? Deliberately deferred: the human flag alone keeps the queue honest about what an agent can pick up, and a context taxonomy only earns its complexity once hands-on rows measurably clutter desk-time use of the queue. If that bites, tags would be a filter over the same score, not a new scheduling input.
+The questions this section once held are settled; each note below records the
+resolution and points at the section that owns the mechanics. The lettered
+anchors stay because code comments cite them (§11a, §11c).
+
+*Voro-managed worktrees per dispatch, or let the agent make its own?* The
+dispatched agent creates its own throwaway worktree (the dispatch preamble
+instructs it, §8); Voro-owned per-dispatch worktrees are deferred until
+parallel dispatch within a single project is genuinely wanted.
+
+*How does `review` get its diff in front of you?* Layered surfacing folded into
+the per-project viewer (§8), not an inline diff pane. Three complementary
+paths, none exclusive: (a) a configurable viewer command run on
+`review`/`running` rows — the `[viewers.*]` templates and `open`, the
+editor-agnostic baseline; (b) a `git diff --stat` summary in the detail pane
+(the git call lives in the `voro` crate, keeping `voro-core` process-free);
+(c) optional tracking of a GitHub PR on the task (`pr_url`), so `pr` can jump
+to where the diff and its review comments already live. The mechanics live in
+§8; the inline diff pane and a live IDE-connect spike stay deferred to
+Milestone D behind that baseline.
+
+*Session-log retention?* Keep the full log at `log_path` indefinitely — a
+single-user session's log is a few MB at most, and the tail is read back for
+usage-cap detection and a redispatch's predecessor notes (§8); revisit if logs
+ever grow enough to cost something.
+
+*Do human tasks (§3) need context/availability tags — `@robot`,
+`@errands`-style GTD contexts?* Deliberately deferred: the human flag alone
+keeps the queue honest about what an agent can pick up. If hands-on rows ever
+clutter desk-time use of the queue, tags would be a filter over the same score,
+not a new scheduling input.
 
 ## 12. Risks
 
-The tool becoming a procrastination object — mitigated by Milestone A's brutal scope: three lists, manual state, immediately lived-in. TUI-first building interface ahead of validated workflow — same mitigation; nothing in Milestone A's UI is speculative, every element maps to the queue from §1. Score distrust — mitigated by the decomposition view and by keeping the formula small enough to compute in your head. Schema regret — mitigated by the event log (replayable) and by SQLite migrations being cheap at single-user scale. And the standing risk of all personal tooling: that triage discipline decays. The untriaged proposals sitting visibly in the queue are the guard rail — as one digest row per project, since triage is the cheapest action there is and forty individual rows would otherwise swamp the queue (§7), backed by an always-visible untriaged count so the backlog stays felt even when the digest itself drops below the cap; if either stops working, that is signal about the design, not the user.
+The tool becoming a procrastination object — mitigated by Milestone A's brutal
+scope: three lists, manual state, immediately lived-in. TUI-first building
+interface ahead of validated workflow — same mitigation; nothing in Milestone
+A's UI is speculative, every element maps to the queue from §1. Score distrust
+— mitigated by the decomposition view and by keeping the formula small enough
+to compute in your head. Schema regret — mitigated by the event log
+(replayable) and by SQLite migrations being cheap at single-user scale. And the
+standing risk of all personal tooling: that triage discipline decays. The
+untriaged proposals sitting visibly in the queue are the guard rail — as one
+digest row per project, since triage is the cheapest action there is and forty
+individual rows would otherwise swamp the queue (§7), backed by an
+always-visible untriaged count so the backlog stays felt even when the digest
+itself drops below the cap; if either stops working, that is signal about the
+design, not the user.

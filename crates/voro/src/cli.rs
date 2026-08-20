@@ -1691,7 +1691,7 @@ fn reject_verb(store: &mut Store, args: RejectArgs) -> Result<String, String> {
 /// (DESIGN.md §6/§8): running | stalled → review — from `stalled` it reports a
 /// dead session's finished work on its behalf. The summary is the completion
 /// note, read back as the PR body when `pr` opens a pull request. `--branch` is
-/// the branch the agent reports its work landed on (task #81), overwriting any
+/// the branch the agent reports its work landed on, overwriting any
 /// intended name dispatch injected. The transition applies first, so a task
 /// that is neither `running` nor `stalled` is refused before any branch is
 /// recorded. A `done` that leaves the task without a branch or summary *warns*
@@ -2687,7 +2687,7 @@ mod tests {
         let e = call(&mut s, &["viewer", "add", "mine", "mine ."]).unwrap_err();
         assert!(e.contains("already exists"), "{e}");
 
-        // a built-in is overridden rather than removed (#405)
+        // a built-in is overridden rather than removed
         let e = call(&mut s, &["viewer", "remove", "zed"]).unwrap_err();
         assert!(e.contains("built into voro"), "{e}");
         call(&mut s, &["viewer", "add", "zed", "zed --wait {path}"]).unwrap();
@@ -2734,7 +2734,7 @@ mod tests {
 
     #[test]
     fn project_archive_hides_the_cockpit_views_and_unarchive_restores_them() {
-        // The acceptance walk (task #136): a project with open and closed
+        // The acceptance walk: a project with open and closed
         // tasks leaves inbox/next/stats wholesale on archive, stays tagged on
         // `project list`, and comes back exactly on unarchive.
         let mut s = store();
@@ -2812,7 +2812,7 @@ mod tests {
         assert!(out.contains("-> done"), "{out}");
     }
 
-    // --- closing verdicts stop the agent's session (task #433) ---
+    // --- closing verdicts stop the agent's session ---
 
     /// A context whose `claude` agent records what its `stop` verb was fired at,
     /// plus that marker's path and the directory to clean up.
@@ -3514,7 +3514,7 @@ mod tests {
     }
 
     /// `show` prints the completion summary of the cycle awaiting a verdict —
-    /// on a first review as well as a rework (task #407) — and stops once the
+    /// on a first review as well as a rework — and stops once the
     /// verdict has been given, when the summary is history.
     #[test]
     fn show_prints_the_completion_summary_under_review() {
@@ -4285,7 +4285,7 @@ mod tests {
         assert!(e.contains("agent override"), "{e}");
     }
 
-    // --- the deep flag (task #241) ---
+    // --- the deep flag ---
 
     #[test]
     fn add_and_set_carry_the_deep_flag_and_show_displays_it() {
@@ -4425,7 +4425,7 @@ mod tests {
         assert!(ok(&mut s, &["show", "1"]).contains("tests missing"));
     }
 
-    // --- branch tracking (task #81, DESIGN.md §5/§8) ---
+    // --- branch tracking (DESIGN.md §5/§8) ---
 
     #[test]
     fn set_tracks_and_clears_a_branch() {
@@ -4688,7 +4688,7 @@ mod tests {
         assert!(out.contains("* [viewer]"), "{out}");
 
         // nothing configured: the built-ins are still listed, with provenance,
-        // since each is a viewer `open` can run (#405)
+        // since each is a viewer `open` can run
         let ctx = ctx_with_toml("");
         let out = run_with(&mut s, &["viewer", "list"], &ctx).unwrap();
         assert!(!out.contains("no viewers configured"), "{out}");
@@ -4869,7 +4869,7 @@ mod tests {
         assert!(!ok(&mut s, &["show", "3"]).contains("incomplete report"));
     }
 
-    // --- set --summary (task #99, DESIGN.md §8) ---
+    // --- set --summary (DESIGN.md §8) ---
 
     #[test]
     fn set_summary_replaces_a_review_tasks_summary() {
@@ -5041,7 +5041,7 @@ mod tests {
         assert!(ok(&mut s, &["show", "1"]).contains("#1 ready"));
     }
 
-    // --- unknown-flag rejection (task #108) ---
+    // --- unknown-flag rejection ---
 
     /// A typo'd flag on a mutating verb is refused by name, before the verb
     /// runs: no transition, no summary, no event.
@@ -5313,7 +5313,7 @@ mod tests {
 
     #[test]
     fn a_doc_links_tasks_across_projects_and_list_answers_which_derive_from_it() {
-        // The acceptance case (task #267): register a plan, link tasks in
+        // The acceptance case: register a plan, link tasks in
         // three projects to it, and ask which tasks came from that plan.
         let mut s = store();
         ok(&mut s, &["project", "add", "augere", "/tmp/augere"]);
