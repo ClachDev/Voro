@@ -616,6 +616,14 @@ pub struct App {
     /// silently rendering an empty config.
     pub config_error: Option<String>,
     pub config_sel: usize,
+    /// Vertical scroll offset of the Config screen's agents pane (DESIGN.md §9),
+    /// driven by `J`/`K` and `PgDn`/`PgUp`. The pane carries no selection of its
+    /// own — `j`/`k` belong to the viewers list below it — so the scroll is the
+    /// only way past the fold on a terminal too short for every agent.
+    pub config_agents_scroll: u16,
+    /// The largest useful `config_agents_scroll` for the pane as last rendered,
+    /// recorded by `draw_config` for the same reason as `detail_max_scroll`.
+    pub config_agents_max_scroll: std::cell::Cell<u16>,
 
     pub mode: Mode,
     /// Whether the detail views fold the score decomposition (DESIGN.md §7) and
@@ -709,6 +717,8 @@ impl App {
             config_anon_viewer: None,
             config_error: None,
             config_sel: 0,
+            config_agents_scroll: 0,
+            config_agents_max_scroll: std::cell::Cell::new(0),
             mode: Mode::Normal,
             show_score: false,
             show_history: false,
@@ -747,6 +757,12 @@ impl App {
     /// the screen to show the operator which file is in play.
     pub fn config_path(&self) -> &std::path::Path {
         &self.dispatch_ctx.agents_path
+    }
+
+    /// The database this run opened (DESIGN.md §5), for the footer to name it
+    /// when it is not the operator's own store (§9).
+    pub fn db_path(&self) -> &std::path::Path {
+        &self.dispatch_ctx.db_path
     }
 
     /// Refresh if another process has committed since the last check. Cheap
@@ -1207,12 +1223,15 @@ impl App {
         }
 
         // A question is worth asking only while a session it answers for is
-        // badged, and stops being worth holding an answer to the moment none
-        // is.
+        // *held*, and stops being worth holding an answer to the moment none
+        // is. A session retrying its rejected request is badged but not held —
+        // it is mid-turn and will carry on by itself — so it buys no reading,
+        // which matters here more than elsewhere because the reading is bought
+        // with an API call.
         let asked_for: std::collections::HashSet<String> = self
             .cap_targets
             .iter()
-            .filter(|t| self.caps.contains_key(&t.task_id))
+            .filter(|t| self.caps.get(&t.task_id).is_some_and(|r| !r.retrying))
             .filter_map(|t| t.cap.clone())
             .collect();
         self.account_caps.retain(|q, _| asked_for.contains(q));
@@ -1365,6 +1384,13 @@ impl App {
     fn scroll_detail(&mut self, delta: i64) {
         let max = self.detail_max_scroll.get() as i64;
         self.detail_scroll = (self.detail_scroll as i64 + delta).clamp(0, max) as u16;
+    }
+
+    /// Scroll the Config screen's agents pane, clamped the same way against the
+    /// overflow `draw_config` last measured.
+    fn scroll_config_agents(&mut self, delta: i64) {
+        let max = self.config_agents_max_scroll.get() as i64;
+        self.config_agents_scroll = (self.config_agents_scroll as i64 + delta).clamp(0, max) as u16;
     }
 
     /// Tab cycles cockpit → tasks → projects → config → cockpit; `alt-1` to
@@ -2364,18 +2390,45 @@ impl App {
         // account's own instant retires case by case: a cap the screen never
         // timed is timed after all once the agent has said when.
         let (mut ready, mut waiting): (Vec<i64>, Vec<i64>) = (Vec::new(), Vec::new());
+        let mut retrying = 0usize;
         for id in self.caps.keys().copied() {
-            let due = self.cap_window(id).is_none_or(|window| window.due());
+            let window = self.cap_window(id);
+            // A session retrying the rejected request is the one badged shape
+            // that must be walked past. It is mid-turn, so it will carry on by
+            // itself — and since the nudge stops its target before resuming it
+            // (`nudge_one`), sending into one does not add a redundant turn but
+            // ends the turn already running. That the operator pressed the key
+            // is no argument for it either: the untimed cap below is swept on
+            // their judgement because nothing else knows whether the window is
+            // open, whereas here the session has said outright that it is
+            // working.
+            if window.as_ref().is_some_and(|window| window.retrying) {
+                retrying += 1;
+                continue;
+            }
+            let due = window.is_none_or(|window| window.due());
             if due { &mut ready } else { &mut waiting }.push(id);
         }
         // A sweep visits the strip in a stable order rather than the map's.
         ready.sort_unstable();
+        // Every badged session the sweep declined to touch is accounted for in
+        // what it reports, retrying ones included: a row left alone in silence
+        // reads as one the sweep missed.
+        let retrying_note = match retrying {
+            0 => String::new(),
+            n => format!(" — {n} retrying"),
+        };
         if ready.is_empty() {
-            self.status = Some(if waiting.is_empty() {
+            self.status = Some(if waiting.is_empty() && retrying == 0 {
                 "no session is capped".into()
+            } else if waiting.is_empty() {
+                format!(
+                    "{retrying} capped session{} — retrying, none waiting on you",
+                    if retrying == 1 { "" } else { "s" }
+                )
             } else {
                 format!(
-                    "{} capped session{} — none has reached its reset yet",
+                    "{} capped session{} — none has reached its reset yet{retrying_note}",
                     waiting.len(),
                     if waiting.len() == 1 { "" } else { "s" }
                 )
@@ -2406,6 +2459,7 @@ impl App {
         if !waiting.is_empty() {
             note.push_str(&format!(" — {} still before its reset", waiting.len()));
         }
+        note.push_str(&retrying_note);
         if !refused.is_empty() {
             note.push_str(&format!(" — refused {}", refused.join("; ")));
         }
@@ -3314,6 +3368,14 @@ impl App {
             KeyCode::Char('d') => self.delete_selected_viewer(),
             KeyCode::Char('V') => self.open_default_picker(DefaultKind::Viewer),
             KeyCode::Char('A') => self.open_default_picker(DefaultKind::Agent),
+            // The agents pane takes the cockpit card's scroll keys for the same
+            // reason it has there: `j`/`k` are the list's — here the viewers'
+            // — so the pane below them is driven by the shifted pair and the
+            // page keys (DESIGN.md §9).
+            KeyCode::Char('J') => self.scroll_config_agents(1),
+            KeyCode::Char('K') => self.scroll_config_agents(-1),
+            KeyCode::PageDown => self.scroll_config_agents(DETAIL_PAGE_STEP),
+            KeyCode::PageUp => self.scroll_config_agents(-DETAIL_PAGE_STEP),
             _ => {}
         }
     }
@@ -5993,8 +6055,10 @@ mod tests {
                 std::process::id()
             ),
         );
+        // Double-quoted in the shell so a fixture can carry the apostrophe the
+        // agent's real cap message has in it.
         let logs = if define_logs {
-            format!("logs = \"printf '%s' '{logs_output}' # {{session}}\"\n")
+            format!("logs = \"printf '%s' \\\"{logs_output}\\\" # {{session}}\"\n")
         } else {
             String::new()
         };
@@ -6065,7 +6129,7 @@ mod tests {
     #[test]
     fn a_live_capped_dispatch_is_read_with_its_reset_time() {
         let (mut app, task_id, project_path) =
-            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+            cap_env(true, "You've hit your session limit · resets 9:50pm");
         assert_eq!(app.cap_target_ids(), vec![task_id]);
 
         settle_cap(&mut app, task_id, true);
@@ -6190,11 +6254,8 @@ mod tests {
     /// the sweep goes by the instant.
     #[test]
     fn the_sweep_goes_by_the_accounts_instant() {
-        let (mut app, task_id, project_path) = cap_env_with(
-            true,
-            "Session limit reached - Retrying in 5m (9:50pm)",
-            &cap_verb(""),
-        );
+        let (mut app, task_id, project_path) =
+            cap_env_with(true, "Session limit reached - resets 9:50pm", &cap_verb(""));
         settle_cap(&mut app, task_id, true);
         // An hour short of the 21:50 the screen named: on the parse alone this
         // session is waiting, and the sweep would leave it alone.
@@ -6242,6 +6303,41 @@ mod tests {
         }
         assert!(app.caps.is_empty(), "{:?}", app.caps);
         assert!(!asked.exists(), "an uncapped fleet asked anyway");
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// A retrying session buys no account reading. It is badged, but it is
+    /// mid-turn rather than held, so there is nothing for an instant to answer
+    /// — and this is the one probe where the difference is money rather than a
+    /// subprocess.
+    #[test]
+    fn a_retrying_session_never_asks_the_account() {
+        let asked = std::env::temp_dir().join(format!("voro-cap-retry-{}", std::process::id()));
+        let _ = std::fs::remove_file(&asked);
+        let (mut app, task_id, project_path) = cap_env_with(
+            true,
+            "Session limit reached - Retrying in 5m (9:50pm) - attempt 2/10",
+            &format!(
+                "cap = \"printf 'x' >> '{}'\"\nmodel = \"workhorse\"\n",
+                asked.display()
+            ),
+        );
+        settle_cap(&mut app, task_id, true);
+        assert!(app.caps[&task_id].retrying);
+        for _ in 0..20 {
+            app.poll_cap_probes();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !asked.exists(),
+            "a retrying session asked the account anyway"
+        );
+        assert!(app.account_caps.is_empty());
+        assert!(
+            !app.cap_window(task_id).expect("a window").due(),
+            "and it is never swept"
+        );
 
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
     }
@@ -6313,7 +6409,7 @@ mod tests {
     #[test]
     fn an_agent_without_the_cap_verb_still_badges_from_the_screen() {
         let (mut app, task_id, project_path) =
-            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+            cap_env(true, "Session limit reached - resets 9:50pm");
         settle_cap(&mut app, task_id, true);
         app.now_minutes = Some(20 * 60 + 50);
         for _ in 0..10 {
@@ -6349,7 +6445,7 @@ mod tests {
     #[test]
     fn u_nudges_a_capped_session_whose_window_has_reopened() {
         let (mut app, task_id, project_path) =
-            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+            cap_env(true, "You've hit your session limit · resets 9:50pm");
         settle_cap(&mut app, task_id, true);
         // An hour past the 21:50 the agent named.
         app.now_minutes = Some(22 * 60 + 50);
@@ -6392,7 +6488,7 @@ mod tests {
     #[test]
     fn u_releases_the_capped_session_before_resuming_it() {
         let (mut app, task_id, project_path) =
-            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+            cap_env(true, "You've hit your session limit · resets 9:50pm");
         settle_cap(&mut app, task_id, true);
         app.now_minutes = Some(22 * 60 + 50);
 
@@ -6422,7 +6518,7 @@ mod tests {
     #[test]
     fn a_nudge_whose_release_fails_sends_nothing() {
         let (mut app, task_id, project_path) =
-            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+            cap_env(true, "You've hit your session limit · resets 9:50pm");
         settle_cap(&mut app, task_id, true);
         app.now_minutes = Some(22 * 60 + 50);
         set_verb(
@@ -6452,7 +6548,7 @@ mod tests {
     #[test]
     fn u_leaves_a_capped_session_that_is_still_waiting() {
         let (mut app, task_id, project_path) =
-            cap_env(true, "Session limit reached - Retrying in 5m (9:50pm)");
+            cap_env(true, "You've hit your session limit · resets 9:50pm");
         settle_cap(&mut app, task_id, true);
         // An hour short of the 21:50 the agent named.
         app.now_minutes = Some(20 * 60 + 50);
@@ -6509,6 +6605,47 @@ mod tests {
             Some(NUDGE),
             "{:?}",
             app.status
+        );
+
+        let _ = std::fs::remove_dir_all(project_path.parent().unwrap());
+    }
+
+    /// The one badged session the sweep walks past (DESIGN.md §8): one that is
+    /// retrying the request the limit rejected. It is mid-turn and will carry
+    /// on by itself, and a nudge would not add a turn to it but end the one
+    /// running, since the send stops its target first. So it is skipped however
+    /// far past the named time the clock has gone — and said aloud, because a
+    /// row passed over in silence reads as one the sweep failed to reach.
+    #[test]
+    fn u_leaves_a_retrying_session_alone() {
+        let (mut app, task_id, project_path) = cap_env(
+            true,
+            "429 exceeded your rate limit · Retrying in 30s · attempt 3/10",
+        );
+        settle_cap(&mut app, task_id, true);
+        assert!(app.caps[&task_id].retrying);
+        app.now_minutes = Some(22 * 60 + 50);
+
+        key(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(
+            delivered(&project_path),
+            None,
+            "a mid-turn session is not sent into: {:?}",
+            app.status
+        );
+        assert_eq!(
+            nudge_stopped(&project_path),
+            None,
+            "nor stopped, which is what a send would have done to it first"
+        );
+        assert!(
+            app.caps.contains_key(&task_id),
+            "and it keeps its badge, since nothing was done about it"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("1 capped session — retrying, none waiting on you")
         );
 
         let _ = std::fs::remove_dir_all(project_path.parent().unwrap());

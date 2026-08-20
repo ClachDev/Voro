@@ -29,6 +29,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0017_schema_migrations.sql"),
     include_str!("../migrations/0018_project_viewer.sql"),
     include_str!("../migrations/0019_session_liveness_source.sql"),
+    include_str!("../migrations/0020_store_meta.sql"),
 ];
 
 /// Whether a path lies inside a Cargo build directory — a `target` component
@@ -47,8 +48,9 @@ fn path_is_cargo_target(path: &Path) -> bool {
 
 /// Write the journal rows for a migration pass (§5). Migrations applied before
 /// the journal existed are backfilled with a NULL `sql`; what this pass applies
-/// is recorded verbatim, signed with the build that applied it.
-fn record_in_journal(tx: &Connection, from_version: usize) -> Result<()> {
+/// is recorded verbatim, signed with the build that applied it and, on a
+/// protected store, with the consent that let it (§5).
+fn record_in_journal(tx: &Connection, from_version: usize, consent: Option<&str>) -> Result<()> {
     let found: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
         [],
@@ -64,7 +66,7 @@ fn record_in_journal(tx: &Connection, from_version: usize) -> Result<()> {
             params![idx as i64],
         )?;
     }
-    let by = applied_by();
+    let by = applied_by(consent);
     for idx in (from_version + 1)..=MIGRATIONS.len() {
         tx.execute(
             "INSERT OR REPLACE INTO schema_migrations (idx, sql, applied_at, applied_by)
@@ -76,12 +78,15 @@ fn record_in_journal(tx: &Connection, from_version: usize) -> Result<()> {
 }
 
 /// How a build signs the journal: crate version and the running executable's
-/// path, which is what identifies the build behind a divergence.
-fn applied_by() -> String {
+/// path, which is what identifies the build behind a divergence. A consented
+/// migration of a protected store appends how the consent was given, so even
+/// a `--yes` override leaves a trace.
+fn applied_by(consent: Option<&str>) -> String {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "an unknown executable".to_string());
-    format!("voro {} at {exe}", env!("CARGO_PKG_VERSION"))
+    let via = consent.map(|c| format!(", {c}")).unwrap_or_default();
+    format!("voro {} at {exe}{via}", env!("CARGO_PKG_VERSION"))
 }
 
 /// The way out of a database carrying a migration this build does not have:
@@ -181,11 +186,29 @@ pub struct TaskEdit {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
+        Store::open_with_consent(path, None)
+    }
+
+    /// Open with consent to migrate a protected store (§5): the TUI's launch
+    /// prompt and `voro migrate` call this after a human has answered, or with
+    /// `--yes` standing in for one. `consent` says how the consent was given
+    /// and is recorded in the journal's `applied_by`. On an unprotected store
+    /// it changes nothing — migration there never needed asking.
+    pub fn open_migrate(path: &Path, consent: &str) -> Result<Store> {
+        Store::open_with_consent(path, Some(consent))
+    }
+
+    fn open_with_consent(path: &Path, consent: Option<&str>) -> Result<Store> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| Error::Invalid(format!("cannot create {}: {e}", dir.display())))?;
         }
-        Store::from_connection_at(Connection::open(path)?, Some(path))
+        Store::open_at(
+            Connection::open(path)?,
+            path,
+            &Store::production_db_path(),
+            consent,
+        )
     }
 
     pub fn open_in_memory() -> Result<Store> {
@@ -254,6 +277,24 @@ impl Store {
     }
 
     fn from_connection_at(conn: Connection, path: Option<&Path>) -> Result<Store> {
+        Store::open_at_opt(conn, path, &Store::production_db_path(), None)
+    }
+
+    fn open_at(
+        conn: Connection,
+        path: &Path,
+        production: &Path,
+        consent: Option<&str>,
+    ) -> Result<Store> {
+        Store::open_at_opt(conn, Some(path), production, consent)
+    }
+
+    fn open_at_opt(
+        conn: Connection,
+        path: Option<&Path>,
+        production: &Path,
+        consent: Option<&str>,
+    ) -> Result<Store> {
         conn.pragma_update(None, "foreign_keys", true)?;
         let mut store = Store { conn };
         let version = store.schema_version()?;
@@ -269,10 +310,62 @@ impl Store {
         if version < MIGRATIONS.len()
             && let Some(path) = path
         {
+            // The consent gate (§5). A store with no schema at all is exempt —
+            // a fresh install creates its database silently, and there is
+            // nothing yet to protect.
+            if version > 0 && consent.is_none() && store.is_protected(path, production)? {
+                return Err(Error::MigrationsPending {
+                    path: path.to_path_buf(),
+                    pending: MIGRATIONS.len() - version,
+                    version,
+                    known: MIGRATIONS.len(),
+                });
+            }
             store.snapshot(path, version)?;
         }
-        store.migrate()?;
+        store.migrate(consent)?;
+        if path == Some(production) {
+            store.mark_protected()?;
+        }
         Ok(store)
+    }
+
+    /// Whether this store is the operator's (§5): opened at the production
+    /// path, or carrying the `protected` marker a past open there wrote — how
+    /// the property survives a symlink, a moved data directory, or a restored
+    /// copy. Runs before any migration, so it must read a store from before
+    /// `store_meta` existed, where only the path can answer.
+    fn is_protected(&self, path: &Path, production: &Path) -> Result<bool> {
+        if path == production {
+            return Ok(true);
+        }
+        let has_meta: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_meta'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_meta == 0 {
+            return Ok(false);
+        }
+        let marked: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = 'protected'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(marked.as_deref() == Some("1"))
+    }
+
+    /// `INSERT OR IGNORE` so an already-marked store takes no write at all:
+    /// opening must not bump `data_version` for connections polling it.
+    fn mark_protected(&self) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO store_meta (key, value) VALUES ('protected', '1')",
+            [],
+        )?;
+        Ok(())
     }
 
     /// Check the journal (§5) against the migrations this build carries. The
@@ -323,7 +416,10 @@ impl Store {
         Ok(found > 0)
     }
 
-    fn schema_version(&self) -> Result<usize> {
+    /// The store's `user_version`. An open store always reads as the count of
+    /// migrations its build carries; `voro migrate` reports it when there was
+    /// nothing to apply.
+    pub fn schema_version(&self) -> Result<usize> {
         Ok(self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as usize)
@@ -372,9 +468,9 @@ impl Store {
     /// Migrations may rebuild tables (SQLite cannot alter CHECK constraints),
     /// so foreign-key enforcement is suspended for the duration and integrity
     /// verified afterwards — the procedure SQLite documents for schema changes.
-    fn migrate(&mut self) -> Result<()> {
+    fn migrate(&mut self, consent: Option<&str>) -> Result<()> {
         self.conn.pragma_update(None, "foreign_keys", false)?;
-        let applied = self.apply_migrations();
+        let applied = self.apply_migrations(consent);
         let restored = self.conn.pragma_update(None, "foreign_keys", true);
         applied?;
         restored?;
@@ -391,7 +487,7 @@ impl Store {
         Ok(())
     }
 
-    fn apply_migrations(&mut self) -> Result<()> {
+    fn apply_migrations(&mut self, consent: Option<&str>) -> Result<()> {
         let tx = self.conn.transaction()?;
         let version: usize =
             tx.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as usize;
@@ -399,7 +495,7 @@ impl Store {
             tx.execute_batch(sql)?;
             tx.pragma_update(None, "user_version", (i + 1) as i64)?;
         }
-        record_in_journal(&tx, version)?;
+        record_in_journal(&tx, version, consent)?;
         tx.commit()?;
         Ok(())
     }
@@ -2147,6 +2243,124 @@ mod schema_guard_tests {
         let path = dir.join("voro.db");
         Store::open(&path).unwrap();
         assert!(!Store::backup_dir_for(&path).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A store one migration short of current, built by replaying the list —
+    /// the state a release upgrade or a from-source build finds the operator's
+    /// store in.
+    fn store_at_previous_version(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
+            .unwrap();
+    }
+
+    fn open_as_production(path: &Path, consent: Option<&str>) -> Result<Store> {
+        Store::open_at(Connection::open(path).unwrap(), path, path, consent)
+    }
+
+    #[test]
+    fn the_production_store_refuses_to_migrate_without_consent() {
+        let dir = scratch("gate-refuse");
+        let path = dir.join("voro.db");
+        store_at_previous_version(&path);
+
+        let message = match open_as_production(&path, None) {
+            Ok(_) => panic!("a protected store with pending migrations should not open"),
+            Err(e) => e.to_string(),
+        };
+        assert!(message.contains("pending migration"), "{message}");
+        assert!(message.contains("voro migrate"), "{message}");
+        // Refused means untouched: no migration applied, no snapshot taken.
+        let version: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, (MIGRATIONS.len() - 1) as i64);
+        assert!(!Store::backup_dir_for(&path).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn consent_migrates_the_production_store_and_is_journalled() {
+        let dir = scratch("gate-consent");
+        let path = dir.join("voro.db");
+        store_at_previous_version(&path);
+
+        open_as_production(&path, Some("via voro migrate --yes")).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        let by: String = conn
+            .query_row(
+                "SELECT applied_by FROM schema_migrations WHERE idx = ?1",
+                [MIGRATIONS.len() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(by.contains("via voro migrate --yes"), "{by}");
+        // The snapshot still precedes a consented migration.
+        assert!(Store::backup_dir_for(&path).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The marker, not the path, is what makes a moved or restored copy of the
+    /// operator's store keep refusing (§5).
+    #[test]
+    fn the_protected_marker_travels_with_the_file() {
+        let dir = scratch("gate-marker");
+        let path = dir.join("voro.db");
+        // A full open at its "production" path writes the marker.
+        open_as_production(&path, None).unwrap();
+        let moved = dir.join("restored-copy.db");
+        std::fs::rename(&path, &moved).unwrap();
+        // Winding the copy back one version makes it pending again; the gate
+        // fires before any migration would re-apply, so the state is enough.
+        Connection::open(&moved)
+            .unwrap()
+            .pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
+            .unwrap();
+
+        assert!(matches!(
+            Store::open(&moved),
+            Err(Error::MigrationsPending { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_fresh_production_store_is_created_silently_and_marked() {
+        let dir = scratch("gate-fresh");
+        let path = dir.join("voro.db");
+        let store = open_as_production(&path, None).unwrap();
+        let marked: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = 'protected'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marked, "1");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unprotected store — scratch `--db`, the dev store — migrates on open
+    /// exactly as before the gate existed.
+    #[test]
+    fn an_unprotected_store_still_migrates_silently() {
+        let dir = scratch("gate-scratch");
+        let path = dir.join("scratch.db");
+        store_at_previous_version(&path);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

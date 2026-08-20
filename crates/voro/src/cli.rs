@@ -129,8 +129,9 @@ tasks
                                   the git branch dispatch injects into the
                                   prompt; --no-branch clears it. --summary
                                   sets or replaces a running/review task's
-                                  completion summary (the PR body `pr` opens
-                                  from) without a reject/done round trip.
+                                  completion summary — the PR description `pr`
+                                  opens the pull request from, so write it as
+                                  one — without a reject/done round trip.
                                   --repo re-points the task at another of its
                                   project's repos; --no-repo returns it to the
                                   project default
@@ -165,6 +166,14 @@ tasks
                                   from a target/ directory seeds it by itself
                                   on first run; --force rebuilds it. Refused
                                   against your real store
+  migrate [--yes]                 apply pending schema migrations to your real
+                                  store, the one store that never migrates as
+                                  a side effect of being opened (the TUI asks
+                                  the same question at launch). Asks at a
+                                  terminal; --yes consents from a script and
+                                  is recorded in the migration journal. Dev
+                                  and scratch stores migrate on open and need
+                                  none of this
   import <project> [--repo NAME] [--gh-repo owner/name]
                                   import open GitHub issues as proposed
                                   tasks via `gh issue list`; idempotent.
@@ -234,11 +243,14 @@ transitions
                                   running | stalled → review (from stalled:
                                   reporting a dead session's finished work on
                                   its behalf); the summary is the agent's
-                                  completion note (kept as a summary event, and
-                                  the PR body `pr` opens from) — write it as a
-                                  PR description; --branch records the git branch
-                                  the work landed on (agent return path). Warns
-                                  but succeeds when branch or summary is absent
+                                  completion report, kept as a summary event
+                                  and used as the body `pr` opens the pull
+                                  request with — so write it as a PR
+                                  description, what changed and why then how
+                                  you verified it, not a status line; --branch
+                                  records the git branch the work landed on
+                                  (agent return path). Warns but succeeds when
+                                  branch or summary is absent
   accept <task-id> [--yes]        review | waiting → done; then offers to
                                   remove the task's dispatch worktree (--yes
                                   skips the confirmation)
@@ -306,6 +318,15 @@ enum Verb {
         /// Discard what is there and rebuild it.
         #[arg(long)]
         force: bool,
+    },
+    /// Apply pending migrations to a protected store (DESIGN.md §5). The
+    /// pending case never reaches this handler — the store refuses to open, and
+    /// `main` collects consent before there is a `Store` to pass — so what is
+    /// left to report here is that nothing was pending.
+    Migrate {
+        /// Consent from a script; recorded in the migration journal.
+        #[arg(long)]
+        yes: bool,
     },
     Explain {
         task_id: i64,
@@ -705,6 +726,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Next => next_verb(store),
         Verb::Stats => stats_verb(store),
         Verb::Seed { force } => seed_verb(store, ctx, force),
+        Verb::Migrate { .. } => migrate_verb(store, ctx),
         Verb::Explain { task_id } => explain_verb(store, task_id, ctx),
         Verb::Agent { cmd } => agent_verb(cmd, ctx),
         Verb::Dispatch { task_id, agent } => {
@@ -1704,9 +1726,17 @@ fn done_verb(store: &mut Store, args: DoneArgs) -> Result<String, String> {
             .filter_map(|(what, present)| (!present).then_some(what))
             .collect();
         if !missing.is_empty() {
+            // Naming the shape of the half that is missing, where that half is
+            // the summary: an agent told to supply one is told it is the PR
+            // description (DESIGN.md §8).
+            let shape = if has_summary {
+                ""
+            } else {
+                "; the summary is the PR description `pr` opens the pull request from"
+            };
             write!(
                 out,
-                "\nnote: no {} recorded — complete the report with `voro set {id}` if this task produced code",
+                "\nnote: no {} recorded — complete the report with `voro set {id}` if this task produced code{shape}",
                 missing.join(" or ")
             )
             .unwrap();
@@ -1776,7 +1806,7 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
     if incomplete {
         writeln!(
             out,
-            "incomplete report: a branch is recorded but no summary — complete it with `voro set {id} --summary ...`"
+            "incomplete report: a branch is recorded but no summary — complete it with `voro set {id} --summary ...`, written as the PR description `pr` opens the pull request from"
         )
         .unwrap();
     }
@@ -2091,6 +2121,14 @@ fn seed_verb(store: &mut Store, ctx: &DispatchCtx, force: bool) -> Result<String
         ctx.db_path.display(),
         summary.projects,
         summary.tasks
+    ))
+}
+
+fn migrate_verb(store: &Store, ctx: &DispatchCtx) -> Result<String, String> {
+    let version = store.schema_version().map_err(|e| e.to_string())?;
+    Ok(format!(
+        "nothing pending: {} is at schema {version}, the newest this build carries",
+        ctx.db_path.display()
     ))
 }
 
@@ -4761,13 +4799,17 @@ mod tests {
         ok(&mut s, &["start", "1"]);
         let out = ok(&mut s, &["done", "1", "--summary", "did it"]);
         assert!(out.contains("note: no branch recorded"), "{out}");
+        // Only the summary half carries the shape note.
+        assert!(!out.contains("PR description"), "{out}");
 
-        // branch given, no summary: the note names summary only
+        // branch given, no summary: the note names summary only, and says what
+        // shape the half it is asking for takes (DESIGN.md §8).
         ok(&mut s, &["add", "demo", "T2", "--state", "ready"]);
         ok(&mut s, &["set", "2", "--branch", "feat/x"]);
         ok(&mut s, &["start", "2"]);
         let out = ok(&mut s, &["done", "2"]);
         assert!(out.contains("note: no summary recorded"), "{out}");
+        assert!(out.contains("the summary is the PR description"), "{out}");
     }
 
     #[test]
@@ -4794,10 +4836,13 @@ mod tests {
         ok(&mut s, &["done", "1", "--branch", "feat/x"]);
 
         assert!(ok(&mut s, &["list"]).contains("[incomplete report]"));
+        let shown = ok(&mut s, &["show", "1"]);
         assert!(
-            ok(&mut s, &["show", "1"])
-                .contains("incomplete report: a branch is recorded but no summary")
+            shown.contains("incomplete report: a branch is recorded but no summary"),
+            "{shown}"
         );
+        // The nudge names the shape of the half it is asking for.
+        assert!(shown.contains("the PR description"), "{shown}");
     }
 
     #[test]
@@ -4912,6 +4957,22 @@ mod tests {
         let out = ok(&mut s, &["help"]);
         assert!(
             out.contains("[--summary TEXT | --summary-file PATH]"),
+            "{out}"
+        );
+    }
+
+    /// Both verbs that record one say what a summary is: the description `pr`
+    /// opens the pull request from (DESIGN.md §8).
+    #[test]
+    fn help_describes_a_summary_as_the_pr_description() {
+        let mut s = store();
+        // The help is hand-wrapped into its column, so match on the prose
+        // rather than on where the lines happen to break.
+        let out = ok(&mut s, &["help"]);
+        let flowed = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flowed.contains("write it as a PR description"), "{out}");
+        assert!(
+            flowed.contains("the PR description `pr` opens the pull request from"),
             "{out}"
         );
     }

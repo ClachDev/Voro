@@ -784,6 +784,7 @@ mod tests {
         let mut probe = CapProbe::default();
         let capped = CapReading {
             reset_minutes: Some(1310),
+            retrying: false,
         };
         probe.inject_result(7, Some(capped));
         probe.inject_result(8, None);

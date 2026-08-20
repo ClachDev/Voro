@@ -306,11 +306,12 @@ mod tests {
     #[test]
     fn a_capped_session_reads_as_capped_through_the_logs_verb() {
         let reading = read_session_cap(
-            "printf 'Session limit reached · Retrying in 5m (9:50pm)' # {session}",
+            "printf \"You've hit your session limit · resets 9:50pm (Europe/London)\" # {session}",
             "uuid-1",
         )
         .expect("a cap");
         assert_eq!(reading.reset_label().as_deref(), Some("21:50"));
+        assert!(!reading.retrying);
 
         // The reference reaches the command as itself, so a session can be
         // singled out by it rather than the template being merely decorative.

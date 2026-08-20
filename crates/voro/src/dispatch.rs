@@ -48,11 +48,12 @@ the operator answers right here in this session — so when your question has be
 answered, run `voro resume {task_id}` before continuing, to move the task back to
 running (Voro records no answer text; the exchange is already in this transcript).
 The `--from {task_id}` on `propose` links each follow-up discovered-from this
-task; drop it for a proposal that stands on its own. Finish
-with your work committed on a branch and a PR-ready `--summary` on `done` — what
-changed, why, and how you verified it — since `voro pr` opens the pull request
-straight from that summary. Never modify the database with raw SQL, which would
-bypass the state machine and event log.{branch}{docs}{rework}
+task; drop it for a proposal that stands on its own. Finish with your work
+committed on a branch and a `--summary` on `done`: that summary is the pull
+request's description — `voro pr` opens the PR with it as the body — so write it
+as one, a short account of what changed and why followed by how you verified it,
+not a status line. Never modify the database with raw SQL, which would bypass
+the state machine and event log.{branch}{docs}{rework}
 
 ---
 
@@ -63,11 +64,12 @@ bypass the state machine and event log.{branch}{docs}{rework}
 /// narrowed to the diff since the rejected revision, so the summary is what
 /// carries the operator from each of their points to the change that answers
 /// it; without it they are back to rediscovering the rework from the diff.
-const REWORK_SUMMARY_SENTENCE: &str = "Report with `voro done {task_id}{db} --summary \"...\"` whose summary answers that \
-     feedback point by point — one item per point, saying what you changed or \
-     why you did not. The operator re-reviews only the diff since the revision \
-     they rejected, so that summary is what connects your changes to their \
-     points.";
+const REWORK_SUMMARY_SENTENCE: &str = "Report with `voro done {task_id}{db} --summary \"...\"`. That summary is the \
+     pull request's description, so write it as one — a PR body that answers \
+     that feedback point by point, one item per point, saying what you changed \
+     or why you did not. The operator re-reviews only the diff since the \
+     revision they rejected, so that summary is what connects your changes to \
+     their points.";
 
 /// The `{rework}` block for a task that has already been through review and was
 /// sent back (DESIGN.md §8). It rides the preamble because a redispatch is the
@@ -1918,7 +1920,19 @@ fn default_base_branch(repo_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use voro_core::{LivenessSource, NewTask, Priority};
+
+    /// Distinguishes fixtures built within the same clock tick.
+    ///
+    /// A nanosecond stamp reads as though it could not repeat, and on one
+    /// thread it does not: consecutive `SystemTime::now()` calls always differ,
+    /// because each is ordered after the last. Across threads there is no such
+    /// ordering, and the clock does not advance a nanosecond at a time — it
+    /// steps roughly every 20-30ns, so any two threads reading inside one step
+    /// read the same number. Measured on this workstation: 4000 reads across
+    /// eight threads yielded 1493 duplicates.
+    static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
     /// A scratch database, a freshly-`git init`ed clean project, and an
     /// `voro.toml` whose one agent is a stub command that just reads the
@@ -1932,14 +1946,7 @@ mod tests {
     /// Like [`fixture`], but with the whole `voro.toml` supplied, for tests
     /// exercising the session verbs.
     fn fixture_toml(agents_toml: &str) -> (Store, DispatchCtx, PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "voro-dispatch-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = fixture_root();
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
         git(&project, &["init", "-q"]);
@@ -1957,6 +1964,72 @@ mod tests {
             message_grace: std::time::Duration::from_millis(300),
         };
         (store, ctx, project)
+    }
+
+    /// A scratch directory no other fixture can name, however many are built
+    /// at once: the process id separates test binaries, the counter separates
+    /// fixtures within one, and the stamp keeps reruns of a recycled pid apart.
+    fn fixture_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "voro-dispatch-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn fixtures_built_at_once_on_many_threads_get_distinct_roots() {
+        const THREADS: usize = 8;
+        let gate = std::sync::Barrier::new(THREADS);
+
+        let roots: Vec<PathBuf> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        gate.wait();
+                        let (_store, _ctx, project) = fixture("true");
+                        project.parent().unwrap().to_path_buf()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let distinct: std::collections::HashSet<_> = roots.iter().collect();
+        assert_eq!(distinct.len(), THREADS, "roots collided: {roots:?}");
+    }
+
+    /// Eight fixtures spend long enough in `git init` to drift apart on the
+    /// clock, so the test above can pass even on a name that has no counter in
+    /// it. This one names four thousand roots with nothing in between, where a
+    /// clock-only name collides tens of times over.
+    #[test]
+    fn roots_named_back_to_back_on_many_threads_are_all_distinct() {
+        const THREADS: usize = 8;
+        const EACH: usize = 500;
+        let gate = std::sync::Barrier::new(THREADS);
+
+        let roots: Vec<PathBuf> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        gate.wait();
+                        (0..EACH).map(|_| fixture_root()).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        let distinct: std::collections::HashSet<_> = roots.iter().collect();
+        assert_eq!(distinct.len(), THREADS * EACH, "roots collided");
     }
 
     fn git(dir: &Path, args: &[&str]) {
@@ -2328,12 +2401,32 @@ mod tests {
         );
         assert!(reworking.contains("point by point"), "{reworking}");
         assert!(
+            reworking.contains("pull request's description"),
+            "a rework summary is a PR body too: {reworking}"
+        );
+        assert!(
             reworking.contains("voro done 62 --summary"),
             "the instruction must be copy-pasteable: {reworking}"
         );
 
         let first = render_preamble(62, &db, None, &[], false);
         assert!(!first.contains("point by point"), "{first}");
+    }
+
+    /// Every dispatched prompt says what shape a completion summary takes: it
+    /// is the pull request's description, since `voro pr` opens the PR with it
+    /// as the body (DESIGN.md §8).
+    #[test]
+    fn preamble_says_the_summary_is_the_pr_description() {
+        let plain = render_preamble(62, &Store::production_db_path(), None, &[], false);
+        // The template is hand-wrapped, so match the prose rather than where
+        // the lines happen to break.
+        let flowed = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flowed.contains("that summary is the pull request's description"),
+            "{plain}"
+        );
+        assert!(flowed.contains("not a status line"), "{plain}");
     }
 
     /// The rejection as the live session hears it: the operator's points
@@ -2354,6 +2447,10 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("point by point"), "{message}");
+        assert!(
+            message.contains("pull request's description"),
+            "the rework summary is the PR body: {message}"
+        );
         assert!(message.contains("voro done 62 --summary"), "{message}");
     }
 

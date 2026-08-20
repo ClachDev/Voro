@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Migrating your real store now takes a yes.** Every build used to migrate
+  any database it opened as a side effect of opening it, which is how an
+  unreleased migration from a worktree once landed on real data. The operator's
+  store now carries a `protected` marker — in the file itself, so it survives a
+  symlink, a moved data directory, or a restored copy — and a protected store
+  with pending migrations refuses to migrate silently: launching the TUI shows
+  the pending count and asks before the terminal is taken, every CLI verb
+  refuses with a message pointing at the new `voro migrate` verb, and
+  `voro migrate --yes` consents from a script, recorded in the migration
+  journal's `applied_by` so even the override leaves a trace. A fresh install
+  still creates its database with no ceremony, and dev and scratch stores
+  migrate on open exactly as before.
+
 - **The cap badge takes its reset time from the agent, not from its screen.**
   Voro used to read "resets 6:40pm" off a capped session's output and guess
   which 6:40pm was meant, because a bare clock time carries no date. Agents can
@@ -286,6 +299,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--gh-repo owner/name`.
 
 ### Fixed
+
+- **The Config screen's agents pane no longer hides agents in silence.** It drew
+  the rows it could fit and dropped the rest, and its bottom border looked the
+  same either way — on a short terminal with several agents configured, the ones
+  past the fold could only be read by resizing the terminal or running `voro
+  agent list` at the shell. The pane now scrolls with `J`/`K` and the page keys,
+  the same gesture the cockpit's focus card takes and for the same reason: this
+  pane has no selection of its own, `j`/`k` on that screen belonging to the
+  viewers list below it. When there is nothing hidden the border says nothing;
+  when there is, it carries the overflow and the keys that move it.
 
 - **A capped session's badge now shows the reset time it actually named.** Real
   cap messages end with an upgrade prompt that mentions a usage limit of its

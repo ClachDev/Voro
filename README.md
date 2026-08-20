@@ -69,11 +69,14 @@ dispatch to with the command each one runs, the viewers it opens diffs in, and
 the path of the `voro.toml` they were resolved from. `tab` cycles between them
 and `alt-1`–`alt-4` jump straight to one; until you have registered a project
 only Projects and Config exist, since the other two have nothing to show, and
-`tab` cycles just those. `j`/`k` move the selection, and the
-footer always shows the keys that apply to what you have selected. A bare digit
-sets the number on the row you have selected — `0`–`3` a task's priority on the
-Cockpit and Tasks screens, `0`–`5` a project's weight on the Projects screen.
-The walkthrough below drives one task from nothing to a reviewed diff.
+`tab` cycles just those. `j`/`k` move the selection, a click selects a row
+directly, and the footer always shows the keys that apply to what you have
+selected. `?` opens the full key map for whichever screen you are on — the
+walkthrough below names only the keys it needs, and that map is where the rest
+live. A bare digit sets the number on the row you have selected — `0`–`3` a
+task's priority on the Cockpit and Tasks screens, `0`–`5` a project's weight on
+the Projects screen. The walkthrough below drives one task from nothing to a
+reviewed diff.
 
 **1. Register a project.** A first launch against an empty database opens on the
 Projects screen and stays within reach of it — `tab` is the way back there, and
@@ -111,13 +114,16 @@ a menu of the three verdicts — `triage → ready` accepts it into ready work,
 always floats items that need you first (a question shows `⏎ resume`, a finished
 task shows `⏎ review`) above the highest-scoring ready tasks.
 
-When a proposal is worth keeping but badly written, refine it rather than ruling
-on it. Refine is not a verdict, so it is not one of the menu's outcomes — it is a
+When a task is worth keeping but badly written, refine it rather than ruling on
+it. Refine is not a verdict, so it is not one of the menu's outcomes — it is a
 key you press over the row itself: `r` sends the task to an agent to rewrite the
 body against a one-line note about what is wrong (`voro triage <id> refine --note
 "..."` on the CLI), and `R` opens an interactive session to talk the body into
-shape. Either way the task stays a proposal, marked `↻ refined`, so you triage the
-improved version next pass.
+shape. Either way the task leaves the queue for `refining` while the rewrite is in
+flight — `C` cancels a round that is taking too long — and comes back marked
+`↻ refined`, so you triage the improved version next pass. Ready work refines too,
+not just proposals: rewriting the body invalidates the verdict you gave the old
+one, so a refined ready task comes back through triage as well.
 
 **4. Dispatch it to an agent.** Select a ready task and press `d` to hand it to
 the default coding agent, or `D` to choose which agent. Voro launches a headless
@@ -129,13 +135,18 @@ agent's interface, not yours.
 **5. Review what lands.** When the agent calls `done`, the task moves to
 `review` and rises to the top of the queue, and its detail card leads with the
 agent's completion summary — what it says it changed and how it verified.
-Press `o` to open its checkout in a viewer, or `g` to open its pull request
-(creating it when the project reviews through GitHub). The viewer needs no
-setup: Voro ships with `code`, `cursor` and `zed` built in and opens the first
-one on your PATH; if none of them is there, `o` opens a small form to name the
-editor you do use instead. With the account and the diff in front of you, press
-`enter` (`⏎ review`) to accept or reject the work; rejecting with a note
-re-dispatches the agent to address it.
+Press `o` to open its checkout in a viewer, or `g` to open its pull request,
+which it creates from that summary — after showing you the branch and title —
+when the task has no PR recorded yet. The two keys are static rather than
+per-project: `o` is always the local diff, `g` is always GitHub, so neither has
+to be thought about before it is pressed, and on a checkout with nowhere to push
+`g` says so and names `o` instead. The viewer needs no setup: Voro ships with
+`code`, `cursor` and `zed` built in and opens the first one on your PATH; if none
+of them is there, `o` opens a small form to name the editor you do use instead.
+With the account and the diff in front of you, press `enter` (`⏎ review`) to
+accept or reject the work; rejecting with a note re-dispatches the agent to
+address it, and `w` hands the task off instead, parking it out of the queue while
+you wait on someone else's review.
 
 Accepting records your verdict and completes the task — it does not merge
 anything. On a project you review through GitHub the work lands when its pull
@@ -145,8 +156,11 @@ the agent reported, recorded on the task and printed by `voro show <id>` as
 `branch:`, and landing it is one command in the project checkout: `git merge
 <branch>`.
 
-Other keys worth knowing on a selected task: `s` change state, `x` the score
-breakdown, `h` its history, `e` edit, `l` the session log, and `q` to quit.
+Other keys worth knowing on a selected task: `a` sends one line into the agent's
+own session without leaving the cockpit, and `A` opens that session to talk to it
+in person; `s` changes state, `c` links the documents an agent should read before
+it starts, `x` folds in the score breakdown, `h` the task's history, `e` edits it,
+`l` pages the session log, and `q` quits. `?` has the rest.
 
 ## Design
 

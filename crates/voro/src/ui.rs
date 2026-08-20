@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -6,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use voro_core::{
     ActionRow, CapWindow, CompletionReport, DepKind, DepRef, DigestRow, EffectiveScore, Event,
-    QueueRow, ScoreBreakdown, Session, SessionOutcome, StateCounts, TaskState,
+    QueueRow, ScoreBreakdown, Session, SessionOutcome, StateCounts, Store, TaskState,
 };
 
 use crate::app::{
@@ -736,11 +738,20 @@ fn strip_pr_span() -> Span<'static> {
 /// is only the *third* shape that differs, and invisibly: "reset passed" read
 /// off an instant is a fact, where read off a bare `6:40pm` it is the nearest
 /// occurrence of a time that carries no date.
+///
+/// A fourth says the session is retrying it (§8), which is the one shape that
+/// wants *nothing* done about it: the turn is still running and will carry on
+/// by itself. It still badges rather than reading as healthy, because a
+/// session sitting on a retry is as idle-looking on the strip as a capped one
+/// and the operator deserves the reason — but it says which, so `u` passing it
+/// over reads as the right answer instead of a missed row.
 fn capped_span(window: &CapWindow) -> Span<'static> {
-    let text = match (&window.label, window.passed) {
-        (_, true) => "  ⚠ capped · reset passed".to_string(),
-        (Some(at), false) => format!("  ⚠ capped ↻{at}"),
-        (None, false) => "  ⚠ capped".to_string(),
+    let text = match (&window.label, window.passed, window.retrying) {
+        (Some(at), _, true) => format!("  ⚠ capped · retrying ↻{at}"),
+        (None, _, true) => "  ⚠ capped · retrying".to_string(),
+        (_, true, false) => "  ⚠ capped · reset passed".to_string(),
+        (Some(at), false, false) => format!("  ⚠ capped ↻{at}"),
+        (None, false, false) => "  ⚠ capped".to_string(),
     };
     Span::styled(
         text,
@@ -1758,19 +1769,34 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     }
 
     // The pane takes the height its rows need, yielding only what the viewers
-    // list below needs for a border and a row: that list scrolls with its
-    // selection while this paragraph does not, so an agent hidden here is the
-    // more expensive truncation.
+    // list below needs for a border and a row: both panes scroll, so the split
+    // is about which one is read whole without a keypress, and that is this one.
     let agents_h = (agent_lines.len() as u16 + 2).clamp(3, main.height.saturating_sub(3).max(3));
     let [agents_area, viewers_area] =
         Layout::vertical([Constraint::Length(agents_h), Constraint::Min(3)]).areas(main);
 
-    let agents = Paragraph::new(agent_lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Agents (read-only — * default)"),
+    // The rows the pane cannot fit are reached with `J`/`K` and the page keys,
+    // the cockpit card's gesture: the pane carries no selection to scroll with,
+    // and `j`/`k` here are the viewers list's. The count and the keys ride the
+    // bottom border, so a pane that is hiding agents says so.
+    let total = agent_lines.len() as u16;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Agents (read-only — * default)");
+    let max_scroll = total.saturating_sub(agents_area.height.saturating_sub(2));
+    app.config_agents_max_scroll.set(max_scroll);
+    let scroll = app.config_agents_scroll.min(max_scroll);
+    let block = if max_scroll > 0 {
+        block.title_bottom(
+            Line::from(format!(" {scroll}/{max_scroll} ↕ J/K PgDn/PgUp ")).right_aligned(),
+        )
+    } else {
+        block
+    };
+    frame.render_widget(
+        Paragraph::new(agent_lines).scroll((scroll, 0)).block(block),
+        agents_area,
     );
-    frame.render_widget(agents, agents_area);
 
     // Viewers: every viewer `open` can run — the built-ins with the user's
     // tables layered over them, each carrying its provenance like the agents
@@ -1866,7 +1892,10 @@ fn wrap_status(msg: &str, width: u16) -> Vec<String> {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    // A red status message overrides the key line, as before.
+    // A red status message overrides the key line, as before, and owns the row
+    // whole — the indicator below would be competing with wrapped text for a
+    // right margin that moves (DESIGN.md §9). The message is gone on the next
+    // keystroke; the store is not going anywhere.
     if let Some(msg) = &app.status {
         let lines: Vec<Line> = wrap_status(msg, area.width)
             .into_iter()
@@ -1883,7 +1912,80 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(key, Style::new().bold()));
         spans.push(Span::styled(format!(" {label}"), Style::new().dim()));
     }
-    frame.render_widget(Line::from(spans), area);
+    // The store, right-aligned the way the header right-aligns its counts, so
+    // the key line keeps the left margin it has always started at. The line is
+    // measured first and the indicator takes what is left over: the key line's
+    // slot budget is fixed and documented (DESIGN.md §9), a store path's length
+    // is not, so the occupant that cannot be bounded is the one that yields. On
+    // the operator's own store there is no indicator, the reserved width is
+    // zero, and the key line gets the row back byte for byte.
+    let keys_line = Line::from(spans);
+    let leftover = area
+        .width
+        .saturating_sub(keys_line.width() as u16)
+        .saturating_sub(1);
+    let indicator = db_indicator(app.db_path(), leftover);
+    let reserved = indicator
+        .as_deref()
+        .map_or(0, |text| Span::raw(text).width() as u16 + 1);
+    let [keys, store] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(reserved)]).areas(area);
+    frame.render_widget(keys_line, keys);
+    if let Some(text) = indicator {
+        frame.render_widget(
+            Line::from(vec![Span::raw(" "), Span::styled(text, Style::new().dim())]),
+            store,
+        );
+    }
+}
+
+/// The store to name in the footer within `budget` columns — the ones the key
+/// line left — or `None` when it is the operator's own and there is nothing to
+/// say, or when not even the store's filename fits (DESIGN.md §9).
+///
+/// The comparison is against [`Store::production_db_path`] rather than
+/// [`Store::default_db_path`], which is the crux of it: the default is `dev.db`
+/// for a `target/` build, so an indicator keyed on it would stay silent on a dev
+/// store — the very case that asks the question. This is the rule dispatch's
+/// `--db` flag and `voro seed` already follow (§5).
+fn db_indicator(db_path: &Path, budget: u16) -> Option<String> {
+    if db_path == Store::production_db_path() {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    shorten_store_path(db_path, home.as_deref(), budget)
+}
+
+/// A store path cut down to what identifies it inside `budget` columns: `~` for
+/// the home directory, then leading directories given up whole for a `…`, since
+/// the filename and its parent are the half that names the store and the path to
+/// them is the half that does not. The ladder ends at the bare filename —
+/// `dev.db` says "not your store" in six columns — and below that at `None`,
+/// because a fragment of a name identifies nothing and the columns are the key
+/// line's to have back. Absence is not neutral here: an empty right margin means
+/// the operator's own store, so the indicator would rather say nothing than say
+/// something unreadable.
+fn shorten_store_path(path: &Path, home: Option<&Path>, budget: u16) -> Option<String> {
+    let text = match home
+        .filter(|home| !home.as_os_str().is_empty())
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    };
+    let budget = usize::from(budget);
+    if text.chars().count() <= budget {
+        return Some(text);
+    }
+    let parts: Vec<&str> = text.split('/').collect();
+    for first in 1..parts.len() {
+        let candidate = format!("…/{}", parts[first..].join("/"));
+        if candidate.chars().count() <= budget {
+            return Some(candidate);
+        }
+    }
+    let name = parts.last().copied().unwrap_or_default();
+    (!name.is_empty() && name.chars().count() <= budget).then(|| name.to_string())
 }
 
 /// Whether the selection is a brief refine can still rewrite — a proposal or a
@@ -2010,12 +2112,13 @@ const NEW_KEYS: [(&str, &str); 2] = [
 
 /// The uppercase keys DESIGN.md §9 names as standing outside the case
 /// convention, because none is the shifted half of a pair: `C` and the projects
-/// screen's `A` share a letter with an unrelated action, `J`/`K` scroll the
-/// card, and the Config screen's `V`/`A` pick defaults. Every other uppercase
-/// binding has to be the interactive half of a pair, which the test below
-/// enforces screen by screen.
+/// screen's `A` share a letter with an unrelated action, `J`/`K` scroll a pane
+/// that has no selection to scroll with — the cockpit's card and the Config
+/// screen's agents — and the Config screen's `V`/`A` pick defaults. Every other
+/// uppercase binding has to be the interactive half of a pair, which the test
+/// below enforces screen by screen.
 #[cfg(test)]
-const CASE_EXCEPTIONS: [(Screen, &str); 7] = [
+const CASE_EXCEPTIONS: [(Screen, &str); 9] = [
     (Screen::Cockpit, "C"),
     (Screen::Cockpit, "J"),
     (Screen::Cockpit, "K"),
@@ -2023,6 +2126,8 @@ const CASE_EXCEPTIONS: [(Screen, &str); 7] = [
     (Screen::Projects, "A"),
     (Screen::Config, "V"),
     (Screen::Config, "A"),
+    (Screen::Config, "J"),
+    (Screen::Config, "K"),
 ];
 const MESSAGE_KEYS: [(&str, &str); 2] = [
     ("a", "message the task's session, headless"),
@@ -2164,6 +2269,8 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
                 "Navigation",
                 vec![
                     ("j/k", "move the selection"),
+                    ("J/K", "scroll the agents pane"),
+                    ("PgUp/PgDn", "page the agents pane"),
                     ("?", "this key map"),
                     ("q", "quit"),
                 ],
@@ -2622,6 +2729,199 @@ mod tests {
         assert_eq!(status_height(&app, Rect::new(0, 0, 40, 3)), 1);
     }
 
+    /// The footer names the store only when it is not the operator's own
+    /// (DESIGN.md §9), and the comparison is against the production path rather
+    /// than the default one — so a dev build, whose default *is* `dev.db`, says
+    /// so instead of staying silent (§5).
+    #[test]
+    fn the_footer_names_every_store_but_the_operator_s() {
+        assert_eq!(db_indicator(&Store::production_db_path(), 110), None);
+        assert!(
+            db_indicator(&Store::dev_db_path(), 110).is_some_and(|text| text.ends_with("dev.db")),
+            "a dev build has to name dev.db, got {:?}",
+            db_indicator(&Store::dev_db_path(), 110)
+        );
+        assert_eq!(
+            db_indicator(Path::new("/tmp/scratch/voro.db"), 110),
+            Some("/tmp/scratch/voro.db".to_string())
+        );
+    }
+
+    /// A store under the home directory is shown against `~`, which is both
+    /// shorter and how the operator refers to it.
+    #[test]
+    fn a_store_under_home_is_shown_against_a_tilde() {
+        assert_eq!(
+            shorten_store_path(
+                Path::new("/home/op/.local/share/voro/dev.db"),
+                Some(Path::new("/home/op")),
+                110
+            )
+            .as_deref(),
+            Some("~/.local/share/voro/dev.db")
+        );
+        // No home to compare against leaves the path as it is.
+        assert_eq!(
+            shorten_store_path(Path::new("/srv/voro/voro.db"), None, 110).as_deref(),
+            Some("/srv/voro/voro.db")
+        );
+    }
+
+    /// The budget is whatever the key line did not want, so the same store
+    /// renders whole beside a short line and gives up its leading directories
+    /// beside a long one.
+    #[test]
+    fn the_store_shortens_into_the_columns_the_key_line_left() {
+        let long = Path::new("/home/op/very/deeply/nested/scratch/area/voro.db");
+        let home = Some(Path::new("/home/op"));
+        assert_eq!(
+            shorten_store_path(long, home, 41).as_deref(),
+            Some("~/very/deeply/nested/scratch/area/voro.db")
+        );
+        assert_eq!(
+            shorten_store_path(long, home, 40).as_deref(),
+            Some("…/deeply/nested/scratch/area/voro.db")
+        );
+        assert_eq!(
+            shorten_store_path(long, home, 20).as_deref(),
+            Some("…/area/voro.db")
+        );
+    }
+
+    /// The bottom of the ladder: the bare filename, which still says "not your
+    /// store", and then nothing at all — a fragment of a name identifies no
+    /// store, and an empty right margin is the key line's to have back.
+    #[test]
+    fn a_store_with_no_room_left_shows_its_filename_or_nothing() {
+        let long = Path::new("/home/op/very/deeply/nested/scratch/area/voro.db");
+        let home = Some(Path::new("/home/op"));
+        assert_eq!(
+            shorten_store_path(long, home, 7).as_deref(),
+            Some("voro.db"),
+            "the filename alone fits and is worth saying"
+        );
+        // One column more and the `…` marking what was dropped fits too.
+        assert_eq!(
+            shorten_store_path(long, home, 9).as_deref(),
+            Some("…/voro.db")
+        );
+        assert_eq!(shorten_store_path(long, home, 6), None);
+        assert_eq!(shorten_store_path(long, home, 0), None);
+        // A name too long for the row is never cut mid-word: `…g-store-name.db`
+        // names nothing.
+        assert_eq!(
+            shorten_store_path(Path::new("/tmp/a-very-long-store-name.db"), None, 20),
+            None
+        );
+    }
+
+    /// End-to-end: the indicator reaches the footer of a drawn screen, dim and
+    /// right of the key line, without costing the region a row.
+    #[test]
+    fn the_footer_carries_the_store_on_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with_status("", 1, 0);
+        app.status = None;
+        // Wide enough that the cockpit's key line and `dummy_ctx`'s store both
+        // fit: the indicator never takes a column the line wanted.
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        let text = screen_text(&terminal);
+        // `dummy_ctx`'s store is not the operator's, so the row names it.
+        assert!(text.contains("/nonexistent/voro.db"), "{text}");
+        assert!(
+            text.contains("⏎ act · d/D dispatch"),
+            "the key line still starts the row: {text}"
+        );
+        assert!(text.contains("q quit"), "and still ends it: {text}");
+
+        // A message owns the row alone; nothing competes with it.
+        app.status = Some("task 9 has no session on record".into());
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        let text = screen_text(&terminal);
+        assert!(text.contains("task 9 has no session on record"), "{text}");
+        assert!(!text.contains("/nonexistent/voro.db"), "{text}");
+    }
+
+    /// The row the key line spends its whole budget on — a `review` task with a
+    /// branch, a PR and a session, on both screens that show it — keeps every
+    /// slot at an ordinary width. Whatever the store does with what is left, it
+    /// may not cost the line a key.
+    #[test]
+    fn the_widest_key_line_keeps_its_last_slots() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_in_review_with_everything();
+        for (screen, first) in [(Screen::Cockpit, "⏎ review"), (Screen::Tasks, "⏎ view")] {
+            app.screen = screen;
+            let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw(f, &app);
+                })
+                .unwrap();
+            let text = screen_text(&terminal);
+            assert!(
+                text.contains(first),
+                "{screen:?} lost its first slot: {text}"
+            );
+            for slot in ["o open", "g PR", "? keys", "q quit"] {
+                assert!(text.contains(slot), "{screen:?} lost `{slot}`: {text}");
+            }
+        }
+    }
+
+    /// A `review` task carrying everything the key line can advertise: a branch
+    /// (`o`), a pull request (`g`), and a session to message (`a/A`).
+    fn app_in_review_with_everything() -> crate::app::App {
+        use voro_core::{Action, NewTask, Store};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        let task = store
+            .create_task(NewTask {
+                project_id: p.id,
+                repo_id: None,
+                title: "a task under review".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Ready,
+                agent: None,
+                human: false,
+                deep: false,
+            })
+            .unwrap();
+        store
+            .record_dispatch(task.id, "claude", None, LivenessSource::Listing, None)
+            .unwrap();
+        store.apply(task.id, Action::Complete(None)).unwrap();
+        store.set_branch(task.id, Some("feat/x")).unwrap();
+        store
+            .set_pr(task.id, Some("https://github.com/o/r/pull/1"))
+            .unwrap();
+
+        let mut app = crate::app::App::new(
+            store,
+            crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+                "/home/op/deeply/nested/scratch/store/voro.db",
+            )),
+        )
+        .unwrap();
+        app.status = None;
+        app
+    }
+
     /// End-to-end: the Config screen renders the read-only agents (with the
     /// default marked) over the editable named viewers, drawn through the real
     /// screen draw path (DESIGN.md §5).
@@ -2760,9 +3060,108 @@ mod tests {
             assert!(rendered.contains(&format!("{{model}}: m{n}")), "{rendered}");
         }
         // The viewers list keeps a row of its own; what it gave up it can still
-        // scroll to, which the agents paragraph could not.
+        // scroll to.
         assert!(rendered.contains("Viewers"), "{rendered}");
         assert!(rendered.contains("code -n {path}"), "{rendered}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The bug (task #450): where the pane cannot fit its rows, the ones past
+    /// the fold were simply not drawn and nothing said so. Now the bottom
+    /// border carries the overflow and the keys that move it, and `J` walks the
+    /// hidden agents into view — on a terminal no larger than 80x24.
+    #[test]
+    fn config_agents_pane_scrolls_to_the_agents_it_cannot_fit() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        use voro_core::Store;
+
+        let dir = std::env::temp_dir().join(format!(
+            "voro-ui-config-scroll-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agents_path = dir.join("voro.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut toml = String::from("[viewers.zed]\ncmd = \"zed {path}\"\n");
+        for n in 1..=6 {
+            toml.push_str(&format!(
+                "\n[agents.mine{n}]\ndispatch = \"mine{n} run {{prompt_file}} --model {{model}}\"\n\
+                 model = \"m{n}\"\n"
+            ));
+        }
+        std::fs::write(&agents_path, toml).unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+        let ctx = crate::dispatch::DispatchCtx {
+            db_path: dir.join("voro.db"),
+            agents_path,
+            runtime_dir: dir.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
+        };
+        let mut app = App::new(store, ctx).unwrap();
+        alt_screen(&mut app, '4');
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, app: &App| {
+            terminal
+                .draw(|f| {
+                    draw(f, app);
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        let rendered = render(&mut terminal, &app);
+        let hidden = app.config_agents_max_scroll.get();
+        assert!(
+            hidden > 0,
+            "eight agents should overflow an 80x24 pane:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("0/{hidden} ↕ J/K PgDn/PgUp")),
+            "the pane hides rows without saying so:\n{rendered}"
+        );
+
+        // Every agent is reachable: walk to the bottom a row at a time and the
+        // last one — the one the fold ate — is on screen.
+        let last = app
+            .config_agents
+            .last()
+            .expect("agents are configured")
+            .name
+            .clone();
+        assert!(!rendered.contains(&last), "{rendered}");
+        for _ in 0..hidden {
+            app.on_key(KeyEvent::from(KeyCode::Char('J')));
+        }
+        assert_eq!(app.config_agents_scroll, hidden, "J clamps at the bottom");
+        let rendered = render(&mut terminal, &app);
+        assert!(rendered.contains(&last), "{rendered}");
+        assert!(
+            rendered.contains(&format!("{hidden}/{hidden} ↕ J/K PgDn/PgUp")),
+            "{rendered}"
+        );
+
+        // `K` walks back, and the viewers list keeps its own `j`/`k`.
+        app.on_key(KeyEvent::from(KeyCode::PageUp));
+        assert!(app.config_agents_scroll < hidden);
+        let before = app.config_sel;
+        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_ne!(app.config_sel, before, "j still moves the viewer selection");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -3331,6 +3730,7 @@ mod tests {
             task,
             CapReading {
                 reset_minutes: Some(21 * 60 + 50),
+                retrying: false,
             },
         );
         app.now_minutes = Some(20 * 60 + 50);
@@ -3357,6 +3757,22 @@ mod tests {
         let line = row(&app);
         assert!(line.contains("⚠ capped"), "{line}");
         assert!(!line.contains('↻'), "{line}");
+        assert!(!line.contains("reset passed"), "{line}");
+
+        // A session retrying the rejected request says so, and never says its
+        // reset has passed however long ago the named time went by: it is
+        // mid-turn, so the time is when its own request goes out rather than
+        // when the operator should step in.
+        app.caps.insert(
+            task,
+            CapReading {
+                reset_minutes: Some(21 * 60 + 50),
+                retrying: true,
+            },
+        );
+        app.now_minutes = Some(22 * 60);
+        let line = row(&app);
+        assert!(line.contains("⚠ capped · retrying ↻21:50"), "{line}");
         assert!(!line.contains("reset passed"), "{line}");
 
         // And the badge clears itself once the reading goes away, which is what
