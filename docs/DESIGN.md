@@ -1200,9 +1200,9 @@ is a server process registered with a daemon, and `-p --resume` bypasses that
 daemon to own the transcript file — which is why the registry refuses it
 while a supervisor lives. Voro's answer is not to route around that hold but to
 remove it: the built-in `claude` message verb is a plain `claude -p --resume
-{session}`, and the session is stopped, through the same optional `stop` verb
-the close path uses, as soon as it comes to rest — so the hold is already
-gone by the time any message is sent. One session id, one Voro-composed name,
+{session}`, and the send releases the session first, through the same optional
+`stop` verb the close path uses, waiting for the answer — so the hold is gone
+by the time the message goes out. One session id, one Voro-composed name,
 one linear transcript for the task's whole life, and no kill step anywhere near
 a send.
 
@@ -1244,44 +1244,54 @@ quick message replaces that pid with the process carrying its turn, while a dead
 pid still proves nothing (a dispatch's pid is a launcher that exits at birth)
 and falls back to the listing verdict.
 
-**The release happens at rest, not at the transition that hands back.** The
-handover verbs fire mid-turn: `voro done` and `voro ask` run inside the agent's
+**The release happens at rest, and on the send that needs it.** The handover
+verbs fire mid-turn: `voro done` and `voro ask` run inside the agent's
 still-executing turn, so stopping at the transition itself would kill the tail
-of the very turn that is reporting. The trigger is therefore *rest*, judged from
-the two sources reconciliation already reads — a task in a between-turns state
+of the very turn that is reporting. The trigger is therefore *rest*, judged
+from the two sources a send already reads — a task in a between-turns state
 (`needs-input`, `review`, `waiting`) whose open session's listing entry reports
-its turn ended (state `done`) is stopped, best-effort, exactly as a closing row
-is. The guard is load-bearing in both directions. A session at `blocked` — a
+its turn ended (state `done`) is released, and only then does the message go
+out. The guard is load-bearing in both directions. A session at `blocked` — a
 permission prompt, a supervisor mid-turn — never reads `done`, so it is never
 stopped; an entry that is absent was never registered or has already been
 stopped, so there is nothing to do, and the stop is idempotent and safe on a
 dead session. Nothing about the row changes: it stays open, it stays the task's
 conversation, and no event and no transition is recorded. Only the agent-side
-registration goes, which is also why firing the rule on every pass converges
-rather than repeating — a stopped session leaves the listing, so the next pass
-finds nothing at rest to stop.
+registration goes.
+
+Reconciliation makes no release of its own, and the reason is the operator's
+desk rather than the model. A pass runs on every read, unprompted and in the
+background, so a rule swept there fires `stop` at whatever it finds — including
+sessions the operator is sitting in front of, in a window belonging to a task
+they are not even looking at, and again on every pass. That cost is real rather
+than hypothetical: such a stop resets the window it lands in, and no reading of
+a listing is worth doing that to a desk. Every stop Voro makes therefore hangs
+off something the operator just did — a closing verdict, or the send this
+release covers.
 
 What emerges is an invariant worth stating on its own: **a message can only
 ever be delivered to a session that has explicitly handed back to Voro.**
 Mid-turn, the liveness gate refuses the send honestly; between turns, the
-rest-stop has already released the hold. Consecutive messages fall under the
-same rule whether or not a finished `-p` turn puts the session back in the
-agent's registry: where it does, the entry reads `done` again and the next pass
-releases it again; where it does not, there was never a hold to release.
-Stacked mid-turn sends are structurally impossible rather than merely
-discouraged. The send path carries no unconditional stop of its own: it gates
-on liveness as before, and only where the target's listing entry still reads
-`done` — the operator outrunning a reconcile tick — does it make the same
-release inline and waited-on, refusing the send outright if that release fails.
-A message that could not be made deliverable commits nothing and leaves the
-task exactly where it was.
+send releases the hold itself and waits for the answer before spawning
+anything. Consecutive messages fall under the same rule whether or not a
+finished `-p` turn puts the session back in the agent's registry: where it does,
+the entry reads `done` again and the next send releases it again; where it does
+not, there was never a hold to release. Stacked mid-turn sends are structurally
+impossible rather than merely discouraged. The stop is not unconditional: the
+send gates on liveness first, releases only where the target's listing entry
+reads `done`, and refuses outright if that release fails. A message that could
+not be made deliverable commits nothing and leaves the task exactly where it
+was.
 
-The trade, recorded rather than discovered later: releasing at rest retires the
-session's entry from the agent's own view at *handover* rather than at close, so
-a review task's named row lives in Voro's queue and not in the agent's session
-list. Attach still opens the stopped session with its full context — a stop
-keeps the conversation — so jumping in, answering in-session and reading the
-output are all unaffected.
+The trade, recorded rather than discovered later: an entry lingers in the
+agent's own view until something the operator does clears it. A handed-back
+session keeps its entry until the first message into it, and a session
+reconciliation finalises keeps its entry until the verdict that closes the task.
+That is a lingering listing entry and nothing broken — the same degradation an
+agent defining no `stop` verb has always had — and the operator's close still
+clears the common case. Attach is unaffected either way: a stop keeps the
+conversation, so jumping in, answering in-session and reading the output all
+open the session with its full context.
 
 **A permission mode is a property of a launch, not of a verb.**
 `--permission-mode` is per invocation rather than something the session
@@ -1344,19 +1354,20 @@ agent that defines none — or one whose `stop` fails — degrades to exactly
 what Voro did before, a lingering listing entry and nothing broken. The
 transition never waits on it and never rolls back for it. Which closes stop is
 deliberately narrower than which closes happen: the operator's closing verdicts
-(`Accept`, `Abort`, `Abandon`) stop, and so do the reconciler's finalisations,
-both the dead-dispatch stall and the stale-row heal, since by then the session
-is over and Voro has said so. Sessions that stay open — `needs-input`,
-`review`, `waiting` — are not stopped by a *close*, because there is no close;
-they are released by the rest-stop above instead, on its own narrower test, and
-that release takes the registration without taking the row, so the operator
-still answers and rejects into them. A refine round's conclusion is the one
-close that does not stop, because its commonest trigger is the rewriting agent's
-own `voro set --body-file`, a call made from inside the session and mid-turn:
-stopping there would kill the agent that just reported. `voro-core` decides
-*whether* a close stops (`Store::apply_closing` hands back the session a verdict
-retired, `Store::reconcile_session` the one a pass finalised); the `voro` crate
-supplies the spawn, beside the other process seams.
+(`Accept`, `Abort`, `Abandon`) stop, and nothing else does. The reconciler's
+finalisations — the dead-dispatch stall, the stale-row heal — close the row
+and leave the entry, because a pass fires in the background at sessions nobody
+asked about (above); the entry they leave is retired by the verdict that
+eventually closes the task. Sessions that stay open — `needs-input`, `review`,
+`waiting` — are not stopped by a *close* either, because there is no close;
+they are released by the send that needs them released, above, and that release
+takes the registration without taking the row, so the operator still answers and
+rejects into them. A refine round's conclusion is the one close that does not
+stop, because its commonest trigger is the rewriting agent's own `voro set
+--body-file`, a call made from inside the session and mid-turn: stopping there
+would kill the agent that just reported. `voro-core` decides *whether* a close
+stops (`Store::apply_closing` hands back the session a verdict retired); the
+`voro` crate supplies the spawn, beside the other process seams.
 
 **Worktree lifecycle.** A dispatched agent does its work in a throwaway git
 worktree of the project checkout it creates itself — the dispatch preamble
@@ -1651,18 +1662,18 @@ It goes out through the existing `message` verb rather than through any new
 channel, and it is the one send that releases its target *unconditionally*
 first. A supervisor-owned session refuses a plain headless `--resume` for as
 long as its supervisor lives, and a capped session's supervisor is alive by
-definition, so something has to remove that hold. The rest-stop above never
-will: it fires on a listing entry that reads `done`, and a capped session reads
-`blocked` — the same word a permission prompt earns — for as long as it
-sits there. So the sweep stops the session itself, waits for the answer, and
-resumes it in place, abandoning the nudge if the release fails rather than
-spawning a send that could only be refused. No `tmux send-keys` channel or
-supervisor IPC is needed, and none is built. The send is otherwise recorded
-exactly as a quick message is, with the pid now carrying the turn, so a nudged
-session stays as visible to the reconciler as a messaged one; the badge is
-dropped the moment the send lands, so a second press cannot put a second agent
-on the same worktree, and it returns on the next reading if the session is
-still held.
+definition, so something has to remove that hold. The rest test above never
+covers it: it releases on a listing entry that reads `done`, and a capped
+session reads `blocked` — the same word a permission prompt earns — for as
+long as it sits there. So the sweep stops the session itself, waits for the
+answer, and resumes it in place, abandoning the nudge if the release fails
+rather than spawning a send that could only be refused. No `tmux send-keys`
+channel or supervisor IPC is needed, and none is built. The send is otherwise
+recorded exactly as a quick message is, with the pid now carrying the turn, so
+a nudged session stays as visible to the reconciler as a messaged one; the
+badge is dropped the moment the send lands, so a second press cannot put a
+second agent on the same worktree, and it returns on the next reading if the
+session is still held.
 
 Two costs come with that unconditional stop, priced rather than discovered. The
 stop is exactly as safe as the cap reading is right: a nudge into a session
@@ -1678,8 +1689,8 @@ is mid-turn, and refused again when the session is listed live — but a capped
 session is `running`, listed live, and *not* mid-turn, which is the one
 combination nothing else in the cockpit can recognise. Nothing else may skip
 those guards, and standing them down is what obliges the sweep to release its
-own target rather than trusting the rest rule to have done it (above). The
-sweep fires only when pressed — a staging decision rather than a principle:
+own target unconditionally rather than on the rest test (above). The sweep
+fires only when pressed — a staging decision rather than a principle:
 automatic resumption once the window reopens is wanted, and manual first buys
 the evidence automation needs, that a nudge reliably lands and that the badge
 does not false-positive, while a wrong reading still costs one keypress instead

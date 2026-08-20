@@ -1028,11 +1028,9 @@ const MESSAGE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// How much of a failed send's log to look at for the line to quote back.
 const LOG_TAIL_BYTES: u64 = 4096;
 
-/// How long the send path's inline rest-stop is waited on before the send is
-/// refused ([`stop_session_now`]). Generous next to the sub-second call it
-/// covers, and it is only ever paid when the operator has outrun a reconcile
-/// tick — but bounded, because a stop that hangs must not take the cockpit with
-/// it.
+/// How long the send path's release is waited on before the send is refused
+/// ([`stop_session_now`]). Generous next to the sub-second call it covers, but
+/// bounded, because a stop that hangs must not take the cockpit with it.
 const STOP_WAIT: Duration = Duration::from_secs(5);
 
 /// One line said into a session that already exists (DESIGN.md §8), assembled by
@@ -1271,11 +1269,10 @@ pub(crate) fn append_launch_log(path: &Path, line: &str) {
     }
 }
 
-/// Retire an agent's own registry entry for a session Voro has just closed
-/// (DESIGN.md §8) — the process half of the rule that a session's entry follows
-/// its row. `voro-core` decides *whether* a close should stop (the session comes
-/// from `Store::apply_closing` or a reconciler finalisation); this supplies the
-/// spawn.
+/// Retire an agent's own registry entry for a session an operator's verdict has
+/// just closed (DESIGN.md §8) — the process half of the rule that a session's
+/// entry follows its row. `voro-core` decides *whether* a close should stop (the
+/// session comes back from `Store::apply_closing`); this supplies the spawn.
 ///
 /// Best-effort in every direction, which is what makes it safe to fire from
 /// inside a transition that has already committed: an agent that defines no
@@ -1298,12 +1295,11 @@ pub fn stop_session(ctx: &DispatchCtx, config: &AgentsConfig, session: &Session)
     });
 }
 
-/// The same stop, waited on: the send path's inline fallback (DESIGN.md §8),
-/// where the operator has outrun a reconcile tick and the session is still
-/// registered at rest. Unlike the detached form the answer matters — a session
-/// whose hold was not released cannot be resumed in place — so this reports
-/// rather than merely logging, and the caller refuses the send on an `Err`
-/// having committed nothing.
+/// The same stop, waited on: the release a send makes of the session it is
+/// about to resume (DESIGN.md §8). Unlike the detached form the answer matters
+/// — a session whose hold was not released cannot be resumed in place — so
+/// this reports rather than merely logging, and the caller refuses the send on
+/// an `Err` having committed nothing.
 ///
 /// "Nothing to stop" is `Ok(())`, not a failure: an agent that defines no `stop`
 /// verb, or a session with no captured reference, is one Voro was never going to
@@ -1390,8 +1386,8 @@ fn spawn_stop(
 
 /// Load the agents config for a one-off [`stop_session`], best-effort: a missing
 /// or malformed `voro.toml` costs the stop, never the transition that asked for
-/// it. Callers that already hold a config — the reconciler, sweeping many
-/// sessions — pass their own rather than reloading per session.
+/// it. Callers that already hold a config pass their own rather than reloading
+/// per session.
 pub fn stop_closed_session(ctx: &DispatchCtx, session: &Session) {
     if let Ok(config) = AgentsConfig::load(&ctx.agents_path) {
         stop_session(ctx, &config, session);
