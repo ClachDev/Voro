@@ -383,7 +383,7 @@ cmd = \"git -C {path} difftool -d {base}...{branch}\"  # inline note
 
     /// A built-in viewer lives in the binary, so the write helpers cannot touch
     /// it — but they can be told to override it, and it is a legitimate default
-    /// with no table of its own (#405).
+    /// with no table of its own.
     #[test]
     fn built_in_viewers_are_unwritable_but_overridable_and_defaultable() {
         let dir = scratch("builtin");
@@ -446,7 +446,7 @@ cmd = \"git -C {path} difftool -d {base}...{branch}\"  # inline note
 
     /// Naming the editor is enough: the command a new operator has no way to
     /// guess is assumed, and naming a built-in starts from what it replaces
-    /// rather than from a worse guess at the same thing (#405).
+    /// rather than from a worse guess at the same thing.
     #[test]
     fn a_viewer_added_with_no_command_gets_the_obvious_one() {
         let dir = scratch("assumed");

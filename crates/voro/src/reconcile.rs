@@ -12,7 +12,7 @@
 //! answer or feedback continues the work), and a session still open on a closed
 //! task is stale and finalised — neither needs a probe.
 //!
-//! Liveness has two sources (task #75), and which of them owns a session is
+//! Liveness has two sources, and which of them owns a session is
 //! recorded on its row at launch by the code that spawned the process
 //! (`sessions.liveness_source`, DESIGN.md §8) rather than inferred here.
 //! A listing-authoritative session is queried through [`crate::session_probe`],
@@ -29,7 +29,7 @@
 //! the spawned-pid check.
 //!
 //! The row's own pid is still read in one direction, whichever source owns the
-//! session: a pid that is *alive* proves the session is (task #390). A quick
+//! session: a pid that is *alive* proves the session is. A quick
 //! message replaces that pid with the process carrying its turn, and where the
 //! agent had to fork to be joined at all, that turn is a `-p` run the agent's
 //! listing never shows — so the listing would report the session gone while the
@@ -46,8 +46,8 @@
 //! can finish.
 //!
 //! Whether a *dead* session died capped is read from the same per-agent verb
-//! set, through an optional `logs` (task #415). Voro's own launch log — the
-//! only channel there used to be — cannot answer for a supervisor-owned launch:
+//! set, through an optional `logs`. Voro's own launch log
+//! cannot answer for a supervisor-owned launch:
 //! the launcher exits at birth having written nothing but the backgrounding
 //! banner, so the scan could essentially never report `capped` for a `--bg`
 //! dispatch, whatever killed it. An agent that can print a session's recent
@@ -57,12 +57,12 @@
 //! — is not taken here at all: it is slow enough to need its own off-loop
 //! runner ([`crate::probe::CapProbe`]), and it changes nothing in the database.
 //!
-//! Whatever a pass finalises, it also stops (task #433): the agent's `stop` verb
+//! Whatever a pass finalises, it also stops: the agent's `stop` verb
 //! is fired at the closed session's reference so its own listing loses the entry
 //! along with the row, best-effort and unwaited-on.
 //!
 //! A session left *open* is stopped too, on a narrower test — the rest-stop
-//! ([`rest_stop`], task #428). A task in `needs-input`, `review` or `waiting`
+//! ([`rest_stop`]). A task in `needs-input`, `review` or `waiting`
 //! has handed back, and once its listing entry agrees that the turn is over, the
 //! agent's hold on the session is released. Its row stays open and stays the
 //! task's conversation; only the registration goes, and with it the lock that
@@ -531,7 +531,7 @@ mod tests {
         (s, t.id, session.id)
     }
 
-    // --- sessions-verb liveness (task #75) ---
+    // --- sessions-verb liveness ---
 
     /// An `voro.toml` whose `claude` agent lists sessions by catting a
     /// canned JSON file, plus that file's path for the test to fill in.
@@ -689,7 +689,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The quick-message case (task #390): a forked `-p` turn does not appear
+    /// The quick-message case: a forked `-p` turn does not appear
     /// in the agent's listing at all, so the ref the session now carries reads
     /// as gone — while the process answering the message is right there on the
     /// row. A live pid outranks the listing, or the send the operator just made
@@ -770,7 +770,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- finalising a session stops it (task #433) ---
+    // --- finalising a session stops it ---
 
     /// A `voro.toml` whose `claude` agent lists `listing` and whose `stop` verb
     /// records the reference it was fired at, plus that marker's path — so a
@@ -871,7 +871,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- the rest-stop releases a session that has handed back (task #428) ---
+    // --- the rest-stop releases a session that has handed back ---
 
     /// The transitions that put a task at rest with its session still open, and
     /// the name each test labels its fixture with.
@@ -1070,7 +1070,7 @@ mod tests {
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Stalled);
     }
 
-    // --- capped deaths read the session's own output (task #415) ---
+    // --- capped deaths read the session's own output ---
 
     /// A `voro.toml` whose `claude` agent lists no sessions and prints
     /// `logs_output` for any session, plus the log file path a launch would
@@ -1184,7 +1184,7 @@ mod tests {
         let _ = std::fs::remove_file(&log);
     }
 
-    // --- refine rounds read the source they recorded (tasks #379, #387) ---
+    // --- refine rounds read the source they recorded ---
 
     /// The refine-side twin of
     /// [`a_listed_live_session_is_left_alone_despite_a_dead_pid`]: a headless
@@ -1254,10 +1254,10 @@ mod tests {
         assert_eq!(s.task(task_id).unwrap().state, TaskState::Refining);
     }
 
-    /// The tail #379 left open (task #387): a *headless* round whose ref capture
-    /// timed out. Its recorded pid is a `--bg` launcher, dead within a second of
-    /// the launch, and inferring the flavour from the missing ref read that
-    /// round as the interactive one and finalised it `failed` while its agent
+    /// A *headless* round whose ref capture timed out. Its recorded pid is a
+    /// `--bg` launcher, dead within a second of the launch, so inferring the
+    /// flavour from the missing ref would read that round as the interactive
+    /// one and finalise it `failed` while its agent
     /// was still rewriting the body. Recorded listing-authoritative, it is
     /// simply unprobeable — left in `refining` until the rewrite lands or the
     /// listing says it is gone, exactly as a ref-less dispatch already was.

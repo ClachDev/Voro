@@ -4,7 +4,7 @@
 //! detached — kept out of voro-core, which stays pure of process and filesystem
 //! I/O. The atomic state-plus-session write is voro-core's `Store::record_dispatch`.
 //!
-//! For agents that define a `sessions` verb (task #75), dispatch additionally
+//! For agents that define a `sessions` verb, dispatch additionally
 //! captures the agent's own session reference after launch — by polling the
 //! `sessions` listing for a session started in this project since the spawn,
 //! falling back to the `backgrounded · <id>` line launchers print into the
@@ -103,7 +103,7 @@ they carry the plan this task implements, and the body assumes them.
 {list}";
 
 /// Shared by both branch blocks below so the early-registration instruction
-/// cannot drift (task #96). `{name}` is the assigned branch or the `<name>` the
+/// cannot drift. `{name}` is the assigned branch or the `<name>` the
 /// agent will choose; `{task_id}`/`{db}` keep the command copy-pasteable under
 /// launch styles that drop the environment.
 const BRANCH_REGISTER_SENTENCE: &str = "register it with `voro set {task_id}{db} --branch {name}` as you do, so Voro \
@@ -134,8 +134,8 @@ const BRANCH_ISOLATE_SENTENCE: &str = "Isolate your work in a worktree, through 
      before you commit. Lacking such a mechanism, make the throwaway worktree \
      yourself: `git worktree add <path> -b {name}`.";
 
-/// The `{branch}` block for a task that carries an intended git branch (task
-/// #81): the agent is told the name, to do its work in a throwaway worktree on
+/// The `{branch}` block for a task that carries an intended git branch:
+/// the agent is told the name, to do its work in a throwaway worktree on
 /// it rather than the primary checkout via [`BRANCH_ISOLATE_SENTENCE`], to
 /// register it early via [`BRANCH_REGISTER_SENTENCE`], to confirm it at
 /// completion, and to self-serve a rebase onto a moved base via
@@ -1308,8 +1308,8 @@ pub fn stop_session(ctx: &DispatchCtx, config: &AgentsConfig, session: &Session)
 /// "Nothing to stop" is `Ok(())`, not a failure: an agent that defines no `stop`
 /// verb, or a session with no captured reference, is one Voro was never going to
 /// release, and the send that follows either lands or is refused by the agent
-/// itself — which is the pre-#428 behaviour, not a regression this should
-/// pre-empt. A stop still running when [`STOP_WAIT`] is up is a failure, since
+/// itself — the same degradation an agent without a release path always had,
+/// not a regression this should pre-empt. A stop still running when [`STOP_WAIT`] is up is a failure, since
 /// the lock demonstrably has not been released yet; the straggler is reaped off
 /// the loop as the detached form's is.
 pub fn stop_session_now(
@@ -1478,7 +1478,7 @@ pub fn open(
     let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     // Nothing resolving at all is the one failure a caller can *answer* rather
     // than just report — the TUI raises its add-viewer form on it — so it is
-    // told apart from every other way opening can fail (#405).
+    // told apart from every other way opening can fail.
     let viewer = match config.viewer_cmd(viewer_name.as_deref()) {
         Ok(cmd) => cmd,
         Err(e @ voro_core::Error::NoViewer { .. }) => {
@@ -2095,8 +2095,8 @@ mod tests {
     }
 
     /// A quick propose opens no session row and moves nothing: the whole of its
-    /// effect is the agent it spawned, whose deliverable is a `voro add` (task
-    /// #315). What the prompt carries is the operator's line and the `add`
+    /// effect is the agent it spawned, whose deliverable is a `voro add`.
+    /// What the prompt carries is the operator's line and the `add`
     /// command that files the task.
     #[test]
     fn propose_spawns_an_expansion_that_records_nothing() {
@@ -2119,7 +2119,7 @@ mod tests {
 
     /// A quick propose names its session for its project the way the planning
     /// session beside it does, so the two read alike in the agent's listing and
-    /// a bare number in a Voro-composed name is always a task id (task #447).
+    /// a bare number in a Voro-composed name is always a task id.
     #[test]
     fn propose_names_its_session_for_the_project() {
         let (mut store, ctx, project) =
@@ -2651,7 +2651,7 @@ mod tests {
         assert_eq!(store.sessions_for(id).unwrap().len(), 2);
     }
 
-    // --- session-ref capture (task #75) ---
+    // --- session-ref capture ---
 
     /// A canned `sessions` listing whose one entry matches the dispatched
     /// project's cwd with a far-future start time, so the first capture poll
@@ -3067,7 +3067,7 @@ mod tests {
     }
 
     /// A viewer name nothing resolves reports the action first and never calls
-    /// the config file invalid — it may not even exist (#405). The
+    /// the config file invalid — it may not even exist. The
     /// nothing-resolves-at-all message is `voro-core`'s, tested there against
     /// an injected PATH probe rather than the developer's own PATH.
     #[test]
@@ -3160,7 +3160,7 @@ mod tests {
         assert!(err.contains("zed"), "{err}");
     }
 
-    // --- refine (task #314) ---
+    // --- refine ---
 
     /// Read a prompt the stub agent copied out with `cat {prompt_file} > file`,
     /// waiting for the copy to *complete* rather than merely to start: the shell
@@ -3251,7 +3251,7 @@ mod tests {
         );
         assert!(prompt.contains("what the parent actually did"), "{prompt}");
         // the one write it is told to make, with the id and database literal,
-        // and the retitle that may ride along on it (task #391)
+        // and the retitle that may ride along on it
         assert!(
             prompt.contains(&format!(
                 "voro set {id} --db {} --body-file <path> [--title",
@@ -3299,7 +3299,7 @@ mod tests {
         );
     }
 
-    /// A round captures its session ref exactly as a dispatch does (task #379).
+    /// A round captures its session ref exactly as a dispatch does.
     /// It has to: the round renders the agent's *dispatch* template, so under a
     /// `--bg` launcher the pid on the row belongs to a launcher that exits at
     /// birth, and only the agent's own listing can say the round is still
@@ -3334,7 +3334,7 @@ mod tests {
 
     /// Capture is best-effort here as it is for a dispatch: a listing that
     /// matches nothing leaves the ref NULL, says so, and the round runs on —
-    /// still recorded listing-authoritative (task #387), which is what leaves
+    /// still recorded listing-authoritative, which is what leaves
     /// reconcile with nothing to probe rather than a launcher pid to misread.
     #[test]
     fn refine_survives_a_ref_it_cannot_capture() {
@@ -3372,7 +3372,7 @@ mod tests {
         assert!(prompt.contains("docs/PLAN.md"), "{prompt}");
     }
 
-    // --- launch identity (task #326) ---
+    // --- launch identity ---
 
     /// Wait for a file the stub agent wrote to hold `until`, so an assertion
     /// about a detached launch races neither the spawn nor the write: the shell
@@ -3447,9 +3447,9 @@ mod tests {
         assert!(!launched.contains('{'), "unsubstituted: {launched}");
     }
 
-    /// Defect 3: the refine prompt used to substitute into the seed, so a task
-    /// body discussing a command template was rewritten before the agent read
-    /// it — corrupting the very subject of the rewrite.
+    /// A task body discussing a command template must reach the agent
+    /// verbatim: substituting into the seed would corrupt the very subject of
+    /// the rewrite.
     #[test]
     fn a_refine_hands_the_agent_a_body_full_of_placeholders_unchanged() {
         let (mut store, ctx, project) = fixture("cat {prompt_file} > refine-prompt.txt");
@@ -3524,9 +3524,9 @@ mod tests {
         assert!(!store.refined_flag(id).unwrap());
     }
 
-    /// The widening of task #352: a triaged task whose body the operator now
-    /// wants rewritten refines like a proposal, and the round takes it out of
-    /// the dispatchable queue while it runs (DESIGN.md §6).
+    /// A triaged task whose body the operator now wants rewritten refines like
+    /// a proposal, and the round takes it out of the dispatchable queue while
+    /// it runs (DESIGN.md §6).
     #[test]
     fn a_ready_task_refines_like_a_proposal() {
         let (mut store, ctx, project) = fixture("cat {prompt_file} > refine-prompt.txt");
@@ -3642,7 +3642,7 @@ mod tests {
         assert_eq!(store.sessions_for(id).unwrap().len(), 1);
     }
 
-    // --- planning sessions (task #112) ---
+    // --- planning sessions ---
 
     #[test]
     fn plan_session_assembles_the_launch_and_writes_the_prompt() {
@@ -3735,7 +3735,7 @@ mod tests {
         assert!(err.contains(ctx.agents_path.to_str().unwrap()), "{err}");
     }
 
-    // --- the deep flag (task #241) ---
+    // --- the deep flag ---
 
     /// The stub command writes the model it was rendered with to a per-task
     /// marker file, so a successful run proves which model reached the spawned

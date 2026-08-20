@@ -137,7 +137,9 @@ when its last blocker closes.
 ```
 voro start <id>                      # ready → running (claim the task)
 voro ask <id> --question "A or B?"   # running → needs-input (blocked on human)
-voro answer <id> TEXT                # needs-input → running
+voro resume <id>                     # needs-input → running, once the question
+                                     #   is answered in your session (Voro
+                                     #   records no answer text)
 voro done <id> [--summary TEXT] [--branch NAME]
                                      # running → review; --branch records the
                                      #   git branch your work landed on

@@ -105,14 +105,10 @@ pub const VIEWER_BASE_PLACEHOLDER: &str = "{base}";
 /// deliberate: a verb is an opaque per-agent contract, which is exactly what
 /// lets an agent define a subset of them and degrade per-verb. `codex` defines
 /// no `message` and the TUI's quick-message key says so on the status line.
-/// It resumes the session in place rather than forking it
-/// ([`NEW_SESSION_PLACEHOLDER`], which the verb no longer carries): a
-/// `claude --bg` session keeps its supervisor process after finishing its turn,
-/// and that supervisor refuses a headless `--resume` for as long as it lives —
-/// so Voro releases it at rest instead, through `stop`, and the send then lands
-/// on the session's own reference (DESIGN.md §8). A fork would land too, but it
-/// moves the conversation out from under the name Voro composed for it, and that
-/// name is how the operator addresses the session everywhere outside Voro.
+/// A `claude --bg` session keeps its supervisor process after finishing its
+/// turn, and that supervisor refuses a headless `--resume` for as long as it
+/// lives — Voro releases it at rest through `stop`, so the send lands on the
+/// session's own reference (DESIGN.md §8).
 ///
 /// It carries `--permission-mode` for the same reason `dispatch` does: the mode
 /// belongs to a launch rather than to a verb (DESIGN.md §8). The flag is per
@@ -2049,7 +2045,7 @@ mod tests {
         }
     }
 
-    // --- plan verb (task #112) ---
+    // --- plan verb ---
 
     #[test]
     fn plan_parses_resolves_and_is_optional() {
@@ -2579,9 +2575,9 @@ mod tests {
         assert_eq!(rendered.command, "say '{prompt_file}' '/run/m.md'");
     }
 
-    /// A stale `continue` line — from a pre-pivot config or the old codex
-    /// built-in — is now an unknown field, so the config is refused rather than
-    /// silently honouring a verb Voro no longer runs (DESIGN.md §6/§8).
+    /// A `continue` line is an unknown field, so a config carrying one is
+    /// refused rather than loading with a verb Voro never runs (DESIGN.md
+    /// §6/§8).
     #[test]
     fn a_continue_verb_is_now_an_unknown_field() {
         let text = r#"
@@ -2704,8 +2700,8 @@ mod tests {
     /// Nothing installed, nothing configured: the failure asks for the one
     /// thing the operator can act on — register the viewer they already use —
     /// and only then says what was probed. It never tells them to install an
-    /// editor, and never calls the config file invalid: it may not even exist
-    /// (#405).
+    /// editor, and never calls the config file invalid: it may not even
+    /// exist.
     #[test]
     fn viewer_resolution_errors_with_guidance_when_nothing_resolves() {
         let message = config()
@@ -3005,7 +3001,7 @@ mod tests {
         assert!(agents["codex"].resume().is_some());
     }
 
-    // --- launch identity and rendered commands (task #326) ---
+    // --- launch identity and rendered commands ---
 
     /// A dispatch of task 7 with a fixed prompt file, so a rendered command is
     /// a stable string to assert on.
@@ -3421,8 +3417,8 @@ mod tests {
         );
     }
 
-    /// What a headless launch records on its session row (DESIGN.md §8, task
-    /// #387): an agent with a `sessions` verb may hand the work to a supervisor,
+    /// What a headless launch records on its session row (DESIGN.md §8): an
+    /// agent with a `sessions` verb may hand the work to a supervisor,
     /// so its listing is the authority; one without has only the pid Voro
     /// spawned.
     #[test]
