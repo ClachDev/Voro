@@ -185,16 +185,16 @@ itself out from under you.
   of finished `voro-*` entries, each backed by a supervisor process that runs
   until you reboot. That listing is how you find a session to attach to and how
   Voro reads liveness, so both got worse the longer it grew. A session's entry
-  now follows its row — accept, abort or abandon a task, or let the reconciler
-  finalise a dead or stale session, and the agent is asked to retire its own
-  entry for it. The conversation is kept: `claude stop` drops the entry from the
-  default listing and `claude attach` still reopens it. Sessions Voro keeps open
-  on purpose (`needs-input`, `review`, `waiting`) are retired at *handover*
-  rather than at close — once the agent's own listing agrees the turn is over,
-  not merely that the task is waiting on you — which is what leaves the session
-  free for a quick message to resume in place. The row stays open either way, so
-  you still answer and reject into it and `A` still opens it with its full
-  context. Agents declare the capability with a new optional
+  now follows its row: accept, abort or abandon a task, and the agent is asked
+  to retire its own entry for it. The conversation is kept: `claude stop` drops
+  the entry from the default listing and `claude attach` still reopens it.
+  Sessions Voro keeps open on purpose (`needs-input`, `review`, `waiting`) are
+  not stopped at all — you still answer and reject into the row, and `A` still
+  opens it with its full context — and a quick message releases the
+  supervisor's hold at the moment you send, so the session resumes in place.
+  Every stop follows something you just did, a closing verdict or that send:
+  nothing reaches into a session on a background pass, which is what used to
+  make an unrelated window flicker while you worked. Agents declare the capability with a new optional
   `stop` verb (`{session}`), built in for `claude`; an agent without one, such
   as `codex`, behaves exactly as before, and a stop that fails leaves a line in
   `launches.log` rather than touching the transition.
