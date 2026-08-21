@@ -25,10 +25,10 @@ end-to-end. Expect churn.
 Voro is Unix-only — Linux and macOS. It installs a single binary, `voro`, that is
 both the TUI cockpit (run with no arguments) and the CLI (`voro <verb>`).
 
-Prebuilt binaries are published for two targets only: `x86_64-unknown-linux-gnu`
-and `aarch64-apple-darwin`, which is to say 64-bit Intel and AMD Linux and Apple
-Silicon macOS. Every other Unix — an Intel Mac, an ARM Linux box — is supported
-by building from source, covered at the end of this section.
+Prebuilt binaries are published for two targets: `x86_64-unknown-linux-gnu`
+(64-bit Intel/AMD Linux) and `aarch64-apple-darwin` (Apple Silicon macOS).
+Every other Unix, an Intel Mac included, builds from source; see the end of
+this section.
 
 On one of those two platforms, the quickest path is the prebuilt shell
 installer, which downloads the right binary and drops it in Cargo's bin
@@ -47,8 +47,8 @@ Release](https://github.com/ClachDev/Voro/releases) also carries tarballs for
 those same two targets alongside their checksums. Download one, extract it, and
 put `voro` on your `PATH`.
 
-To build and install from source instead — and on any platform without a
-prebuilt binary, this is the way in — you need Rust 1.88 or newer:
+To build and install from source, the only path on a platform without a
+prebuilt binary, you need Rust 1.88 or newer:
 
 ```bash
 cargo install voro
@@ -63,67 +63,58 @@ arguments:
 voro
 ```
 
-The cockpit has four screens — **Cockpit** (the next-action queue), **Tasks**
-(every task), **Projects**, and **Config**, which lists the agents Voro will
-dispatch to with the command each one runs, the viewers it opens diffs in, and
-the path of the `voro.toml` they were resolved from. `tab` cycles between them
-and `alt-1`–`alt-4` jump straight to one; until you have registered a project
-only Projects and Config exist, since the other two have nothing to show, and
-`tab` cycles just those. `j`/`k` move the selection, a click selects a row
-directly, and the footer always shows the keys that apply to what you have
-selected. `?` opens the full key map for whichever screen you are on — the
-walkthrough below names only the keys it needs, and that map is where the rest
-live. A bare digit sets the number on the row you have selected — `0`–`3` a
-task's priority on the Cockpit and Tasks screens, `0`–`5` a project's weight on
-the Projects screen. The walkthrough below drives one task from nothing to a
-reviewed diff.
+The cockpit has four screens:
 
-**1. Register a project.** A first launch against an empty database opens on the
-Projects screen and stays within reach of it — `tab` is the way back there, and
-`alt-3` any time after. Press `a`
-to add one — Voro asks for a name and a path. Press `0`–`5` on a project to set
-its weight: the higher the weight, the harder that project's tasks pull toward the
-top of the queue.
+- **Cockpit**: the next-action queue.
+- **Tasks**: every task.
+- **Projects**: your projects and their weights.
+- **Config**: the agents Voro dispatches to, the viewers it opens diffs in,
+  and the path of the `voro.toml` each was resolved from.
 
-**2. Create a task.** From the Cockpit or Tasks screen, press `n` and type one
-line saying what you want — ⏎ hands it to an agent in the background, which
-expands it into a title and a body and files the task for you. The cockpit never
-goes away and nothing waits: the proposal turns up in the queue a refresh or two
-later, ready for the triage step below. Press `N` instead to plan the task in an
-interactive session, when one line is not enough and you would rather talk it
-through, or `ctrl-n` to write the whole thing out by hand in your `$EDITOR` —
-the rare path, and the only one that sets the state, priority, agent and
-blockers at creation time. Its `state:` line decides where the task lands: it
-starts at `ready`, so a template saved unedited joins the queue as ready work
-straight away — set it to `proposed` instead to route the task through triage,
-or to `parked` to file it without it competing for attention yet.
+`tab` cycles the screens and `alt-1`–`alt-4` jump straight to one. Until you
+register a project, only Projects and Config exist. `j`/`k` or a click moves
+the selection, and the footer shows the keys that apply to it. A bare digit
+sets the number on the selected row: `0`–`3` a task's priority on the Cockpit
+and Tasks screens, `0`–`5` a project's weight on the Projects screen. `?`
+opens the full key map; the walkthrough below names only the keys it needs.
 
-However the task arrives, **the body you end up with is the prompt** the
-dispatched agent receives, so it is worth being written like one — by the
-proposing agent here, and improvable with the refine keys below before you
-dispatch it.
+The walkthrough drives one task from nothing to a reviewed diff.
 
-**3. Triage it into the queue.** A proposal — a task you created with `state:
-proposed`, or one an agent filed with `voro propose` — needs a verdict from you
-before anything can work it. Proposals never take a queue slot each: they collapse
-into one digest row per project, so the first `enter` lands on that digest and the
-footer reads `⏎ expand`, folding it open to list the proposals underneath. Move
-down onto the proposal itself and the footer reads `⏎ triage`; `enter` there opens
-a menu of the three verdicts — `triage → ready` accepts it into ready work,
-`triage → parked` sets it aside, and `triage → rejected` closes it out. The queue
-always floats items that need you first (a question shows `⏎ resume`, a finished
-task shows `⏎ review`) above the highest-scoring ready tasks.
+**1. Register a project.** A first launch opens on the Projects screen
+(`alt-3` gets you back later). Press `a` to add one; Voro asks for a name and
+a path. Press `0`–`5` to set its weight: the higher the weight, the harder
+the project's tasks pull toward the top of the queue.
 
-When a task is worth keeping but badly written, refine it rather than ruling on
-it. Refine is not a verdict, so it is not one of the menu's outcomes — it is a
-key you press over the row itself: `r` sends the task to an agent to rewrite the
-body against a one-line note about what is wrong (`voro triage <id> refine --note
-"..."` on the CLI), and `R` opens an interactive session to talk the body into
-shape. Either way the task leaves the queue for `refining` while the rewrite is in
-flight — `C` cancels a round that is taking too long — and comes back marked
-`↻ refined`, so you triage the improved version next pass. Ready work refines too,
-not just proposals: rewriting the body invalidates the verdict you gave the old
-one, so a refined ready task comes back through triage as well.
+**2. Create a task.** From the Cockpit or Tasks screen, press `n` and type
+one line saying what you want. ⏎ hands it to a background agent, which expands
+it into a title and a body and files the task; the proposal appears in the
+queue a refresh or two later, ready for triage. Press `N` instead to plan the
+task in an interactive session, or `ctrl-n` to write it out by hand in your
+`$EDITOR`. The `$EDITOR` form is the only path that sets state, priority,
+agent and blockers at creation time. Its `state:` line decides where the task
+lands: `ready` (the default) joins the queue directly, `proposed` routes it
+through triage, and `parked` files it without competing for attention yet.
+
+However the task arrives, **the body is the prompt** the dispatched agent
+receives, so it should read like one. The proposing agent writes it that way,
+and the refine keys below improve it before dispatch.
+
+**3. Triage it into the queue.** A proposal (a task you created with `state:
+proposed`, or one an agent filed with `voro propose`) needs a verdict from you
+before anything can work it. Proposals collapse into one digest row per
+project: `enter` on the digest expands it, and `enter` on a proposal opens the
+verdict menu. `triage → ready` accepts it into ready work, `triage → parked`
+sets it aside, and `triage → rejected` closes it out. The queue floats items
+that need you (a question shows `⏎ resume`, a finished task `⏎ review`) above
+the highest-scoring ready tasks.
+
+To improve a proposal instead of ruling on it, press `r`: an agent rewrites
+the body against your one-line note about what is wrong (`voro triage <id>
+refine --note "..."` on the CLI). `R` opens an interactive session instead,
+and `C` cancels a round that is taking too long. The task sits in `refining`
+while the rewrite runs and returns marked `↻ refined` for the next triage
+pass. Ready work refines too: rewriting the body invalidates the verdict you
+gave the old one, so a refined ready task also returns through triage.
 
 **4. Dispatch it to an agent.** Select a ready task and press `d` to hand it to
 the default coding agent, or `D` to choose which agent. Voro launches a headless
@@ -133,28 +124,24 @@ per [`docs/agent-integration.md`](docs/agent-integration.md). Those verbs are th
 agent's interface, not yours.
 
 **5. Review what lands.** When the agent calls `done`, the task moves to
-`review` and rises to the top of the queue, and its detail card leads with the
-agent's completion summary — what it says it changed and how it verified.
-Press `o` to open its checkout in a viewer, or `g` to open its pull request,
-which it creates from that summary — after showing you the branch and title —
-when the task has no PR recorded yet. The two keys are static rather than
-per-project: `o` is always the local diff, `g` is always GitHub, so neither has
-to be thought about before it is pressed, and on a checkout with nowhere to push
-`g` says so and names `o` instead. The viewer needs no setup: Voro ships with
-`code`, `cursor` and `zed` built in and opens the first one on your PATH; if none
-of them is there, `o` opens a small form to name the editor you do use instead.
-With the account and the diff in front of you, press `enter` (`⏎ review`) to
-accept or reject the work; rejecting with a note re-dispatches the agent to
-address it, and `w` hands the task off instead, parking it out of the queue while
-you wait on someone else's review.
+`review` and rises to the top of the queue. Its detail card leads with the
+agent's completion summary: what it changed and how it verified. Press `o` to
+open the checkout in a viewer, or `g` to open the pull request; when no PR is
+recorded yet, `g` creates one from that summary after showing you the branch
+and title. `o` is always the local diff and `g` is always GitHub; on a
+checkout with nowhere to push, `g` says so and names `o`. The viewer needs no
+setup: `code`, `cursor` and `zed` ship built in and the first one on your
+PATH is used. If none is there, `o` opens a small form to name the editor you
+do use. With the summary and the diff in front of you, press `enter`
+(`⏎ review`) to accept or reject the work. Rejecting with a note
+re-dispatches the agent to address it, and `w` hands the task off, parking it
+out of the queue while you wait on someone else's review.
 
-Accepting records your verdict and completes the task — it does not merge
-anything. On a project you review through GitHub the work lands when its pull
-request is merged, which you will usually have done already, with the merged
-diff in front of you. On a project with no remote the work stays on the branch
-the agent reported, recorded on the task and printed by `voro show <id>` as
-`branch:`, and landing it is one command in the project checkout: `git merge
-<branch>`.
+Accepting records your verdict and completes the task; it merges nothing.
+On a GitHub project the work lands when its pull request is merged. On a
+project with no remote the work stays on the branch the agent reported
+(`voro show <id>` prints it as `branch:`), and landing it is one command in
+the checkout: `git merge <branch>`.
 
 Other keys worth knowing on a selected task: `a` sends one line into the agent's
 own session without leaving the cockpit, and `A` opens that session to talk to it
@@ -180,15 +167,15 @@ cargo run
 
 ## Dispatching to agents
 
-Voro dispatches a task by running a shell command template per agent, and ships
-with built-in `claude` and `codex` agents, so with one of those on your `PATH` a
-fresh install dispatches with no configuration: `voro dispatch <task-id>` (or the
-dispatch key in the TUI) launches a headless session on a ready task. The agent
-reports back through the return-path verbs (`voro ask/done/propose`), and its work
-lands in `review` where `voro open` or `voro pr` puts the diff in front of you.
-Viewers work the same way: `code`, `cursor` and `zed` are built in and probed on
-`PATH`, so `voro open` needs no configuration either. `voro agent list` and
-`voro viewer list` show the effective sets and where each entry comes from.
+Voro dispatches a task by running a shell command template per agent. The
+`claude` and `codex` agents are built in, so with one of those on your `PATH`
+a fresh install dispatches with no configuration: `voro dispatch <task-id>`
+(or the dispatch key in the TUI) launches a headless session on a ready task.
+The agent reports back through the return-path verbs (`voro ask/done/propose`)
+and its work lands in `review`, where `voro open` or `voro pr` puts the diff
+in front of you. Viewers work the same way: `code`, `cursor` and `zed` are
+built in and probed on `PATH`. `voro agent list` and `voro viewer list` show
+the effective sets and where each entry comes from.
 
 ![Claude with Voro in tmux showing sessions and tasks](docs/images/claude-voro.png)
 
