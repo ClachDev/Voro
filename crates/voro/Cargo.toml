@@ -1,6 +1,6 @@
 [package]
 name = "voro"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,7 +11,7 @@ keywords = ["cli", "tui", "tasks", "productivity", "agents"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-voro-core = { path = "../voro-core", version = "0.1.0" }
+voro-core = { path = "../voro-core", version = "0.2.0" }
 ratatui.workspace = true
 clap = { version = "4.6.1", features = ["derive"] }
 

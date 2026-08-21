@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 
-## [Unreleased](https://github.com/ClachDev/Voro/compare/v0.1.0...HEAD) - ReleaseDate
+## [Unreleased](https://github.com/ClachDev/Voro/compare/v0.2.0...HEAD) - ReleaseDate
+
+## [0.2.0](https://github.com/ClachDev/Voro/compare/v0.1.0...v0.2.0) - 2026-08-21
 
 The release where the loop closes around the operator rather than the agent.
 Refine answers the proposal that is worth keeping but badly written; a task's
