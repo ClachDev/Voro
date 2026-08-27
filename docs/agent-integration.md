@@ -3,63 +3,30 @@
 This is the optional glue between Voro and Claude Code, the one agent with richer
 integration points than "run a shell command." None of it is required — dispatch
 works for any agent through a command template (DESIGN.md §8) — and none of it
-lives in `voro-core` or the dispatch path. It is per-agent configuration you drop
-into a project.
-
-The **return path** is the few CLI verbs an agent calls from inside its session to
-report what happened; DESIGN.md §8 covers why the surface is deliberately this
-small. Hooks are a belt-and-braces layer under it, driven by Claude Code's own
-lifecycle events for a session that forgets to call the verbs itself.
+lives in `voro-core` or the dispatch path. Nothing here is installed per
+project: agent definitions live in `~/.config/voro/voro.toml`, and the hooks at
+the end are user-level Claude Code settings.
 
 ## The return path
 
-Dispatch injects a preamble naming the verbs with the task's literal id already
-substituted in (DESIGN.md §8), so a *dispatched* agent needs nothing from this
-section. This file is for the other way to reach the verbs — an operator-pasted
-snippet and Claude Code hooks — which read the task and database from
-`VORO_TASK_ID` and `VORO_DB` (dispatch exports both) rather than from a rendered
-command. That makes them best-effort under launch styles that do not propagate the
-spawned process's environment, notably `claude --bg`; there the injected preamble
-is the reliable path (DESIGN.md §8). Advertise the verbs by pasting this into the
-project's `CLAUDE.md` (or `AGENTS.md`):
+The **return path** is the few CLI verbs an agent calls from inside its session
+to report what happened: `ask` moves the task to `needs-input`, `resume` back to
+`running`, `done` to `review`, and `propose` files a `proposed` task
+discovered-from this one. DESIGN.md §8 covers why the surface is this small.
 
-```markdown
-## Reporting back to Voro
+An agent learns the verbs one of two ways, neither of which touches the project
+it runs in. A *dispatched* session gets them from the preamble dispatch
+prepends to every prompt, with the task's literal id and, off the default
+store, the `--db` path rendered into each command (DESIGN.md §8); that is what
+makes the path survive `claude --bg`, whose supervised session inherits none of
+the launcher's environment. A session *you* start gets them from the `voro-cli`
+skill in the Claude Code plugin (README, *Agents*), which activates in any
+directory and teaches the agent the CLI and how to find the right project from
+its cwd.
 
-You were dispatched by Voro on task $VORO_TASK_ID. When you reach one of these
-points, run the matching command — Voro surfaces it in the operator's queue:
-
-    voro ask "$VORO_TASK_ID" --question "Schema A or B? Trade-offs: ..."
-    voro resume "$VORO_TASK_ID"
-    voro done "$VORO_TASK_ID" --branch "$(git rev-parse --abbrev-ref HEAD)" \
-        --summary "<what changed and why, then how you verified it — a PR description>"
-    voro propose <project> "Follow-up title" --from "$VORO_TASK_ID" \
-        --body-file plan.md
-
-- `ask` when you are blocked on a human decision and cannot proceed.
-- `resume` once that question is answered here in this session, to move the task
-  back to `running` and carry on — Voro records no answer text, the exchange is
-  already in this transcript.
-- `done` when the work is complete and ready for review. Record **both** flags on
-  the one call: `--branch` is the git branch your work landed on and `--summary`
-  is the pull request's description — what changed and why, then how you
-  verified it, written as a PR body rather than a status line. On a
-  GitHub-reviewed project `voro pr` opens the pull request with that summary as
-  its body and needs both, on any project the summary is the review context, and
-  a `done` that supplies only one leaves the task flagged `[incomplete report]`.
-  Omit both only for a task that produced no code (planning, triage). If the
-  task named an intended branch, you were told which one in the dispatch
-  preamble — create or check it out yourself.
-- `propose` to record follow-up work you noticed; `--from "$VORO_TASK_ID"` links
-  it back to this task (`voro` reads no environment on its own — pass the id, as
-  every verb here does).
-
-`VORO_TASK_ID` and `VORO_DB` are already in your environment — do not set them.
-```
-
-`ask` moves the task to `needs-input`, `resume` back to `running`, `done` to
-`review`, and `propose` files a `proposed` task discovered-from this one. See
-DESIGN.md §8 for why the surface is this small.
+Dispatch also exports `VORO_TASK_ID` and `VORO_DB` onto the spawned process.
+`voro` itself reads neither; they exist for the hooks below, which run as
+subprocesses of the session and use them to address the right task.
 
 ## Session verbs: attachable dispatch
 
@@ -447,17 +414,16 @@ argument.
 Two things make this safe to leave installed:
 
 - **Guard on `VORO_TASK_ID`.** Only a dispatched session has it set. Without the
-  guard, these hooks in a user-level `~/.claude/settings.json` would fire
-  `voro done` at the end of *every* ordinary interactive session. The guard makes
-  them inert outside dispatch, so they are safe at any settings scope; putting
-  them in the dispatched project's `.claude/settings.json` narrows them further.
+  guard, these hooks in `~/.claude/settings.json` would fire `voro done` at the
+  end of *every* ordinary interactive session. The guard makes them inert
+  outside dispatch, so one user-level installation covers every project.
 - **Swallow the exit code.** A rejected transition exits non-zero; `|| true`
   keeps Claude Code from surfacing it to the operator as a failed hook.
 
 Both fallbacks are fiddly enough to inline that they get a small wrapper script on
 your `PATH` instead.
 
-`.claude/settings.json`:
+`~/.claude/settings.json`:
 
 ```json
 {

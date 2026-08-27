@@ -2174,9 +2174,9 @@ corrupt each other whichever lands first: a hook's late `done` on a
 reconciled task completes it `stalled → review`, the same place the other
 order reaches. There is deliberately no failure hook: a crash or usage-cap
 `SIGKILL` bypasses `SessionEnd`, so hard failure stays with the reconciler by
-design. The concrete hooks, wrapper scripts, and sample `.claude/settings.json`
-— with the `CLAUDE.md`/`AGENTS.md` return-path snippet — are per-agent glue,
-not core, and live in [`agent-integration.md`](agent-integration.md).
+design. The concrete hooks, wrapper scripts, and sample user-level
+`settings.json` are per-agent glue, not core, and live in
+[`agent-integration.md`](agent-integration.md).
 
 Dispatch runs in the **task's resolved repo** (§3/§5) — its own repo when it
 names one, the project's default otherwise — which must be a git repository;
