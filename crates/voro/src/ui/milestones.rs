@@ -9,7 +9,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use voro_core::Task;
 
-use super::{HitMap, KeySection, SELECTED, draw_status, status_height, task_ref};
+use super::status::{KeySection, draw_status, status_height};
+use super::{HitMap, SELECTED, task_ref};
 use crate::app::App;
 
 /// The widest a milestone title runs in a row's label before its ellipsis.
