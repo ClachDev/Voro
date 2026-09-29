@@ -190,7 +190,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // A config that fails to load is reported by the verb that needs it.
         if let Ok(config) = voro_core::AgentsConfig::load(&ctx.agents_path) {
             for warning in config.warnings() {
-                eprintln!("voro: {warning}");
+                eprintln!("{warning}");
             }
         }
         match cli::run(&mut store, verb_args, &ctx) {

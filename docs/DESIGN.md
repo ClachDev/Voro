@@ -560,13 +560,13 @@ may be a project with no task to name (§8).
 The file also carries `max_running`, the dispatch WIP cap (§7): operator
 preference about how the tool behaves, not state about a task. It is optional
 and validated at load, since a negative cap would produce a nonsense queue
-rather than an obvious error. A `[costs]` table left over from the attention
-price (§7) still loads. Its contents are never read; every CLI verb prints one
-warning naming it as ignored, and the TUI shows the same warning on its
-startup status line and on the Config screen. Because the file carries app options and not just agents,
-it is named `voro.toml`. A missing file is not an error; the built-ins alone
-are a working config, so a fresh install with `claude` and an editor on PATH
-both dispatches and reviews without any TOML.
+rather than an obvious error. A `[costs]` table loads, but its contents are
+never read, since the queue carries no attention price (§7); every CLI verb
+prints one warning naming it as ignored, and the TUI shows the same warning on
+its startup status line and on the Config screen. Because the file carries app
+options and not just agents, it is named `voro.toml`. A missing file is not an
+error; the built-ins alone are a working config, so a fresh install with
+`claude` and an editor on PATH both dispatches and reviews without any TOML.
 
 `voro agent list` shows the effective set with each agent's provenance —
 built-in, user, or user-override — names the optional verbs each agent
@@ -796,7 +796,7 @@ enforces this: `ask` on a human task is refused, `complete` lands in `done`, and
 dispatch and redispatch both refuse to open an agent session on one — the same
 shape as dispatch's refusal of a non-git checkout, an error saying why rather
 than a silent skip. Setting an agent override on a human task (or flagging human
-a task that carries one) is refused too, since the override exists only to pick
+a task that carries one) is also refused, since the override exists only to pick
 a dispatch agent. To keep the unreachability total, a task currently sitting in
 `needs-input` or `review`, or one with an agent session still open, cannot be
 flagged human as it stands — such a task is demonstrably agent-executed;
@@ -997,18 +997,16 @@ be handed, and the dispatch default. `stalled` is deliberately excluded from
 `next`: an agent asking for fresh work should not be handed a stall that needs
 redispatching with its prior session's context.
 
-**No attention price.** The queue once divided each row's score by a per-action
-cost — 0.8 for *answer* and *triage*, 1.0 for *dispatch*, 1.4 for a review,
-1.8 for *do* — on the theory that a cheap decision should outrank an expensive
-review of the same worth. The operator removed it on 2026-09-29, after
-running with every cost at 1.0. On the real store the 1.8 on *do*
-exceeded the ratio between adjacent priority bands (P1 against P2 is 14.0
-against 8.0, 1.75), so a human P1 ranked below every dispatchable P2 of its
-project: the three ready P1 tasks sat 47th, 48th and 75th, and a P1 that
-`voro next` returned was missing from the inbox. The queue ranks by the raw
-score, so `voro next` and the first ready row of the queue name the same task,
-milestones aside (`next` never hands one out). `explain` and the TUI's score
-decomposition end at the total.
+**No attention price.** The queue ranks every row by its raw score, with no
+per-action cost dividing it, because a cost wider than the ratio between
+adjacent priority bands ranks a human P1 below every dispatchable P2 of its
+project. `voro next` and the first ready row of the queue name the same task,
+milestones aside (`next` never hands one out), under two further conditions.
+The dispatch WIP cap must not be reached: at the cap the queue drops its
+dispatch rows while `next` ignores the gate. And a ready row must make the
+ten-row cut: when ten attention rows outscore every ready task, the queue shows
+no ready row at all. `explain` and the TUI's score decomposition end at the
+total.
 
 **Ties at the cut.** The age cap produces exact ties in bulk: every P2 in a
 weight-3 project reaches 3 × 2 + 2 = 8.00 after twenty days, and the real store
@@ -1844,10 +1842,10 @@ librarianship: there is no documents screen, and a document's own row remains
 `{docs}`. A task with a milestone renders a block naming each nearest
 milestone by id and title, and one sentence: a follow-up the agent proposes
 takes `--blocks <id>` only if the milestone cannot pass without it. A task
-with none renders nothing, so its prompt is byte-for-byte what it was before
-milestones existed. `propose` accepts `--blocks` as `add` does, which is how a
-follow-up joins a milestone; the sentence keeps it from joining one that can
-pass without it, since every member grows the count of open work.
+with none renders nothing, so its prompt carries no milestone text.
+`propose` accepts `--blocks` as `add` does, which is how a follow-up joins a
+milestone; the sentence keeps it from joining one that can pass without it,
+since every member grows the count of open work.
 
 **Branch names** flow through dispatch in both directions, and Voro runs no git
 in either — it only passes a name in and records one back. A task carries an
@@ -2246,7 +2244,7 @@ priority, agent, `human` and blockers at creation time. On the Milestones tab
 (§9) the three keys file a milestone instead of a task. The quick propose and
 the planning session keep their machinery and swap the body guidance: the
 agent files with `voro add --milestone`, keeps the title to four words or
-fewer because it fills the cockpit's 16-character column, and writes the body
+fewer because it is a label cut to 16 characters, and writes the body
 as the acceptance statement, what the operator will watch happen in measurable
 terms. The planning session also runs `voro milestones` first, so the
 operator hears about a milestone that already covers the outcome. The form
@@ -2457,18 +2455,17 @@ at `n`. The tab may later merge into the browser or the projects screen, so
 its list and its keys live in their own modules (`app/milestones.rs`,
 `ui/milestones.rs`) and bind nothing on any other screen.
 
-The cockpit gains a label and nothing else. A queue row whose task belongs to a
-milestone ends with that milestone's title, cut to 16 characters with an
-ellipsis, flush against the pane's right edge and two spaces clear of what
-precedes it; a task with several shows the first and `+N`. The task's title
-gives way to the label and ends in an ellipsis when it must, while its badges
-stay directly after it. A pane too narrow to keep 20 columns of title beside
-the label drops the label from that row. A row with no milestone reserves
-nothing and reads as it did before milestones existed. Widths count display
-columns, not bytes. The running strip and the proposals under a folded-open
-digest place the label the same way. A milestone reaches
-the queue only once it is ready (§3), as an ordinary *do* row whose
-transition menu is the tab's.
+The cockpit shows milestones as a label and nothing else. A queue row whose
+task belongs to a milestone ends with that milestone's title, cut to 16
+characters with an ellipsis, flush against the pane's right edge and two spaces
+clear of what precedes it; a task with several shows the first and `+N`. The
+task's title gives way to the label and ends in an ellipsis when it must, while
+its badges stay directly after it. A pane too narrow to keep 20 columns of
+title beside the label drops the label from that row. A row with no milestone
+reserves no width for one. Widths count display columns, not bytes. The running
+strip and the proposals under a folded-open digest place the label the same
+way. A milestone reaches the queue only once it is ready (§3), as an ordinary
+*do* row whose transition menu is the tab's.
 
 `M` in the task browser groups it by milestone. Each milestone heads a fold
 showing its title and the tab's counts; folds start closed, and ⏎ on one opens
