@@ -1,6 +1,9 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub(crate) mod milestones;
+mod tree;
+
+pub(crate) use tree::blocks_edges;
 
 pub use crate::dispatch::Filing;
 use crate::ui::Hit;
@@ -149,12 +152,29 @@ pub enum CockpitRow {
 
 /// One row of the task browser. Ungrouped, every row is a task; grouped by
 /// milestone (DESIGN.md §9), each milestone heads a fold of its members and a
-/// final `None` fold holds the unattached tasks.
+/// final `None` fold holds the unattached tasks. In the tree arrangement every
+/// row is a [`BrowserRow::Node`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserRow {
     Group(Option<i64>),
     /// An index into `App::all`.
     Task(usize),
+    /// An index into `App::tree_rows`, and the row's task as an index into
+    /// `App::all`.
+    Node {
+        row: usize,
+        task: usize,
+    },
+}
+
+impl BrowserRow {
+    /// The row's task as an index into `App::all`; `None` on a fold header.
+    pub fn task_index(&self) -> Option<usize> {
+        match self {
+            BrowserRow::Task(i) | BrowserRow::Node { task: i, .. } => Some(*i),
+            BrowserRow::Group(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -705,6 +725,13 @@ pub struct App {
     /// open; `None` is the unattached fold. Both held across refreshes.
     pub browse_by_milestone: bool,
     pub open_groups: std::collections::HashSet<Option<i64>>,
+    /// Whether the task browser shows the blocker tree (`t`), and which of
+    /// its folds are open, by the task heading each. Both held across
+    /// refreshes; the tree and milestone grouping exclude each other.
+    pub browse_tree: bool,
+    pub open_folds: std::collections::HashSet<i64>,
+    /// The browser's blocker tree with every fold open, rebuilt per refresh.
+    pub tree_rows: Vec<voro_core::TreeRow>,
     /// The task browser's rows, which `tasks_sel` counts in.
     pub browser_rows: Vec<BrowserRow>,
 
@@ -770,7 +797,7 @@ pub struct App {
 }
 
 /// Browser grouping: attention states first, closed last.
-fn browse_order(state: TaskState) -> u8 {
+pub(crate) fn browse_order(state: TaskState) -> u8 {
     match state {
         TaskState::Proposed => 0,
         TaskState::Refining => 1,
@@ -830,6 +857,9 @@ impl App {
             milestones_sel: 0,
             browse_by_milestone: false,
             open_groups: std::collections::HashSet::new(),
+            browse_tree: false,
+            open_folds: std::collections::HashSet::new(),
+            tree_rows: Vec::new(),
             browser_rows: Vec::new(),
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
@@ -997,6 +1027,7 @@ impl App {
             .collect();
         self.last_sessions = self.store.latest_sessions()?;
         self.all = all;
+        self.tree_rows = self.build_tree();
         self.load_milestones()?;
         self.running = self.store.running_rows()?;
         self.counts = self.store.state_counts()?;
@@ -1251,10 +1282,10 @@ impl App {
                 CockpitRow::Proposal(i, j) => Some(self.digest_child(*i, *j)?.candidate.task.id),
                 CockpitRow::Running(i) => Some(self.running.get(*i)?.task_id),
             },
-            Screen::Tasks => match self.browser_rows.get(self.tasks_sel)? {
-                BrowserRow::Task(i) => Some(self.all.get(*i)?.task.id),
-                BrowserRow::Group(_) => None,
-            },
+            Screen::Tasks => {
+                let i = self.browser_rows.get(self.tasks_sel)?.task_index()?;
+                Some(self.all.get(i)?.task.id)
+            }
             Screen::Milestones => Some(self.milestones.get(self.milestones_sel)?.milestone.id),
             Screen::Projects | Screen::Config => None,
         }
@@ -1709,7 +1740,7 @@ impl App {
             Screen::Tasks => match self.browser_rows.get(self.tasks_sel)? {
                 BrowserRow::Group(group) if self.open_groups.contains(group) => Some("⏎ collapse"),
                 BrowserRow::Group(_) => Some("⏎ expand"),
-                BrowserRow::Task(_) => Some("⏎ view"),
+                BrowserRow::Task(_) | BrowserRow::Node { .. } => Some("⏎ view"),
             },
             Screen::Milestones => {
                 self.milestones
@@ -2071,6 +2102,8 @@ impl App {
             // `M` is not a variant of `m`: grouping the browser and attaching
             // a task merely share a letter (DESIGN.md §9).
             KeyCode::Char('M') if self.screen == Screen::Tasks => self.toggle_browse_by_milestone(),
+            KeyCode::Char('t') if self.screen == Screen::Tasks => self.toggle_browse_tree(),
+            KeyCode::Char(' ') if self.screen == Screen::Tasks => self.toggle_selected_fold(),
             // `C` is not a variant of `c` — cancelling a refine and linking a
             // document merely share a letter, so they keep their own slots
             // (DESIGN.md §9).

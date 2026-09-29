@@ -16,6 +16,7 @@ use crate::app::{
 };
 
 mod milestones;
+mod tree;
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
@@ -1562,16 +1563,28 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     ])
     .areas(frame.area());
 
-    let indent = if app.browse_by_milestone { "  " } else { "" };
     let items: Vec<ListItem> = app
         .browser_rows
         .iter()
         .map(|row| {
-            let r = match row {
+            let (r, node) = match row {
                 BrowserRow::Group(group) => {
                     return ListItem::new(milestones::group_line(app, *group));
                 }
-                BrowserRow::Task(i) => &app.all[*i],
+                BrowserRow::Task(i) => (&app.all[*i], None),
+                BrowserRow::Node { row, task } => {
+                    let node = &app.tree_rows[*row];
+                    let r = &app.all[*task];
+                    if node.reference {
+                        return ListItem::new(tree::reference_line(node, r));
+                    }
+                    (r, Some(node))
+                }
+            };
+            let indent = match node {
+                Some(node) => tree::prefix(app, node),
+                None if app.browse_by_milestone => "  ".to_string(),
+                None => String::new(),
             };
             let closed = r.task.state.is_terminal();
             let style = if closed || r.weight == 0 {
@@ -1610,6 +1623,9 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             if app.incomplete_report.contains(&r.task.id) {
                 spans.push(incomplete_report_span());
             }
+            if let Some(node) = node {
+                spans.extend(tree::suffix(app, node, r));
+            }
             spans.extend(blocker_spans(r));
             ListItem::new(Line::from(spans))
         })
@@ -1619,6 +1635,8 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
         ListState::default().with_selected(if empty { None } else { Some(app.tasks_sel) });
     let title = if app.browse_by_milestone {
         "All tasks — by milestone"
+    } else if app.browse_tree {
+        "All tasks — by blockers"
     } else {
         "All tasks"
     };
@@ -2360,6 +2378,8 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
                     vec![
                         ("j/k", "move the selection"),
                         ("M", "group by milestone"),
+                        ("t", "tree by blockers"),
+                        ("space", "toggle a tree fold"),
                         ("ctrl-r", "refresh"),
                         ("?", "this key map"),
                         ("q", "quit"),

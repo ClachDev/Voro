@@ -17,6 +17,7 @@ pub mod seed;
 mod store;
 mod template;
 mod transition;
+mod tree;
 
 pub use agent::{
     AgentSessionEntry, AgentTemplate, AgentsConfig, BUILTIN_VIEWER_NAMES, Launch, LaunchSpec,
@@ -48,6 +49,7 @@ pub use scheduler::{
 pub use store::{NewTask, Store, TaskEdit};
 pub use template::{render, shell_quote};
 pub use transition::{Action, Triage};
+pub use tree::{TreeRow, blocker_tree, blocks_tree};
 
 #[cfg(test)]
 mod tests {
