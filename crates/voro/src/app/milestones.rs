@@ -4,19 +4,20 @@
 //! into another as a unit.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use voro_core::{DepKind, MilestoneMembers, Priority, Task, TaskState};
+use voro_core::{DepKind, MilestoneMembers, Task, TaskState};
 
-use super::{App, BrowserRow, CreateFlow, Mode, transition_actions};
+use super::{App, BrowserRow, CreateFlow, Filing, Mode, transition_actions};
 
 /// The tab's order: ready first, since a ready milestone is the operator's
-/// move, then parked, then closed.
+/// move, then proposed ones awaiting a verdict, then parked, then closed.
 fn tab_order(state: TaskState) -> u8 {
     match state {
         TaskState::Ready => 0,
-        TaskState::Parked => 1,
-        TaskState::Done => 3,
-        TaskState::Rejected => 4,
-        _ => 2,
+        TaskState::Proposed => 1,
+        TaskState::Parked => 2,
+        TaskState::Done => 4,
+        TaskState::Rejected => 5,
+        _ => 3,
     }
 }
 
@@ -160,89 +161,59 @@ impl App {
     }
 
     /// The Milestones tab's keys (DESIGN.md §9). Movement, `?` and the screen
-    /// keys are `key_normal`'s.
+    /// keys are `key_normal`'s. The create keys are the other screens' three,
+    /// filing a milestone; ⏎ on a proposed milestone opens the triage menu, as
+    /// it does on a proposal in the queue.
     pub(super) fn key_milestones(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('r') if ctrl => {
                 let result = self.refresh();
                 self.report(result);
             }
-            KeyCode::Enter => self.open_milestone_browser(),
-            KeyCode::Char('n') => {
-                self.mode = Mode::MilestoneTitle {
-                    buffer: String::new(),
-                };
+            KeyCode::Enter => {
+                let proposed = self
+                    .milestones
+                    .get(self.milestones_sel)
+                    .is_some_and(|m| m.milestone.state == TaskState::Proposed);
+                if proposed {
+                    self.open_milestone_menu();
+                } else {
+                    self.open_milestone_browser();
+                }
             }
+            KeyCode::Char('n') if ctrl => self.new_task(CreateFlow::Editor(Filing::Milestone)),
+            KeyCode::Char('n') => self.new_task(CreateFlow::Quick(Filing::Milestone)),
+            KeyCode::Char('N') => self.new_task(CreateFlow::Plan(Filing::Milestone)),
             KeyCode::Char('e') => {
                 if let Some(task_id) = self.selected_task_id() {
                     self.pending_editor = Some(super::EditorRequest::Edit { task_id });
                 }
             }
-            KeyCode::Char('s') => {
-                let Some(m) = self.milestones.get(self.milestones_sel) else {
-                    return;
-                };
-                let actions = transition_actions(&m.milestone);
-                if actions.is_empty() {
-                    self.status = Some(format!(
-                        "milestone is {} — nowhere to go",
-                        m.milestone.state
-                    ));
-                } else {
-                    self.mode = Mode::Transition {
-                        task_id: m.milestone.id,
-                        actions,
-                        sel: 0,
-                    };
-                }
-            }
+            KeyCode::Char('s') => self.open_milestone_menu(),
             _ => {}
         }
     }
 
-    /// The one-line title `n` collects on the tab; ⏎ hands it to the create
-    /// keys' project picker, which skips itself when one project can take it.
-    pub(super) fn key_milestone_title(&mut self, key: KeyEvent, mut buffer: String) {
-        match key.code {
-            KeyCode::Esc => return,
-            KeyCode::Enter => {
-                let title = buffer.trim();
-                if !title.is_empty() {
-                    self.new_task(CreateFlow::Milestone(title.to_string()));
-                }
-                return;
-            }
-            KeyCode::Backspace => {
-                buffer.pop();
-            }
-            KeyCode::Char(c) => buffer.push(c),
-            _ => {}
-        }
-        self.mode = Mode::MilestoneTitle { buffer };
-    }
-
-    /// Create a milestone, parked (DESIGN.md §3), and put the tab's cursor on
-    /// it.
-    pub(super) fn create_milestone(&mut self, project_id: i64, title: &str) {
-        let result = self
-            .store
-            .create_milestone(project_id, title, "", Priority::P2);
-        let Some(milestone) = self.report(result) else {
+    /// The selected milestone's transition menu: triage on a proposal, done or
+    /// abandon once triaged.
+    fn open_milestone_menu(&mut self) {
+        let Some(m) = self.milestones.get(self.milestones_sel) else {
             return;
         };
-        let result = self.refresh();
-        self.report(result);
-        if let Some(i) = self
-            .milestones
-            .iter()
-            .position(|m| m.milestone.id == milestone.id)
-        {
-            self.milestones_sel = i;
+        let actions = transition_actions(&m.milestone);
+        if actions.is_empty() {
+            self.status = Some(format!(
+                "milestone is {} — nowhere to go",
+                m.milestone.state
+            ));
+        } else {
+            self.mode = Mode::Transition {
+                task_id: m.milestone.id,
+                actions,
+                sel: 0,
+            };
         }
-        self.status = Some(format!(
-            "milestone #{} created parked — m on a task attaches it",
-            milestone.id
-        ));
     }
 
     /// The transition menu's done on a ready milestone.
@@ -353,7 +324,7 @@ impl App {
 pub(crate) mod tests {
     use super::*;
     use crate::app::Screen;
-    use voro_core::{Action, NewTask, Store};
+    use voro_core::{Action, NewTask, Priority, Store};
 
     fn key(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::from(code));
@@ -361,12 +332,6 @@ pub(crate) mod tests {
 
     fn alt_key(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::new(code, KeyModifiers::ALT));
-    }
-
-    fn type_str(app: &mut App, text: &str) {
-        for c in text.chars() {
-            key(app, KeyCode::Char(c));
-        }
     }
 
     pub(crate) fn app_from(store: Store) -> App {
@@ -399,6 +364,7 @@ pub(crate) mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap()
             .id
@@ -409,7 +375,7 @@ pub(crate) mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let p = store.create_project("voro", "/tmp/voro").unwrap().id;
         let m = store
-            .create_milestone(p, "Carpet crossing", "", Priority::P2)
+            .create_milestone(p, "Carpet crossing", "", Priority::P2, TaskState::Parked)
             .unwrap()
             .id;
         let t = new_task(&mut store, p, "tune traction", TaskState::Ready);
@@ -442,13 +408,15 @@ pub(crate) mod tests {
     fn the_tab_orders_ready_then_parked_then_closed() {
         let mut store = Store::open_in_memory().unwrap();
         let p = store.create_project("voro", "/tmp/voro").unwrap().id;
-        let gone = store.create_milestone(p, "gone", "", Priority::P2).unwrap();
+        let gone = store
+            .create_milestone(p, "gone", "", Priority::P2, TaskState::Parked)
+            .unwrap();
         store.apply(gone.id, Action::Abandon).unwrap();
         let parked = store
-            .create_milestone(p, "parked", "", Priority::P2)
+            .create_milestone(p, "parked", "", Priority::P2, TaskState::Parked)
             .unwrap();
         let ready = store
-            .create_milestone(p, "ready", "", Priority::P2)
+            .create_milestone(p, "ready", "", Priority::P2, TaskState::Parked)
             .unwrap();
         store.apply(ready.id, Action::Unpark).unwrap();
         let app = app_from(store);
@@ -457,35 +425,92 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn n_creates_a_parked_milestone_absent_from_the_queue() {
+    fn the_create_keys_file_a_milestone_through_the_ordinary_flows() {
         let mut app = seeded();
         alt_key(&mut app, KeyCode::Char('5'));
         assert_eq!(app.screen, Screen::Milestones);
-        key(&mut app, KeyCode::Char('n'));
-        type_str(&mut app, "Dock handover");
-        key(&mut app, KeyCode::Enter);
-        assert!(
-            matches!(
-                app.mode,
-                Mode::PickProject {
-                    flow: CreateFlow::Milestone(_),
-                    ..
-                }
+        for (code, modifiers, flow) in [
+            (
+                KeyCode::Char('n'),
+                KeyModifiers::NONE,
+                CreateFlow::Quick(Filing::Milestone),
             ),
-            "several projects, so the picker asks which"
+            (
+                KeyCode::Char('N'),
+                KeyModifiers::SHIFT,
+                CreateFlow::Plan(Filing::Milestone),
+            ),
+            (
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                CreateFlow::Editor(Filing::Milestone),
+            ),
+        ] {
+            app.on_key(KeyEvent::new(code, modifiers));
+            assert!(
+                matches!(app.mode, Mode::PickProject { flow: f, .. } if f == flow),
+                "several projects, so the picker asks which: {flow:?}"
+            );
+            key(&mut app, KeyCode::Esc);
+        }
+        let before = app.store.tasks().unwrap().len();
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            app.pending_editor,
+            Some(crate::app::EditorRequest::Create {
+                filing: Filing::Milestone,
+                ..
+            })
+        ));
+        assert_eq!(app.store.tasks().unwrap().len(), before, "no row yet");
+    }
+
+    #[test]
+    fn enter_on_a_proposed_milestone_opens_triage_and_ready_queues_it() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap().id;
+        let m = store
+            .create_milestone(p, "Dock", "", Priority::P2, TaskState::Proposed)
+            .unwrap()
+            .id;
+        let mut app = app_from(store);
+        alt_key(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.selected_task_id(), Some(m));
+        assert_eq!(app.enter_hint(), Some("⏎ triage"));
+        key(&mut app, KeyCode::Enter);
+        let Mode::Transition { actions, .. } = &app.mode else {
+            panic!("⏎ opens the triage menu");
+        };
+        assert_eq!(
+            actions,
+            &Store::legal_actions(TaskState::Proposed, true),
+            "the verdicts a proposal gets"
         );
         key(&mut app, KeyCode::Enter);
-        let created = app
-            .milestones
+        assert_eq!(app.store.task(m).unwrap().state, TaskState::Ready);
+        assert!(app.queue_task_ids().contains(&m));
+    }
+
+    #[test]
+    fn refine_is_refused_on_a_milestone() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap().id;
+        let m = store
+            .create_milestone(p, "Dock", "", Priority::P2, TaskState::Proposed)
+            .unwrap()
+            .id;
+        let mut app = app_from(store);
+        alt_key(&mut app, KeyCode::Char('2'));
+        app.tasks_sel = app
+            .browser_rows
             .iter()
-            .map(|m| &m.milestone)
-            .find(|t| t.title == "Dock handover")
-            .expect("created")
-            .clone();
-        assert_eq!(created.state, TaskState::Parked);
-        assert!(created.milestone && created.human);
-        assert!(!app.queue_task_ids().contains(&created.id));
-        assert_eq!(app.selected_task_id(), Some(created.id));
+            .position(|r| matches!(r, BrowserRow::Task(i) if app.all[*i].task.id == m))
+            .unwrap();
+        key(&mut app, KeyCode::Char('r'));
+        assert!(matches!(app.mode, Mode::Normal));
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(status.contains("acceptance statement"), "{status}");
     }
 
     #[test]
@@ -564,8 +589,14 @@ pub(crate) mod tests {
     fn a_task_with_two_milestones_sits_in_both_folds_and_not_in_unattached() {
         let mut store = Store::open_in_memory().unwrap();
         let p = store.create_project("voro", "/tmp/voro").unwrap().id;
-        let a = store.create_milestone(p, "a", "", Priority::P2).unwrap().id;
-        let b = store.create_milestone(p, "b", "", Priority::P2).unwrap().id;
+        let a = store
+            .create_milestone(p, "a", "", Priority::P2, TaskState::Parked)
+            .unwrap()
+            .id;
+        let b = store
+            .create_milestone(p, "b", "", Priority::P2, TaskState::Parked)
+            .unwrap()
+            .id;
         let shared = new_task(&mut store, p, "shared", TaskState::Ready);
         let loose = new_task(&mut store, p, "loose", TaskState::Ready);
         store.block_tasks(shared, &[a, b]).unwrap();

@@ -264,9 +264,11 @@ pub(super) fn key_map(screens: KeySection) -> Vec<KeySection> {
         (
             "Actions",
             vec![
-                ("⏎", "browse the milestone's tasks"),
-                ("s", "done, or abandon"),
-                ("n", "new milestone, parked"),
+                ("⏎", "browse its tasks, or triage a proposal"),
+                ("s", "triage, done, or abandon"),
+                ("n", "new milestone, proposed headless"),
+                ("N", "new milestone, planned with an agent"),
+                ("ctrl-n", "new milestone, by hand in $EDITOR"),
                 ("e", "edit the milestone's body"),
             ],
         ),
@@ -317,7 +319,13 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let p = store.create_project("voro", "/tmp/voro").unwrap().id;
         let m = store
-            .create_milestone(p, "Carpet crossing under fleet", "", Priority::P2)
+            .create_milestone(
+                p,
+                "Carpet crossing under fleet",
+                "",
+                Priority::P2,
+                TaskState::Parked,
+            )
             .unwrap()
             .id;
         let t = new_task(&mut store, p, LONG_TITLE, TaskState::Ready);
@@ -337,11 +345,11 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let p = store.create_project("voro", "/tmp/voro").unwrap().id;
         let a = store
-            .create_milestone(p, "Dock", "", Priority::P2)
+            .create_milestone(p, "Dock", "", Priority::P2, TaskState::Parked)
             .unwrap()
             .id;
         let b = store
-            .create_milestone(p, "Fleet", "", Priority::P2)
+            .create_milestone(p, "Fleet", "", Priority::P2, TaskState::Parked)
             .unwrap()
             .id;
         let t = new_task(&mut store, p, "shared", TaskState::Ready);
@@ -410,7 +418,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let p = store.create_project("voro", "/tmp/voro").unwrap().id;
         let m = store
-            .create_milestone(p, "Carpet crossing", "", Priority::P2)
+            .create_milestone(p, "Carpet crossing", "", Priority::P2, TaskState::Parked)
             .unwrap()
             .id;
         let proposal = new_task(&mut store, p, "follow-up", TaskState::Proposed);

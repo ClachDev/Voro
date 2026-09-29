@@ -150,4 +150,7 @@ pub enum Error {
          Milestones tab"
     )]
     MilestoneRefused { id: i64 },
+
+    #[error("milestone {id} '{title}' is already open in this project")]
+    MilestoneExists { id: i64, title: String },
 }
