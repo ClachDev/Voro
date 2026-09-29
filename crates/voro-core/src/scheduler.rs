@@ -91,59 +91,7 @@ pub const QUEUE_MAX_ROWS: usize = 10;
 /// (§7). Overridable as `max_running` in `voro.toml`.
 pub const DEFAULT_MAX_RUNNING: i64 = 5;
 
-/// What each next action costs the operator's attention (§7) — the divisor
-/// that turns a raw score into the effective one the queue ranks by. The band
-/// is deliberately narrow, so pricing nudges the order rather than overturning
-/// it: priority still dominates within an action kind.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct AttentionCosts {
-    /// Answering a question: a decision, not a work session.
-    pub answer: f64,
-    /// Triaging a proposal: a minute at most.
-    pub triage: f64,
-    /// Handing a task to an agent. Near-instant, so its real cost is the
-    /// concurrency slot the WIP gate meters rather than this divisor.
-    pub dispatch: f64,
-    /// Reviewing a diff, locally or on a PR: the expensive one.
-    pub review: f64,
-    /// Doing a human-only task by hand: the most expensive of all.
-    pub human_do: f64,
-}
-
-impl Default for AttentionCosts {
-    fn default() -> AttentionCosts {
-        AttentionCosts {
-            answer: 0.8,
-            triage: 0.8,
-            dispatch: 1.0,
-            review: 1.4,
-            human_do: 1.8,
-        }
-    }
-}
-
-impl AttentionCosts {
-    /// The divisor for one next action. `redispatch` prices as `dispatch`
-    /// because it *is* one — the operator's move is the same keypress, and it
-    /// opens the same session; `pr`, `review PR`, and `open` are the same
-    /// review either way, differing only in the medium the diff arrives on
-    /// (§3). `accept` joins them: on a task that produced no code the summary
-    /// *is* the deliverable, so reading it and deciding is that same review.
-    pub fn of(&self, action: NextAction) -> f64 {
-        match action {
-            NextAction::Answer => self.answer,
-            NextAction::Triage => self.triage,
-            NextAction::Dispatch | NextAction::Redispatch => self.dispatch,
-            NextAction::Pr | NextAction::ReviewPr | NextAction::Open | NextAction::Accept => {
-                self.review
-            }
-            NextAction::Do => self.human_do,
-        }
-    }
-}
-
-/// Whether an action starts an agent, and so spends a concurrency slot rather
-/// than only the operator's attention (§7).
+/// Whether an action starts an agent, and so spends a concurrency slot (§7).
 fn opens_a_session(action: NextAction) -> bool {
     matches!(action, NextAction::Dispatch | NextAction::Redispatch)
 }
@@ -162,7 +110,7 @@ impl WipGate {
     }
 }
 
-/// One row of the queue, priced by what it asks of the operator.
+/// One row of the queue.
 // A task row carries a whole `Candidate` and a digest only a summary, so the
 // variants differ in size; boxing would buy an indirection over a list capped
 // at ten rows.
@@ -175,25 +123,37 @@ pub enum QueueRow {
     Digest(DigestRow),
 }
 
-/// A task's row: the candidate, the verb it asks for, and what that verb costs.
+/// A task's row: the candidate and the verb it asks for.
 #[derive(Debug, Clone)]
 pub struct ActionRow {
     pub candidate: Candidate,
     pub action: NextAction,
-    pub cost: f64,
-    /// `score / cost` — what the queue ranks by.
-    pub effective: f64,
 }
 
 /// One project's proposals, collapsed so a triage backlog cannot swamp the
-/// queue with cheap rows (§7). Scored as its best child, so the digest survives
-/// the cut exactly when that child would have.
+/// queue (§7). Scored as its best child, so the digest survives the cut
+/// exactly when that child would have.
 #[derive(Debug, Clone)]
 pub struct DigestRow {
     pub project_name: String,
     /// The constituent proposals, in the order they would have ranked.
     pub tasks: Vec<ActionRow>,
-    pub effective: f64,
+    pub score: f64,
+}
+
+/// The rows the cap cut that score exactly what the last shown row scores
+/// (§7): the queue's order among them carries no information, so the count is
+/// named rather than left for the operator to guess at.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TiedCut {
+    pub count: usize,
+    pub score: f64,
+}
+
+impl std::fmt::Display for TiedCut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "+{} more at {:.1}", self.count, self.score)
+    }
 }
 
 /// The queue as rendered: its rows, plus the dispatch gate's state when it is
@@ -204,13 +164,15 @@ pub struct Queue {
     /// `Some` while dispatch is at capacity, carrying the counts the capacity
     /// line names in place of the suppressed rows.
     pub at_capacity: Option<WipGate>,
+    /// `Some` when the cap cut rows tied with the last one shown.
+    pub tied_cut: Option<TiedCut>,
 }
 
 impl QueueRow {
-    pub fn effective(&self) -> f64 {
+    pub fn score(&self) -> f64 {
         match self {
-            QueueRow::Action(row) => row.effective,
-            QueueRow::Digest(row) => row.effective,
+            QueueRow::Action(row) => row.candidate.score.total,
+            QueueRow::Digest(row) => row.score,
         }
     }
 
@@ -224,17 +186,15 @@ impl QueueRow {
     }
 }
 
-/// The next-action queue (§1): the `QUEUE_MAX_ROWS` highest-*effective*-scoring
-/// next actions, in one list. The cap is uniform — every state competes for the
-/// same slots, so a low-scoring row of any kind can fall below the cut (§7) —
-/// but what competes is the attention price `score / cost(action)`, so a cheap
-/// decision outranks an expensive review of the same raw worth.
+/// The next-action queue (§1): the `QUEUE_MAX_ROWS` highest-scoring next
+/// actions, in one list. The cap is uniform — every state competes for the
+/// same slots, so a low-scoring row of any kind can fall below the cut (§7).
 ///
-/// Two rows are not priced but shaped: dispatch is metered by the WIP gate
-/// rather than a divisor, so at capacity its rows leave the queue entirely; and
-/// proposals collapse into one digest row per project, since at a divisor below
-/// one a large triage backlog would otherwise crowd out everything else.
-pub fn queue(candidates: &[Candidate], costs: &AttentionCosts, gate: WipGate) -> Queue {
+/// Two rows are shaped rather than ranked as they stand: dispatch is metered
+/// by the WIP gate, so at capacity its rows leave the queue entirely; and
+/// proposals collapse into one digest row per project, so a large triage
+/// backlog cannot crowd out everything else.
+pub fn queue(candidates: &[Candidate], gate: WipGate) -> Queue {
     let at_capacity = gate.at_capacity();
     let mut actions: Vec<ActionRow> = Vec::new();
     for candidate in candidates {
@@ -244,27 +204,37 @@ pub fn queue(candidates: &[Candidate], costs: &AttentionCosts, gate: WipGate) ->
         if at_capacity && opens_a_session(action) {
             continue;
         }
-        let cost = costs.of(action);
         actions.push(ActionRow {
-            effective: candidate.score.total / cost,
             candidate: candidate.clone(),
             action,
-            cost,
         });
     }
 
     let mut rows = collapse_proposals(actions);
     rows.sort_by(rank_rows);
+    let tied_cut = tied_cut(&rows);
     rows.truncate(QUEUE_MAX_ROWS);
     Queue {
         rows,
         at_capacity: at_capacity.then_some(gate),
+        tied_cut,
     }
 }
 
+/// How many rows past the cap tie the last row within it, over rows already
+/// in queue order — so the ties are the head of the cut.
+fn tied_cut(rows: &[QueueRow]) -> Option<TiedCut> {
+    let last = rows.get(QUEUE_MAX_ROWS.checked_sub(1)?)?.score();
+    let count = rows[QUEUE_MAX_ROWS..]
+        .iter()
+        .take_while(|row| row.score() == last)
+        .count();
+    (count > 0).then_some(TiedCut { count, score: last })
+}
+
 /// Fold every triage row into one digest per project, leaving the rest as they
-/// are. Each digest takes its best child's effective score, so it competes for
-/// a slot exactly as that child would have.
+/// are. Each digest takes its best child's score, so it competes for a slot
+/// exactly as that child would have.
 fn collapse_proposals(actions: Vec<ActionRow>) -> Vec<QueueRow> {
     let mut by_project: Vec<(String, Vec<ActionRow>)> = Vec::new();
     let mut rows: Vec<QueueRow> = Vec::new();
@@ -281,50 +251,27 @@ fn collapse_proposals(actions: Vec<ActionRow>) -> Vec<QueueRow> {
     }
     rows.extend(by_project.into_iter().map(|(project_name, mut tasks)| {
         tasks.sort_by(|a, b| rank(&a.candidate, &b.candidate));
-        let effective = tasks
+        let score = tasks
             .iter()
-            .map(|row| row.effective)
+            .map(|row| row.candidate.score.total)
             .fold(f64::NEG_INFINITY, f64::max);
         QueueRow::Digest(DigestRow {
             project_name,
             tasks,
-            effective,
+            score,
         })
     }));
     rows
 }
 
-/// Total order for the queue: effective score desc, then the same tie-break
-/// chain the raw score uses (§6/§7). A digest breaks ties on its best child, so
-/// it sits exactly where that child would have.
+/// Total order for the queue: the same chain `rank` applies to tasks (§6/§7).
+/// A digest ranks as its best child, so it sits exactly where that child would
+/// have.
 fn rank_rows(a: &QueueRow, b: &QueueRow) -> std::cmp::Ordering {
-    b.effective().total_cmp(&a.effective()).then_with(|| {
-        match (a.ranking_candidate(), b.ranking_candidate()) {
-            (Some(a), Some(b)) => rank(a, b),
-            (a, b) => a.is_none().cmp(&b.is_none()),
-        }
-    })
-}
-
-/// What a task's raw score becomes once priced by its next action (§7) — the
-/// division `explain` and the TUI decomposition show beside the total.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct EffectiveScore {
-    pub action: NextAction,
-    pub cost: f64,
-    pub effective: f64,
-}
-
-/// The attention price of one task, or `None` for a state that asks nothing of
-/// the operator and so never renders a queue row (§3).
-pub fn effective_score(task: &Task, total: f64, costs: &AttentionCosts) -> Option<EffectiveScore> {
-    let action = task.next_action()?;
-    let cost = costs.of(action);
-    Some(EffectiveScore {
-        action,
-        cost,
-        effective: total / cost,
-    })
+    match (a.ranking_candidate(), b.ranking_candidate()) {
+        (Some(a), Some(b)) => rank(a, b),
+        (a, b) => a.is_none().cmp(&b.is_none()),
+    }
 }
 
 /// The single highest-scoring `ready` task — what `voro next` hands an agent
@@ -586,7 +533,7 @@ mod tests {
 
     // --- ordering over a real store ---
 
-    /// The gate with nothing in flight — the ordering tests are about pricing,
+    /// The gate with nothing in flight — the ordering tests are about ranking,
     /// not capacity, so they run with room to dispatch.
     fn open_gate() -> WipGate {
         WipGate {
@@ -596,11 +543,7 @@ mod tests {
     }
 
     fn default_queue(s: &Store) -> Queue {
-        queue(
-            &s.candidates().unwrap(),
-            &AttentionCosts::default(),
-            open_gate(),
-        )
+        queue(&s.candidates().unwrap(), open_gate())
     }
 
     /// Each row in order: a task row as its id, a digest as its project and
@@ -716,30 +659,25 @@ mod tests {
     }
 
     #[test]
-    fn queue_interleaves_every_actionable_state_by_attention_price() {
+    fn queue_interleaves_every_actionable_state_by_score() {
         let mut s = setup();
         let a = add_project(&mut s, "a", 3);
         let b = add_project(&mut s, "b", 1);
 
-        let question = add_task(&mut s, a, "question", Priority::P2); // 18 ÷0.8 = 22.5
+        let question = add_task(&mut s, a, "question", Priority::P2); // 3×(2+4) = 18
         to_needs_input(&mut s, question);
-        let diff = add_task(&mut s, a, "diff", Priority::P0); // 30 ÷1.4 = 21.4
+        let diff = add_task(&mut s, a, "diff", Priority::P0); // 3×(8+2) = 30
         to_review(&mut s, diff);
-        let small = add_task(&mut s, b, "small question", Priority::P3); // 5 ÷0.8 = 6.25
+        let small = add_task(&mut s, b, "small question", Priority::P3); // 1×(1+4) = 5
         to_needs_input(&mut s, small);
-        let ready = add_task(&mut s, a, "ready task", Priority::P1); // 12 ÷1.0 = 12
-        add_proposed(&mut s, a, "proposal", Priority::P2); // 6 ÷0.8 = 7.5, digested
+        let ready = add_task(&mut s, a, "ready task", Priority::P1); // 3×4 = 12
+        add_proposed(&mut s, a, "proposal", Priority::P2); // 3×2 = 6, digested
 
-        let rows = labels(&default_queue(&s));
-        // The P0 review leads on raw score (30 against the question's 18) and
-        // still loses the top row: 15–60 minutes of attention against a
-        // decision. Priority keeps its grip inside each kind — the P2 question
-        // is far above the P3 one — and the proposals ride as one digest row.
         assert_eq!(
-            rows,
+            labels(&default_queue(&s)),
             vec![
-                format!("#{question}"),
                 format!("#{diff}"),
+                format!("#{question}"),
                 format!("#{ready}"),
                 "▲1 a".to_string(),
                 format!("#{small}"),
@@ -747,58 +685,10 @@ mod tests {
         );
     }
 
-    /// Reading a diff costs the same whatever medium it arrives on, so a row
-    /// whose `pr` degraded to `open` (DESIGN.md §8) keeps its place in the
-    /// queue — the advertisement changed, not the price.
-    #[test]
-    fn the_local_review_path_prices_as_a_review() {
-        let costs = AttentionCosts::default();
-        assert_eq!(costs.of(NextAction::Open), costs.of(NextAction::Pr));
-        // and so does a report with no diff at all (DESIGN.md §6): reading what
-        // came back and deciding on it is the same operator move
-        assert_eq!(costs.of(NextAction::Accept), costs.of(NextAction::Pr));
-    }
-
-    #[test]
-    fn the_cost_band_stays_a_nudge_not_a_re_ranking() {
-        // The worked example from DESIGN.md §7: within one project and one
-        // weight, a P2 review (8.4 ÷1.4 = 6.0) ranks below a P2 triage digest
-        // (8.4 ÷0.8 = 10.5) but above a P3 one (4.2 ÷0.8 = 5.25) — priority
-        // still dominates the action kind.
-        let mut s = setup();
-        let p = add_project(&mut s, "p", 4);
-        let other = add_project(&mut s, "other", 4);
-        let diff = add_task(&mut s, p, "diff", Priority::P2); // 4×(2+2) = 16 ÷1.4 = 11.4
-        to_review(&mut s, diff);
-        add_proposed(&mut s, p, "close idea", Priority::P2); // 4×2 = 8 ÷0.8 = 10
-        add_proposed(&mut s, other, "distant idea", Priority::P3); // 4×1 = 4 ÷0.8 = 5
-
-        assert_eq!(
-            labels(&default_queue(&s)),
-            vec![
-                format!("#{diff}"),
-                "▲1 p".to_string(),
-                "▲1 other".to_string()
-            ]
-        );
-
-        // A P1 review (4×(4+2) = 24 ÷1.4 = 17.1) still beats the P2 digest —
-        // one priority level is worth more than the whole cost band.
-        let urgent = add_task(&mut s, p, "urgent diff", Priority::P1);
-        to_review(&mut s, urgent);
-        assert_eq!(labels(&default_queue(&s))[0], format!("#{urgent}"));
-    }
-
-    #[test]
-    fn a_human_task_is_priced_above_a_dispatch_of_the_same_worth() {
-        // `do` is the most expensive row there is: the operator executes it
-        // personally, where a dispatch is a keypress (§7).
-        let mut s = setup();
-        let p = add_project(&mut s, "p", 3);
-        let by_hand = add_task(&mut s, p, "solder the harness", Priority::P1);
-        let existing = s.task(by_hand).unwrap();
+    fn make_human(s: &mut Store, id: i64) {
+        let existing = s.task(id).unwrap();
         s.update_task(
-            by_hand,
+            id,
             crate::TaskEdit {
                 title: existing.title.clone(),
                 body: existing.body.clone(),
@@ -809,22 +699,76 @@ mod tests {
             },
         )
         .unwrap();
-        let dispatchable = add_task(&mut s, p, "write the driver", Priority::P1);
+    }
 
-        // Identical raw score (3×4 = 12); the divisors split them 6.67 to 12.
+    /// The first ready row of the queue, skipping milestones as `focus` does.
+    fn first_ready(q: &Queue) -> Option<i64> {
+        q.rows.iter().find_map(|row| match row {
+            QueueRow::Action(row)
+                if row.candidate.task.state == TaskState::Ready
+                    && !row.candidate.task.milestone =>
+            {
+                Some(row.candidate.task.id)
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_human_p1_outranks_every_dispatchable_p2_of_its_project() {
+        // Ten P2s at the age cap score 3×2 + 2 = 8; the human P1 scores
+        // 3×4 + 2 = 14 whatever its next action asks of the operator.
+        let mut s = setup();
+        let p = add_project(&mut s, "p", 3);
+        for i in 0..10 {
+            let id = add_task(&mut s, p, &format!("dispatchable {i}"), Priority::P2);
+            set_age_days(&mut s, id, 25.0);
+        }
+        let by_hand = add_task(&mut s, p, "solder the harness", Priority::P1);
+        make_human(&mut s, by_hand);
+        set_age_days(&mut s, by_hand, 25.0);
+
+        let q = default_queue(&s);
+        assert_eq!(first_ready(&q), Some(by_hand));
         assert_eq!(
-            labels(&default_queue(&s)),
-            vec![format!("#{dispatchable}"), format!("#{by_hand}"),]
+            focus(&s.candidates().unwrap()).map(|c| c.task.id),
+            Some(by_hand)
         );
+    }
+
+    #[test]
+    fn next_and_the_first_ready_queue_row_name_the_same_task() {
+        // Attention states lead the queue, but among ready rows its order is
+        // the order `voro next` picks from.
+        let mut s = setup();
+        let heavy = add_project(&mut s, "heavy", 5);
+        let light = add_project(&mut s, "light", 1);
+        let question = add_task(&mut s, heavy, "question", Priority::P1);
+        to_needs_input(&mut s, question);
+        let diff = add_task(&mut s, light, "diff", Priority::P0);
+        to_review(&mut s, diff);
+        for (project, priority) in [
+            (light, Priority::P0),
+            (heavy, Priority::P2),
+            (heavy, Priority::P3),
+        ] {
+            add_task(&mut s, project, "ready", priority);
+        }
+        let by_hand = add_task(&mut s, heavy, "by hand", Priority::P1);
+        make_human(&mut s, by_hand);
+
+        let candidates = s.candidates().unwrap();
+        let q = queue(&candidates, open_gate());
+        assert_eq!(first_ready(&q), focus(&candidates).map(|c| c.task.id));
+        assert_eq!(first_ready(&q), Some(by_hand));
     }
 
     // --- the dispatch WIP gate (§7) ---
 
     #[test]
     fn the_wip_gate_suppresses_dispatch_rows_only_at_the_cap() {
-        // Dispatch is near-instant for the operator, so its true cost is the
-        // concurrency slot, not attention: below the cap it is priced at 1.0
-        // like anything else, and at the cap it leaves the queue entirely.
+        // Dispatch spends a concurrency slot: below the cap it ranks like
+        // anything else, and at the cap it leaves the queue entirely.
         let mut s = setup();
         let p = add_project(&mut s, "p", 3);
         let ready = add_task(&mut s, p, "startable", Priority::P0);
@@ -836,7 +780,6 @@ mod tests {
         let at = |running, max_running| {
             queue(
                 &s.candidates().unwrap(),
-                &AttentionCosts::default(),
                 WipGate {
                     running,
                     max_running,
@@ -875,24 +818,11 @@ mod tests {
         let mut s = setup();
         let p = add_project(&mut s, "p", 3);
         let by_hand = add_task(&mut s, p, "drive to the lab", Priority::P2);
-        let existing = s.task(by_hand).unwrap();
-        s.update_task(
-            by_hand,
-            crate::TaskEdit {
-                title: existing.title.clone(),
-                body: existing.body.clone(),
-                priority: existing.priority,
-                agent: None,
-                human: true,
-                deep: false,
-            },
-        )
-        .unwrap();
+        make_human(&mut s, by_hand);
         add_task(&mut s, p, "dispatchable", Priority::P0);
 
         let q = queue(
             &s.candidates().unwrap(),
-            &AttentionCosts::default(),
             WipGate {
                 running: 9,
                 max_running: 5,
@@ -909,7 +839,6 @@ mod tests {
 
         let q = queue(
             &s.candidates().unwrap(),
-            &AttentionCosts::default(),
             WipGate {
                 running: 0,
                 max_running: 0,
@@ -923,13 +852,13 @@ mod tests {
 
     #[test]
     fn proposals_collapse_into_one_digest_scored_as_its_best_child() {
-        // Cheap rows must not swamp the queue: nine proposals at ÷0.8 would
-        // otherwise fill it. One digest per project, scored as the best child,
-        // so it survives the cut exactly when that child would have.
+        // A triage backlog must not swamp the queue: nine proposals would
+        // otherwise take nine rows. One digest per project, scored as the best
+        // child, so it survives the cut exactly when that child would have.
         let mut s = setup();
         let p = add_project(&mut s, "p", 3);
         let other = add_project(&mut s, "other", 3);
-        let best = add_proposed(&mut s, p, "the good idea", Priority::P0); // 24 ÷0.8 = 30
+        let best = add_proposed(&mut s, p, "the good idea", Priority::P0); // 3×8 = 24
         for i in 0..8 {
             add_proposed(&mut s, p, &format!("idea {i}"), Priority::P3);
         }
@@ -940,12 +869,8 @@ mod tests {
         let QueueRow::Digest(digest) = &q.rows[0] else {
             panic!("expected a digest, got {:?}", q.rows[0]);
         };
-        // 24 ÷0.8, give or take the age bonus these tasks accrue as the test runs
-        assert!(
-            (digest.effective - 30.0).abs() < 0.1,
-            "{}",
-            digest.effective
-        );
+        // 24, give or take the age bonus these tasks accrue as the test runs
+        assert!((digest.score - 24.0).abs() < 0.1, "{}", digest.score);
         // Its children are ordered as they would have ranked, best first, so
         // folding it open opens on the proposal worth triaging.
         assert_eq!(digest.tasks[0].candidate.task.id, best);
@@ -959,16 +884,16 @@ mod tests {
         let heavy = add_project(&mut s, "heavy", 5);
         let light = add_project(&mut s, "light", 1);
         for i in 0..QUEUE_MAX_ROWS {
-            add_task(&mut s, heavy, &format!("loud {i}"), Priority::P3); // 5×1 = 5 ÷1.0
+            add_task(&mut s, heavy, &format!("loud {i}"), Priority::P3); // 5×1 = 5
         }
-        // 1×1 = 1 ÷0.8 = 1.25 against ten rows at 5: below the cut.
+        // 1×1 = 1 against ten rows at 5: below the cut.
         add_proposed(&mut s, light, "quiet idea", Priority::P3);
 
         let q = default_queue(&s);
         assert_eq!(q.rows.len(), QUEUE_MAX_ROWS);
         assert!(!labels(&q).iter().any(|l| l.starts_with('▲')));
 
-        // Raise the same proposal's priority (1×8 = 8 ÷0.8 = 10) and its
+        // Raise the same proposal's priority (1×8 = 8) and its
         // digest earns a row, displacing one of the ten.
         let loud_idea = add_proposed(&mut s, light, "loud idea", Priority::P0);
         let q = default_queue(&s);
@@ -993,6 +918,45 @@ mod tests {
         let ids = task_ids(&default_queue(&s));
         assert_eq!(ids.len(), QUEUE_MAX_ROWS);
         assert_eq!(ids, tasks[..QUEUE_MAX_ROWS]);
+    }
+
+    #[test]
+    fn the_queue_counts_the_rows_it_cut_at_a_tie() {
+        // Forty P2s at the age cap all score 3×2 + 2 = 8: ten are shown, and
+        // the thirty cut at the same score are counted. A P3 below them is
+        // cut too, but it is not a tie.
+        let mut s = setup();
+        let p = add_project(&mut s, "p", 3);
+        for i in 0..40 {
+            let id = add_task(&mut s, p, &format!("tied {i}"), Priority::P2);
+            set_age_days(&mut s, id, 30.0);
+        }
+        add_task(&mut s, p, "lower", Priority::P3);
+
+        let q = default_queue(&s);
+        assert_eq!(q.rows.len(), QUEUE_MAX_ROWS);
+        assert_eq!(
+            q.tied_cut,
+            Some(TiedCut {
+                count: 30,
+                score: 8.0
+            })
+        );
+    }
+
+    #[test]
+    fn a_cut_below_the_last_score_is_not_a_tie() {
+        let mut s = setup();
+        let p = add_project(&mut s, "p", 3);
+        for i in 0..QUEUE_MAX_ROWS {
+            let id = add_task(&mut s, p, &format!("shown {i}"), Priority::P2);
+            set_age_days(&mut s, id, 30.0);
+        }
+        add_task(&mut s, p, "lower", Priority::P3);
+
+        let q = default_queue(&s);
+        assert_eq!(q.rows.len(), QUEUE_MAX_ROWS);
+        assert_eq!(q.tied_cut, None);
     }
 
     #[test]
@@ -1138,12 +1102,10 @@ mod tests {
     }
 
     #[test]
-    fn equal_raw_totals_are_split_by_what_the_row_costs() {
+    fn equal_totals_fall_to_the_state_precedence() {
         // Contrived so the folded scores collide: needs-input 3×(1+4) = 15,
-        // review 5×(1+2) = 15. Before pricing this was a genuine tie broken by
-        // the state precedence (§6); now the divisors decide it outright —
-        // 18.75 for the question against 10.71 for the diff — and the
-        // precedence is left to rows that tie on the effective score too.
+        // review 5×(1+2) = 15. The state precedence (§6) puts the question
+        // first.
         let mut s = setup();
         let a = add_project(&mut s, "a", 3);
         let b = add_project(&mut s, "b", 5);

@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/ClachDev/Voro/compare/v0.2.0...HEAD) - ReleaseDate
 
+### Changed
+
+- **The queue ranks by raw score again.** The attention price divided each
+  row's score by a per-action cost, and the 1.8 on `do` exceeded the 1.75
+  ratio between a P1 and a P2 at one weight, so a human P1 ranked below every
+  dispatchable P2 of its project. On a real store the three ready P1 tasks
+  sat 47th, 48th and 75th, and `voro next` named a task the inbox left out.
+  The inbox and the cockpit queue now rank by the score `explain` prints, and
+  their first ready row is the task `voro next` returns. `explain` and the
+  TUI's score decomposition drop the `action` and `effective` lines.
+- **The queue counts the rows it cut at a tie.** When the ten-row cap cuts
+  rows scoring exactly what the last shown row scores, the inbox ends with a
+  line such as `+38 more at 8.0` and the cockpit queue pane carries the same
+  text on its bottom border. Every P2 in a weight-3 project reaches 8.0 once
+  the age bonus caps at twenty days, so these ties come in dozens.
+
+### Removed
+
+- **The `[costs]` table in `voro.toml`.** A file that still carries it loads,
+  and every CLI verb prints one warning naming the table as ignored; the TUI
+  shows the same warning on its startup status line and on the Config screen.
+  `max_running` is unchanged.
+
 ## [0.2.0](https://github.com/ClachDev/Voro/compare/v0.1.0...v0.2.0) - 2026-08-21
 
 The release where the loop closes around the operator rather than the agent.

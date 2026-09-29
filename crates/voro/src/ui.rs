@@ -7,8 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use voro_core::{
-    ActionRow, CapWindow, CompletionReport, DepKind, DepRef, DigestRow, EffectiveScore, Event,
-    QueueRow, ScoreBreakdown, Session, SessionOutcome, StateCounts, Store, TaskState,
+    ActionRow, CapWindow, CompletionReport, DepKind, DepRef, DigestRow, Event, QueueRow,
+    ScoreBreakdown, Session, SessionOutcome, StateCounts, Store, TaskState,
 };
 
 use crate::app::{
@@ -309,7 +309,7 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             if app.show_score
                 && let Some(b) = app.score_breakdown(*task_id)
             {
-                lines.extend(score_lines(&b, app.effective_score(t, b.total)));
+                lines.extend(score_lines(&b));
             }
             lines.push(Line::default());
             lines.extend(crate::markdown::body_lines(&t.body));
@@ -530,10 +530,10 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
 /// view: one dim line breaking the total down, plus a "not scheduled" note
 /// where the task's state keeps it out of the queue. Shared by the cockpit pane
 /// and the tasks-screen Detail popup.
-fn score_lines(b: &ScoreBreakdown, effective: Option<EffectiveScore>) -> Vec<Line<'static>> {
+fn score_lines(b: &ScoreBreakdown) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         format!(
-            "weight {} · {} (value {}) · {} (+{}) · blocks ×{} (+{}) · base w×(p+s+u) {:.1} · age {:.1}d (+{:.2})",
+            "weight {} · {} (value {}) · {} (+{}) · blocks ×{} (+{}) · base w×(p+s+u) {:.1} · age {:.1}d (+{:.2}) = {:.2}",
             b.weight,
             b.priority,
             b.priority_value,
@@ -543,24 +543,11 @@ fn score_lines(b: &ScoreBreakdown, effective: Option<EffectiveScore>) -> Vec<Lin
             b.unblock_bonus,
             b.base,
             b.age_days,
-            b.age_bonus
+            b.age_bonus,
+            b.total
         ),
         Style::new().dim(),
     ))];
-    // What the queue ranks by: the total priced by what the row asks of the
-    // operator (DESIGN.md §7).
-    if let Some(e) = effective {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{:.2} ÷ {} ({}) = {:.2} effective",
-                b.total,
-                e.cost,
-                e.action.as_str(),
-                e.effective
-            ),
-            Style::new().dim(),
-        )));
-    }
     if !matches!(
         b.state,
         TaskState::Ready
@@ -1079,7 +1066,7 @@ fn session_lines(session: &Session, state: TaskState) -> Vec<Line<'static>> {
     lines
 }
 
-/// One task's queue row: the effective score it was ranked by, its state, and
+/// One task's queue row: the score it was ranked by, its state, and
 /// the markers the row carries. Shared by the top-level rows and the proposals
 /// listed under an expanded digest, which differ only in indent and dimming.
 /// `width` is the pane's inner width, whose right edge the milestone label
@@ -1093,9 +1080,9 @@ fn action_row_line(app: &App, row: &ActionRow, indent: &str, width: u16) -> Line
         Style::new()
     };
     let score = if untriaged {
-        Span::styled(format!("{:5.1} ", row.effective), style)
+        Span::styled(format!("{:5.1} ", c.score.total), style)
     } else {
-        score_span(row.effective)
+        score_span(c.score.total)
     };
     let head = vec![
         score,
@@ -1134,7 +1121,7 @@ fn action_row_line(app: &App, row: &ActionRow, indent: &str, width: u16) -> Line
 /// child, so a triage backlog stays felt without swamping the queue.
 fn digest_line(app: &App, digest: &DigestRow) -> Line<'static> {
     let mut spans = vec![
-        Span::styled(format!("{:5.1} ", digest.effective), Style::new().dim()),
+        Span::styled(format!("{:5.1} ", digest.score), Style::new().dim()),
         Span::styled(
             format!(
                 "▲ {} awaiting triage ({})",
@@ -1223,6 +1210,13 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
             .right_aligned(),
         );
     }
+    // The cap cut rows that tie the last one shown, whose order among
+    // themselves means nothing, so the pane counts them (DESIGN.md §7).
+    if let Some(cut) = app.queue.tied_cut {
+        block = block.title_bottom(
+            Line::from(Span::styled(format!(" {cut} "), Style::new().dim())).right_aligned(),
+        );
+    }
     let list = List::new(items).block(block).highlight_style(SELECTED);
     frame.render_stateful_widget(list, area, &mut state);
     hits.push_list(area, state.offset(), rows.len(), |i| {
@@ -1257,7 +1251,10 @@ fn digest_detail_lines(digest: &DigestRow) -> Vec<Line<'static>> {
     ];
     lines.extend(digest.tasks.iter().map(|row| {
         Line::from(vec![
-            Span::styled(format!("{:5.1} ", row.effective), Style::new().dim()),
+            Span::styled(
+                format!("{:5.1} ", row.candidate.score.total),
+                Style::new().dim(),
+            ),
             Span::raw(format!(
                 "{} {} {}",
                 task_ref(row.candidate.task.id),
@@ -1280,7 +1277,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             Some(QueueRow::Action(row)) => (
                 &row.candidate.task,
                 row.candidate.project_name.as_str(),
-                Some(row.effective),
+                Some(row.candidate.score.total),
             ),
             Some(QueueRow::Digest(digest)) => {
                 let para = Paragraph::new(digest_detail_lines(digest))
@@ -1299,7 +1296,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             Some(row) => (
                 &row.candidate.task,
                 row.candidate.project_name.as_str(),
-                Some(row.effective),
+                Some(row.candidate.score.total),
             ),
             None => {
                 frame.render_widget(Paragraph::new("").block(block), area);
@@ -1409,7 +1406,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     if app.show_score
         && let Some(b) = app.score_breakdown(task.id)
     {
-        lines.extend(score_lines(&b, app.effective_score(task, b.total)));
+        lines.extend(score_lines(&b));
     }
     // Only where the report is the thing being acted on: a task under review,
     // or handed off for someone else to review (DESIGN.md §8). Once a verdict
@@ -1794,7 +1791,16 @@ fn draw_config(frame: &mut Frame, app: &App, hits: &mut HitMap) {
 
     // Agents: one line each (default starred, verbs listed), plus a warning line
     // where an override drops built-in verbs (DESIGN.md §8).
-    let mut agent_lines: Vec<Line> = Vec::new();
+    let mut agent_lines: Vec<Line> = app
+        .config_warnings
+        .iter()
+        .map(|warning| {
+            Line::from(Span::styled(
+                format!("! {warning}"),
+                Style::new().fg(Color::Yellow),
+            ))
+        })
+        .collect();
     for a in &app.config_agents {
         let marker = if a.is_default { "* " } else { "  " };
         let verbs = if a.verbs.is_empty() {
@@ -4855,6 +4861,35 @@ mod tests {
         );
         assert!(!rendered.contains("startable"), "{rendered}");
         assert!(rendered.contains("asking"), "{rendered}");
+    }
+
+    /// The queue pane counts the rows its cap cut at the last row's score, in
+    /// the words the inbox uses (DESIGN.md §7).
+    #[test]
+    fn the_queue_pane_counts_rows_cut_at_a_tie() {
+        use voro_core::{Store, TiedCut};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap();
+        ready_task(&mut store, p.id, "shown");
+        let mut app = test_app(store);
+        app.queue.tied_cut = Some(TiedCut {
+            count: 38,
+            score: 8.0,
+        });
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        assert!(
+            screen_text(&terminal).contains("+38 more at 8.0"),
+            "{}",
+            screen_text(&terminal)
+        );
     }
 
     /// End-to-end: a body taller than the focus card overflows, so the pane
