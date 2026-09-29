@@ -5,20 +5,23 @@
 [![docs.rs](https://img.shields.io/docsrs/voro-core)](https://docs.rs/voro-core)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-An attention-based session manager for AI-assisted development across many
-projects. Voro tracks tasks per project, weights each project by how much it
-matters *today*, and answers one question: **where should your attention go right
-now?**
+Four coding-agent sessions across three repositories, and nothing that says
+which one is waiting on you. A terminal multiplexer shows the sessions; an
+issue tracker holds the tasks; neither ranks what needs a human next.
 
-A single **next-action queue** drives everything: questions, reviews, and
-proposals that need a human first, then the highest-scoring ready tasks across
-all projects — each body written as a prompt, ready to dispatch to a coding
-agent.
+Voro is a personal cockpit for working with coding agents. It keeps one
+**next-action queue** across every project you register: questions agents have
+asked, diffs ready to review, proposals waiting for triage, then the
+highest-scoring ready tasks. Each task body is written as a prompt, so one key
+dispatches it to Claude Code or Codex in a headless session, and the agent
+reports back into the same queue when it finishes or gets stuck.
+
+Voro is local and single-operator: one binary, one SQLite file, no server.
 
 **Status:** early development. The cockpit, CLI, and dispatch loop work
 end-to-end. Expect churn.
 
-![Voro TUI showing the next-action queue and running sessions](docs/images/voro-tui.png)
+![A task dispatched from the cockpit, returning as a review with the agent's summary, and accepted](docs/images/first-dispatch.gif)
 
 ## Install
 
@@ -54,100 +57,95 @@ prebuilt binary, you need Rust 1.88 or newer:
 cargo install voro
 ```
 
-## Quickstart
+Dispatch needs a coding agent on your `PATH`: `claude` (Claude Code) or `codex`.
+Both are built in and need no configuration.
 
-Voro is driven from its TUI cockpit. Launch it by running `voro` with no
+## First dispatch
+
+Everything below happens in the cockpit. Launch it by running `voro` with no
 arguments:
 
 ```bash
 voro
 ```
 
-The cockpit has four screens:
+A first launch opens on the Projects screen. `tab` cycles the five screens
+(Cockpit, Tasks, Projects, Config, Milestones), `j`/`k` or a click moves
+the selection, and the footer lists the keys that apply to the selected row.
+`?` opens the full key map.
 
-- **Cockpit**: the next-action queue.
-- **Tasks**: every task.
-- **Projects**: your projects and their weights.
-- **Config**: the agents Voro dispatches to, the viewers it opens diffs in,
-  and the path of the `voro.toml` each was resolved from.
+**1. Register a project.** On the Projects screen press `a`; Voro asks for a
+name and the path to a checkout. The project starts at weight 3 — the
+higher the weight, the harder its tasks pull toward the top of the queue.
 
-`tab` cycles the screens and `alt-1`–`alt-4` jump straight to one. Until you
-register a project, only Projects and Config exist. `j`/`k` or a click moves
-the selection, and the footer shows the keys that apply to it. A bare digit
-sets the number on the selected row: `0`–`3` a task's priority on the Cockpit
-and Tasks screens, `0`–`5` a project's weight on the Projects screen. `?`
-opens the full key map; the walkthrough below names only the keys it needs.
+**2. Create a task.** `tab` to the Cockpit and press `n`. Type one line saying
+what you want and press ⏎. A background agent expands the line into a title
+and a body written as a prompt, and files it as a proposal; it appears in the
+queue a refresh or two later. (`ctrl-n` writes the task by hand in your
+`$EDITOR` and lands it in the queue directly; `N` plans it with an agent in
+an interactive session first.)
 
-The walkthrough drives one task from nothing to a reviewed diff.
+**3. Accept it.** Select the proposal and press ⏎; choose `triage → ready`.
+If the body is not quite right, `r` has an agent rewrite it against a
+one-line note from you instead.
 
-**1. Register a project.** A first launch opens on the Projects screen
-(`alt-3` gets you back later). Press `a` to add one; Voro asks for a name and
-a path. Press `0`–`5` to set its weight: the higher the weight, the harder
-the project's tasks pull toward the top of the queue.
+**4. Dispatch it.** With the ready task selected, press `d`. Voro launches a
+headless session in the project's checkout, prepends the return-path verbs
+to the task body, and shows the session in the running strip at the bottom of
+the Cockpit. The agent works in its own git worktree. If it needs a decision
+it calls `voro ask`, and the task rises to the top of the queue as `⏎ resume`;
+`A` drops you into the session to answer, `a` sends one line without leaving
+the cockpit.
 
-**2. Create a task.** From the Cockpit or Tasks screen, press `n` and type
-one line saying what you want. ⏎ hands it to a background agent, which expands
-it into a title and a body and files the task; the proposal appears in the
-queue a refresh or two later, ready for triage. Press `N` instead to plan the
-task in an interactive session, or `ctrl-n` to write it out by hand in your
-`$EDITOR`. The `$EDITOR` form is the only path that sets state, priority,
-agent and blockers at creation time. Its `state:` line decides where the task
-lands: `ready` (the default) joins the queue directly, `proposed` routes it
-through triage, and `parked` files it without competing for attention yet.
+**5. Review it.** When the agent calls `voro done` the task rises to the top
+of the queue as `⏎ review`, with the agent's summary of what changed and how
+it was verified. `o` opens the diff in your editor (`code`, `cursor` and `zed`
+are detected on `PATH`); `g` opens the pull request, creating one from the
+summary if none exists. ⏎ accepts or rejects. Rejecting with a note sends the
+agent back to work; accepting completes the task. Voro merges nothing — the
+work lands when you merge the branch or the PR.
 
-However the task arrives, **the body is the prompt** the dispatched agent
-receives, so it should read like one. The proposing agent writes it that way,
-and the refine keys below improve it before dispatch.
+That is the loop. The queue is the only screen you need to watch: whatever is
+on top is the next thing that needs you.
 
-**3. Triage it into the queue.** A proposal (a task you created with `state:
-proposed`, or one an agent filed with `voro propose`) needs a verdict from you
-before anything can work it. Proposals collapse into one digest row per
-project: `enter` on the digest expands it, and `enter` on a proposal opens the
-verdict menu. `triage → ready` accepts it into ready work, `triage → parked`
-sets it aside, and `triage → rejected` closes it out. The queue floats items
-that need you (a question shows `⏎ resume`, a finished task `⏎ review`) above
-the highest-scoring ready tasks.
+Past the first dispatch, the keys that earn their place: `0`–`3` sets a
+task's priority and `0`–`5` a project's weight (0 parks the project); `x`
+shows why a task scored where it did; `c` links documents the agent should
+read before starting; `w` parks a task while you wait on someone else; `h`
+shows its history; `l` pages the session log; `s` changes state by hand.
+Agents propose follow-up work they notice through `voro propose`, and those
+proposals collapse into one digest row per project until you triage them.
 
-To improve a proposal instead of ruling on it, press `r`: an agent rewrites
-the body against your one-line note about what is wrong (`voro triage <id>
-refine --note "..."` on the CLI). `R` opens an interactive session instead,
-and `C` cancels a round that is taking too long. The task sits in `refining`
-while the rewrite runs and returns marked `↻ refined` for the next triage
-pass. Ready work refines too: rewriting the body invalidates the verdict you
-gave the old one, so a refined ready task also returns through triage.
+## Agents
 
-**4. Dispatch it to an agent.** Select a ready task and press `d` to hand it to
-the default coding agent, or `D` to choose which agent. Voro launches a headless
-session; the agent works against the task body and reports back through the
-return-path verbs (`voro ask` / `voro done` / `voro propose`), which are wired up
-per [`docs/agent-integration.md`](docs/agent-integration.md). Those verbs are the
-agent's interface, not yours.
+`claude` and `codex` are built in. Dispatch runs a shell command template per
+agent and prepends a preamble to the prompt naming the return-path verbs
+(`voro ask`, `voro done`, `voro propose`) with the task's id already
+substituted, so a dispatched session needs nothing installed in the project:
+no `CLAUDE.md` snippet, no hooks, no configuration.
 
-**5. Review what lands.** When the agent calls `done`, the task moves to
-`review` and rises to the top of the queue. Its detail card leads with the
-agent's completion summary: what it changed and how it verified. Press `o` to
-open the checkout in a viewer, or `g` to open the pull request; when no PR is
-recorded yet, `g` creates one from that summary after showing you the branch
-and title. `o` is always the local diff and `g` is always GitHub; on a
-checkout with nowhere to push, `g` says so and names `o`. The viewer needs no
-setup: `code`, `cursor` and `zed` ship built in and the first one on your
-PATH is used. If none is there, `o` opens a small form to name the editor you
-do use. With the summary and the diff in front of you, press `enter`
-(`⏎ review`) to accept or reject the work. Rejecting with a note
-re-dispatches the agent to address it, and `w` hands the task off, parking it
-out of the queue while you wait on someone else's review.
+Sessions you start yourself get the same verbs from the Claude Code plugin,
+which teaches the agent the CLI, the database resolution rules, and how to
+file follow-up tasks against the right project from any directory:
 
-Accepting records your verdict and completes the task; it merges nothing.
-On a GitHub project the work lands when its pull request is merged. On a
-project with no remote the work stays on the branch the agent reported
-(`voro show <id>` prints it as `branch:`), and landing it is one command in
-the checkout: `git merge <branch>`.
+```bash
+claude plugin marketplace add ClachDev/Voro
+claude plugin install voro
+```
 
-Other keys worth knowing on a selected task: `a` sends one line into the agent's
-own session without leaving the cockpit, and `A` opens that session to talk to it
-in person; `s` changes state, `c` links the documents an agent should read before
-it starts, `x` folds in the score breakdown, `h` the task's history, `e` edits it,
-`l` pages the session log, and `q` quits. `?` has the rest.
+The skill activates in every project you open in Claude Code, not only Voro
+checkouts. Contributors working from a local clone can point the marketplace
+at the checkout instead: `claude plugin marketplace add /path/to/Voro`.
+
+![Claude with Voro in tmux showing sessions and tasks](docs/images/claude-voro.png)
+
+To add an agent, change a model, or override a built-in, layer a
+`~/.config/voro/voro.toml` on top (`voro agent init` writes a skeleton).
+`voro agent list` and `voro viewer list` show the effective sets and where
+each entry comes from. The template format, the session verbs (attach,
+resume, message, stop), and the optional Claude Code hooks that catch a
+session which exits without reporting are in
+[`docs/agent-integration.md`](docs/agent-integration.md).
 
 ## Design
 
@@ -163,52 +161,6 @@ Rust workspace: `voro-core` (store, scheduler) and `voro` (ratatui TUI).
 cargo build --workspace
 cargo test --workspace
 cargo run
-```
-
-## Dispatching to agents
-
-Voro dispatches a task by running a shell command template per agent. The
-`claude` and `codex` agents are built in, so with one of those on your `PATH`
-a fresh install dispatches with no configuration: `voro dispatch <task-id>`
-(or the dispatch key in the TUI) launches a headless session on a ready task.
-The agent reports back through the return-path verbs (`voro ask/done/propose`)
-and its work lands in `review`, where `voro open` or `voro pr` puts the diff
-in front of you. Viewers work the same way: `code`, `cursor` and `zed` are
-built in and probed on `PATH`. `voro agent list` and `voro viewer list` show
-the effective sets and where each entry comes from.
-
-![Claude with Voro in tmux showing sessions and tasks](docs/images/claude-voro.png)
-
-To extend or override the built-in agents and viewers, layer a
-`~/.config/voro/voro.toml` on top (`voro agent init` writes a skeleton). The
-dispatch semantics, the per-project viewer, and the `voro.toml` format are covered in
-[`docs/DESIGN.md`](docs/DESIGN.md) §8; the `CLAUDE.md`/`AGENTS.md` return-path
-snippet and the Claude Code hooks configuration are in
-[`docs/agent-integration.md`](docs/agent-integration.md).
-
-## Claude Code plugin
-
-Voro ships a Claude Code plugin — the `voro-cli` skill — so any coding session
-can create, propose, and transition Voro tasks through the CLI. Register this
-repo as a plugin marketplace once, then install the plugin:
-
-```bash
-claude plugin marketplace add ClachDev/Voro
-claude plugin install voro
-```
-
-The skill then activates in **any** project you open in Claude Code, not just a
-Voro checkout — it teaches the agent the read/write verbs, the database
-resolution rules, and how to file follow-up tasks against the right project. The
-`@marketplace` suffix (`claude plugin install voro@voro`) is only for
-disambiguation when several marketplaces expose a plugin named `voro`; the plain
-name works here.
-
-Contributors working from a local clone can point the marketplace at the
-checkout instead of GitHub:
-
-```bash
-claude plugin marketplace add /path/to/Voro
 ```
 
 ## License

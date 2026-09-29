@@ -12,8 +12,10 @@ use voro_core::{
 };
 
 use crate::app::{
-    App, CockpitRow, Mode, Screen, TaskRow, ViewerFormState, ViewerOption, viewer_label,
+    App, BrowserRow, CockpitRow, Mode, Screen, TaskRow, ViewerFormState, ViewerOption, viewer_label,
 };
+
+mod milestones;
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
@@ -31,6 +33,7 @@ pub enum Hit {
     /// A Config screen row, settings list and viewers list alike: an index into
     /// `App::config_rows`, the one space `config_sel` counts in.
     ConfigRow(usize),
+    MilestoneRow(usize),
     /// An option of whichever modal picker is open.
     PickerOption(usize),
 }
@@ -100,6 +103,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> HitMap {
         Screen::Tasks => draw_tasks(frame, app, &mut hits),
         Screen::Projects => draw_projects(frame, app, &mut hits),
         Screen::Config => draw_config(frame, app, &mut hits),
+        Screen::Milestones => milestones::draw(frame, app, &mut hits),
     }
     // A modal owns the pointer: the screen behind it keeps drawing but stops
     // being clickable, so only the popup's own options are targets.
@@ -160,6 +164,7 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 crate::app::CreateFlow::Quick => "Project to propose a task in",
                 crate::app::CreateFlow::Editor => "Project for the new task",
                 crate::app::CreateFlow::Plan => "Project to plan a task in",
+                crate::app::CreateFlow::Milestone(_) => "Project for the new milestone",
             };
             let list = List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(title))
@@ -172,9 +177,13 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             actions,
             sel,
         } => {
+            let milestone = app
+                .all
+                .iter()
+                .any(|r| r.task.id == *task_id && r.task.milestone);
             let items: Vec<ListItem> = actions
                 .iter()
-                .map(|a| ListItem::new(crate::app::action_label(a)))
+                .map(|a| ListItem::new(crate::app::transition_label(a, milestone)))
                 .collect();
             let count = items.len();
             let height = items.len() as u16 + 2;
@@ -288,6 +297,7 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             if t.deep {
                 lines.push(deep_line());
             }
+            lines.extend(milestones::detail_lines(app, *task_id));
             if let Some(session) = app.last_sessions.get(task_id) {
                 lines.extend(session_lines(session, t.state));
             }
@@ -311,7 +321,7 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 .wrap(Wrap { trim: false })
                 .scroll((*scroll, 0))
                 .block(Block::default().borders(Borders::ALL).title(format!(
-                    "#{task_id} — ⏎ state · 0-3 priority · ! deep · c docs · x score · h history · j/k scroll · esc close"
+                    "#{task_id} — ⏎ state · 0-3 priority · ! deep · c docs · m milestones · x score · h history · j/k scroll · esc close"
                 )));
             frame.render_widget(para, area);
         }
@@ -361,6 +371,33 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             let list = List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(format!(
                     "Documents for #{task_id} — ⏎ link/unlink, esc close"
+                )))
+                .highlight_style(SELECTED);
+            frame.render_stateful_widget(list, area, &mut state);
+            hits.push_list(area, state.offset(), count, Hit::PickerOption);
+        }
+        Mode::MilestoneTitle { buffer } => draw_text_entry_popup(
+            frame,
+            "New milestone — its title; ⏎ to pick a project, esc to cancel".to_string(),
+            buffer,
+        ),
+        Mode::MilestonePicker {
+            task_id,
+            milestones,
+            sel,
+            ..
+        } => {
+            let items: Vec<ListItem> = milestones
+                .iter()
+                .map(|m| ListItem::new(milestones::picker_row(app, *task_id, m)))
+                .collect();
+            let count = items.len();
+            let height = items.len() as u16 + 2;
+            let area = popup_area(frame, 64, height.max(3));
+            let mut state = ListState::default().with_selected(Some(*sel));
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(format!(
+                    "Milestones for #{task_id} — ⏎ attach/detach, esc close"
                 )))
                 .highlight_style(SELECTED);
             frame.render_stateful_widget(list, area, &mut state);
@@ -1064,6 +1101,8 @@ fn action_row_line(app: &App, row: &ActionRow, indent: &str) -> Line<'static> {
         state_span(c.task.state),
         Span::styled(format!(" {}", c.task.priority), style),
         deep_marker(c.task.deep),
+        Span::raw(" "),
+        milestones::column_span(app, c.task.id),
         Span::styled(format!(" {}: {}", c.project_name, c.task.title), style),
     ];
     if c.task.human {
@@ -1355,6 +1394,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     if task.deep {
         lines.push(deep_line());
     }
+    lines.extend(milestones::detail_lines(app, task.id));
     if let Some(session) = app.last_sessions.get(&task.id) {
         lines.extend(session_lines(session, task.state));
     }
@@ -1449,7 +1489,8 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                     format!("{:>6}  ", format_elapsed(r.elapsed_secs)),
                     Style::new().dim(),
                 ),
-                Span::raw(r.task_title.clone()),
+                milestones::column_span(app, r.task_id),
+                Span::raw(format!(" {}", r.task_title)),
             ];
             if waiting {
                 let open = app.dependents.get(&r.task_id).map_or(0, |d| {
@@ -1509,10 +1550,17 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     ])
     .areas(frame.area());
 
+    let indent = if app.browse_by_milestone { "  " } else { "" };
     let items: Vec<ListItem> = app
-        .all
+        .browser_rows
         .iter()
-        .map(|r| {
+        .map(|row| {
+            let r = match row {
+                BrowserRow::Group(group) => {
+                    return ListItem::new(milestones::group_line(app, *group));
+                }
+                BrowserRow::Task(i) => &app.all[*i],
+            };
             let closed = r.task.state.is_terminal();
             let style = if closed || r.weight == 0 {
                 Style::new().dim()
@@ -1522,7 +1570,7 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             let mut spans = vec![
                 Span::styled(
                     format!(
-                        "{} {:11} {}",
+                        "{indent}{} {:11} {}",
                         task_ref(r.task.id),
                         r.task.state,
                         r.task.priority,
@@ -1554,14 +1602,24 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let empty = items.is_empty();
+    let empty = app.all.is_empty();
     let mut state =
         ListState::default().with_selected(if empty { None } else { Some(app.tasks_sel) });
+    let title = if app.browse_by_milestone {
+        "All tasks — by milestone"
+    } else {
+        "All tasks"
+    };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("All tasks"))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(SELECTED);
     frame.render_stateful_widget(list, list_area, &mut state);
-    hits.push_list(list_area, state.offset(), app.all.len(), Hit::TaskRow);
+    hits.push_list(
+        list_area,
+        state.offset(),
+        app.browser_rows.len(),
+        Hit::TaskRow,
+    );
     if empty {
         let inner = list_area.inner(ratatui::layout::Margin::new(1, 1));
         // Like the cockpit's, this box has only one case to explain: the
@@ -2113,7 +2171,7 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
             let next = if app.projects.is_empty() {
                 "projects"
             } else {
-                "cockpit"
+                "milestones"
             };
             vec![
                 enter,
@@ -2124,6 +2182,7 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
                 ("q", "quit", true),
             ]
         }
+        Screen::Milestones => milestones::hint_candidates(app, enter),
     }
 }
 
@@ -2169,11 +2228,12 @@ const NEW_KEYS: [(&str, &str); 2] = [
 /// screen's agents. Every other uppercase binding has to be the interactive half
 /// of a pair, which the test below enforces screen by screen.
 #[cfg(test)]
-const CASE_EXCEPTIONS: [(Screen, &str); 7] = [
+const CASE_EXCEPTIONS: [(Screen, &str); 8] = [
     (Screen::Cockpit, "C"),
     (Screen::Cockpit, "J"),
     (Screen::Cockpit, "K"),
     (Screen::Tasks, "C"),
+    (Screen::Tasks, "M"),
     (Screen::Projects, "A"),
     (Screen::Config, "J"),
     (Screen::Config, "K"),
@@ -2202,6 +2262,9 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
         }
         keys.push(("alt-3", "projects"));
         keys.push(("alt-4", "config"));
+        if !no_projects {
+            keys.push(("alt-5", "milestones"));
+        }
         ("Screens", keys)
     };
     match screen {
@@ -2214,6 +2277,7 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
                 ("s", "change state"),
                 ("!", "toggle deep — the agent's best model"),
                 ("c", "link and unlink documents"),
+                ("m", "attach to or detach from milestones"),
                 ("C", "cancel a refine in flight"),
                 ("x", "fold the score decomposition in"),
                 ("h", "fold the task's history in"),
@@ -2246,7 +2310,7 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
             ]
         }
         Screen::Tasks => {
-            let mut actions = vec![("⏎", "open the task's detail")];
+            let mut actions = vec![("⏎", "open the task's detail, or a fold")];
             actions.extend(pairs(DISPATCH_KEYS));
             actions.extend(pairs(REFINE_KEYS));
             actions.extend([
@@ -2254,6 +2318,7 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
                 ("s", "change state"),
                 ("!", "toggle deep — the agent's best model"),
                 ("c", "link and unlink documents"),
+                ("m", "attach to or detach from milestones"),
                 ("C", "cancel a refine in flight"),
                 ("o", "open the local diff in a viewer"),
                 ("g", "open the PR on GitHub"),
@@ -2273,6 +2338,7 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
                     "Navigation",
                     vec![
                         ("j/k", "move the selection"),
+                        ("M", "group by milestone"),
                         ("ctrl-r", "refresh"),
                         ("?", "this key map"),
                         ("q", "quit"),
@@ -2281,6 +2347,7 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
                 screens("next screen"),
             ]
         }
+        Screen::Milestones => milestones::key_map(screens("next screen")),
         Screen::Projects => vec![
             (
                 "Actions",
@@ -2426,7 +2493,9 @@ fn draw_key_map(frame: &mut Frame, app: &App, page: usize) {
         Screen::Tasks => "tasks",
         Screen::Projects => "projects",
         Screen::Config => "config",
+        Screen::Milestones => "milestones",
     };
+
     let title = if pages > 1 {
         format!(
             "Keys — {screen} — {}/{pages}, tab pages — any key closes",
@@ -2622,15 +2691,10 @@ mod tests {
 
     /// The key map may not advertise a jump the gate would refuse (DESIGN.md
     /// §9): with no project registered the Screens section drops `alt-1` and
-    /// `alt-2`, and gets them back the moment one exists.
+    /// `alt-2` and `alt-5`, and gets them back the moment one exists.
     #[test]
     fn the_key_map_hides_the_gated_screen_jumps() {
-        for screen in [
-            Screen::Cockpit,
-            Screen::Tasks,
-            Screen::Projects,
-            Screen::Config,
-        ] {
+        for screen in Screen::ALL {
             let jumps = |no_projects: bool| -> Vec<&'static str> {
                 key_map(screen, no_projects)
                     .into_iter()
@@ -2642,7 +2706,7 @@ mod tests {
             assert_eq!(jumps(true), vec!["alt-3", "alt-4"], "{screen:?}");
             assert_eq!(
                 jumps(false),
-                vec!["alt-1", "alt-2", "alt-3", "alt-4"],
+                vec!["alt-1", "alt-2", "alt-3", "alt-4", "alt-5"],
                 "{screen:?}"
             );
         }
@@ -4304,11 +4368,11 @@ mod tests {
 
         let cockpit = render(&app, &mut terminal);
         assert!(
-            cockpit.contains("P2! voro: the hard one"),
+            cockpit.contains(&format!("P2! {:16} voro: the hard one", "")),
             "queue row should mark the deep task: {cockpit}"
         );
         assert!(
-            cockpit.contains("P2  voro: the ordinary one"),
+            cockpit.contains(&format!("P2  {:16} voro: the ordinary one", "")),
             "a workhorse row keeps the column blank: {cockpit}"
         );
         assert!(
@@ -5713,12 +5777,7 @@ mod tests {
         let mut seen_cancel = false;
         let mut seen_message = false;
         let mut seen_review_keys = false;
-        for screen in [
-            Screen::Cockpit,
-            Screen::Tasks,
-            Screen::Projects,
-            Screen::Config,
-        ] {
+        for screen in Screen::ALL {
             app.screen = screen;
             let mut i = 0;
             loop {
@@ -5796,12 +5855,7 @@ mod tests {
         // A combined slot (`d/D`, `j/k`) stands for its individual keys on both
         // sides, so compare key by key.
         let split = |key: &'static str| key.split('/').collect::<Vec<_>>();
-        for screen in [
-            Screen::Cockpit,
-            Screen::Tasks,
-            Screen::Projects,
-            Screen::Config,
-        ] {
+        for screen in Screen::ALL {
             let mut app = App::new(
                 voro_core::Store::open_in_memory().unwrap(),
                 crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
@@ -5837,12 +5891,7 @@ mod tests {
             .flat_map(|set| set.iter())
             .map(|(key, _)| *key)
             .collect();
-        for screen in [
-            Screen::Cockpit,
-            Screen::Tasks,
-            Screen::Projects,
-            Screen::Config,
-        ] {
+        for screen in Screen::ALL {
             for no_projects in [false, true] {
                 let uppercase = key_map(screen, no_projects)
                     .into_iter()
@@ -5934,12 +5983,7 @@ mod tests {
             .unwrap();
             let mut terminal = Terminal::new(TestBackend::new(W, H)).unwrap();
 
-            for screen in [
-                Screen::Cockpit,
-                Screen::Tasks,
-                Screen::Projects,
-                Screen::Config,
-            ] {
+            for screen in Screen::ALL {
                 app.screen = screen;
                 app.on_key(KeyEvent::from(KeyCode::Char('?')));
                 // More turns than any screen's map has pages; the page index

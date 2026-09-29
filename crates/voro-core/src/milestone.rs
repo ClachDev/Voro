@@ -10,6 +10,7 @@ use rusqlite::{Connection, params};
 use crate::error::{Error, Result};
 use crate::model::{Priority, Task, TaskState};
 use crate::store::{Store, TASK_COLUMNS, get_task, log_event, task_from_row};
+use crate::transition::Action;
 
 /// A milestone with the tasks that count toward it.
 #[derive(Debug, Clone)]
@@ -215,6 +216,31 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Close a ready milestone as done (DESIGN.md §6): the human path's
+    /// `start` then `complete`, in one transaction, so a milestone is never
+    /// left `running`. Refused on a task that is not a ready milestone.
+    pub fn close_milestone(&mut self, milestone_id: i64) -> Result<Task> {
+        let milestone = self.task(milestone_id)?;
+        if !milestone.milestone {
+            return Err(Error::Invalid(format!(
+                "task {milestone_id} is not a milestone"
+            )));
+        }
+        if milestone.state != TaskState::Ready {
+            return Err(Error::Invalid(format!(
+                "milestone {milestone_id} is {}; only a ready one closes as done",
+                milestone.state
+            )));
+        }
+        let tx = self.conn.transaction()?;
+        crate::transition::apply_action(&tx, milestone_id, Action::Start)?;
+        crate::transition::apply_action(&tx, milestone_id, Action::Complete(None))?;
+        tx.commit()?;
+        self.task(milestone_id)
+    }
+}
+
 impl Task {
     /// Refuse a CLI transition on a milestone (DESIGN.md §6): only the
     /// operator opens or closes one, and only in the TUI.
@@ -224,6 +250,18 @@ impl Task {
         }
         Ok(())
     }
+
+    /// The verdicts the TUI offers on a milestone (DESIGN.md §6): done once it
+    /// is ready, through [`Store::close_milestone`], and abandon while it is
+    /// open. `Complete` stands for done here, the one verb the menu offers
+    /// that the machine reaches in two steps.
+    pub fn milestone_actions(&self) -> Vec<Action> {
+        match self.state {
+            TaskState::Ready => vec![Action::Complete(None), Action::Abandon],
+            TaskState::Done | TaskState::Rejected => vec![],
+            _ => vec![Action::Abandon],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -231,7 +269,6 @@ mod tests {
     use super::*;
     use crate::model::DepKind;
     use crate::store::NewTask;
-    use crate::transition::Action;
 
     fn store() -> (Store, i64) {
         let mut s = Store::open_in_memory().unwrap();
@@ -359,6 +396,35 @@ mod tests {
         assert_eq!(s.task(f.a).unwrap().state, TaskState::Ready);
         let a = s.milestone_members(f.a).unwrap();
         assert_eq!((a.open(), a.done()), (0, 3));
+    }
+
+    #[test]
+    fn a_ready_milestone_closes_as_done_in_one_step() {
+        let (mut s, p) = store();
+        let f = fixture(&mut s, p);
+        for id in f.chain.into_iter().rev() {
+            close(&mut s, id);
+        }
+        assert_eq!(
+            s.task(f.a).unwrap().milestone_actions(),
+            vec![Action::Complete(None), Action::Abandon]
+        );
+        let a = s.close_milestone(f.a).unwrap();
+        assert_eq!(a.state, TaskState::Done);
+        assert!(a.milestone_actions().is_empty());
+        // Closing A was B's last open blocker but one: t4 still holds it.
+        assert_eq!(s.task(f.b).unwrap().state, TaskState::Parked);
+    }
+
+    #[test]
+    fn only_a_ready_milestone_closes_and_a_parked_one_offers_abandon() {
+        let (mut s, p) = store();
+        let m = s.create_milestone(p, "m", "", Priority::P2).unwrap();
+        assert_eq!(m.milestone_actions(), vec![Action::Abandon]);
+        assert!(s.close_milestone(m.id).is_err());
+        assert_eq!(s.task(m.id).unwrap().state, TaskState::Parked);
+        let plain = task(&mut s, p, "plain", TaskState::Ready);
+        assert!(s.close_milestone(plain.id).is_err());
     }
 
     #[test]

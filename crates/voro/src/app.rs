@@ -1,5 +1,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+pub(crate) mod milestones;
+
 use crate::ui::Hit;
 use voro_core::{
     Action, ActionRow, AgentsConfig, CompletionReport, DepKind, DepRef, DigestRow, Event,
@@ -34,6 +36,19 @@ pub enum Screen {
     Tasks,
     Projects,
     Config,
+    Milestones,
+}
+
+#[cfg(test)]
+impl Screen {
+    /// Every screen, in Tab-ring and alt-digit order (DESIGN.md §9).
+    pub const ALL: [Screen; 5] = [
+        Screen::Cockpit,
+        Screen::Tasks,
+        Screen::Projects,
+        Screen::Config,
+        Screen::Milestones,
+    ];
 }
 
 /// Which global default a [`Mode::DefaultPicker`] is setting (DESIGN.md §5):
@@ -129,6 +144,16 @@ pub enum CockpitRow {
     /// queue index, then the proposal's index within it.
     Proposal(usize, usize),
     Running(usize),
+}
+
+/// One row of the task browser. Ungrouped, every row is a task; grouped by
+/// milestone (DESIGN.md §9), each milestone heads a fold of its members and a
+/// final `None` fold holds the unattached tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserRow {
+    Group(Option<i64>),
+    /// An index into `App::all`.
+    Task(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +294,23 @@ pub enum Mode {
         resolved: Option<String>,
         sel: usize,
     },
+    /// Collecting a new milestone's one-line title on the Milestones tab
+    /// (DESIGN.md §9). The project is asked for after, through the create
+    /// keys' own picker.
+    MilestoneTitle {
+        buffer: String,
+    },
+    /// Attaching a task to milestones or detaching it (DESIGN.md §9): every
+    /// open milestone, the task's own project's first, with ⏎ adding or
+    /// removing the task's `blocks` edge to the highlighted one in place. The
+    /// ticks are read from the App's per-refresh dependency map, as the
+    /// document picker's are; `back` is the detail popup's scroll to return to.
+    MilestonePicker {
+        task_id: i64,
+        milestones: Vec<Task>,
+        sel: usize,
+        back: Option<u16>,
+    },
     /// Toggling a task's document links (DESIGN.md §3/§8): every registered
     /// document, the task's own project's first, with ⏎ linking or unlinking the
     /// highlighted one in place. Which are linked is read from the App's own
@@ -325,6 +367,7 @@ impl Mode {
             | Mode::Transition { sel, .. }
             | Mode::AgentPicker { sel, .. }
             | Mode::DocPicker { sel, .. }
+            | Mode::MilestonePicker { sel, .. }
             | Mode::ViewerPicker { sel, .. }
             | Mode::DefaultPicker { sel, .. } => Some(*sel),
             _ => None,
@@ -337,6 +380,7 @@ impl Mode {
             | Mode::Transition { sel, .. }
             | Mode::AgentPicker { sel, .. }
             | Mode::DocPicker { sel, .. }
+            | Mode::MilestonePicker { sel, .. }
             | Mode::ViewerPicker { sel, .. }
             | Mode::DefaultPicker { sel, .. } => Some(sel),
             _ => None,
@@ -349,12 +393,14 @@ impl Mode {
 /// a modal and hands it to a background agent that writes the task and files it,
 /// `N` opens the interactive planning session, and `ctrl-n` — the rare path, and
 /// the only one that sets state, priority and dependencies at creation time —
-/// opens the manual `$EDITOR` form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// opens the manual `$EDITOR` form. The Milestones tab's `n` collects a
+/// milestone's title first and carries it here.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateFlow {
     Quick,
     Editor,
     Plan,
+    Milestone(String),
 }
 
 /// Which refine intensity a keypress asks for (DESIGN.md §6): a one-line note
@@ -491,6 +537,25 @@ fn jump_verb<'a>(
     match want {
         JumpVerb::Attach => attach.or(resume),
         JumpVerb::Resume => resume.or(attach),
+    }
+}
+
+/// The transition menu for a task: the machine's legal actions, or on a
+/// milestone the two verdicts the TUI offers it (DESIGN.md §6).
+fn transition_actions(task: &Task) -> Vec<Action> {
+    if task.milestone {
+        task.milestone_actions()
+    } else {
+        Store::legal_actions(task.state, task.human)
+    }
+}
+
+/// [`action_label`] for a task's menu: on a milestone `Complete` is done,
+/// which [`Store::close_milestone`] reaches in one step.
+pub fn transition_label(action: &Action, milestone: bool) -> &'static str {
+    match action {
+        Action::Complete(_) if milestone => "done → done",
+        _ => action_label(action),
     }
 }
 
@@ -636,6 +701,20 @@ pub struct App {
     /// When `now_minutes` was last read.
     clock_read_at: Option<std::time::Instant>,
 
+    /// Every milestone with its members (DESIGN.md §3), closed ones included,
+    /// in the Milestones tab's order: ready, parked, then closed.
+    pub milestones: Vec<voro_core::MilestoneMembers>,
+    /// Each task's nearest milestones by id, for the cockpit column and the
+    /// detail panes. Loaded per refresh from one read of the graph.
+    pub milestone_of: std::collections::HashMap<i64, Vec<i64>>,
+    pub milestones_sel: usize,
+    /// Whether the task browser groups by milestone (`M`), and which folds are
+    /// open; `None` is the unattached fold. Both held across refreshes.
+    pub browse_by_milestone: bool,
+    pub open_groups: std::collections::HashSet<Option<i64>>,
+    /// The task browser's rows, which `tasks_sel` counts in.
+    pub browser_rows: Vec<BrowserRow>,
+
     pub cockpit_rows: Vec<CockpitRow>,
     pub cockpit_sel: usize,
     pub tasks_sel: usize,
@@ -750,6 +829,12 @@ impl App {
             now_minutes: None,
             now_epoch: None,
             clock_read_at: None,
+            milestones: Vec::new(),
+            milestone_of: std::collections::HashMap::new(),
+            milestones_sel: 0,
+            browse_by_milestone: false,
+            open_groups: std::collections::HashSet::new(),
+            browser_rows: Vec::new(),
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
             tasks_sel: 0,
@@ -913,6 +998,7 @@ impl App {
             .collect();
         self.last_sessions = self.store.latest_sessions()?;
         self.all = all;
+        self.load_milestones()?;
         self.running = self.store.running_rows()?;
         self.counts = self.store.state_counts()?;
 
@@ -939,7 +1025,12 @@ impl App {
         self.cockpit_sel = self
             .cockpit_sel
             .min(self.cockpit_rows.len().saturating_sub(1));
-        self.tasks_sel = self.tasks_sel.min(self.all.len().saturating_sub(1));
+        self.tasks_sel = self
+            .tasks_sel
+            .min(self.browser_rows.len().saturating_sub(1));
+        self.milestones_sel = self
+            .milestones_sel
+            .min(self.milestones.len().saturating_sub(1));
         self.projects_sel = self.projects_sel.min(self.projects.len().saturating_sub(1));
         self.config_sel = self
             .config_sel
@@ -1167,7 +1258,11 @@ impl App {
                 CockpitRow::Proposal(i, j) => Some(self.digest_child(*i, *j)?.candidate.task.id),
                 CockpitRow::Running(i) => Some(self.running.get(*i)?.task_id),
             },
-            Screen::Tasks => Some(self.all.get(self.tasks_sel)?.task.id),
+            Screen::Tasks => match self.browser_rows.get(self.tasks_sel)? {
+                BrowserRow::Task(i) => Some(self.all.get(*i)?.task.id),
+                BrowserRow::Group(_) => None,
+            },
+            Screen::Milestones => Some(self.milestones.get(self.milestones_sel)?.milestone.id),
             Screen::Projects | Screen::Config => None,
         }
     }
@@ -1485,9 +1580,10 @@ impl App {
     pub fn move_selection(&mut self, delta: i64) {
         let (sel, len) = match self.screen {
             Screen::Cockpit => (&mut self.cockpit_sel, self.cockpit_rows.len()),
-            Screen::Tasks => (&mut self.tasks_sel, self.all.len()),
+            Screen::Tasks => (&mut self.tasks_sel, self.browser_rows.len()),
             Screen::Projects => (&mut self.projects_sel, self.projects.len()),
             Screen::Config => (&mut self.config_sel, self.config_rows.len()),
+            Screen::Milestones => (&mut self.milestones_sel, self.milestones.len()),
         };
         if len == 0 {
             return;
@@ -1503,9 +1599,10 @@ impl App {
     fn select_index(&mut self, index: usize) {
         let (sel, len) = match self.screen {
             Screen::Cockpit => (&mut self.cockpit_sel, self.cockpit_rows.len()),
-            Screen::Tasks => (&mut self.tasks_sel, self.all.len()),
+            Screen::Tasks => (&mut self.tasks_sel, self.browser_rows.len()),
             Screen::Projects => (&mut self.projects_sel, self.projects.len()),
             Screen::Config => (&mut self.config_sel, self.config_rows.len()),
+            Screen::Milestones => (&mut self.milestones_sel, self.milestones.len()),
         };
         if index >= len {
             return;
@@ -1528,11 +1625,12 @@ impl App {
         self.config_agents_scroll = (self.config_agents_scroll as i64 + delta).clamp(0, max) as u16;
     }
 
-    /// Tab cycles cockpit → tasks → projects → config → cockpit; `alt-1` to
-    /// `alt-4` jump directly (DESIGN.md §9). Until a project is registered the
-    /// ring is the shorter Projects ↔ Config, the cockpit and the browser
-    /// having nothing to show and nothing to do until one exists; a screen off
-    /// that ring enters it at Projects, where the first step is.
+    /// Tab cycles cockpit → tasks → projects → config → milestones → cockpit;
+    /// `alt-1` to `alt-5` jump directly (DESIGN.md §9). Until a project is
+    /// registered the ring is the shorter Projects ↔ Config, the cockpit, the
+    /// browser and the milestones having nothing to show and nothing to do
+    /// until one exists; a screen off that ring enters it at Projects, where
+    /// the first step is.
     pub fn toggle_screen(&mut self) {
         if self.projects.is_empty() {
             self.screen = match self.screen {
@@ -1545,7 +1643,8 @@ impl App {
             Screen::Cockpit => Screen::Tasks,
             Screen::Tasks => Screen::Projects,
             Screen::Projects => Screen::Config,
-            Screen::Config => Screen::Cockpit,
+            Screen::Config => Screen::Milestones,
+            Screen::Milestones => Screen::Cockpit,
         };
     }
 
@@ -1553,7 +1652,9 @@ impl App {
     /// having a project (DESIGN.md §9), in Voro's usual shape for a refusal: no
     /// move, and a status line naming the key to press instead.
     fn jump_to_screen(&mut self, screen: Screen) {
-        if self.projects.is_empty() && matches!(screen, Screen::Cockpit | Screen::Tasks) {
+        if self.projects.is_empty()
+            && matches!(screen, Screen::Cockpit | Screen::Tasks | Screen::Milestones)
+        {
             self.status = Some(NO_PROJECTS_JUMP_HINT.into());
             return;
         }
@@ -1567,7 +1668,9 @@ impl App {
     /// §6/§8) and any other task opens its transition menu.
     fn activate_selection(&mut self) {
         if self.screen == Screen::Tasks {
-            if let Some(task_id) = self.selected_task_id() {
+            if let Some(BrowserRow::Group(group)) = self.browser_rows.get(self.tasks_sel) {
+                self.toggle_group(*group);
+            } else if let Some(task_id) = self.selected_task_id() {
                 self.mode = Mode::Detail { task_id, scroll: 0 };
             }
             return;
@@ -1583,7 +1686,7 @@ impl App {
                 let id = task.id;
                 self.apply_and_refresh(id, Action::Resume);
             } else {
-                let actions = Store::legal_actions(task.state, task.human);
+                let actions = transition_actions(task);
                 if !actions.is_empty() {
                     self.mode = Mode::Transition {
                         task_id: task.id,
@@ -1610,7 +1713,12 @@ impl App {
                     .filter(|v| v.editable)
                     .map(|_| "⏎ edit"),
             },
-            Screen::Tasks => self.all.get(self.tasks_sel).map(|_| "⏎ view"),
+            Screen::Tasks => match self.browser_rows.get(self.tasks_sel)? {
+                BrowserRow::Group(group) if self.open_groups.contains(group) => Some("⏎ collapse"),
+                BrowserRow::Group(_) => Some("⏎ expand"),
+                BrowserRow::Task(_) => Some("⏎ view"),
+            },
+            Screen::Milestones => self.milestones.get(self.milestones_sel).map(|_| "⏎ browse"),
             Screen::Cockpit => match self.cockpit_rows.get(self.cockpit_sel)? {
                 CockpitRow::Queue(i) => match self.queue.rows.get(*i)? {
                     QueueRow::Digest(digest) => {
@@ -1725,6 +1833,13 @@ impl App {
                 sel,
                 back,
             } => self.key_doc_picker(key, task_id, docs, sel, back),
+            Mode::MilestoneTitle { buffer } => self.key_milestone_title(key, buffer),
+            Mode::MilestonePicker {
+                task_id,
+                milestones,
+                sel,
+                back,
+            } => self.key_milestone_picker(key, task_id, milestones, sel, back),
             Mode::ViewerPicker {
                 project_id,
                 options,
@@ -1763,6 +1878,7 @@ impl App {
             Hit::TaskRow(i) if self.screen == Screen::Tasks => self.select_index(i),
             Hit::ProjectRow(i) if self.screen == Screen::Projects => self.select_index(i),
             Hit::ConfigRow(i) if self.screen == Screen::Config => self.select_index(i),
+            Hit::MilestoneRow(i) if self.screen == Screen::Milestones => self.select_index(i),
             Hit::PickerOption(i) => self.click_picker_option(i),
             _ => {}
         }
@@ -1833,6 +1949,10 @@ impl App {
                     self.jump_to_screen(Screen::Config);
                     return;
                 }
+                KeyCode::Char('5') => {
+                    self.jump_to_screen(Screen::Milestones);
+                    return;
+                }
                 _ => {}
             }
         }
@@ -1847,6 +1967,12 @@ impl App {
         // below; it binds no digits at all.
         if self.screen == Screen::Config {
             self.key_config(key);
+            return;
+        }
+        // The Milestones tab binds its own few keys and no others, so its
+        // list and its keys can move to another screen as a unit.
+        if self.screen == Screen::Milestones {
+            self.key_milestones(key);
             return;
         }
         // A bare digit sets the number on the selected row, which on the cockpit
@@ -1886,7 +2012,7 @@ impl App {
             }
             KeyCode::Char('s') => {
                 if let Some(task) = self.selected_task() {
-                    let actions = Store::legal_actions(task.state, task.human);
+                    let actions = transition_actions(task);
                     if actions.is_empty() {
                         self.status = Some(format!("task is {} — nowhere to go", task.state));
                     } else {
@@ -1936,6 +2062,14 @@ impl App {
                     self.open_doc_picker(id, None);
                 }
             }
+            KeyCode::Char('m') => {
+                if let Some(id) = self.selected_task_id() {
+                    self.open_milestone_picker(id, None);
+                }
+            }
+            // `M` is not a variant of `m`: grouping the browser and attaching
+            // a task merely share a letter (DESIGN.md §9).
+            KeyCode::Char('M') if self.screen == Screen::Tasks => self.toggle_browse_by_milestone(),
             // `C` is not a variant of `c` — cancelling a refine and linking a
             // document merely share a letter, so they keep their own slots
             // (DESIGN.md §9).
@@ -2203,6 +2337,7 @@ impl App {
                     Err(e) => self.status = Some(e),
                 }
             }
+            CreateFlow::Milestone(title) => self.create_milestone(project_id, &title),
         }
     }
 
@@ -2212,7 +2347,9 @@ impl App {
     /// it back through triage (DESIGN.md §6).
     pub fn is_refinable(&self, task_id: i64) -> bool {
         self.all.iter().any(|r| {
-            r.task.id == task_id && matches!(r.task.state, TaskState::Proposed | TaskState::Ready)
+            r.task.id == task_id
+                && !r.task.milestone
+                && matches!(r.task.state, TaskState::Proposed | TaskState::Ready)
         })
     }
 
@@ -4068,6 +4205,10 @@ impl App {
                     Action::RejectWork(_) => Some(PromptKind::RejectWork),
                     _ => None,
                 };
+                let milestone = self
+                    .all
+                    .iter()
+                    .any(|r| r.task.id == task_id && r.task.milestone);
                 match kind {
                     Some(kind) => {
                         let buffer = self.prompt_seed(task_id, kind);
@@ -4076,6 +4217,9 @@ impl App {
                             kind,
                             buffer,
                         };
+                    }
+                    None if milestone && matches!(action, Action::Complete(_)) => {
+                        self.close_milestone(task_id)
                     }
                     None => self.apply_and_refresh(task_id, action),
                 }
@@ -4128,7 +4272,7 @@ impl App {
             KeyCode::Char('h') => self.show_history = !self.show_history,
             KeyCode::Enter | KeyCode::Char('s') => {
                 if let Some(task) = self.all.iter().map(|r| &r.task).find(|t| t.id == task_id) {
-                    let actions = Store::legal_actions(task.state, task.human);
+                    let actions = transition_actions(task);
                     if actions.is_empty() {
                         self.status = Some(format!("task is {} — nowhere to go", task.state));
                     } else {
@@ -4151,6 +4295,11 @@ impl App {
             // to restore; when nothing opens it, fall through and stay put.
             KeyCode::Char('c') => {
                 if self.open_doc_picker(task_id, Some(scroll)) {
+                    return;
+                }
+            }
+            KeyCode::Char('m') => {
+                if self.open_milestone_picker(task_id, Some(scroll)) {
                     return;
                 }
             }
@@ -4184,6 +4333,11 @@ impl App {
             && self.digest(*i).is_some()
         {
             return "select a proposal inside the digest (⏎ expands) to set its priority";
+        }
+        if self.screen == Screen::Tasks
+            && let Some(BrowserRow::Group(_)) = self.browser_rows.get(self.tasks_sel)
+        {
+            return "select a task inside the fold (⏎ expands) to set its priority";
         }
         "nothing selected"
     }
@@ -4419,16 +4573,23 @@ mod tests {
         key(&mut app, KeyCode::Tab);
         assert_eq!(app.screen, Screen::Config);
         key(&mut app, KeyCode::Tab);
+        assert_eq!(app.screen, Screen::Milestones);
+        key(&mut app, KeyCode::Tab);
         assert_eq!(app.screen, Screen::Cockpit);
     }
 
-    /// The gate's only refusal: the alt-digit jumps to the cockpit and the
-    /// browser no-op and say where to go instead, while `alt-3` and `alt-4`
-    /// keep working. All four jump again once a project is registered.
+    /// The gate's only refusal: the alt-digit jumps to the cockpit, the
+    /// browser and the milestones no-op and say where to go instead, while
+    /// `alt-3` and `alt-4` keep working. All five jump again once a project is
+    /// registered.
     #[test]
     fn the_gated_screen_jumps_refuse_until_a_project_exists() {
         let mut app = empty_app();
-        for (press, blocked) in [('1', Screen::Cockpit), ('2', Screen::Tasks)] {
+        for (press, blocked) in [
+            ('1', Screen::Cockpit),
+            ('2', Screen::Tasks),
+            ('5', Screen::Milestones),
+        ] {
             for from in [Screen::Projects, Screen::Config] {
                 app.screen = from;
                 app.status = None;
@@ -4451,6 +4612,7 @@ mod tests {
             ('2', Screen::Tasks),
             ('3', Screen::Projects),
             ('4', Screen::Config),
+            ('5', Screen::Milestones),
         ] {
             app.status = None;
             alt_key(&mut app, KeyCode::Char(press));
@@ -5266,11 +5428,11 @@ mod tests {
 
     // --- projects screen (task, DESIGN.md §9) ---
 
-    /// Tab cycles cockpit → tasks → projects → config → cockpit, and the
-    /// alt-digits jump to a screen directly — from every screen, including the
-    /// two that handle their own keys (DESIGN.md §9).
+    /// Tab cycles cockpit → tasks → projects → config → milestones → cockpit,
+    /// and the alt-digits jump to a screen directly — from every screen,
+    /// including the three that handle their own keys (DESIGN.md §9).
     #[test]
-    fn tab_and_alt_digits_move_between_the_four_screens() {
+    fn tab_and_alt_digits_move_between_the_five_screens() {
         let mut app = app_with(&[]);
         assert_eq!(app.screen, Screen::Cockpit);
         key(&mut app, KeyCode::Tab);
@@ -5280,9 +5442,14 @@ mod tests {
         key(&mut app, KeyCode::Tab);
         assert_eq!(app.screen, Screen::Config);
         key(&mut app, KeyCode::Tab);
+        assert_eq!(app.screen, Screen::Milestones);
+        key(&mut app, KeyCode::Tab);
         assert_eq!(app.screen, Screen::Cockpit);
 
+        alt_key(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.screen, Screen::Milestones);
         alt_key(&mut app, KeyCode::Char('2'));
+
         assert_eq!(app.screen, Screen::Tasks);
         alt_key(&mut app, KeyCode::Char('1'));
         assert_eq!(app.screen, Screen::Cockpit);
