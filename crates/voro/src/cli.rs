@@ -168,6 +168,10 @@ tasks
                                   ones show state proposed. A milestone is
                                   triaged like any proposal, but opened and
                                   closed only from the TUI
+  tree <task-id>                  the task and its blockers, nested two
+                                  columns per level, nearest blockers only.
+                                  A blocker already printed under another
+                                  task prints again as `↑ #N title`
   inbox                           the next-action queue: questions, reviews,
                                   proposals, top ready tasks — ranked by score.
                                   Proposals ride as one digest row per project;
@@ -334,6 +338,9 @@ enum Verb {
     Milestones {
         #[arg(long)]
         all: bool,
+    },
+    Tree {
+        task_id: i64,
     },
     Inbox,
     Next,
@@ -758,6 +765,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         },
         Verb::List(args) => list_verb(store, &args),
         Verb::Milestones { all } => milestones_verb(store, all),
+        Verb::Tree { task_id } => tree_verb(store, task_id),
         Verb::Inbox => inbox_verb(store, ctx),
         Verb::Next => next_verb(store),
         Verb::Stats => stats_verb(store),
@@ -2046,6 +2054,36 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
 /// `N open · M done` for a milestone's members.
 fn member_counts(m: &MilestoneMembers) -> String {
     format!("{} open · {} done", m.open(), m.done())
+}
+
+/// One task's blockers as the browser's tree lays them out (DESIGN.md §9),
+/// siblings in browse order, without the browser's fold markers.
+fn tree_verb(store: &mut Store, task_id: i64) -> Result<String, String> {
+    store.task(task_id).map_err(|e| e.to_string())?;
+    let mut tasks = store.tasks().map_err(|e| e.to_string())?;
+    tasks.sort_by_key(|t| (crate::app::browse_order(t.state), t.id));
+    let order: Vec<i64> = tasks.iter().map(|t| t.id).collect();
+    let deps = store.deps_by_task().map_err(|e| e.to_string())?;
+    let edges = crate::app::blocks_edges(&deps);
+    let mut out = String::new();
+    for row in voro_core::blocker_tree(task_id, &order, &edges) {
+        let Some(task) = tasks.iter().find(|t| t.id == row.id) else {
+            continue;
+        };
+        let indent = "  ".repeat(row.depth);
+        if row.reference {
+            writeln!(out, "{indent}↑ #{} {}", task.id, task.title).unwrap();
+            continue;
+        }
+        let marker = if task.milestone { "  [milestone]" } else { "" };
+        writeln!(
+            out,
+            "{indent}#{} {} {}{marker}",
+            task.id, task.state, task.title
+        )
+        .unwrap();
+    }
+    Ok(out)
 }
 
 fn milestones_verb(store: &mut Store, all: bool) -> Result<String, String> {

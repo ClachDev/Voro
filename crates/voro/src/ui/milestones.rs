@@ -22,7 +22,7 @@ const MIN_TITLE: usize = 20;
 /// The label's separation from the title and badges before it.
 const GAP: usize = 2;
 
-fn milestone_style() -> Style {
+pub(super) fn milestone_style() -> Style {
     Style::new().fg(Color::Blue)
 }
 

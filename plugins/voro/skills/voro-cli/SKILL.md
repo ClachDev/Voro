@@ -29,6 +29,7 @@ voro next               # the single top ready task, with its full body
 voro list [--state ready] [--project NAME]
 voro show <id>          # body, deps, event history
 voro show <id> --event <event-id>   # one event's detail alone, undecorated
+voro tree <id>          # the task and its blockers, nested; a repeat prints as ↑ #N
 voro explain <id>       # score decomposition (weight × priority + age bonus)
 ```
 

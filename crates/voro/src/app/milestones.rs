@@ -96,7 +96,10 @@ impl App {
         (count(|s| !s.is_terminal()), count(|s| s == TaskState::Done))
     }
 
-    fn build_browser_rows(&self) -> Vec<BrowserRow> {
+    pub(super) fn build_browser_rows(&self) -> Vec<BrowserRow> {
+        if self.browse_tree {
+            return self.tree_browser_rows();
+        }
         if !self.browse_by_milestone {
             return (0..self.all.len()).map(BrowserRow::Task).collect();
         }
@@ -116,22 +119,28 @@ impl App {
     }
 
     /// Rebuild the browser rows and keep the selection on the row it was on:
-    /// the same task, or the same fold.
-    fn rebuild_browser(&mut self) {
-        let current = self.browser_rows.get(self.tasks_sel).map(|row| match row {
-            BrowserRow::Task(i) => BrowserRow::Task(*i),
-            BrowserRow::Group(g) => BrowserRow::Group(*g),
-        });
+    /// the same row, or failing that the first row of the same task.
+    pub(super) fn rebuild_browser(&mut self) {
+        let current = self.browser_rows.get(self.tasks_sel).copied();
         self.browser_rows = self.build_browser_rows();
+        let task = current.and_then(|row| row.task_index());
         self.tasks_sel = current
             .and_then(|row| self.browser_rows.iter().position(|r| *r == row))
+            .or_else(|| {
+                let task = task?;
+                self.browser_rows
+                    .iter()
+                    .position(|r| r.task_index() == Some(task))
+            })
             .unwrap_or(0)
             .min(self.browser_rows.len().saturating_sub(1));
     }
 
     /// `M` on the browser: group by milestone, folds closed, or flatten again.
+    /// Grouping turns the tree off.
     pub(super) fn toggle_browse_by_milestone(&mut self) {
         self.browse_by_milestone = !self.browse_by_milestone;
+        self.browse_tree = false;
         self.open_groups.clear();
         self.rebuild_browser();
     }
@@ -150,6 +159,7 @@ impl App {
             return;
         };
         self.browse_by_milestone = true;
+        self.browse_tree = false;
         self.open_groups = [Some(id)].into();
         self.browser_rows = self.build_browser_rows();
         self.tasks_sel = self

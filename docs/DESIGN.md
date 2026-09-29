@@ -2477,6 +2477,24 @@ milestone and heads none. Membership is §3's, so a task tied between two
 milestones appears in both folds, and a milestone behind another appears as a
 member of the other's fold.
 
+`t` in the task browser lays it out as a tree of `blocks` edges. A top-level
+row is a task that blocks nothing among the browser's rows, and each task's
+blockers nest beneath it, two columns deeper per level, siblings in browse
+order. The tree is drawn from the transitive reduction: a task nests only its
+nearest blockers, so a direct edge that another blocker already implies adds no
+row. A blocker serving several dependents prints in full under the first one
+the walk reaches and as a one-line `↑ #N title` reference, with nothing beneath
+it, under each of the others. Every row with blockers beneath it is a fold,
+opened and closed with space. Folds start closed and show `N open · M done`
+over the distinct tasks they hide, and a milestone row carries `[milestone]`.
+⏎ and every other task key act on a tree row's task as on a list row, which is
+why folds take space rather than ⏎. The tree and milestone grouping exclude
+each other: `t` turns grouping off and `M` turns the tree off. The tree lays out
+whatever rows the browser holds, so a filter on the browser would narrow it,
+dropping edges to the tasks the filter hides; the browser has no filter yet, so
+today it holds every task. `voro tree <task-id>` prints one task's part of the
+same tree for agents, without the fold markers.
+
 `m` on a task — on the cockpit, in the browser and inside the browser's detail
 popup — opens a picker over every open milestone, the task's own project's
 first, with the milestones the task blocks directly ticked. ⏎ adds or removes
