@@ -1,6 +1,6 @@
 //! Rendering for the Milestones tab and the milestone parts of the other
-//! screens (DESIGN.md §9): the cockpit column, the browser's fold headers, the
-//! picker, and the tab's own key line and key map.
+//! screens (DESIGN.md §9): the cockpit's row label, the browser's fold
+//! headers, the picker, and the tab's own key line and key map.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -12,41 +12,87 @@ use voro_core::Task;
 use super::{HitMap, KeySection, SELECTED, draw_status, status_height, task_ref};
 use crate::app::App;
 
-/// The cockpit column's width, fixed so the project and title after it stay
-/// aligned whether or not a row has a milestone.
-pub(super) const COLUMN_WIDTH: usize = 16;
+/// The widest a milestone title runs in a row's label before its ellipsis.
+const LABEL_WIDTH: usize = 16;
+
+/// The fewest columns of task title a row keeps beside its label; a pane too
+/// narrow for that drops the label instead.
+const MIN_TITLE: usize = 20;
+
+/// The label's separation from the title and badges before it.
+const GAP: usize = 2;
 
 fn milestone_style() -> Style {
     Style::new().fg(Color::Blue)
 }
 
-/// `text` cut to `width` characters, ending in `…` when it had to be cut.
+/// `text`'s width in display columns.
+fn columns(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// `text` cut to `width` display columns, ending in `…` when it had to be cut.
 fn truncate(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
+    if columns(text) <= width {
         return text.to_string();
     }
-    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+    let room = width.saturating_sub(1);
+    let mut kept = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = columns(c.encode_utf8(&mut [0; 4]));
+        if used + w > room {
+            break;
+        }
+        used += w;
+        kept.push(c);
+    }
     format!("{kept}…")
 }
 
-/// The cockpit's milestone column: the title of the task's nearest
-/// milestone, with `+N` for the others when it has several, padded to
-/// [`COLUMN_WIDTH`]. Blank when it has none.
-pub(super) fn column_span(app: &App, task_id: i64) -> Span<'static> {
+/// The row label for a task's milestones: the nearest one's title, cut to
+/// [`LABEL_WIDTH`], with `+N` for the others when it has several.
+fn label(app: &App, task_id: i64) -> Option<String> {
     let milestones = app.milestones_of(task_id);
-    let text = match milestones.split_first() {
-        None => String::new(),
-        Some((first, rest)) => {
-            let more = if rest.is_empty() {
-                String::new()
-            } else {
-                format!(" +{}", rest.len())
-            };
-            let room = COLUMN_WIDTH - more.chars().count();
-            format!("{}{more}", truncate(&first.title, room))
-        }
+    let (first, rest) = milestones.split_first()?;
+    let title = truncate(&first.title, LABEL_WIDTH);
+    Some(if rest.is_empty() {
+        title
+    } else {
+        format!("{title} +{}", rest.len())
+    })
+}
+
+/// A cockpit or running-strip row `width` columns wide: `head`, the task's
+/// `title`, the `badges` that follow it, and the task's milestone label flush
+/// against the right edge. The title gives way to the label, which is dropped
+/// when fewer than [`MIN_TITLE`] columns of title would remain beside it.
+pub(super) fn row_line(
+    app: &App,
+    task_id: i64,
+    width: u16,
+    mut head: Vec<Span<'static>>,
+    title: Span<'static>,
+    badges: Vec<Span<'static>>,
+) -> Line<'static> {
+    let spans_width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
+    let label = label(app, task_id).and_then(|label| {
+        let fixed = spans_width(&head) + spans_width(&badges) + GAP + columns(&label);
+        let room = (width as usize).checked_sub(fixed)?;
+        (room >= MIN_TITLE).then_some((label, room))
+    });
+    let Some((label, room)) = label else {
+        head.push(title);
+        head.extend(badges);
+        return Line::from(head);
     };
-    Span::styled(format!("{text:<COLUMN_WIDTH$}"), milestone_style())
+    let title = Span::styled(truncate(&title.content, room), title.style);
+    let pad = room - title.width() + GAP;
+    head.push(title);
+    head.extend(badges);
+    head.push(Span::raw(" ".repeat(pad)));
+    head.push(Span::styled(label, milestone_style()));
+    Line::from(head)
 }
 
 /// The detail panes' milestone lines: one per nearest milestone, which is
@@ -288,7 +334,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use voro_core::{DepKind, Priority, Store, TaskState};
+    use voro_core::{DepKind, LivenessSource, Priority, Store, TaskState};
 
     use crate::app::App;
     use crate::app::milestones::tests::{app_from, new_task};
@@ -312,59 +358,128 @@ mod tests {
 
     const LONG_TITLE: &str = "Tune wheel traction control for low-pile carpet under load";
 
-    #[test]
-    fn a_member_row_shows_its_milestone_and_forty_characters_of_its_title_at_100_columns() {
+    /// Tasks titled as given, each blocking a fresh milestone per name in its
+    /// list, and every task dispatched when `running`, so it rows in the
+    /// running strip rather than the queue.
+    fn members(tasks: &[(&str, &[&str])], running: bool) -> (App, Vec<i64>) {
         let mut store = Store::open_in_memory().unwrap();
         let p = store.create_project("voro", "/tmp/voro").unwrap().id;
-        let m = store
-            .create_milestone(p, "Carpet crossing under fleet", "", Priority::P2)
-            .unwrap()
-            .id;
-        let t = new_task(&mut store, p, LONG_TITLE, TaskState::Ready);
-        store.add_dep(m, t, DepKind::Blocks).unwrap();
-        let app = app_from(store);
-        let row = rows(&app, 100)
+        let mut ids = Vec::new();
+        for (title, milestones) in tasks {
+            let t = new_task(&mut store, p, title, TaskState::Ready);
+            let ms: Vec<i64> = milestones
+                .iter()
+                .map(|m| store.create_milestone(p, m, "", Priority::P2).unwrap().id)
+                .collect();
+            if !ms.is_empty() {
+                store.block_tasks(t, &ms).unwrap();
+            }
+            if running {
+                store
+                    .record_dispatch(t, "claude", None, LivenessSource::Listing, None)
+                    .unwrap();
+            }
+            ids.push(t);
+        }
+        (app_from(store), ids)
+    }
+
+    /// The task's row: the first line naming it for a queue row, the last for
+    /// a running-strip row, which sits below the detail pane.
+    fn row_of(app: &App, width: u16, t: i64, running: bool) -> String {
+        let mut named = rows(app, width)
             .into_iter()
-            .find(|r| r.contains(&format!("#{t}")))
-            .expect("the task has a cockpit row");
-        assert!(row.contains("Carpet crossing… voro: "), "{row}");
-        let title: String = LONG_TITLE.chars().take(40).collect();
-        assert!(row.contains(&title), "{row}");
+            .filter(|r| r.contains(&format!("#{t} ")));
+        let row = if running {
+            named.next_back()
+        } else {
+            named.next()
+        };
+        row.expect("the task has a cockpit row")
+    }
+
+    #[test]
+    fn a_row_without_a_milestone_renders_as_before_the_label() {
+        for running in [false, true] {
+            let (app, ids) = members(&[("alone", &[])], running);
+            let row = row_of(&app, 100, ids[0], running);
+            let body = row.trim_end_matches('│').trim_end();
+            let expected = if running {
+                "  alone"
+            } else {
+                "P2  voro: alone"
+            };
+            assert!(body.ends_with(expected), "{row}");
+        }
+    }
+
+    #[test]
+    fn member_rows_end_their_labels_at_the_panes_right_edge() {
+        for running in [false, true] {
+            let (app, ids) = members(
+                &[
+                    ("short", &["Carpet crossing under fleet"]),
+                    ("also short", &["Dock"]),
+                ],
+                running,
+            );
+            let first = row_of(&app, 100, ids[0], running);
+            let second = row_of(&app, 100, ids[1], running);
+            let edge = |row: &str, label: &str| {
+                assert!(row.ends_with(&format!("  {label}│")), "{row}");
+                row.chars().count() - 1
+            };
+            assert_eq!(
+                edge(&first, "Carpet crossing…"),
+                edge(&second, "Dock"),
+                "labels end in one column"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_title_gives_way_to_the_whole_label() {
+        let title = LONG_TITLE.repeat(3);
+        let title = &title[..120];
+        for running in [false, true] {
+            let (app, ids) = members(&[(title, &["Dock"])], running);
+            let row = row_of(&app, 100, ids[0], running);
+            assert!(row.ends_with("…  Dock│"), "{row}");
+            assert!(row.contains(&LONG_TITLE[..20]), "{row}");
+        }
     }
 
     #[test]
     fn a_task_with_two_milestones_shows_the_first_and_a_count() {
-        let mut store = Store::open_in_memory().unwrap();
-        let p = store.create_project("voro", "/tmp/voro").unwrap().id;
-        let a = store
-            .create_milestone(p, "Dock", "", Priority::P2)
-            .unwrap()
-            .id;
-        let b = store
-            .create_milestone(p, "Fleet", "", Priority::P2)
-            .unwrap()
-            .id;
-        let t = new_task(&mut store, p, "shared", TaskState::Ready);
-        store.block_tasks(t, &[a, b]).unwrap();
-        let app = app_from(store);
-        let row = rows(&app, 100)
-            .into_iter()
-            .find(|r| r.contains(&format!("#{t}")))
-            .unwrap();
-        assert!(row.contains("Dock +1          voro: shared"), "{row}");
+        for running in [false, true] {
+            let (app, ids) = members(&[("shared", &["Dock", "Fleet"])], running);
+            let row = row_of(&app, 100, ids[0], running);
+            assert!(row.ends_with("  Dock +1│"), "{row}");
+        }
     }
 
     #[test]
-    fn with_no_milestones_the_column_is_blank_and_the_tab_points_at_n() {
+    fn a_narrow_pane_drops_the_label_and_keeps_the_title() {
+        for running in [false, true] {
+            let (app, ids) = members(&[(LONG_TITLE, &["Dock"])], running);
+            let row = row_of(&app, 60, ids[0], running);
+            assert!(!row.contains("Dock"), "{row}");
+            assert!(!row.contains('…'), "{row}");
+            let before_border = row.trim_end_matches('│').chars().last();
+            assert_ne!(
+                before_border,
+                Some(' '),
+                "the title runs to the edge: {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_no_milestones_the_tab_points_at_n() {
         let mut store = Store::open_in_memory().unwrap();
         let p = store.create_project("voro", "/tmp/voro").unwrap().id;
-        let t = new_task(&mut store, p, "alone", TaskState::Ready);
+        new_task(&mut store, p, "alone", TaskState::Ready);
         let mut app = app_from(store);
-        let row = rows(&app, 100)
-            .into_iter()
-            .find(|r| r.contains(&format!("#{t}")))
-            .unwrap();
-        assert!(row.contains(&format!("P2  {:16} voro: alone", "")), "{row}");
 
         app.on_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT));
         let screen = rows(&app, 100).join("\n");

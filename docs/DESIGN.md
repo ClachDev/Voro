@@ -2435,12 +2435,16 @@ at `n`. The tab may later merge into the browser or the projects screen, so
 its list and its keys live in their own modules (`app/milestones.rs`,
 `ui/milestones.rs`) and bind nothing on any other screen.
 
-The cockpit gains a column and nothing else. Sixteen characters between the
-priority and the project hold the title of the task's milestone, cut with an
-ellipsis; a task with several shows the first and `+N`, and a task with none
-leaves the column blank, so the project and title after it stay aligned. At
-100 columns a row still shows 40 characters of the task's own title. The
-running strip carries the same column before its title. A milestone reaches
+The cockpit gains a label and nothing else. A queue row whose task belongs to a
+milestone ends with that milestone's title, cut to 16 characters with an
+ellipsis, flush against the pane's right edge and two spaces clear of what
+precedes it; a task with several shows the first and `+N`. The task's title
+gives way to the label and ends in an ellipsis when it must, while its badges
+stay directly after it. A pane too narrow to keep 20 columns of title beside
+the label drops the label from that row. A row with no milestone reserves
+nothing and reads as it did before milestones existed. Widths count display
+columns, not bytes. The running strip and the proposals under a folded-open
+digest place the label the same way. A milestone reaches
 the queue only once it is ready (§3), as an ordinary *do* row whose
 transition menu is the tab's.
 
