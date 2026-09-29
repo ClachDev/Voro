@@ -435,7 +435,7 @@ impl Store {
 /// invariants, append to the event log, and cascade dependant readiness —
 /// against an already-open transaction so callers can bundle further writes
 /// (a session insert, for dispatch) into the same atomic unit.
-fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskState> {
+pub(crate) fn apply_action(tx: &Connection, task_id: i64, action: Action) -> Result<TaskState> {
     let task = get_task(tx, task_id)?.ok_or(Error::TaskNotFound(task_id))?;
 
     use TaskState::*;

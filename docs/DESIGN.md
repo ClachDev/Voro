@@ -802,7 +802,10 @@ cannot move it. `start`, `done`, `abandon`, `park`, `unpark` and every other
 transition verb refuse a milestone with one line naming the TUI's Milestones
 tab, where the operator opens and closes it. The refusal is a CLI guard
 (`Task::refuse_cli_transition` in `voro-core`) rather than an arm of the
-machine, because the TUI drives the same `Store::apply` to close one. No verb
+machine, because the TUI closes one through the same machine: its *done* runs
+`start` then `complete` in one transaction (`Store::close_milestone`), since
+the machine has no step from `ready` to `done`, and its *abandon* is the
+ordinary `Store::apply`. No verb
 sets or clears the flag, and clearing `human` on a milestone is refused, so a
 milestone is never dispatchable. The promotion of §5 needs no special case:
 a milestone with blockers readies when the last one closes, one with none
@@ -2350,21 +2353,24 @@ the app already loads; every screen change after that is a key the operator
 pressed, so a refresh, a poll, or deleting the last project never moves them.
 **That landing is held by a gate rather than left to the first keypress:**
 until a project exists the TUI is a two-screen tool, Projects and Config, and
-the cockpit and the task browser cannot be entered at all — a screen whose
+the cockpit, the task browser and the Milestones tab cannot be entered at all
+— a screen whose
 entire message is "not here" is worse than a screen that cannot be reached.
 Config stays reachable throughout because it edits the `voro.toml` viewers and
 agents, which needs no project; the gate is about screens with nothing to show,
 not about a rule that nothing may be done first. Because the gate is expressed
 as a shorter Tab ring (Projects ↔ Config) and the projects screen binds no
 screen jumps, the only place a refusal can fire is the alt-digit jump to the
-cockpit or the browser, which no-ops with a status line naming the route to a
-project — the same shape as `n`'s own zero-project refusal. The `?` key map
-stops advertising `alt-1` and `alt-2` while the gate holds, since a map that
+cockpit, the browser or the Milestones tab, which no-ops with a status line
+naming the route to a project — the same shape as `n`'s own zero-project
+refusal. The `?` key map stops advertising `alt-1`, `alt-2` and `alt-5` while
+the gate holds, since a map that
 listed them would be promising a refusal. Adding the first project does not
 move the operator off the projects screen, but every screen is reachable from
-the next keypress on. With the cockpit and the browser unreachable without a
-project, each empty state has exactly one case left to explain — a drained
-queue and a project with no tasks — and both point at `n`. The create keys
+the next keypress on. With the cockpit, the browser and the Milestones tab
+unreachable without a project, each empty state has exactly one case left to
+explain — a drained queue, a project with no tasks, a project with no
+milestone — and all three point at `n`. The create keys
 ask *which* project only when there is a choice to be made, and they offer only
 projects that can take the task: an archived project refuses new work (§5), so
 it is dropped from the picker rather than listed there to fail. What remains is
@@ -2377,10 +2383,11 @@ picker entirely and creates straight into the live one, and a store whose every
 project is archived opens no picker at all, refusing with a status line
 pointing at the projects screen.
 
-Beyond the cockpit, the TUI cycles (Tab, or `alt-1`–`alt-4`, subject to the gate
-above while no project is registered) through three further full-screen views:
+Beyond the cockpit, the TUI cycles (Tab, or `alt-1`–`alt-5`, subject to the gate
+above while no project is registered) through four further full-screen views:
 the **task browser**, the **projects screen** (weights, archive, and the
-per-project viewer), and a **Config screen** that renders and edits the
+per-project viewer), the **Milestones tab** described below, and a **Config
+screen** that renders and edits the
 `voro.toml` surface (§5) — the effective agents read-only with provenance and
 the default marked, then the settings list of §5, then the named viewers
 editable in place (add, change command, delete) through the comment-preserving
@@ -2412,12 +2419,55 @@ offers a "new viewer…" entry that opens the same add-viewer form and selects t
 new viewer for that project, so first-time viewer setup needs no detour through
 the Config screen.
 
+**Milestones (§3) have a screen of their own, the Milestones tab, fifth on the
+Tab ring and on `alt-5`.** It lists milestones and not their members: the
+members belong to the task browser. Each row gives a milestone's state,
+project, title and `N open · M done`, the counts `voro milestones` prints.
+Ready milestones sort first, then parked ones, then done and rejected ones,
+dimmed. The pane beneath shows the selected milestone's body, which holds its
+acceptance statement. `n` asks for a one-line title and then a project through
+the create keys' own picker, and creates the milestone parked. `e` opens the
+body in the editor, as it does for a task. `s` opens the transition menu, which
+offers *done* on a ready milestone and *abandon* on any open one (§6). ⏎ opens
+the task browser grouped by milestone, with that milestone's fold open and
+under the cursor. With no milestone registered the list is one line pointing
+at `n`. The tab may later merge into the browser or the projects screen, so
+its list and its keys live in their own modules (`app/milestones.rs`,
+`ui/milestones.rs`) and bind nothing on any other screen.
+
+The cockpit gains a column and nothing else. Sixteen characters between the
+priority and the project hold the title of the task's milestone, cut with an
+ellipsis; a task with several shows the first and `+N`, and a task with none
+leaves the column blank, so the project and title after it stay aligned. At
+100 columns a row still shows 40 characters of the task's own title. The
+running strip carries the same column before its title. A milestone reaches
+the queue only once it is ready (§3), as an ordinary *do* row whose
+transition menu is the tab's.
+
+`M` in the task browser groups it by milestone. Each milestone heads a fold
+showing its title and the tab's counts; folds start closed, and ⏎ on one opens
+or closes it. A final `unattached` fold holds every task that belongs to no
+milestone and heads none. Membership is §3's, so a task tied between two
+milestones appears in both folds, and a milestone behind another appears as a
+member of the other's fold.
+
+`m` on a task — on the cockpit, in the browser and inside the browser's detail
+popup — opens a picker over every open milestone, the task's own project's
+first, with the milestones the task blocks directly ticked. ⏎ adds or removes
+that `blocks` edge in place and the picker stays open, as the document picker
+on `c` does (§8); attaching a task to a ready milestone demotes it to parked
+(§6). The detail panes name each of a task's nearest milestones on a
+`milestone:` line, so the triage view of a proposal filed with `--blocks`
+shows the milestone it joins: the verdict confirms the attachment, or `m`
+corrects it first. Like `c`, `m` is in the key map and not on the key line,
+since attaching moves no task's state.
+
 **A bare digit sets the number on the selected row, and screen jumps carry the
 modifier.** The digit's meaning follows the selection rather than the screen:
 `0`–`3` set the selected *task's* priority on the cockpit, in the task
 browser, and in the browser's detail popup, and `0`–`5` set the selected
 *project's* weight on the projects screen. Screen switching is the thing that gave way, because it is not the
-frequent act; Tab already cycles all four screens. Re-prioritising is. The
+frequent act; Tab already cycles all five screens. Re-prioritising is. The
 daily move is "this project matters more today" and "this task matters more
 than that one", and both should cost one keystroke on the row already under
 the cursor. Giving the bare digit one
@@ -2427,7 +2477,7 @@ crossterm reports no SHIFT modifier for a digit — a shifted digit arrives as
 its bare symbol — those symbols are layout-dependent, and `!`, shift-1, is
 already the deep toggle. `ctrl-<digit>` produces no distinct
 sequence in a
-legacy terminal, so `alt-1`–`alt-4` are the jumps, layout-independent and
+legacy terminal, so `alt-1`–`alt-5` are the jumps, layout-independent and
 testable. Some terminal emulators claim `alt-<digit>` for themselves, and where
 they do the jump never arrives and Tab still cycles; nothing else is
 bound to the chord, so nothing changes hands. A digit that resolves to no task
@@ -2551,7 +2601,8 @@ and the shift is the operator saying they are willing to be taken somewhere.
 
 The rule binds *pairs*, and only pairs, which is the same line the key line
 already draws between a shifted sibling and a mere letter-sharer. It therefore has nothing to say about a key whose uppercase is a different
-action: the cockpit's `c` link documents and `C` cancel a refine, and the
+action: the cockpit's `c` link documents and `C` cancel a refine, the
+browser's `m` attach to milestones and `M` group by milestone, and the
 projects screen's `a` add and `A` archive. Nor about an uppercase key with no
 lowercase sibling at all: `J`/`K` and the page keys scroll the pane the
 screen's selection cannot reach — the cockpit's focus card, the Config

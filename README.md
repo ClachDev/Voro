@@ -69,10 +69,10 @@ arguments:
 voro
 ```
 
-A first launch opens on the Projects screen. `tab` cycles the four screens
-(Cockpit, Tasks, Projects, Config), `j`/`k` or a click moves the selection,
-and the footer lists the keys that apply to the selected row. `?` opens the
-full key map.
+A first launch opens on the Projects screen. `tab` cycles the five screens
+(Cockpit, Tasks, Projects, Config, Milestones), `j`/`k` or a click moves
+the selection, and the footer lists the keys that apply to the selected row.
+`?` opens the full key map.
 
 **1. Register a project.** On the Projects screen press `a`; Voro asks for a
 name and the path to a checkout. The project starts at weight 3 — the
