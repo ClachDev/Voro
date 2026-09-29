@@ -30,7 +30,7 @@ pub fn template_new(filing: Filing) -> String {
                 # state: proposed | parked | ready. A milestone is always human.\n\
                 title: \n\
                 priority: 2\n\
-                state: parked\n\
+                state: ready\n\
                 milestone: true\n\
                 blocked-by: \n\
                 ---\n"
@@ -317,7 +317,12 @@ mod tests {
         let filled = template_new(Filing::Milestone).replace("title: \n", "title: Dock\n");
         let form = parse(&filled, true).unwrap();
         assert!(form.milestone);
-        assert_eq!(form.state, Some(TaskState::Parked));
+        let task = parse(
+            &template_new(Filing::Task).replace("title: \n", "title: T\n"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(form.state, task.state, "both forms default to one state");
         assert!(!parse(VALID, true).unwrap().milestone);
         assert!(parse("title: T\nmilestone: true\n---\n", false).is_err());
     }

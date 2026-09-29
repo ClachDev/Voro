@@ -257,7 +257,7 @@ transitions
                                   with the agent, so it lives in the TUI, on `R`
                                   over the row. A proposed milestone takes the
                                   three verdicts; refine is refused on one
-  start <task-id>                ready → running
+  start <task-id>                 ready → running
   ask <task-id> --question TEXT   running → needs-input
   resume <task-id>                needs-input → running, once you have answered
                                   the question in the agent's own session
@@ -1574,17 +1574,14 @@ fn set_verb(store: &mut Store, mut args: SetArgs) -> Result<String, String> {
         human,
         deep,
     };
-    // Cleared before the edit, so `--no-milestone --no-human` is not refused
-    // for dropping `human` from a milestone; set after it, once `human` holds.
-    if args.no_milestone {
-        store.set_milestone(id, false).map_err(|e| e.to_string())?;
-    }
-    let task = store.update_task(id, edit).map_err(|e| e.to_string())?;
-    let task = if args.milestone {
-        store.set_milestone(id, true).map_err(|e| e.to_string())?
-    } else {
-        task
+    let milestone = match (args.milestone, args.no_milestone) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        (false, false) => None,
     };
+    let task = store
+        .update_task_and_milestone(id, edit, milestone)
+        .map_err(|e| e.to_string())?;
     let task = if concludes_refine {
         store
             .conclude_refine(id, RefineOutcome::Applied)
@@ -2524,6 +2521,15 @@ fn triage_verb(store: &mut Store, args: TriageArgs, ctx: &DispatchCtx) -> Result
             apply_unguarded(store, ctx, args.task_id, Action::Triage(verdict), false)
         }
         Err(()) => {
+            if store
+                .task(args.task_id)
+                .map_err(|e| e.to_string())?
+                .milestone
+            {
+                return Err(
+                    dispatch::MILESTONE_REFINE_REFUSAL.replace("{id}", &args.task_id.to_string())
+                );
+            }
             let Some(note) = note else {
                 return Err(format!(
                     "refine needs a note saying what to fix: `voro triage {} refine --note \
@@ -4102,6 +4108,58 @@ mod tests {
 
         let e = err(&mut s, &["done", "1"]);
         assert!(e.contains("Milestones tab"), "{e}");
+    }
+
+    #[test]
+    fn a_failed_set_changes_nothing_on_a_milestone() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "p", "/tmp"]);
+        ok(&mut s, &["propose", "p", "Carpet crossing", "--milestone"]);
+        err(&mut s, &["set", "1", "--no-milestone", "--agent", "claude"]);
+        let m = s.task(1).unwrap();
+        assert!(m.milestone && m.human && m.agent.is_none());
+        ok(&mut s, &["propose", "p", "Dock", "--milestone"]);
+        let e = err(&mut s, &["set", "2", "--title", "carpet  Crossing"]);
+        assert!(e.contains("milestone 1"), "{e}");
+        assert_eq!(s.task(2).unwrap().title, "Dock");
+    }
+
+    #[test]
+    fn set_milestone_is_refused_on_a_running_task() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "p", "/tmp"]);
+        ok(
+            &mut s,
+            &["add", "p", "by hand", "--state", "ready", "--human"],
+        );
+        ok(&mut s, &["start", "1"]);
+        let e = err(&mut s, &["set", "1", "--milestone"]);
+        assert!(e.contains("proposed, parked or ready"), "{e}");
+        assert!(!s.task(1).unwrap().milestone);
+    }
+
+    #[test]
+    fn refine_without_a_note_on_a_milestone_names_the_milestone_refusal() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "p", "/tmp"]);
+        ok(&mut s, &["propose", "p", "Carpet crossing", "--milestone"]);
+        let e = err(&mut s, &["triage", "1", "refine"]);
+        assert!(e.contains("acceptance statement"), "{e}");
+    }
+
+    #[test]
+    fn the_start_help_line_sits_in_the_description_column() {
+        let line = HELP
+            .lines()
+            .find(|l| l.starts_with("  start <task-id>"))
+            .unwrap();
+        let column = HELP
+            .lines()
+            .find(|l| l.starts_with("  resume <task-id>"))
+            .unwrap()
+            .find("needs-input")
+            .unwrap();
+        assert_eq!(line.find("ready → running"), Some(column), "{line}");
     }
 
     #[test]

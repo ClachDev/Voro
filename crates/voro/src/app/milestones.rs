@@ -541,23 +541,48 @@ pub(crate) mod tests {
         let Mode::Transition { actions, .. } = &app.mode else {
             panic!("⏎ opens the transition menu");
         };
-        assert_eq!(actions, &vec![Action::Complete(None), Action::Abandon]);
+        assert_eq!(
+            actions,
+            &vec![Action::Complete(None), Action::Park, Action::Abandon]
+        );
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.store.task(m).unwrap().state, TaskState::Done);
         assert!(!app.queue_task_ids().contains(&m));
     }
 
     #[test]
-    fn the_tab_state_key_offers_abandon_on_a_parked_milestone() {
+    fn the_tab_state_key_offers_a_parked_milestone_unpark_and_abandon() {
         let (mut app, m, _) = one_milestone();
         alt_key(&mut app, KeyCode::Char('5'));
         key(&mut app, KeyCode::Char('s'));
         let Mode::Transition { actions, .. } = &app.mode else {
             panic!("s opens the transition menu");
         };
-        assert_eq!(actions, &vec![Action::Abandon]);
+        assert_eq!(actions, &vec![Action::Unpark, Action::Abandon]);
+        key(&mut app, KeyCode::Char('j'));
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.store.task(m).unwrap().state, TaskState::Rejected);
+    }
+
+    /// A milestone parked with nothing blocking it is not stuck: the operator
+    /// unparks it from the tab, and parks it again from there.
+    #[test]
+    fn an_unblocked_parked_milestone_unparks_and_parks_from_the_tab() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap().id;
+        let m = store
+            .create_milestone(p, "Dock", "", Priority::P2, TaskState::Parked)
+            .unwrap()
+            .id;
+        let mut app = app_from(store);
+        alt_key(&mut app, KeyCode::Char('5'));
+        key(&mut app, KeyCode::Char('s'));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.store.task(m).unwrap().state, TaskState::Ready);
+        key(&mut app, KeyCode::Char('s'));
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.store.task(m).unwrap().state, TaskState::Parked);
     }
 
     #[test]

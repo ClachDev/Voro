@@ -311,7 +311,7 @@ pub(super) fn key_map(screens: KeySection) -> Vec<KeySection> {
             "Actions",
             vec![
                 ("⏎", "browse its tasks, or triage a proposal"),
-                ("s", "triage, done, or abandon"),
+                ("s", "triage, or change its state"),
                 ("n", "new milestone, proposed headless"),
                 ("N", "new milestone, planned with an agent"),
                 ("ctrl-n", "new milestone, by hand in $EDITOR"),

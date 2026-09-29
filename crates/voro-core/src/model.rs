@@ -490,8 +490,8 @@ pub struct Task {
     pub deep: bool,
     /// Marks an outcome the operator watches happen (DESIGN.md §3): a human
     /// task gated on everything that blocks it. Its members and a task's own
-    /// milestone are derived from `blocks` edges, never stored. Only the
-    /// operator opens or closes one, and only in the TUI.
+    /// milestone are derived from `blocks` edges, never stored. Past triage
+    /// only the operator moves one, and only in the TUI.
     pub milestone: bool,
 }
 
