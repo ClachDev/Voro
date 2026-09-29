@@ -280,6 +280,37 @@ pub fn seed(store: &mut Store) -> Result<SeedSummary> {
     age(store, mote_done.id, "-16 days")?;
     tasks += 1;
 
+    // Two milestones, the second behind the first (§3): the fleet one counts
+    // the heartbeat, the mission layer and the schema pin; the carpet one
+    // counts the fleet milestone and one task of its own.
+    let fleet = store.create_milestone(
+        mote.id,
+        "Fleet mission",
+        "A mission dispatched over the fleet API completes on a real robot.",
+        Priority::P1,
+    )?;
+    store.block_tasks(blocked.id, &[fleet.id])?;
+    store.block_tasks(mote_done.id, &[fleet.id])?;
+    tasks += 1;
+
+    let carpet = store.create_milestone(
+        mote.id,
+        "Carpet crossing",
+        "The robot crosses the office carpet under a fleet mission without a stall.",
+        Priority::P2,
+    )?;
+    let traction = ready_task(
+        store,
+        mote.id,
+        "Tune wheel traction control for low-pile carpet",
+        "",
+        Priority::P2,
+    )?;
+    store.block_tasks(fleet.id, &[carpet.id])?;
+    store.block_tasks(traction.id, &[carpet.id])?;
+    age(store, traction.id, "-1 days")?;
+    tasks += 2;
+
     // --- AugereAI: the triage queue, plus the layout's awkward cases ---
     let augere = store.create_project("AugereAI", &repo_path("AugereAI"))?;
     store.set_weight(augere.id, 2)?;
@@ -490,6 +521,18 @@ mod tests {
             .find(|t| t.title.starts_with("Ship mission-layer"))
             .expect("the blocked task");
         assert_eq!(blocked.state, TaskState::Parked);
+    }
+
+    #[test]
+    fn the_board_has_one_milestone_behind_another() {
+        let store = seeded();
+        let milestones = store.milestones(false).unwrap();
+        assert_eq!(milestones.len(), 2);
+        let (fleet, carpet) = (&milestones[0], &milestones[1]);
+        assert_eq!(fleet.members.len(), 3);
+        assert_eq!((fleet.open(), fleet.done()), (2, 1));
+        assert!(carpet.members.iter().any(|t| t.id == fleet.milestone.id));
+        assert_eq!(carpet.members.len(), 2);
     }
 
     #[test]

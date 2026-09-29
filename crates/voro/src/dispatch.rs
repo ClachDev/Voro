@@ -53,7 +53,7 @@ committed on a branch and a `--summary` on `done`: that summary is the pull
 request's description — `voro pr` opens the PR with it as the body — so write it
 as one, a short account of what changed and why followed by how you verified it,
 not a status line. Never modify the database with raw SQL, which would bypass
-the state machine and event log.{branch}{docs}{rework}
+the state machine and event log.{branch}{docs}{milestones}{rework}
 
 ---
 
@@ -101,6 +101,16 @@ This task derives from the document(s) below. Read them before the task body:
 they carry the plan this task implements, and the body assumes them.
 
 {list}";
+
+/// The `{milestones}` block for a task that counts toward a milestone
+/// (DESIGN.md §3/§8): its nearest milestones downstream, so a follow-up the
+/// agent files can join the milestone only when the milestone needs it.
+const MILESTONES_TEMPLATE: &str = "\n\n\
+This task counts toward the milestone(s) below:
+
+{list}
+
+A follow-up you propose takes `--blocks <id>` only if the milestone cannot pass without it.";
 
 /// Shared by both branch blocks below so the early-registration instruction
 /// cannot drift. `{name}` is the assigned branch or the `<name>` the
@@ -342,6 +352,7 @@ fn render_preamble(
     db_path: &Path,
     branch: Option<&str>,
     docs: &[(String, String)],
+    milestones: &[(i64, String)],
     rework: bool,
 ) -> String {
     let db_flag = db_flag(db_path);
@@ -391,6 +402,18 @@ fn render_preamble(
             .join("\n");
         render(LINKED_DOCS_TEMPLATE, &[("{list}", list.as_str())])
     };
+    // A task in no milestone renders no block, so its prompt is byte-for-byte
+    // what it was before milestones existed.
+    let milestones_block = if milestones.is_empty() {
+        String::new()
+    } else {
+        let list = milestones
+            .iter()
+            .map(|(id, title)| format!("    #{id}  {title}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        render(MILESTONES_TEMPLATE, &[("{list}", list.as_str())])
+    };
     // A task nobody has rejected renders no block, so a first dispatch's prompt
     // is byte-for-byte what it was before delta re-review existed.
     let rework_block = if rework {
@@ -409,6 +432,7 @@ fn render_preamble(
         &[
             ("{branch}", branch_block.as_str()),
             ("{docs}", docs_block.as_str()),
+            ("{milestones}", milestones_block.as_str()),
             ("{rework}", rework_block.as_str()),
             ("{task_id}", task_id.as_str()),
             ("{db}", db_flag.as_str()),
@@ -1657,6 +1681,12 @@ fn spawn_session(
             Ok((doc.label().to_string(), location))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let milestones = store
+        .milestones_of(task_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|m| (m.id, m.title))
+        .collect::<Vec<_>>();
     // A redispatch of work that was reviewed and sent back carries the
     // answer-the-feedback instruction (DESIGN.md §8): the successor session has
     // none of the rejected round's context, so the points in the body's
@@ -1667,7 +1697,14 @@ fn spawn_session(
         .unwrap_or(false);
     let prompt = format!(
         "{}{body}",
-        render_preamble(task_id, &ctx.db_path, task.branch.as_deref(), &docs, rework)
+        render_preamble(
+            task_id,
+            &ctx.db_path,
+            task.branch.as_deref(),
+            &docs,
+            &milestones,
+            rework
+        )
     );
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("cannot write prompt {}: {e}", prompt_path.display()))?;
@@ -2190,7 +2227,7 @@ mod tests {
         assert!(prompt.contains("Detailed prompt."), "{prompt}");
         // the rendered preamble is dropped in ahead of the task body
         assert!(
-            prompt.starts_with(&render_preamble(id, &ctx.db_path, None, &[], false)),
+            prompt.starts_with(&render_preamble(id, &ctx.db_path, None, &[], &[], false)),
             "{prompt}"
         );
         assert!(
@@ -2200,10 +2237,39 @@ mod tests {
     }
 
     #[test]
+    fn a_member_task_s_prompt_names_its_milestone() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let id = ready_task(&mut store, &project);
+        let m = store
+            .create_milestone(
+                store.task(id).unwrap().project_id,
+                "Carpet crossing",
+                "",
+                Priority::P2,
+            )
+            .unwrap();
+        store.block_tasks(id, &[m.id]).unwrap();
+
+        dispatch(&mut store, &ctx, id, None).unwrap();
+
+        let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
+        assert!(
+            prompt.contains(&format!("#{}  Carpet crossing", m.id)),
+            "{prompt}"
+        );
+        assert!(prompt.contains("takes `--blocks <id>` only if"), "{prompt}");
+        let block_at = prompt.find("Carpet crossing").unwrap();
+        assert!(
+            block_at < prompt.find("# Do the thing").unwrap(),
+            "{prompt}"
+        );
+    }
+
+    #[test]
     fn preamble_renders_a_db_flag_only_for_a_non_default_database() {
         // a scratch (non-default) db renders --db on every verb, shell-quoted
         let db = PathBuf::from("/tmp/scratch/voro.db");
-        let rendered = render_preamble(62, &db, None, &[], false);
+        let rendered = render_preamble(62, &db, None, &[], &[], false);
         assert!(
             rendered.contains("voro ask 62 --db '/tmp/scratch/voro.db'"),
             "{rendered}"
@@ -2218,7 +2284,7 @@ mod tests {
         );
 
         // the default db is what the verbs resolve to unaided, so no flag
-        let default = render_preamble(62, &Store::production_db_path(), None, &[], false);
+        let default = render_preamble(62, &Store::production_db_path(), None, &[], &[], false);
         assert!(default.contains("voro ask 62 --question"), "{default}");
         assert!(!default.contains("--db"), "{default}");
     }
@@ -2228,7 +2294,7 @@ mod tests {
         // no assigned branch: the agent is told to register the name it picks,
         // but branch-assignment wording and a completion `voro done --branch`
         // are absent, since no name is known.
-        let plain = render_preamble(62, &Store::production_db_path(), None, &[], false);
+        let plain = render_preamble(62, &Store::production_db_path(), None, &[], &[], false);
         assert!(!plain.contains("git branch `"), "{plain}");
         assert!(plain.contains("voro set 62 --branch <name>"), "{plain}");
         assert!(!plain.contains("voro done 62 --branch"), "{plain}");
@@ -2248,6 +2314,7 @@ mod tests {
             62,
             &Store::production_db_path(),
             Some("feat/parser"),
+            &[],
             &[],
             false,
         );
@@ -2282,7 +2349,8 @@ mod tests {
         // because the harness names the branch itself, both cases spell out the
         // rename onto the branch Voro tracks.
         for (branch, name) in [(None, "<name>"), (Some("feat/parser"), "feat/parser")] {
-            let rendered = render_preamble(62, &Store::production_db_path(), branch, &[], false);
+            let rendered =
+                render_preamble(62, &Store::production_db_path(), branch, &[], &[], false);
             assert!(rendered.contains("`EnterWorktree` tool"), "{rendered}");
             assert!(
                 rendered.contains(&format!("git switch -c {name}")),
@@ -2317,7 +2385,7 @@ mod tests {
                 "https://example.com/rfc".to_string(),
             ),
         ];
-        let linked = render_preamble(62, &db, None, &docs, false);
+        let linked = render_preamble(62, &db, None, &docs, &[], false);
         assert!(
             linked.contains("derives from the document(s) below"),
             "{linked}"
@@ -2336,7 +2404,7 @@ mod tests {
         assert!(docs_at < linked.rfind("---").unwrap(), "{linked}");
 
         // A task citing no document renders exactly the prompt it always did.
-        let plain = render_preamble(62, &db, None, &[], false);
+        let plain = render_preamble(62, &db, None, &[], &[], false);
         assert!(!plain.contains("derives from the document"), "{plain}");
     }
 
@@ -2345,7 +2413,7 @@ mod tests {
     #[test]
     fn preamble_tells_a_redispatched_rework_to_answer_the_feedback() {
         let db = Store::production_db_path();
-        let reworking = render_preamble(62, &db, None, &[], true);
+        let reworking = render_preamble(62, &db, None, &[], &[], true);
         assert!(
             reworking.contains("been through review once already"),
             "{reworking}"
@@ -2360,7 +2428,7 @@ mod tests {
             "the instruction must be copy-pasteable: {reworking}"
         );
 
-        let first = render_preamble(62, &db, None, &[], false);
+        let first = render_preamble(62, &db, None, &[], &[], false);
         assert!(!first.contains("point by point"), "{first}");
     }
 
@@ -2369,7 +2437,7 @@ mod tests {
     /// as the body (DESIGN.md §8).
     #[test]
     fn preamble_says_the_summary_is_the_pr_description() {
-        let plain = render_preamble(62, &Store::production_db_path(), None, &[], false);
+        let plain = render_preamble(62, &Store::production_db_path(), None, &[], &[], false);
         // The template is hand-wrapped, so match the prose rather than where
         // the lines happen to break.
         let flowed = plain.split_whitespace().collect::<Vec<_>>().join(" ");

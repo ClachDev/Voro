@@ -488,6 +488,11 @@ pub struct Task {
     /// orders the queue, and to the agent override, which picks which agent
     /// runs. Default `false` means the workhorse.
     pub deep: bool,
+    /// Marks an outcome the operator watches happen (DESIGN.md §3): a human
+    /// task gated on everything that blocks it. Its members and a task's own
+    /// milestone are derived from `blocks` edges, never stored. Only the
+    /// operator opens or closes one, and only in the TUI.
+    pub milestone: bool,
 }
 
 /// The verb a task's queue row asks of the human (DESIGN.md §3), derived from
@@ -758,6 +763,7 @@ mod tests {
             closed_at: None,
             human,
             deep: false,
+            milestone: false,
         }
     }
 

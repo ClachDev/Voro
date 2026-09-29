@@ -144,4 +144,10 @@ pub enum Error {
 
     #[error("{0}")]
     Invalid(String),
+
+    #[error(
+        "task {id} is a milestone; only the operator opens or closes one, from the TUI's \
+         Milestones tab"
+    )]
+    MilestoneRefused { id: i64 },
 }
