@@ -257,6 +257,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         s.apply(t.id, Action::Start).unwrap();
@@ -391,6 +392,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         let dead_pid = dead_pid();
@@ -434,6 +436,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         s.record_refine_launch(
@@ -466,6 +469,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         let (_, session) = s

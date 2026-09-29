@@ -58,6 +58,7 @@ pub fn issue_new_task(project_id: i64, repo_id: Option<i64>, issue: &GithubIssue
         agent: None,
         human: false,
         deep: false,
+        milestone: false,
     }
 }
 

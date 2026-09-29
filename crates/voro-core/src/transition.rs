@@ -770,6 +770,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         })
         .unwrap()
         .id
@@ -1070,6 +1071,7 @@ mod tests {
                 agent: None,
                 human: true,
                 deep: false,
+                milestone: false,
             })
             .unwrap()
             .id

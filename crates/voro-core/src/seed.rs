@@ -236,6 +236,7 @@ pub fn seed(store: &mut Store) -> Result<SeedSummary> {
         agent: None,
         human: true,
         deep: false,
+        milestone: false,
     })?;
     store.link_doc(human.id, design.id)?;
     age(store, human.id, "-4 days")?;
@@ -288,6 +289,7 @@ pub fn seed(store: &mut Store) -> Result<SeedSummary> {
         "Fleet mission",
         "A mission dispatched over the fleet API completes on a real robot.",
         Priority::P1,
+        TaskState::Parked,
     )?;
     store.block_tasks(blocked.id, &[fleet.id])?;
     store.block_tasks(mote_done.id, &[fleet.id])?;
@@ -298,6 +300,7 @@ pub fn seed(store: &mut Store) -> Result<SeedSummary> {
         "Carpet crossing",
         "The robot crosses the office carpet under a fleet mission without a stall.",
         Priority::P2,
+        TaskState::Parked,
     )?;
     let traction = ready_task(
         store,
@@ -325,6 +328,7 @@ pub fn seed(store: &mut Store) -> Result<SeedSummary> {
         agent: Some("claude".into()),
         human: false,
         deep: true,
+        milestone: false,
     })?;
     store.apply(deep.id, Action::Start)?;
     store.set_branch(deep.id, Some("mcp-front-door"))?;
@@ -426,6 +430,7 @@ fn ready_task(
         agent: None,
         human: false,
         deep: false,
+        milestone: false,
     })
 }
 
@@ -446,6 +451,7 @@ fn proposed_task(
         agent: None,
         human: false,
         deep: false,
+        milestone: false,
     })
 }
 

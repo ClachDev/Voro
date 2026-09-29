@@ -126,10 +126,17 @@ one member while its own members stay its own, so a milestone may block
 another without either counting the other's work twice. A task's milestone is
 the nearest milestone downstream of it — every one at that distance when
 several tie — and like membership it is derived from the edges and stored
-nowhere. A milestone is created parked and reaches the queue only when its
-last blocker closes, through the ordinary promotion (§5), as an ordinary *do*
-row; `voro next` never returns one. Only the operator creates or closes a
-milestone, and only in the TUI (§6). Regression is not modelled: `done` stays
+nowhere. A milestone is created the way a task is: filed through `voro add
+--milestone` or `voro propose --milestone`, by the operator or by an agent,
+landing in `proposed` for ordinary triage. The verdict has its ordinary
+effect: *ready* with no open blocker readies it, *ready* with one parks it
+until the last blocker closes (§5), and either way it reaches the queue as an
+ordinary *do* row; `voro next` never returns one. A title matching another
+open milestone in the same project, with case folded and whitespace runs
+collapsed, is refused on creation, on a rename and when an existing task is
+flagged, naming the one already there. A proposed milestone takes its triage
+verdict from the CLI or the TUI; every later move, passing it as *done*
+above all, is the operator's, in the TUI (§6). Regression is not modelled: `done` stays
 terminal, and a capability that breaks later is a new task. Progress is
 reported as counts of open and done members rather than a percentage, because
 filing a follow-up grows the denominator.
@@ -346,7 +353,7 @@ CREATE TABLE tasks (
                                           -- model rather than its workhorse (§8)
   milestone  INTEGER NOT NULL DEFAULT 0 CHECK (milestone IN (0,1)),
                                           -- 1 = an outcome gated on its blockers (§3);
-                                          -- always human, created parked
+                                          -- always human
   question   TEXT,                        -- set iff state = 'needs-input'
   pr_url     TEXT,                        -- optional tracked GitHub PR (§11c); base-repo URL
   branch     TEXT,                        -- optional git branch (§8); intended name dispatch
@@ -797,19 +804,32 @@ a dispatch agent. To keep the unreachability total, a task currently sitting in
 flagged human as it stands — such a task is demonstrably agent-executed;
 resolve it first.
 
-A **milestone** (§3) walks the human path and adds one restriction: the CLI
-cannot move it. `start`, `done`, `abandon`, `park`, `unpark` and every other
-transition verb refuse a milestone with one line naming the TUI's Milestones
-tab, where the operator opens and closes it. The refusal is a CLI guard
+A **milestone** (§3) walks the human path and adds one restriction: past
+triage, the CLI cannot move it. A proposed milestone takes the three verdicts
+from `voro triage` as from the TUI's triage menu, with the same effects as on
+a task. After that, `start`, `done`, `abandon`, `park`, `unpark` and every
+other transition verb refuse it with one line naming the TUI's Milestones tab,
+where the operator moves it. There the menu offers a human task's transitions,
+park and unpark included, except that a ready milestone is passed as *done*
+in one step in place of `start`. Refine is refused on
+one, because its prompt rewrites a body into a dispatchable brief and a
+milestone's body is an acceptance statement. The refusal is a CLI guard
 (`Task::refuse_cli_transition` in `voro-core`) rather than an arm of the
 machine, because the TUI closes one through the same machine: its *done* runs
 `start` then `complete` in one transaction (`Store::close_milestone`), since
 the machine has no step from `ready` to `done`, and its *abandon* is the
-ordinary `Store::apply`. No verb
-sets or clears the flag, and clearing `human` on a milestone is refused, so a
+ordinary `Store::apply`, as are *park* and *unpark*. Creation goes through the ordinary insert
+(`Store::create_task` with the flag set), which sets `human` with it and
+imposes no state of its own; `add --state` and the `$EDITOR` form pick one as
+they do for a task. `voro set --milestone` flags an existing `proposed`,
+`parked` or `ready` task and sets `human` through the same checks as
+`--human`; `--no-milestone` clears the flag and leaves `human` alone. The flag
+changes in the same transaction as the rest of the edit
+(`Store::update_task_and_milestone`), so a refused `set` leaves it as it was.
+Clearing `human` on a milestone is refused, so a
 milestone is never dispatchable. The promotion of §5 needs no special case:
-a milestone with blockers readies when the last one closes, one with none
-stays parked, and a `--blocks` naming a ready milestone demotes it to
+a milestone with blockers readies when the last one closes, one parked with
+none stays parked, and a `--blocks` naming a ready milestone demotes it to
 `parked` like any other dependent.
 
 `review` carries a *sub-state* in its fields rather than splitting into two
@@ -2232,7 +2252,15 @@ a verb serves one kind of target.
 
 `N` is the interactive session, for the case a one-shot cannot serve, and
 `ctrl-n` is the manual `$EDITOR` form — the only path that sets state,
-priority, agent, `human` and blockers at creation time. `N` picks a project and
+priority, agent, `human` and blockers at creation time. On the Milestones tab
+(§9) the three keys file a milestone instead of a task. The quick propose and
+the planning session keep their machinery and swap the body guidance: the
+agent files with `voro add --milestone`, keeps the title to four words or
+fewer because it fills the cockpit's 16-character column, and writes the body
+as the acceptance statement, what the operator will watch happen in measurable
+terms. The planning session also runs `voro milestones` first, so the
+operator hears about a milestone that already covers the outcome. The form
+opens with `milestone: true` and the task form's default state. `N` picks a project and
 suspends the terminal in the same round-trip used for `$EDITOR` and
 attach/resume, launching the default agent's **`plan` verb** in the project's
 default repo (§3): an optional agent template — an interactive *foreground*
@@ -2425,12 +2453,16 @@ members belong to the task browser. Each row gives a milestone's state,
 project, title and `N open · M done`, the counts `voro milestones` prints.
 Ready milestones sort first, then parked ones, then done and rejected ones,
 dimmed. The pane beneath shows the selected milestone's body, which holds its
-acceptance statement. `n` asks for a one-line title and then a project through
-the create keys' own picker, and creates the milestone parked. `e` opens the
-body in the editor, as it does for a task. `s` opens the transition menu, which
-offers *done* on a ready milestone and *abandon* on any open one (§6). ⏎ opens
-the task browser grouped by milestone, with that milestone's fold open and
-under the cursor. With no milestone registered the list is one line pointing
+acceptance statement. Proposed milestones sort between ready and parked ones.
+`n`, `N` and `ctrl-n` are the create keys of every other screen, filing a
+milestone (§8): the quick propose, the planning session and the form. None
+writes a row itself. `e` opens the body in the editor, as it does for a task.
+`s` opens the transition menu, which offers the triage verdicts on a proposed
+milestone and a human task's transitions on any other open one, with *done*
+in place of `start` on a ready one (§6). ⏎
+on a proposed milestone opens that same menu, as it does on a proposal in the
+queue; on any other it opens the task browser grouped by milestone, with that
+milestone's fold open and under the cursor. With no milestone registered the list is one line pointing
 at `n`. The tab may later merge into the browser or the projects screen, so
 its list and its keys live in their own modules (`app/milestones.rs`,
 `ui/milestones.rs`) and bind nothing on any other screen.

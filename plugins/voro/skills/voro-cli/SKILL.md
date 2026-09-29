@@ -82,10 +82,20 @@ never dispatched at all.
 
 A milestone is an outcome the operator watches happen, such as
 "Carpet crossing". It is a task that waits on the tasks blocking
-it. Only the operator creates or closes one.
+it.
 
-    voro milestones        # open milestones: id, title, open tasks
+    voro milestones        # open milestones: id, state, title, open tasks
     voro show <id>         # acceptance statement and member tasks
+    voro propose <project> "<title>" --milestone --body-file <path>
+
+Run `voro milestones` before you file one. File a milestone with
+`--milestone` only if none listed covers the outcome. A milestone
+is something the operator can watch the robot or the system do; a
+fix or a refactor is a task. Only the operator closes one.
+
+Keep a milestone's title to four words or fewer, and write its
+body as the acceptance statement: what the operator will watch
+happen, in measurable terms.
 
 Before you add or propose a task, read the member tasks of the
 milestone it belongs to and do not file one that is already there.

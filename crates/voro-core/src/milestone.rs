@@ -9,7 +9,7 @@ use rusqlite::{Connection, params};
 
 use crate::error::{Error, Result};
 use crate::model::{Priority, Task, TaskState};
-use crate::store::{Store, TASK_COLUMNS, get_task, log_event, task_from_row};
+use crate::store::{NewTask, Store, TASK_COLUMNS, TaskEdit, get_task, task_from_row};
 use crate::transition::Action;
 
 /// A milestone with the tasks that count toward it.
@@ -117,33 +117,83 @@ impl Graph {
     }
 }
 
+/// A title as the duplicate check compares it: lowercase, whitespace runs
+/// collapsed to one space.
+fn fold_title(title: &str) -> String {
+    title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 impl Store {
-    /// Create a milestone: a human task flagged `milestone`, parked. It stays
-    /// parked while nothing blocks it, and the ordinary promotion readies it
-    /// when its last blocker closes (DESIGN.md §5).
+    /// Create a milestone in `state`: a human task flagged `milestone`,
+    /// through the ordinary insert. One created parked stays parked while
+    /// nothing blocks it, and the ordinary promotion readies it when its last
+    /// blocker closes (DESIGN.md §5).
     pub fn create_milestone(
         &mut self,
         project_id: i64,
         title: &str,
         body: &str,
         priority: Priority,
+        state: TaskState,
     ) -> Result<Task> {
-        let project = self.project(project_id)?;
-        if project.archived {
-            return Err(Error::ProjectArchived { name: project.name });
-        }
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO tasks (project_id, title, body, priority, state, human, milestone,
-                                state_since, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'parked', 1, 1, datetime('now'), datetime('now'))",
-            params![project_id, title, body, priority],
+        self.create_task(NewTask {
+            project_id,
+            repo_id: None,
+            title: title.into(),
+            body: body.into(),
+            priority,
+            state,
+            agent: None,
+            human: true,
+            deep: false,
+            milestone: true,
+        })
+    }
+
+    /// The open milestone in a project, other than `except`, whose title
+    /// matches `title` with case folded and whitespace runs collapsed — the
+    /// duplicate a new or renamed milestone is refused against.
+    pub(crate) fn open_milestone_titled(
+        &self,
+        project_id: i64,
+        title: &str,
+        except: Option<i64>,
+    ) -> Result<Option<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title FROM tasks WHERE milestone = 1 AND project_id = ?1
+               AND state NOT IN ('done', 'rejected') AND id IS NOT ?2 ORDER BY id",
         )?;
-        let id = tx.last_insert_rowid();
-        log_event(&tx, id, "created", Some("parked"))?;
-        log_event(&tx, id, "milestone", Some("set"))?;
-        tx.commit()?;
-        self.task(id)
+        let rows = stmt.query_map(params![project_id, except], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let wanted = fold_title(title);
+        for row in rows {
+            let (id, existing) = row?;
+            if fold_title(&existing) == wanted {
+                return Ok(Some((id, existing)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Set or clear a task's milestone flag (DESIGN.md §6), through
+    /// [`update_task_and_milestone`](Store::update_task_and_milestone) with the
+    /// task's content as it stands.
+    pub fn set_milestone(&mut self, id: i64, milestone: bool) -> Result<Task> {
+        let task = self.task(id)?;
+        let edit = TaskEdit {
+            title: task.title,
+            body: task.body,
+            priority: task.priority,
+            agent: task.agent,
+            human: task.human,
+            deep: task.deep,
+        };
+        self.update_task_and_milestone(id, edit, Some(milestone))
     }
 
     /// The milestones a task belongs to: the nearest downstream along `blocks`
@@ -242,8 +292,8 @@ impl Store {
 }
 
 impl Task {
-    /// Refuse a CLI transition on a milestone (DESIGN.md §6): only the
-    /// operator opens or closes one, and only in the TUI.
+    /// Refuse a CLI transition on a milestone (DESIGN.md §6): past triage
+    /// only the operator moves one, and only in the TUI.
     pub fn refuse_cli_transition(&self) -> Result<()> {
         if self.milestone {
             return Err(Error::MilestoneRefused { id: self.id });
@@ -251,15 +301,15 @@ impl Task {
         Ok(())
     }
 
-    /// The verdicts the TUI offers on a milestone (DESIGN.md §6): done once it
-    /// is ready, through [`Store::close_milestone`], and abandon while it is
-    /// open. `Complete` stands for done here, the one verb the menu offers
-    /// that the machine reaches in two steps.
+    /// The transitions the TUI offers on a milestone (DESIGN.md §6): a human
+    /// task's, except that a ready one is passed as done in one step, through
+    /// [`Store::close_milestone`], in place of `start`. `Complete` stands for
+    /// done here, the one verb the menu offers that the machine reaches in two
+    /// steps.
     pub fn milestone_actions(&self) -> Vec<Action> {
         match self.state {
-            TaskState::Ready => vec![Action::Complete(None), Action::Abandon],
-            TaskState::Done | TaskState::Rejected => vec![],
-            _ => vec![Action::Abandon],
+            TaskState::Ready => vec![Action::Complete(None), Action::Park, Action::Abandon],
+            state => Store::legal_actions(state, true),
         }
     }
 }
@@ -268,7 +318,7 @@ impl Task {
 mod tests {
     use super::*;
     use crate::model::DepKind;
-    use crate::store::NewTask;
+    use crate::transition::Triage;
 
     fn store() -> (Store, i64) {
         let mut s = Store::open_in_memory().unwrap();
@@ -287,6 +337,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         })
         .unwrap()
     }
@@ -306,8 +357,14 @@ mod tests {
     }
 
     fn fixture(s: &mut Store, p: i64) -> Fixture {
-        let a = s.create_milestone(p, "A", "", Priority::P2).unwrap().id;
-        let b = s.create_milestone(p, "B", "", Priority::P2).unwrap().id;
+        let a = s
+            .create_milestone(p, "A", "", Priority::P2, TaskState::Parked)
+            .unwrap()
+            .id;
+        let b = s
+            .create_milestone(p, "B", "", Priority::P2, TaskState::Parked)
+            .unwrap()
+            .id;
         let t1 = task(s, p, "t1", TaskState::Ready).id;
         let t2 = task(s, p, "t2", TaskState::Ready).id;
         let t3 = task(s, p, "t3", TaskState::Ready).id;
@@ -326,13 +383,188 @@ mod tests {
     }
 
     #[test]
-    fn a_milestone_is_created_parked_human_and_flagged() {
+    fn a_milestone_is_created_in_the_state_asked_human_and_flagged() {
         let (mut s, p) = store();
         let m = s
-            .create_milestone(p, "Carpet crossing", "", Priority::P1)
+            .create_milestone(p, "Carpet crossing", "", Priority::P1, TaskState::Proposed)
             .unwrap();
-        assert_eq!(m.state, TaskState::Parked);
+        assert_eq!(m.state, TaskState::Proposed);
         assert!(m.human && m.milestone);
+        let flagged = s
+            .create_task(NewTask {
+                project_id: p,
+                repo_id: None,
+                title: "Dock handover".into(),
+                body: String::new(),
+                priority: Priority::P2,
+                state: TaskState::Parked,
+                agent: None,
+                human: false,
+                deep: false,
+                milestone: true,
+            })
+            .unwrap();
+        assert!(flagged.human && flagged.milestone, "the flag implies human");
+    }
+
+    #[test]
+    fn a_title_matching_an_open_milestone_is_refused_naming_it() {
+        let (mut s, p) = store();
+        let first = s
+            .create_milestone(p, "Carpet crossing", "", Priority::P2, TaskState::Proposed)
+            .unwrap();
+        let err = s
+            .create_milestone(p, "carpet CROSSING", "", Priority::P2, TaskState::Proposed)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::MilestoneExists { id, .. } if id == first.id),
+            "{err}"
+        );
+        // Another project, or a plain task, may reuse the title.
+        let other = s.create_project("q", "/tmp").unwrap().id;
+        s.create_milestone(
+            other,
+            "Carpet crossing",
+            "",
+            Priority::P2,
+            TaskState::Proposed,
+        )
+        .unwrap();
+        task(&mut s, p, "Carpet crossing", TaskState::Proposed);
+        // A closed milestone no longer holds the title.
+        s.apply(first.id, Action::Triage(Triage::Reject)).unwrap();
+        s.create_milestone(p, "Carpet crossing", "", Priority::P2, TaskState::Proposed)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_proposed_milestone_triaged_ready_readies_or_parks_on_its_blockers() {
+        let (mut s, p) = store();
+        let alone = s
+            .create_milestone(p, "Alone", "", Priority::P2, TaskState::Proposed)
+            .unwrap();
+        assert_eq!(
+            alone.milestone_actions(),
+            Store::legal_actions(TaskState::Proposed, true)
+        );
+        let alone = s.apply(alone.id, Action::Triage(Triage::Ready)).unwrap();
+        assert_eq!(alone.state, TaskState::Ready);
+
+        let gated = s
+            .create_milestone(p, "Gated", "", Priority::P2, TaskState::Proposed)
+            .unwrap();
+        let blocker = task(&mut s, p, "blocker", TaskState::Ready);
+        s.add_dep(gated.id, blocker.id, DepKind::Blocks).unwrap();
+        let gated = s.apply(gated.id, Action::Triage(Triage::Ready)).unwrap();
+        assert_eq!(gated.state, TaskState::Parked);
+        close(&mut s, blocker.id);
+        assert_eq!(s.task(gated.id).unwrap().state, TaskState::Ready);
+    }
+
+    #[test]
+    fn a_rename_or_a_flag_onto_an_open_milestones_title_is_refused() {
+        let (mut s, p) = store();
+        let first = s
+            .create_milestone(p, "Carpet crossing", "", Priority::P2, TaskState::Proposed)
+            .unwrap();
+        let err = s
+            .create_milestone(
+                p,
+                " carpet   CROSSING ",
+                "",
+                Priority::P2,
+                TaskState::Proposed,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::MilestoneExists { id, .. } if id == first.id));
+
+        let dock = s
+            .create_milestone(p, "Dock", "", Priority::P2, TaskState::Proposed)
+            .unwrap();
+        let rename = TaskEdit {
+            title: "Carpet  crossing".into(),
+            body: String::new(),
+            priority: Priority::P2,
+            agent: None,
+            human: true,
+            deep: false,
+        };
+        let err = s.update_task(dock.id, rename.clone()).unwrap_err();
+        assert!(matches!(err, Error::MilestoneExists { id, .. } if id == first.id));
+        assert_eq!(s.task(dock.id).unwrap().title, "Dock");
+        // Renaming a milestone to its own title, recased, is not a duplicate.
+        s.update_task(
+            first.id,
+            TaskEdit {
+                title: "carpet crossing".into(),
+                ..rename.clone()
+            },
+        )
+        .unwrap();
+
+        let plain = task(&mut s, p, "Carpet Crossing", TaskState::Ready);
+        let err = s.set_milestone(plain.id, true).unwrap_err();
+        assert!(matches!(err, Error::MilestoneExists { id, .. } if id == first.id));
+        assert!(!s.task(plain.id).unwrap().milestone);
+    }
+
+    #[test]
+    fn only_a_proposed_parked_or_ready_task_becomes_a_milestone() {
+        let (mut s, p) = store();
+        let running = task(&mut s, p, "running", TaskState::Ready);
+        s.apply(running.id, Action::Start).unwrap();
+        let err = s.set_milestone(running.id, true).unwrap_err();
+        assert!(
+            err.to_string().contains("proposed, parked or ready"),
+            "{err}"
+        );
+        assert!(!s.task(running.id).unwrap().milestone);
+    }
+
+    #[test]
+    fn a_refused_edit_leaves_the_milestone_flag_as_it_was() {
+        let (mut s, p) = store();
+        let m = s
+            .create_milestone(p, "Carpet crossing", "", Priority::P2, TaskState::Proposed)
+            .unwrap();
+        let with_agent = TaskEdit {
+            title: m.title.clone(),
+            body: m.body.clone(),
+            priority: m.priority,
+            agent: Some("claude".into()),
+            human: m.human,
+            deep: false,
+        };
+        assert!(
+            s.update_task_and_milestone(m.id, with_agent.clone(), Some(false))
+                .is_err()
+        );
+        assert!(s.task(m.id).unwrap().milestone);
+        let t = task(&mut s, p, "plain", TaskState::Ready);
+        assert!(
+            s.update_task_and_milestone(t.id, with_agent, Some(true))
+                .is_err()
+        );
+        let t = s.task(t.id).unwrap();
+        assert!(!t.milestone && !t.human);
+    }
+
+    #[test]
+    fn setting_the_flag_sets_human_and_clearing_it_leaves_human() {
+        let (mut s, p) = store();
+        let t = task(&mut s, p, "Carpet crossing", TaskState::Ready);
+        let m = s.set_milestone(t.id, true).unwrap();
+        assert!(m.milestone && m.human);
+        let t = s.set_milestone(t.id, false).unwrap();
+        assert!(!t.milestone && t.human);
+        let events: Vec<String> = s
+            .events_for(t.id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "milestone")
+            .filter_map(|e| e.detail)
+            .collect();
+        assert_eq!(events, vec!["set", "cleared"]);
     }
 
     #[test]
@@ -374,10 +606,13 @@ mod tests {
     fn equally_near_milestones_are_all_reported_in_id_order() {
         let (mut s, p) = store();
         let m2 = s
-            .create_milestone(p, "second", "", Priority::P2)
+            .create_milestone(p, "second", "", Priority::P2, TaskState::Parked)
             .unwrap()
             .id;
-        let m1 = s.create_milestone(p, "first", "", Priority::P2).unwrap().id;
+        let m1 = s
+            .create_milestone(p, "first", "", Priority::P2, TaskState::Parked)
+            .unwrap()
+            .id;
         let t = task(&mut s, p, "shared", TaskState::Ready).id;
         s.block_tasks(t, &[m1, m2]).unwrap();
         let found: Vec<i64> = s.milestones_of(t).unwrap().iter().map(|t| t.id).collect();
@@ -407,7 +642,7 @@ mod tests {
         }
         assert_eq!(
             s.task(f.a).unwrap().milestone_actions(),
-            vec![Action::Complete(None), Action::Abandon]
+            vec![Action::Complete(None), Action::Park, Action::Abandon]
         );
         let a = s.close_milestone(f.a).unwrap();
         assert_eq!(a.state, TaskState::Done);
@@ -417,10 +652,12 @@ mod tests {
     }
 
     #[test]
-    fn only_a_ready_milestone_closes_and_a_parked_one_offers_abandon() {
+    fn only_a_ready_milestone_closes_and_a_parked_one_offers_unpark_and_abandon() {
         let (mut s, p) = store();
-        let m = s.create_milestone(p, "m", "", Priority::P2).unwrap();
-        assert_eq!(m.milestone_actions(), vec![Action::Abandon]);
+        let m = s
+            .create_milestone(p, "m", "", Priority::P2, TaskState::Parked)
+            .unwrap();
+        assert_eq!(m.milestone_actions(), vec![Action::Unpark, Action::Abandon]);
         assert!(s.close_milestone(m.id).is_err());
         assert_eq!(s.task(m.id).unwrap().state, TaskState::Parked);
         let plain = task(&mut s, p, "plain", TaskState::Ready);
@@ -430,7 +667,10 @@ mod tests {
     #[test]
     fn the_open_listing_drops_closed_milestones_and_all_keeps_them() {
         let (mut s, p) = store();
-        let m = s.create_milestone(p, "gone", "", Priority::P2).unwrap().id;
+        let m = s
+            .create_milestone(p, "gone", "", Priority::P2, TaskState::Parked)
+            .unwrap()
+            .id;
         s.apply(m, Action::Abandon).unwrap();
         assert!(s.milestones(false).unwrap().is_empty());
         assert_eq!(s.milestones(true).unwrap().len(), 1);
@@ -439,7 +679,9 @@ mod tests {
     #[test]
     fn a_milestone_refuses_cli_transitions_and_cannot_lose_its_human_flag() {
         let (mut s, p) = store();
-        let m = s.create_milestone(p, "m", "", Priority::P2).unwrap();
+        let m = s
+            .create_milestone(p, "m", "", Priority::P2, TaskState::Parked)
+            .unwrap();
         assert!(matches!(
             m.refuse_cli_transition(),
             Err(Error::MilestoneRefused { .. })

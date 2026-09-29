@@ -403,7 +403,7 @@ fn wait_for_keypress() {
 /// errors back into the file. An empty save cancels.
 fn editor_session(app: &mut App, request: EditorRequest) {
     let (mut text, allow_state) = match request {
-        EditorRequest::Create { .. } => (editor::template_new(), true),
+        EditorRequest::Create { filing, .. } => (editor::template_new(filing), true),
         EditorRequest::Edit { task_id } => {
             let Ok(task) = app.store.task(task_id) else {
                 app.status = Some(format!("task {task_id} not found"));
@@ -433,7 +433,7 @@ fn editor_session(app: &mut App, request: EditorRequest) {
             Ok(saved) => match editor::parse(&saved, allow_state) {
                 Ok(form) => {
                     let applied = match request {
-                        EditorRequest::Create { project_id } => {
+                        EditorRequest::Create { project_id, .. } => {
                             app.create_from_form(project_id, form)
                         }
                         EditorRequest::Edit { task_id } => app.update_from_form(task_id, form),

@@ -81,7 +81,7 @@ documents                         the plan or design doc a body of work derives
 tasks
   add <project> <title> [--body TEXT | --body-file PATH] [--priority 0-3]
       [--state proposed|parked|ready] [--agent NAME] [--blocked-by IDS]
-      [--blocks IDS] [--human] [--deep] [--repo NAME] [--doc DOCS]
+      [--blocks IDS] [--human] [--deep] [--milestone] [--repo NAME] [--doc DOCS]
                                   --repo names which of the project's repos
                                   the task runs in; omitted, it runs in the
                                   project's default repo
@@ -97,18 +97,22 @@ tasks
                                   --deep dispatches on the strongest model the
                                   agent offers rather than its workhorse;
                                   agents that name no models ignore it
+                                  --milestone files a milestone: an outcome
+                                  the operator watches happen, always human.
+                                  Refused when an open milestone in the
+                                  project has the same title, ignoring case
   propose <project> <title> [--body TEXT | --body-file PATH] [--from TASK-ID]
-      [--blocks IDS]
+      [--blocks IDS] [--milestone]
                                   create a proposed task; --from links it
                                   discovered-from that task (dispatch renders
                                   the flag with the running task's id);
                                   --blocks makes the listed tasks wait on it,
-                                  as on `add`
+                                  as on `add`; --milestone as on `add`
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
       [--body TEXT | --body-file PATH] [--append-body TEXT | --append-body-file PATH]
       [--allow-empty] [--blocked-by IDS] [--blocks IDS] [--unlink KIND:ID]
       [--pr URL | --no-pr] [--branch NAME | --no-branch]
-      [--human | --no-human] [--deep | --no-deep]
+      [--human | --no-human] [--deep | --no-deep] [--milestone | --no-milestone]
       [--summary TEXT | --summary-file PATH]
       [--repo NAME | --no-repo] [--doc DOCS | --no-doc]
                                   --body replaces the whole body; --append-body
@@ -141,6 +145,9 @@ tasks
                                   project default
                                   --deep dispatches on the agent's strongest
                                   model; --no-deep returns it to the workhorse
+                                  --milestone flags the task a milestone and
+                                  sets --human; --no-milestone clears the flag
+                                  and leaves human as it is
                                   --doc replaces the task's whole document list
                                   (`voro doc link` adds one without listing the
                                   rest); --no-doc clears it
@@ -157,8 +164,10 @@ tasks
                                   a task in one names it after an arrow
   milestones [--all]              open milestones: id, state, title, and how
                                   many member tasks are open and done. --all
-                                  adds done and rejected ones. A milestone is
-                                  opened and closed only from the TUI
+                                  adds done and rejected ones, and proposed
+                                  ones show state proposed. A milestone is
+                                  triaged like any proposal, but opened and
+                                  closed only from the TUI
   inbox                           the next-action queue: questions, reviews,
                                   proposals, top ready tasks — ranked by score
                                   divided by what each action costs your
@@ -246,7 +255,8 @@ transitions
                                   queue while the rewrite is in flight. The
                                   note-less interactive variant is a conversation
                                   with the agent, so it lives in the TUI, on `R`
-                                  over the row
+                                  over the row. A proposed milestone takes the
+                                  three verdicts; refine is refused on one
   start <task-id>                 ready → running
   ask <task-id> --question TEXT   running → needs-input
   resume <task-id>                needs-input → running, once you have answered
@@ -547,6 +557,8 @@ struct AddArgs {
     #[arg(long)]
     deep: bool,
     #[arg(long)]
+    milestone: bool,
+    #[arg(long)]
     repo: Option<String>,
     #[arg(long)]
     doc: Option<String>,
@@ -565,6 +577,8 @@ struct ProposeArgs {
     from: Option<i64>,
     #[arg(long)]
     blocks: Option<String>,
+    #[arg(long)]
+    milestone: bool,
     /// Hidden: accepted only so the handler can refuse it with a pointer to
     /// `add --state` instead of a generic unknown-argument error.
     #[arg(long, hide = true)]
@@ -614,6 +628,10 @@ struct SetArgs {
     deep: bool,
     #[arg(long, conflicts_with = "deep")]
     no_deep: bool,
+    #[arg(long, conflicts_with = "no_human")]
+    milestone: bool,
+    #[arg(long, conflicts_with = "milestone")]
+    no_milestone: bool,
     #[arg(long)]
     summary: Option<String>,
     #[arg(long, conflicts_with = "summary")]
@@ -1440,6 +1458,7 @@ fn add_verb(store: &mut Store, args: AddArgs) -> Result<String, String> {
             agent: args.agent,
             human: args.human,
             deep: args.deep,
+            milestone: args.milestone,
         })
         .map_err(|e| e.to_string())?;
     let task = match &args.blocked_by {
@@ -1448,7 +1467,13 @@ fn add_verb(store: &mut Store, args: AddArgs) -> Result<String, String> {
             .map_err(|e| e.to_string())?,
         None => task,
     };
-    let mut out = format!("task {} '{}' created ({})", task.id, task.title, task.state);
+    let mut out = format!(
+        "{} {} '{}' created ({})",
+        noun(&task),
+        task.id,
+        task.title,
+        task.state
+    );
     if let Some(repo) = &repo {
         out.push_str(&format!(" in repo '{}'", repo.name));
     }
@@ -1463,6 +1488,11 @@ fn add_verb(store: &mut Store, args: AddArgs) -> Result<String, String> {
         out.push_str(&apply_blocks_flag(store, task.id, raw)?);
     }
     Ok(out)
+}
+
+/// What a creation echo calls the task it made.
+fn noun(task: &Task) -> &'static str {
+    if task.milestone { "milestone" } else { "task" }
 }
 
 /// The agent return-path form of `add` (DESIGN.md §8): always lands in
@@ -1491,9 +1521,10 @@ fn propose_verb(store: &mut Store, args: ProposeArgs) -> Result<String, String> 
             agent: None,
             human: false,
             deep: false,
+            milestone: args.milestone,
         })
         .map_err(|e| e.to_string())?;
-    let mut out = format!("task {} '{}' proposed", task.id, task.title);
+    let mut out = format!("{} {} '{}' proposed", noun(&task), task.id, task.title);
     if let Some(source) = source {
         store
             .add_dep(task.id, source.id, DepKind::DiscoveredFrom)
@@ -1525,7 +1556,7 @@ fn set_verb(store: &mut Store, mut args: SetArgs) -> Result<String, String> {
     } else {
         args.agent.or(current.agent)
     };
-    let human = match (args.human, args.no_human) {
+    let human = match (args.human || args.milestone, args.no_human) {
         (true, _) => true,
         (_, true) => false,
         (false, false) => current.human,
@@ -1543,7 +1574,14 @@ fn set_verb(store: &mut Store, mut args: SetArgs) -> Result<String, String> {
         human,
         deep,
     };
-    let task = store.update_task(id, edit).map_err(|e| e.to_string())?;
+    let milestone = match (args.milestone, args.no_milestone) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        (false, false) => None,
+    };
+    let task = store
+        .update_task_and_milestone(id, edit, milestone)
+        .map_err(|e| e.to_string())?;
     let task = if concludes_refine {
         store
             .conclude_refine(id, RefineOutcome::Applied)
@@ -2474,16 +2512,24 @@ fn ask_verb(store: &mut Store, ctx: &DispatchCtx, args: AskArgs) -> Result<Strin
 /// conversation, which is TUI-only for the same reason planning sessions are
 /// (§8) — the CLI is how an LLM drives Voro.
 fn triage_verb(store: &mut Store, args: TriageArgs, ctx: &DispatchCtx) -> Result<String, String> {
-    refuse_milestone(store, args.task_id)?;
     let note = text_or_file(args.note, args.note_file)?;
     match Triage::try_from(args.target) {
         Ok(verdict) => {
             if note.is_some() {
                 return Err("--note applies to `triage <id> refine` only".into());
             }
-            apply_action(store, ctx, args.task_id, Action::Triage(verdict), false)
+            apply_unguarded(store, ctx, args.task_id, Action::Triage(verdict), false)
         }
         Err(()) => {
+            if store
+                .task(args.task_id)
+                .map_err(|e| e.to_string())?
+                .milestone
+            {
+                return Err(
+                    dispatch::MILESTONE_REFINE_REFUSAL.replace("{id}", &args.task_id.to_string())
+                );
+            }
             let Some(note) = note else {
                 return Err(format!(
                     "refine needs a note saying what to fix: `voro triage {} refine --note \
@@ -2510,6 +2556,18 @@ fn apply_action(
     yes: bool,
 ) -> Result<String, String> {
     refuse_milestone(store, id)?;
+    apply_unguarded(store, ctx, id, action, yes)
+}
+
+/// [`apply_action`] without the milestone refusal, for the triage verdicts: a
+/// proposed milestone is triaged like any proposal (DESIGN.md §6).
+fn apply_unguarded(
+    store: &mut Store,
+    ctx: &DispatchCtx,
+    id: i64,
+    action: Action,
+    yes: bool,
+) -> Result<String, String> {
     let closes = matches!(action, Action::Accept | Action::Abandon);
     let (task, stopped) = store.apply_closing(id, action).map_err(|e| e.to_string())?;
     if let Some(session) = stopped {
@@ -3867,9 +3925,15 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         let p = s.projects().unwrap()[0].id;
-        s.create_milestone(p, "Carpet crossing", "Crosses the carpet.", Priority::P2)
-            .unwrap();
-        s.create_milestone(p, "Room crossing", "", Priority::P2)
+        s.create_milestone(
+            p,
+            "Carpet crossing",
+            "Crosses the carpet.",
+            Priority::P2,
+            TaskState::Parked,
+        )
+        .unwrap();
+        s.create_milestone(p, "Room crossing", "", Priority::P2, TaskState::Parked)
             .unwrap();
         ok(
             &mut s,
@@ -3948,7 +4012,9 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         let p = s.projects().unwrap()[0].id;
-        let m = s.create_milestone(p, "Alone", "", Priority::P0).unwrap();
+        let m = s
+            .create_milestone(p, "Alone", "", Priority::P0, TaskState::Parked)
+            .unwrap();
         assert_eq!(m.state, TaskState::Parked);
         assert!(!ok(&mut s, &["inbox"]).contains("Alone"));
         assert_eq!(ok(&mut s, &["next"]), "no ready tasks\n");
@@ -3972,7 +4038,10 @@ mod tests {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         let p = s.projects().unwrap()[0].id;
-        let m = s.create_milestone(p, "M", "", Priority::P2).unwrap().id;
+        let m = s
+            .create_milestone(p, "M", "", Priority::P2, TaskState::Parked)
+            .unwrap()
+            .id;
         assert_eq!(s.task(m).unwrap().state, TaskState::Parked);
         // The operator readies it in the TUI; the store call stands in for that.
         s.apply(m, Action::Unpark).unwrap();
@@ -3984,6 +4053,140 @@ mod tests {
         assert_eq!(s.task(m).unwrap().state, TaskState::Parked);
         let shown = ok(&mut s, &["show", "2"]);
         assert!(shown.contains("in milestone: #1 M"), "{shown}");
+    }
+
+    #[test]
+    fn propose_milestone_files_a_proposed_human_milestone_once() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "p", "/tmp"]);
+        let out = ok(&mut s, &["propose", "p", "Carpet crossing", "--milestone"]);
+        assert!(
+            out.contains("milestone 1 'Carpet crossing' proposed"),
+            "{out}"
+        );
+        let m = s.task(1).unwrap();
+        assert_eq!(m.state, TaskState::Proposed);
+        assert!(m.human && m.milestone);
+        let listed = ok(&mut s, &["milestones"]);
+        assert!(
+            listed.contains("#1 proposed Carpet crossing  0 open · 0 done"),
+            "{listed}"
+        );
+        let e = err(&mut s, &["propose", "p", "carpet crossing", "--milestone"]);
+        assert!(e.contains("milestone 1 'Carpet crossing'"), "{e}");
+        let e = err(&mut s, &["add", "p", "Carpet Crossing", "--milestone"]);
+        assert!(e.contains("milestone 1"), "{e}");
+        assert_eq!(s.tasks().unwrap().len(), 1);
+        let out = ok(
+            &mut s,
+            &["add", "p", "Dock", "--milestone", "--state", "parked"],
+        );
+        assert!(out.contains("milestone 2 'Dock' created (parked)"), "{out}");
+    }
+
+    #[test]
+    fn a_proposed_milestone_triaged_ready_readies_or_parks_on_its_blockers() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "p", "/tmp"]);
+        ok(&mut s, &["propose", "p", "Alone", "--milestone"]);
+        ok(&mut s, &["triage", "1", "ready"]);
+        assert_eq!(s.task(1).unwrap().state, TaskState::Ready);
+        let inbox = ok(&mut s, &["inbox"]);
+        assert!(inbox.contains("#1 do"), "{inbox}");
+
+        ok(&mut s, &["propose", "p", "Gated", "--milestone"]);
+        ok(
+            &mut s,
+            &["add", "p", "blocker", "--state", "ready", "--blocks", "2"],
+        );
+        ok(&mut s, &["triage", "2", "ready"]);
+        assert_eq!(s.task(2).unwrap().state, TaskState::Parked);
+        ok(&mut s, &["start", "3"]);
+        ok(&mut s, &["done", "3"]);
+        ok(&mut s, &["accept", "3", "--yes"]);
+        assert_eq!(s.task(2).unwrap().state, TaskState::Ready);
+
+        let e = err(&mut s, &["done", "1"]);
+        assert!(e.contains("Milestones tab"), "{e}");
+    }
+
+    #[test]
+    fn a_failed_set_changes_nothing_on_a_milestone() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "p", "/tmp"]);
+        ok(&mut s, &["propose", "p", "Carpet crossing", "--milestone"]);
+        err(&mut s, &["set", "1", "--no-milestone", "--agent", "claude"]);
+        let m = s.task(1).unwrap();
+        assert!(m.milestone && m.human && m.agent.is_none());
+        ok(&mut s, &["propose", "p", "Dock", "--milestone"]);
+        let e = err(&mut s, &["set", "2", "--title", "carpet  Crossing"]);
+        assert!(e.contains("milestone 1"), "{e}");
+        assert_eq!(s.task(2).unwrap().title, "Dock");
+    }
+
+    #[test]
+    fn set_milestone_is_refused_on_a_running_task() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "p", "/tmp"]);
+        ok(
+            &mut s,
+            &["add", "p", "by hand", "--state", "ready", "--human"],
+        );
+        ok(&mut s, &["start", "1"]);
+        let e = err(&mut s, &["set", "1", "--milestone"]);
+        assert!(e.contains("proposed, parked or ready"), "{e}");
+        assert!(!s.task(1).unwrap().milestone);
+    }
+
+    #[test]
+    fn refine_without_a_note_on_a_milestone_names_the_milestone_refusal() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "p", "/tmp"]);
+        ok(&mut s, &["propose", "p", "Carpet crossing", "--milestone"]);
+        let e = err(&mut s, &["triage", "1", "refine"]);
+        assert!(e.contains("acceptance statement"), "{e}");
+    }
+
+    #[test]
+    fn the_start_help_line_sits_in_the_description_column() {
+        let line = HELP
+            .lines()
+            .find(|l| l.starts_with("  start <task-id>"))
+            .unwrap();
+        let column = HELP
+            .lines()
+            .find(|l| l.starts_with("  resume <task-id>"))
+            .unwrap()
+            .find("needs-input")
+            .unwrap();
+        assert_eq!(line.find("ready → running"), Some(column), "{line}");
+    }
+
+    #[test]
+    fn refine_is_refused_on_a_proposed_milestone() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "p", "/tmp"]);
+        ok(&mut s, &["propose", "p", "Carpet crossing", "--milestone"]);
+        let e = err(&mut s, &["triage", "1", "refine", "--note", "shorter"]);
+        assert!(e.contains("acceptance statement"), "{e}");
+        assert_eq!(s.task(1).unwrap().state, TaskState::Proposed);
+    }
+
+    #[test]
+    fn set_milestone_flags_a_task_human_and_no_milestone_clears_it() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "p", "/tmp"]);
+        ok(&mut s, &["add", "p", "Carpet crossing", "--state", "ready"]);
+        ok(&mut s, &["set", "1", "--milestone"]);
+        let t = s.task(1).unwrap();
+        assert!(t.milestone && t.human);
+        ok(&mut s, &["set", "1", "--no-milestone", "--no-human"]);
+        let t = s.task(1).unwrap();
+        assert!(!t.milestone && !t.human);
+        ok(&mut s, &["add", "p", "overridden", "--agent", "claude"]);
+        let e = err(&mut s, &["set", "2", "--milestone"]);
+        assert!(e.contains("agent override"), "{e}");
+        assert!(!s.task(2).unwrap().milestone);
     }
 
     #[test]
@@ -5457,6 +5660,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         crate::dispatch::dispatch(store, ctx, task.id, None).unwrap();

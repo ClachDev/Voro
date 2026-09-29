@@ -160,11 +160,14 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             let height = items.len() as u16 + 2;
             let area = popup_area(frame, 48, height.max(3));
             let mut state = ListState::default().with_selected(Some(*sel));
+            use crate::app::{CreateFlow, Filing};
             let title = match flow {
-                crate::app::CreateFlow::Quick => "Project to propose a task in",
-                crate::app::CreateFlow::Editor => "Project for the new task",
-                crate::app::CreateFlow::Plan => "Project to plan a task in",
-                crate::app::CreateFlow::Milestone(_) => "Project for the new milestone",
+                CreateFlow::Quick(Filing::Task) => "Project to propose a task in",
+                CreateFlow::Editor(Filing::Task) => "Project for the new task",
+                CreateFlow::Plan(Filing::Task) => "Project to plan a task in",
+                CreateFlow::Quick(Filing::Milestone) => "Project to propose a milestone in",
+                CreateFlow::Editor(Filing::Milestone) => "Project for the new milestone",
+                CreateFlow::Plan(Filing::Milestone) => "Project to plan a milestone in",
             };
             let list = List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(title))
@@ -215,7 +218,11 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 .to_string(),
             buffer,
         ),
-        Mode::QuickCreate { project_id, buffer } => {
+        Mode::QuickCreate {
+            project_id,
+            filing,
+            buffer,
+        } => {
             let project = app
                 .projects
                 .iter()
@@ -224,7 +231,14 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 .unwrap_or("the project");
             draw_text_entry_popup(
                 frame,
-                format!("New task in {project} — ⏎ to propose, esc to cancel"),
+                match filing {
+                    crate::app::Filing::Task => {
+                        format!("New task in {project} — ⏎ to propose, esc to cancel")
+                    }
+                    crate::app::Filing::Milestone => {
+                        format!("New milestone in {project} — ⏎ to propose, esc to cancel")
+                    }
+                },
                 buffer,
             )
         }
@@ -376,11 +390,6 @@ fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             frame.render_stateful_widget(list, area, &mut state);
             hits.push_list(area, state.offset(), count, Hit::PickerOption);
         }
-        Mode::MilestoneTitle { buffer } => draw_text_entry_popup(
-            frame,
-            "New milestone — its title; ⏎ to pick a project, esc to cancel".to_string(),
-            buffer,
-        ),
         Mode::MilestonePicker {
             task_id,
             milestones,
@@ -2622,6 +2631,7 @@ mod tests {
                     agent: None,
                     human: false,
                     deep: false,
+                    milestone: false,
                 })
                 .unwrap()
                 .id
@@ -2680,7 +2690,7 @@ mod tests {
         app.refresh().unwrap();
         app.mode = crate::app::Mode::PickProject {
             sel: 0,
-            flow: crate::app::CreateFlow::Quick,
+            flow: crate::app::CreateFlow::Quick(crate::app::Filing::Task),
         };
 
         let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
@@ -3017,6 +3027,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         store
@@ -3523,6 +3534,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         };
         let open = store.create_task(new("open blocker")).unwrap();
         let closed = store.create_task(new("closed blocker")).unwrap();
@@ -3601,6 +3613,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap()
             .id;
@@ -3679,6 +3692,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap()
             .id;
@@ -3737,6 +3751,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap()
             .id;
@@ -3792,6 +3807,7 @@ mod tests {
                     agent: None,
                     human: false,
                     deep: false,
+                    milestone: false,
                 })
                 .unwrap()
                 .id
@@ -3906,6 +3922,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap()
             .id;
@@ -4027,6 +4044,7 @@ mod tests {
                     agent: None,
                     human: false,
                     deep: false,
+                    milestone: false,
                 })
                 .unwrap()
                 .id
@@ -4114,6 +4132,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         store
@@ -4185,6 +4204,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         store
@@ -4279,6 +4299,7 @@ mod tests {
                 agent: None,
                 human: true,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
 
@@ -4347,6 +4368,7 @@ mod tests {
             agent: None,
             human: false,
             deep,
+            milestone: false,
         };
         store.create_task(new("the hard one", true)).unwrap();
         store.create_task(new("the ordinary one", false)).unwrap();
@@ -4421,6 +4443,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         };
         store.create_task(new("open", TaskState::Ready)).unwrap();
         let closed = store.create_task(new("closed", TaskState::Ready)).unwrap();
@@ -4490,6 +4513,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
 
@@ -4587,6 +4611,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         };
         let closed = store
             .create_task(new("closed blocker", Priority::P2))
@@ -4684,6 +4709,7 @@ mod tests {
             agent: None,
             human,
             deep: false,
+            milestone: false,
         };
 
         let triage = store
@@ -4815,6 +4841,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         };
         // Fill the default cap of five, then leave one startable task and one
         // question behind it.
@@ -4886,6 +4913,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
 
@@ -5008,6 +5036,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
 
@@ -5075,6 +5104,7 @@ mod tests {
                     agent: None,
                     human: false,
                     deep: false,
+                    milestone: false,
                 })
                 .unwrap();
             let (_, session) = store
@@ -5129,6 +5159,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         let clean = App::new(store, ctx()).unwrap();
@@ -5163,6 +5194,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         store
@@ -5223,6 +5255,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         store
@@ -5300,6 +5333,7 @@ mod tests {
                     agent: None,
                     human: false,
                     deep: false,
+                    milestone: false,
                 })
                 .unwrap();
             store.apply(task.id, Action::Start).unwrap();
@@ -5425,6 +5459,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         store.apply(task.id, Action::Start).unwrap();
@@ -5536,6 +5571,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         let selected = App::new(store, ctx()).unwrap();
@@ -5571,6 +5607,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         };
         store.create_task(task("ready to go")).unwrap();
         let running = store.create_task(task("under way")).unwrap();
@@ -5645,6 +5682,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         };
         let reviewed = |store: &mut Store, title: &str| {
             let t = store.create_task(task(title)).unwrap();
@@ -5735,6 +5773,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         };
         store
             .create_task(task("a proposal", TaskState::Proposed))
@@ -6094,6 +6133,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         };
         store.create_task(new("idea", TaskState::Proposed)).unwrap();
         store.create_task(new("go", TaskState::Ready)).unwrap();
@@ -6147,6 +6187,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
 
@@ -6240,6 +6281,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap()
     }
@@ -6600,6 +6642,7 @@ mod tests {
             store,
             Mode::QuickCreate {
                 project_id: project.id,
+                filing: crate::app::Filing::Task,
                 buffer: buffer.to_string(),
             },
         )

@@ -146,8 +146,11 @@ pub enum Error {
     Invalid(String),
 
     #[error(
-        "task {id} is a milestone; only the operator opens or closes one, from the TUI's \
+        "task {id} is a milestone; past triage only the operator moves one, from the TUI's \
          Milestones tab"
     )]
     MilestoneRefused { id: i64 },
+
+    #[error("milestone {id} '{title}' is already open in this project")]
+    MilestoneExists { id: i64, title: String },
 }

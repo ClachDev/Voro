@@ -174,13 +174,30 @@ to make; {register}; `<name>` is the name you choose. {rebase}";
 /// for the same reason: the command must name its database literally.
 const PLANNING_PROMPT_TEMPLATE: &str = "\
 <!-- Voro planning session: the deliverable is a task, not a PR -->
-You are an agent launched by Voro to help the operator plan a new task for the
+You are an agent launched by Voro to help the operator plan a new {kind} for the
 project `{project}`. This is an interactive planning conversation: ask the
-operator what they want, and interview them until the task is well defined —
+operator what they want, and interview them until the {kind} is well defined —
 scope, approach where it is settled, and what done looks like. Do not modify
-the project's files; the checkout is there to read, so the task can name real
+the project's files; the checkout is there to read, so the {kind} can name real
 files and code.
 
+{shape}
+
+When the operator confirms the draft, write the body to a file outside the
+checkout and create the {kind} with:
+
+    voro add {project_arg} \"<title>\"{db}{flag} --body-file <path>
+
+Add `--priority <0-3>` if the operator wants something other than the default
+P2. The task is created in `proposed` and the operator triages it from the
+queue, so do not pass a state. If the operator decides against creating a
+task, end the session without creating one — that is a no-op, not a failure.
+Never modify Voro's database with raw SQL, which would bypass the state
+machine and event log.
+";
+
+/// The body guidance of a planning session that drafts a task.
+const PLANNING_TASK_SHAPE: &str = "\
 Write the task body as a self-contained dispatchable prompt: the agent that
 picks it up later gets no other context, so name the relevant files, spell out
 the decisions already made, and give concrete acceptance criteria.
@@ -191,20 +208,19 @@ project's own conventions call for — so the agent does not default to
 committing verification write-ups and work logs as new files. Ask the operator
 where they belong if the project states no convention. Say too what the task
 makes obsolete — existing files, docs, or tooling it replaces — and put
-retiring them in the same task's scope.
+retiring them in the same task's scope.";
 
-When the operator confirms the draft, write the body to a file outside the
-checkout and create the task with:
-
-    voro add {project_arg} \"<title>\"{db} --body-file <path>
-
-Add `--priority <0-3>` if the operator wants something other than the default
-P2. The task is created in `proposed` and the operator triages it from the
-queue, so do not pass a state. If the operator decides against creating a
-task, end the session without creating one — that is a no-op, not a failure.
-Never modify Voro's database with raw SQL, which would bypass the state
-machine and event log.
-";
+/// The body guidance of a planning session that drafts a milestone (DESIGN.md
+/// §3). `{db}` is rendered before the shape is.
+const PLANNING_MILESTONE_SHAPE: &str = "\
+A milestone is something the operator can watch the robot or the system do; a
+fix or a refactor is a task, so say so if that is what the operator describes.
+Run `voro milestones{db}` before drafting and tell the operator if one listed
+already covers the outcome. Keep the title to four words or fewer, because it
+fills a 16-character column. Write the body as the acceptance statement: what
+the operator will watch happen, in measurable terms. No agent executes a
+milestone, so the body is not a prompt; the tasks that reach it are filed
+later and block it.";
 
 /// Rendered per quick propose (DESIGN.md §6/§8) and written as the whole
 /// prompt: the operator's one line, expanded by a headless agent into a task it
@@ -223,18 +239,12 @@ the whole brief:
 
     {intent}
 
-Expand it into a title and a body. The title names what the task achieves, in
-one imperative line. The body is a self-contained dispatchable prompt: the agent
-that picks the task up later gets no other context, so name the relevant files,
-spell out the decisions the intent already settles, and give concrete acceptance
-criteria. The checkout you are running in is there to read, so the body can name
-real files and code. Do not modify it, and do not do the task itself — writing
-its brief is the job.
+{shape}
 
 When the body is ready, write it to a file outside the checkout and create
 exactly one task with:
 
-    voro add {project_arg} \"<title>\"{db} --body-file <path>
+    voro add {project_arg} \"<title>\"{db}{flag} --body-file <path>
 
 File that task even when the intent is thin: infer what you can and say in the
 body where you were guessing. A weak proposal is visible in the queue and the
@@ -244,6 +254,51 @@ the operator triages it from the queue. That one command is the only change you
 may make: no second task, no `voro triage`, and never modify Voro's database
 with raw SQL, which would bypass the state machine and event log.
 ";
+
+/// The expansion guidance of a quick propose that files a task.
+const PROPOSE_TASK_SHAPE: &str = "\
+Expand it into a title and a body. The title names what the task achieves, in
+one imperative line. The body is a self-contained dispatchable prompt: the agent
+that picks the task up later gets no other context, so name the relevant files,
+spell out the decisions the intent already settles, and give concrete acceptance
+criteria. The checkout you are running in is there to read, so the body can name
+real files and code. Do not modify it, and do not do the task itself — writing
+its brief is the job.";
+
+/// The expansion guidance of a quick propose that files a milestone (DESIGN.md
+/// §3).
+const PROPOSE_MILESTONE_SHAPE: &str = "\
+Expand it into a milestone: something the operator can watch the robot or the
+system do. Keep the title to four words or fewer, because it fills a
+16-character column. Write the body as the acceptance statement: what the
+operator will watch happen, in measurable terms. No agent executes a milestone,
+so the body is not a prompt; the tasks that reach it are filed later and block
+it. The checkout you are running in is there to read, so the statement can name
+real behaviour. Do not modify it, and do not do the work itself.";
+
+/// What a create flow files (DESIGN.md §8/§9): an ordinary task, or a
+/// milestone, which the agent files with `voro add --milestone`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filing {
+    Task,
+    Milestone,
+}
+
+impl Filing {
+    fn kind(self) -> &'static str {
+        match self {
+            Filing::Task => "task",
+            Filing::Milestone => "milestone",
+        }
+    }
+
+    fn flag(self) -> &'static str {
+        match self {
+            Filing::Task => "",
+            Filing::Milestone => " --milestone",
+        }
+    }
+}
 
 /// The note-driven refine (DESIGN.md §6): a headless agent rewrites a proposed
 /// task's body to honour the operator's one-line note, and applies it through
@@ -473,13 +528,21 @@ pub fn rework_message(task_id: i64, db_path: &Path, feedback: &str) -> String {
 /// line carries the shell-quoted project name and, exactly as
 /// [`render_preamble`] does, a `--db` flag only when the database is not the
 /// default one the verb resolves to unaided.
-fn render_planning_prompt(project: &str, db_path: &Path) -> String {
+fn render_planning_prompt(project: &str, db_path: &Path, filing: Filing) -> String {
+    let db = db_flag(db_path);
+    let shape = match filing {
+        Filing::Task => PLANNING_TASK_SHAPE.to_string(),
+        Filing::Milestone => render(PLANNING_MILESTONE_SHAPE, &[("{db}", db.as_str())]),
+    };
     render(
         PLANNING_PROMPT_TEMPLATE,
         &[
+            ("{shape}", shape.as_str()),
+            ("{kind}", filing.kind()),
+            ("{flag}", filing.flag()),
             ("{project_arg}", shell_quote(Path::new(project)).as_str()),
             ("{project}", project),
-            ("{db}", db_flag(db_path).as_str()),
+            ("{db}", db.as_str()),
         ],
     )
 }
@@ -488,11 +551,17 @@ fn render_planning_prompt(project: &str, db_path: &Path) -> String {
 /// intent is the operator's own text, so it goes through the single-pass
 /// renderer for the same reason a refine's seed does: a line that mentions
 /// `{db}` must reach the agent as it was typed.
-fn render_propose_prompt(project: &str, db_path: &Path, intent: &str) -> String {
+fn render_propose_prompt(project: &str, db_path: &Path, intent: &str, filing: Filing) -> String {
+    let shape = match filing {
+        Filing::Task => PROPOSE_TASK_SHAPE,
+        Filing::Milestone => PROPOSE_MILESTONE_SHAPE,
+    };
     render(
         PROPOSE_PROMPT_TEMPLATE,
         &[
             ("{intent}", intent.trim()),
+            ("{shape}", shape),
+            ("{flag}", filing.flag()),
             ("{project_arg}", shell_quote(Path::new(project)).as_str()),
             ("{project}", project),
             ("{db}", db_flag(db_path).as_str()),
@@ -605,7 +674,7 @@ pub struct RefineLaunch {
 /// `add` for a new task, `set --body-file` for a refine.
 #[derive(Debug, Clone, Copy)]
 pub enum PlanTarget {
-    Create { project_id: i64 },
+    Create { project_id: i64, filing: Filing },
     Refine { task_id: i64 },
 }
 
@@ -641,7 +710,7 @@ pub fn plan_session(
         ));
     }
     let (label, launch, cwd, prompt, refine) = match target {
-        PlanTarget::Create { project_id } => {
+        PlanTarget::Create { project_id, filing } => {
             let project = store.project(project_id).map_err(|e| e.to_string())?;
             let repo = store.default_repo(project_id).map_err(|e| e.to_string())?;
             (
@@ -650,7 +719,7 @@ pub fn plan_session(
                     project: project.name.clone(),
                 },
                 repo.path,
-                render_planning_prompt(&project.name, &ctx.db_path),
+                render_planning_prompt(&project.name, &ctx.db_path, filing),
                 None,
             )
         }
@@ -692,6 +761,10 @@ pub fn plan_session(
     })
 }
 
+/// Why refine is refused on a milestone (DESIGN.md §6); `{id}` is its id.
+pub const MILESTONE_REFINE_REFUSAL: &str = "task {id} is a milestone — refine rewrites a \
+     dispatchable brief, and a milestone's body is its acceptance statement; e edits it";
+
 /// The precondition both refine flavours share: a refine round starts from
 /// `proposed` or `ready` (DESIGN.md §6), so anything else is refused before a
 /// prompt is written or a process spawned. The transition API refuses it again
@@ -700,6 +773,9 @@ pub fn plan_session(
 /// cancel.
 fn guard_refinable(store: &Store, task_id: i64) -> Result<voro_core::Task, String> {
     let task = store.task(task_id).map_err(|e| e.to_string())?;
+    if task.milestone {
+        return Err(MILESTONE_REFINE_REFUSAL.replace("{id}", &task_id.to_string()));
+    }
     if task.state == TaskState::Refining {
         return Err(format!(
             "task {task_id} is already being refined — cancel that round first"
@@ -990,6 +1066,7 @@ pub fn propose(
     ctx: &DispatchCtx,
     project_id: i64,
     intent: &str,
+    filing: Filing,
 ) -> Result<String, String> {
     if intent.trim().is_empty() {
         return Err("an intent is required".into());
@@ -1031,14 +1108,15 @@ pub fn propose(
             },
             agent: &agent,
             deep: false,
-            prompt: render_propose_prompt(&project.name, &ctx.db_path, intent),
+            prompt: render_propose_prompt(&project.name, &ctx.db_path, intent, filing),
             cwd: repo.path,
         },
     )?;
     reap_expansion(spawned, ctx.launch_log_path());
 
     Ok(format!(
-        "proposing task in {} — it appears in the queue once the agent files it",
+        "proposing {} in {} — it appears in the queue once the agent files it",
+        filing.kind(),
         project.name
     ))
 }
@@ -2077,6 +2155,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap()
             .id
@@ -2093,7 +2172,8 @@ mod tests {
             .create_project("proj", project.to_str().unwrap())
             .unwrap();
 
-        let summary = propose(&store, &ctx, p.id, "  cache the score view  ").unwrap();
+        let summary =
+            propose(&store, &ctx, p.id, "  cache the score view  ", Filing::Task).unwrap();
         assert!(summary.contains("proposing task in proj"), "{summary}");
 
         let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
@@ -2103,6 +2183,54 @@ mod tests {
         // Nothing was created, transitioned, or recorded — the agent's own
         // `voro add` is what makes the task exist.
         assert!(store.tasks().unwrap().is_empty());
+    }
+
+    /// The Milestones tab's quick propose files with `--milestone` and asks
+    /// for the short title and the acceptance statement (DESIGN.md §9).
+    #[test]
+    fn a_milestone_propose_files_with_the_flag_and_asks_for_an_acceptance_statement() {
+        let (mut store, ctx, project) = fixture("cat {prompt_file}");
+        let p = store
+            .create_project("proj", project.to_str().unwrap())
+            .unwrap();
+
+        let summary = propose(&store, &ctx, p.id, "carpet crossing", Filing::Milestone).unwrap();
+        assert!(summary.contains("proposing milestone in proj"), "{summary}");
+
+        let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
+        assert!(prompt.contains(" --milestone --body-file"), "{prompt}");
+        assert!(prompt.contains("four words or fewer"), "{prompt}");
+        assert!(prompt.contains("acceptance statement"), "{prompt}");
+        assert!(!prompt.contains("dispatchable prompt"), "{prompt}");
+        assert!(!prompt.contains('{'), "unsubstituted: {prompt}");
+        assert!(store.tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_milestone_planning_session_lists_milestones_and_files_with_the_flag() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file}\"\nplan = \"stub --interactive {prompt_file}\"\n",
+        );
+        let p = store
+            .create_project("proj", project.to_str().unwrap())
+            .unwrap();
+        plan_session(
+            &store,
+            &ctx,
+            PlanTarget::Create {
+                project_id: p.id,
+                filing: Filing::Milestone,
+            },
+        )
+        .unwrap();
+
+        let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
+        assert!(prompt.contains("plan a new milestone"), "{prompt}");
+        assert!(prompt.contains("--milestone --body-file"), "{prompt}");
+        assert!(prompt.contains("Run `voro milestones"), "{prompt}");
+        assert!(prompt.contains("four words or fewer"), "{prompt}");
+        assert!(!prompt.contains("{db}"), "unsubstituted: {prompt}");
     }
 
     /// A quick propose names its session for its project the way the planning
@@ -2116,7 +2244,7 @@ mod tests {
             .create_project("odm 2", project.to_str().unwrap())
             .unwrap();
 
-        propose(&store, &ctx, p.id, "cache the score view").unwrap();
+        propose(&store, &ctx, p.id, "cache the score view", Filing::Task).unwrap();
 
         assert_eq!(
             marker_text(&project.join("marker.txt")),
@@ -2143,9 +2271,9 @@ mod tests {
             .create_project("proj", project.to_str().unwrap())
             .unwrap();
 
-        assert!(propose(&store, &ctx, p.id, "   ").is_err());
+        assert!(propose(&store, &ctx, p.id, "   ", Filing::Task).is_err());
         store.set_archived(p.id, true).unwrap();
-        let err = propose(&store, &ctx, p.id, "something").unwrap_err();
+        let err = propose(&store, &ctx, p.id, "something", Filing::Task).unwrap_err();
         assert!(err.contains("archived"), "{err}");
         assert!(!ctx.runtime_dir.exists(), "nothing was written");
     }
@@ -2164,7 +2292,7 @@ mod tests {
             .create_project("proj", project.to_str().unwrap())
             .unwrap();
 
-        let err = propose(&store, &ctx, p.id, "something").unwrap_err();
+        let err = propose(&store, &ctx, p.id, "something", Filing::Task).unwrap_err();
         assert!(err.contains("{task_id}"), "{err}");
         assert!(err.contains("stub"), "{err}");
         assert!(!ctx.runtime_dir.exists(), "nothing was written");
@@ -2246,6 +2374,7 @@ mod tests {
                 "Carpet crossing",
                 "",
                 Priority::P2,
+                TaskState::Parked,
             )
             .unwrap();
         store.block_tasks(id, &[m.id]).unwrap();
@@ -2870,6 +2999,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap()
             .id;
@@ -3215,6 +3345,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         };
         let id = store
             .create_task(new(
@@ -3621,7 +3752,15 @@ mod tests {
         let p = store
             .create_project("proj", project.to_str().unwrap())
             .unwrap();
-        let launch = plan_session(&store, &ctx, PlanTarget::Create { project_id: p.id }).unwrap();
+        let launch = plan_session(
+            &store,
+            &ctx,
+            PlanTarget::Create {
+                project_id: p.id,
+                filing: Filing::Task,
+            },
+        )
+        .unwrap();
         assert!(launch.refine.is_none());
     }
 
@@ -3675,7 +3814,15 @@ mod tests {
         // a dirty checkout is fine for planning
         std::fs::write(project.join("scratch.txt"), "uncommitted").unwrap();
 
-        let launch = plan_session(&store, &ctx, PlanTarget::Create { project_id: p.id }).unwrap();
+        let launch = plan_session(
+            &store,
+            &ctx,
+            PlanTarget::Create {
+                project_id: p.id,
+                filing: Filing::Task,
+            },
+        )
+        .unwrap();
         assert_eq!(launch.cwd, project.to_str().unwrap());
 
         // the plan template ran through the same {prompt_file} substitution as
@@ -3709,7 +3856,7 @@ mod tests {
 
     #[test]
     fn planning_prompt_renders_the_db_flag_only_for_a_non_default_database() {
-        let rendered = render_planning_prompt("proj", &Store::production_db_path());
+        let rendered = render_planning_prompt("proj", &Store::production_db_path(), Filing::Task);
         assert!(
             rendered.contains("voro add 'proj' \"<title>\" --body-file"),
             "{rendered}"
@@ -3719,7 +3866,7 @@ mod tests {
 
     #[test]
     fn planning_prompt_asks_for_evidence_routing_and_supersession() {
-        let rendered = render_planning_prompt("proj", &Store::default_db_path());
+        let rendered = render_planning_prompt("proj", &Store::default_db_path(), Filing::Task);
         assert!(
             rendered.contains("where the task's evidence and outputs land"),
             "{rendered}"
@@ -3747,7 +3894,15 @@ mod tests {
             .create_project("proj", project.to_str().unwrap())
             .unwrap();
 
-        let err = plan_session(&store, &ctx, PlanTarget::Create { project_id: p.id }).unwrap_err();
+        let err = plan_session(
+            &store,
+            &ctx,
+            PlanTarget::Create {
+                project_id: p.id,
+                filing: Filing::Task,
+            },
+        )
+        .unwrap_err();
         assert!(err.contains("stub"), "{err}");
         assert!(err.contains("plan"), "{err}");
         assert!(err.contains("{prompt_file}"), "{err}");
@@ -3777,6 +3932,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep,
+                milestone: false,
             })
             .unwrap()
             .id;
@@ -3833,7 +3989,15 @@ mod tests {
         let p = store
             .create_project("proj", project.to_str().unwrap())
             .unwrap();
-        let launch = plan_session(&store, &ctx, PlanTarget::Create { project_id: p.id }).unwrap();
+        let launch = plan_session(
+            &store,
+            &ctx,
+            PlanTarget::Create {
+                project_id: p.id,
+                filing: Filing::Task,
+            },
+        )
+        .unwrap();
         assert!(
             launch.command.contains("--model thinker"),
             "{}",
@@ -3865,6 +4029,7 @@ mod tests {
                 agent: Some("special".into()),
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap()
             .id;

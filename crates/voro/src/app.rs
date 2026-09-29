@@ -2,6 +2,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub(crate) mod milestones;
 
+pub use crate::dispatch::Filing;
 use crate::ui::Hit;
 use voro_core::{
     Action, ActionRow, AgentsConfig, CompletionReport, DepKind, DepRef, DigestRow, Event,
@@ -264,11 +265,13 @@ pub enum Mode {
     EditMaxRunning {
         buffer: String,
     },
-    /// Collecting the one line `n` expands into a task (DESIGN.md §6/§8). Like
-    /// `LinkPr` and unlike `Prompt` it names no task — there is none yet — so it
-    /// carries the project the proposal will land in instead.
+    /// Collecting the one line `n` expands into a task or a milestone
+    /// (DESIGN.md §6/§8). Like `LinkPr` and unlike `Prompt` it names no task —
+    /// there is none yet — so it carries the project the proposal will land in
+    /// instead.
     QuickCreate {
         project_id: i64,
+        filing: Filing,
         buffer: String,
     },
     /// Confirming that `pr` should push a review task's branch and open a ready
@@ -293,12 +296,6 @@ pub enum Mode {
         /// the list independently of cursor position.
         resolved: Option<String>,
         sel: usize,
-    },
-    /// Collecting a new milestone's one-line title on the Milestones tab
-    /// (DESIGN.md §9). The project is asked for after, through the create
-    /// keys' own picker.
-    MilestoneTitle {
-        buffer: String,
     },
     /// Attaching a task to milestones or detaching it (DESIGN.md §9): every
     /// open milestone, the task's own project's first, with ⏎ adding or
@@ -393,14 +390,13 @@ impl Mode {
 /// a modal and hands it to a background agent that writes the task and files it,
 /// `N` opens the interactive planning session, and `ctrl-n` — the rare path, and
 /// the only one that sets state, priority and dependencies at creation time —
-/// opens the manual `$EDITOR` form. The Milestones tab's `n` collects a
-/// milestone's title first and carries it here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// opens the manual `$EDITOR` form. Each carries what it files: the Milestones
+/// tab's three keys file a milestone, every other screen's a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateFlow {
-    Quick,
-    Editor,
-    Plan,
-    Milestone(String),
+    Quick(Filing),
+    Editor(Filing),
+    Plan(Filing),
 }
 
 /// Which refine intensity a keypress asks for (DESIGN.md §6): a one-line note
@@ -415,7 +411,7 @@ pub enum RefineFlow {
 /// A request for main() to suspend the terminal and run $EDITOR.
 #[derive(Debug, Clone, Copy)]
 pub enum EditorRequest {
-    Create { project_id: i64 },
+    Create { project_id: i64, filing: Filing },
     Edit { task_id: i64 },
 }
 
@@ -1718,7 +1714,14 @@ impl App {
                 BrowserRow::Group(_) => Some("⏎ expand"),
                 BrowserRow::Task(_) => Some("⏎ view"),
             },
-            Screen::Milestones => self.milestones.get(self.milestones_sel).map(|_| "⏎ browse"),
+            Screen::Milestones => {
+                self.milestones
+                    .get(self.milestones_sel)
+                    .map(|m| match m.milestone.state {
+                        TaskState::Proposed => "⏎ triage",
+                        _ => "⏎ browse",
+                    })
+            }
             Screen::Cockpit => match self.cockpit_rows.get(self.cockpit_sel)? {
                 CockpitRow::Queue(i) => match self.queue.rows.get(*i)? {
                     QueueRow::Digest(digest) => {
@@ -1812,9 +1815,11 @@ impl App {
             } => self.key_prompt(key, task_id, kind, buffer),
             Mode::LinkPr { task_id, buffer } => self.key_link_pr(key, task_id, buffer),
             Mode::EditMaxRunning { buffer } => self.key_max_running(key, buffer),
-            Mode::QuickCreate { project_id, buffer } => {
-                self.key_quick_create(key, project_id, buffer)
-            }
+            Mode::QuickCreate {
+                project_id,
+                filing,
+                buffer,
+            } => self.key_quick_create(key, project_id, filing, buffer),
             Mode::ConfirmPr {
                 task_id,
                 branch,
@@ -1833,7 +1838,6 @@ impl App {
                 sel,
                 back,
             } => self.key_doc_picker(key, task_id, docs, sel, back),
-            Mode::MilestoneTitle { buffer } => self.key_milestone_title(key, buffer),
             Mode::MilestonePicker {
                 task_id,
                 milestones,
@@ -2001,10 +2005,10 @@ impl App {
             KeyCode::Char('R') => self.refine_selected(RefineFlow::Interactive),
             KeyCode::Enter => self.activate_selection(),
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.new_task(CreateFlow::Editor)
+                self.new_task(CreateFlow::Editor(Filing::Task))
             }
-            KeyCode::Char('n') => self.new_task(CreateFlow::Quick),
-            KeyCode::Char('N') => self.new_task(CreateFlow::Plan),
+            KeyCode::Char('n') => self.new_task(CreateFlow::Quick(Filing::Task)),
+            KeyCode::Char('N') => self.new_task(CreateFlow::Plan(Filing::Task)),
             KeyCode::Char('e') => {
                 if let Some(id) = self.selected_task_id() {
                     self.pending_editor = Some(EditorRequest::Edit { task_id: id });
@@ -2300,7 +2304,7 @@ impl App {
     /// into it when exactly one project can take work, via the project picker
     /// when several can, and a pointer to the projects screen when none can —
     /// because none is registered, or because every one of them is archived.
-    fn new_task(&mut self, flow: CreateFlow) {
+    pub(super) fn new_task(&mut self, flow: CreateFlow) {
         let offered: Vec<i64> = self.creatable_projects().iter().map(|p| p.id).collect();
         match offered.len() {
             0 if self.projects.is_empty() => self.status = Some(NO_PROJECTS_HINT.into()),
@@ -2318,26 +2322,26 @@ impl App {
     /// explanation" style as the dispatch keys.
     fn start_create(&mut self, project_id: i64, flow: CreateFlow) {
         match flow {
-            CreateFlow::Quick => {
+            CreateFlow::Quick(filing) => {
                 self.mode = Mode::QuickCreate {
                     project_id,
+                    filing,
                     buffer: String::new(),
                 };
             }
-            CreateFlow::Editor => {
-                self.pending_editor = Some(EditorRequest::Create { project_id });
+            CreateFlow::Editor(filing) => {
+                self.pending_editor = Some(EditorRequest::Create { project_id, filing });
             }
-            CreateFlow::Plan => {
+            CreateFlow::Plan(filing) => {
                 match crate::dispatch::plan_session(
                     &self.store,
                     &self.dispatch_ctx,
-                    crate::dispatch::PlanTarget::Create { project_id },
+                    crate::dispatch::PlanTarget::Create { project_id, filing },
                 ) {
                     Ok(launch) => self.pending_plan = Some(launch),
                     Err(e) => self.status = Some(e),
                 }
             }
-            CreateFlow::Milestone(title) => self.create_milestone(project_id, &title),
         }
     }
 
@@ -2364,6 +2368,12 @@ impl App {
             return;
         };
         let (task_id, state) = (task.id, task.state);
+        if task.milestone {
+            self.status = Some(
+                crate::dispatch::MILESTONE_REFINE_REFUSAL.replace("{id}", &task_id.to_string()),
+            );
+            return;
+        }
         if state == TaskState::Refining {
             self.status = Some(format!(
                 "task {task_id} is already being refined — C cancels the round"
@@ -3287,11 +3297,17 @@ impl App {
     /// Drive the quick-create prompt (DESIGN.md §6/§8). Enter hands the typed
     /// line to a background agent, esc cancels. The buffer is one line — the
     /// terse intent the agent expands — so this stays a simple line editor.
-    fn key_quick_create(&mut self, key: KeyEvent, project_id: i64, mut buffer: String) {
+    fn key_quick_create(
+        &mut self,
+        key: KeyEvent,
+        project_id: i64,
+        filing: Filing,
+        mut buffer: String,
+    ) {
         match key.code {
             KeyCode::Esc => return,
             KeyCode::Enter => {
-                self.quick_propose(project_id, &buffer);
+                self.quick_propose(project_id, filing, &buffer);
                 return;
             }
             KeyCode::Backspace => {
@@ -3300,7 +3316,11 @@ impl App {
             KeyCode::Char(c) => buffer.push(c),
             _ => {}
         }
-        self.mode = Mode::QuickCreate { project_id, buffer };
+        self.mode = Mode::QuickCreate {
+            project_id,
+            filing,
+            buffer,
+        };
     }
 
     /// Quick propose (DESIGN.md §6/§8): spawn the headless agent that expands
@@ -3309,13 +3329,19 @@ impl App {
     /// proposal shows up in the untriaged count and the queue on a later
     /// refresh, exactly as one an agent filed with `voro propose` does. An empty
     /// line asked for nothing, so it spawns nothing.
-    fn quick_propose(&mut self, project_id: i64, intent: &str) {
+    fn quick_propose(&mut self, project_id: i64, filing: Filing, intent: &str) {
         if intent.trim().is_empty() {
             self.status = Some("cancelled".into());
             return;
         }
         self.status = Some(
-            match crate::dispatch::propose(&self.store, &self.dispatch_ctx, project_id, intent) {
+            match crate::dispatch::propose(
+                &self.store,
+                &self.dispatch_ctx,
+                project_id,
+                intent,
+                filing,
+            ) {
                 Ok(summary) => summary,
                 Err(e) => e,
             },
@@ -4383,6 +4409,7 @@ impl App {
             agent: form.agent,
             human: form.human,
             deep: false,
+            milestone: form.milestone,
         })?;
         if !form.blocked_by.is_empty() {
             self.store.set_blocks_deps(task.id, &form.blocked_by)?;
@@ -4458,6 +4485,7 @@ mod tests {
                     agent: None,
                     human: false,
                     deep: false,
+                    milestone: false,
                 })
                 .unwrap();
             match state {
@@ -4776,6 +4804,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
@@ -6023,6 +6052,7 @@ mod tests {
                     agent: None,
                     human: false,
                     deep: false,
+                    milestone: false,
                 })
                 .unwrap()
         };
@@ -6369,6 +6399,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
 
@@ -6442,6 +6473,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
 
@@ -6512,6 +6544,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
 
@@ -6623,6 +6656,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
@@ -6715,6 +6749,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
@@ -7502,6 +7537,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
@@ -8101,6 +8137,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         crate::dispatch::dispatch(&mut store, &ctx, task.id, None).unwrap();
@@ -8183,6 +8220,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         store
@@ -8240,6 +8278,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         let (_, session) = store
@@ -8285,6 +8324,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         store.apply(task.id, Action::Start).unwrap();
@@ -8380,6 +8420,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         store.set_branch(task.id, Some("feat/thing")).unwrap();
@@ -8759,6 +8800,7 @@ mod tests {
         match &app.mode {
             Mode::QuickCreate {
                 project_id: id,
+                filing: Filing::Task,
                 buffer,
             } => {
                 assert_eq!(*id, project_id);
@@ -8768,6 +8810,35 @@ mod tests {
         }
         assert!(app.pending_editor.is_none());
         assert!(app.pending_plan.is_none());
+    }
+
+    /// The Milestones tab's `n` is the same quick propose, told to file with
+    /// `--milestone`; it writes no row itself (DESIGN.md §9).
+    #[test]
+    fn n_on_the_milestones_tab_launches_the_quick_propose_and_writes_no_row() {
+        let mut app = app_with_stub_dispatch();
+        let before = app.store.tasks().unwrap().len();
+        app.on_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT));
+        assert_eq!(app.screen, Screen::Milestones);
+        key(&mut app, KeyCode::Char('n'));
+        assert!(matches!(
+            app.mode,
+            Mode::QuickCreate {
+                filing: Filing::Milestone,
+                ..
+            }
+        ));
+        for c in "carpet crossing".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(status.contains("proposing milestone in demo"), "{status}");
+        let prompts = written_prompts(&app);
+        assert_eq!(prompts.len(), 1, "one expansion, one prompt");
+        assert!(prompts[0].contains("--milestone"), "{}", prompts[0]);
+        assert_eq!(app.store.tasks().unwrap().len(), before);
     }
 
     /// ⏎ on a typed line spawns the expansion and returns to the queue: the
@@ -8833,7 +8904,7 @@ mod tests {
         assert!(matches!(
             app.mode,
             Mode::PickProject {
-                flow: CreateFlow::Quick,
+                flow: CreateFlow::Quick(Filing::Task),
                 ..
             }
         ));
@@ -8937,7 +9008,10 @@ mod tests {
         ctrl_key(&mut app, KeyCode::Char('n'));
         assert!(matches!(app.mode, Mode::Normal));
         match app.pending_editor {
-            Some(EditorRequest::Create { project_id: id }) => assert_eq!(id, project_id),
+            Some(EditorRequest::Create {
+                project_id: id,
+                filing: Filing::Task,
+            }) => assert_eq!(id, project_id),
             _ => panic!("ctrl-n should queue the manual create form"),
         }
     }
@@ -8973,7 +9047,7 @@ mod tests {
         assert!(matches!(
             app.mode,
             Mode::PickProject {
-                flow: CreateFlow::Plan,
+                flow: CreateFlow::Plan(Filing::Task),
                 ..
             }
         ));
