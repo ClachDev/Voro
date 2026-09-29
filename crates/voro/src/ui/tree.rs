@@ -1,8 +1,9 @@
 //! Rendering for the task browser's tree arrangement (DESIGN.md §9): the
-//! indent and fold marker before a row, the milestone marker and hidden
-//! counts after it, and the one-line reference a repeated task prints as.
+//! indent and fold marker before a row, the milestone and cycle markers and
+//! hidden counts after it, the one-line reference a repeated task prints as,
+//! and the header's count of the tasks the tree leaves out.
 
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use voro_core::TreeRow;
 
@@ -23,12 +24,27 @@ pub(super) fn prefix(app: &App, node: &TreeRow) -> String {
     format!("{}{marker}", "  ".repeat(node.depth))
 }
 
-/// After the row: the milestone marker, and on a closed fold the counts of
-/// what it hides.
+/// The header's account of what the tree leaves out.
+pub(super) fn hidden(app: &App) -> String {
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    format!(
+        "{} task{} with no edges hidden · {} closed tree{} hidden",
+        app.tree_no_edges,
+        plural(app.tree_no_edges),
+        app.tree_closed,
+        plural(app.tree_closed)
+    )
+}
+
+/// After the row: the milestone and cycle markers, and on a closed fold the
+/// counts of what it hides.
 pub(super) fn suffix(app: &App, node: &TreeRow, row: &TaskRow) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if row.task.milestone {
         spans.push(Span::styled("  [milestone]", milestone_style()));
+    }
+    if node.cycle {
+        spans.push(Span::styled("  [cycle]", Style::new().fg(Color::Red)));
     }
     if node.is_fold() && !app.open_folds.contains(&node.id) {
         let (open, done) = app.fold_counts(node);
@@ -59,7 +75,8 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
-    use voro_core::{Priority, Store, TaskState};
+    use ratatui::style::Modifier;
+    use voro_core::{Action, Priority, Store, TaskState};
 
     use crate::app::milestones::tests::{app_from, new_task};
     use crate::app::{App, Screen};
@@ -118,5 +135,48 @@ mod tests {
             open.contains(&format!("    ↑ #{shared} shared blocker")),
             "{open}"
         );
+    }
+
+    /// The header counts what the tree leaves out, and a done blocker under
+    /// an open task draws dimmed.
+    #[test]
+    fn the_header_counts_the_hidden_and_a_done_blocker_is_dim() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap().id;
+        let top = new_task(&mut store, p, "open dependent", TaskState::Ready);
+        let done = new_task(&mut store, p, "finished blocker", TaskState::Ready);
+        new_task(&mut store, p, "lone", TaskState::Ready);
+        store.block_tasks(done, &[top]).unwrap();
+        for action in [Action::Start, Action::Complete(None), Action::Accept] {
+            store.apply(done, action).unwrap();
+        }
+        let mut app = app_from(store);
+        app.screen = Screen::Tasks;
+        for code in ['t', ' '] {
+            app.on_key(KeyEvent::from(KeyCode::Char(code)));
+        }
+
+        let drawn = frame(&app);
+        assert!(
+            drawn.contains(
+                "All tasks — by blockers — 1 task with no edges hidden · 0 closed trees hidden"
+            ),
+            "{drawn}"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                crate::ui::draw(f, &app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let (x, y) = (0..24)
+            .flat_map(|y| (0..100).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                let rest: String = (x..100).map(|x| buffer[(x, y)].symbol()).collect();
+                rest.starts_with(&format!("#{done} done"))
+            })
+            .expect("the done blocker is drawn");
+        assert!(buffer[(x, y)].modifier.contains(Modifier::DIM));
     }
 }

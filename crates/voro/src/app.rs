@@ -730,8 +730,14 @@ pub struct App {
     /// refreshes; the tree and milestone grouping exclude each other.
     pub browse_tree: bool,
     pub open_folds: std::collections::HashSet<i64>,
-    /// The browser's blocker tree with every fold open, rebuilt per refresh.
+    /// The browser's blocker tree with every fold open, rebuilt per refresh,
+    /// and the counts of the tasks it leaves out: those with no edges, and
+    /// the closed tasks heading a tree.
     pub tree_rows: Vec<voro_core::TreeRow>,
+    pub tree_no_edges: usize,
+    pub tree_closed: usize,
+    /// Each task's index in `all`, by id.
+    pub all_index: std::collections::HashMap<i64, usize>,
     /// The task browser's rows, which `tasks_sel` counts in.
     pub browser_rows: Vec<BrowserRow>,
 
@@ -860,6 +866,9 @@ impl App {
             browse_tree: false,
             open_folds: std::collections::HashSet::new(),
             tree_rows: Vec::new(),
+            tree_no_edges: 0,
+            tree_closed: 0,
+            all_index: std::collections::HashMap::new(),
             browser_rows: Vec::new(),
             cockpit_rows: Vec::new(),
             cockpit_sel: 0,
@@ -1026,8 +1035,16 @@ impl App {
             })
             .collect();
         self.last_sessions = self.store.latest_sessions()?;
+        self.all_index = all
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.task.id, i))
+            .collect();
         self.all = all;
-        self.tree_rows = self.build_tree();
+        let tree = self.build_tree();
+        self.tree_rows = tree.rows;
+        self.tree_no_edges = tree.no_edges;
+        self.tree_closed = tree.closed_trees;
         self.load_milestones()?;
         self.running = self.store.running_rows()?;
         self.counts = self.store.state_counts()?;
