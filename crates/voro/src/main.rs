@@ -187,6 +187,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = dispatch::DispatchCtx::from_db_path(&path);
 
     if !verb_args.is_empty() {
+        // A config that fails to load is reported by the verb that needs it.
+        if let Ok(config) = voro_core::AgentsConfig::load(&ctx.agents_path) {
+            for warning in config.warnings() {
+                eprintln!("voro: {warning}");
+            }
+        }
         match cli::run(&mut store, verb_args, &ctx) {
             Ok(output) => {
                 println!("{}", output.trim_end_matches('\n'));

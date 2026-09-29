@@ -16,4 +16,5 @@ ratatui.workspace = true
 clap = { version = "4.6.1", features = ["derive"] }
 
 [dev-dependencies]
+rusqlite.workspace = true
 tempfile.workspace = true

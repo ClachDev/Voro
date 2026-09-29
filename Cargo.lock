@@ -1735,6 +1735,7 @@ version = "0.2.0"
 dependencies = [
  "clap",
  "ratatui",
+ "rusqlite",
  "tempfile",
  "voro-core",
 ]

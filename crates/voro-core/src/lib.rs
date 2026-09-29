@@ -43,8 +43,7 @@ pub use review::{
     parse_pr_revisions, plan_review_diff, was_rejected,
 };
 pub use scheduler::{
-    ActionRow, AttentionCosts, Candidate, DigestRow, EffectiveScore, Queue, QueueRow,
-    ScoreBreakdown, StateCounts, WipGate,
+    ActionRow, Candidate, DigestRow, Queue, QueueRow, ScoreBreakdown, StateCounts, TiedCut, WipGate,
 };
 pub use store::{NewTask, Store, TaskEdit};
 pub use template::{render, shell_quote};

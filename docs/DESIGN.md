@@ -557,13 +557,14 @@ for the session a launch opens, and `{task_id}`, the task's numeric id. Like
 refused on the session verbs, and `{task_id}` on `plan` as well, whose target
 may be a project with no task to name (§8).
 
-The file also carries the queue's two pricing options — `max_running`, the
-dispatch WIP cap, and a `[costs]` table overriding the per-action attention
-divisors (§7) — operator preference about how the tool behaves, not state
-about a task. Both are optional and both are validated at load, since a
-non-positive divisor or a negative cap would produce a nonsense order rather
-than an obvious error. Because it carries app options and not just agents, the
-file is named `voro.toml`. A missing file is not an error; the built-ins alone
+The file also carries `max_running`, the dispatch WIP cap (§7): operator
+preference about how the tool behaves, not state about a task. It is optional
+and validated at load, since a negative cap would produce a nonsense queue
+rather than an obvious error. A `[costs]` table left over from the attention
+price (§7) still loads. Its contents are never read; every CLI verb prints one
+warning naming it as ignored, and the TUI shows the same warning on its
+startup status line and on the Config screen. Because the file carries app options and not just agents,
+it is named `voro.toml`. A missing file is not an error; the built-ins alone
 are a working config, so a fresh install with `claude` and an editor on PATH
 both dispatches and reviews without any TOML.
 
@@ -634,9 +635,6 @@ cmd = "zed {path}"
 cmd = "git -C {path} difftool -d {base}...{branch}"
 
 max_running = 5
-
-[costs]
-review = 1.4
 ```
 
 ## 6. Task state machine
@@ -851,9 +849,7 @@ does with one. The summary is not consulted: it lives in the event log rather th
 task row, and a review task with nothing to push has no other move whether or
 not the agent reported well. A *missing* summary on a task that does have a
 branch is the separate `[incomplete report]` flag (§8), which is not a verb
-at all. The queue row reads `next: accept` and
-prices as a review (§7), because reading what came back and deciding on it is
-the same operator move whichever medium it arrives in. Nothing about the
+at all. The queue row reads `next: accept`. Nothing about the
 checkout is consulted for this arm — a task with no branch has no forge
 question to ask, so the `pr` → *open* degrade (§8) never fires on it and no
 `git remote` is run.
@@ -979,8 +975,8 @@ the TUI (and later `voro explain <task>`).
 
 Ordering of the queue: the ten highest-scoring rows across every actionable
 state — `needs-input`, `review`, `stalled`, `proposed`, and `ready` alike —
-in one list sorted by score, or more precisely by the *attention price* below,
-which divides that score by what each row asks of the operator. There is a
+in one list sorted by score, with the tie-break chain of the state precedence
+(§6), priority, older `state_since`, then id. There is a
 single cap over the whole list rather than a per-state rule: each row is one
 next action, they all compete on the same score, and ten is enough to keep the
 autonomy to pick around the top item while few enough that the queue stays an
@@ -999,35 +995,29 @@ be handed, and the dispatch default. `stalled` is deliberately excluded from
 `next`: an agent asking for fresh work should not be handed a stall that needs
 redispatching with its prior session's context.
 
-**Attention price.** The score above answers "how much is this row worth?" and
-nothing else, which prices the queue backwards for a tool whose scarce resource
-is attention rather than value: a PR review is fifteen to sixty minutes of a
-human being, triaging a proposal is one, and ranking them on worth alone puts
-the expensive row on top and starves the cheap one. So the queue ranks by
-`effective_score = score / cost(action)`,
-where the action is the row's own next-action verb (§3) and the cost is the
-operator's, not the machine's. This is display-layer only: the stored score, the
-state machine, and every transition are untouched, and `explain` gains one line
-showing the division. The band is deliberately narrow — *answer* and *triage* at 0.8, *dispatch*
-at 1.0, *pr*/*review PR*/*accept* at 1.4, *do* at 1.8 — so the pricing is a
-nudge, not a re-ranking. A P2 review (8.4 ÷ 1.4 ≈ 6.0) falls below a P2
-triage (8.4 ÷ 0.8 ≈ 10.5) but stays above a P3 one (≈ 5.1), and one priority
-level is worth more than the whole band. *Redispatch* prices as *dispatch*
-because it is one: the operator's move is the same keypress and it opens the
-same session, differing only in the context the successor inherits. *pr*,
-*review PR*, and *accept* share a price for the same reason: they are one
-review in three media — a diff to open, a diff already open, and a report
-that is the whole deliverable (§6, §8). Widening the band is how this
-stops being trustworthy; the defaults live in code and are overridable per
-action in a `[costs]` table in `voro.toml` (§5), which is where an operator who
-reviews faster than they triage says so. Learned or auto-calibrated costs are
-deliberately out: the transition timestamps measure elapsed wall-clock, not
-operator attention, so they cannot tell a review from an idle afternoon.
+**No attention price.** The queue once divided each row's score by a per-action
+cost — 0.8 for *answer* and *triage*, 1.0 for *dispatch*, 1.4 for a review,
+1.8 for *do* — on the theory that a cheap decision should outrank an expensive
+review of the same worth. The operator removed it on 2026-09-29, after
+running with every cost at 1.0. On the real store the 1.8 on *do*
+exceeded the ratio between adjacent priority bands (P1 against P2 is 14.0
+against 8.0, 1.75), so a human P1 ranked below every dispatchable P2 of its
+project: the three ready P1 tasks sat 47th, 48th and 75th, and a P1 that
+`voro next` returned was missing from the inbox. The queue ranks by the raw
+score, so `voro next` and the first ready row of the queue name the same task,
+milestones aside (`next` never hands one out). `explain` and the TUI's score
+decomposition end at the total.
 
-Dispatch is the one action the divisor prices wrongly, and it is shaped rather
-than priced. Handing a task to an agent costs the operator a keypress, so on
-attention alone it would outrank everything — but every dispatch manufactures a
-future review and loads the fleet, so its real cost is a *concurrency slot*. It is therefore metered. `max_running` (default 5, set in `voro.toml` or
+**Ties at the cut.** The age cap produces exact ties in bulk: every P2 in a
+weight-3 project reaches 3 × 2 + 2 = 8.00 after twenty days, and the real store
+carried 43 of them. The queue's order among tied rows carries no information,
+so when the cap cuts rows scoring exactly what its last shown row scores, the
+queue names their count beneath itself — `+38 more at 8.0` as the inbox's last
+line, and on the cockpit queue pane's bottom border.
+
+Dispatch is shaped rather than ranked as it stands. Handing a task to an agent
+costs the operator a keypress, but every dispatch manufactures a future review
+and loads the fleet, so its real cost is a *concurrency slot*. It is therefore metered. `max_running` (default 5, set in `voro.toml` or
 on the Config screen's settings list, §5) caps how many dispatches ride at
 once. At the cap, every row whose action would open a session — *dispatch*
 and *redispatch* alike — leaves the queue, replaced by a single capacity line
@@ -1038,10 +1028,9 @@ nothing to start. A `do` row is untouched by the gate — a
 human task spends the operator's hands, not a slot — and the counts (§12) keep
 the suppressed backlog felt.
 
-Cheap actions need one further guard, or the pricing swaps one swamping for
-another: forty proposals at 0.8 would fill the queue with triage. Proposals
-therefore no longer render individual rows at all. They collapse into **one digest row per project** — `▲ 9 proposals
-awaiting triage (mote)` — scored as the *maximum* effective score among its
+Proposals need one further guard, or forty of them would fill the queue with
+triage. They render no individual rows. They collapse into **one digest row per project** — `▲ 9 proposals
+awaiting triage (mote)` — scored as the *maximum* score among its
 children. The digest therefore survives the cut exactly when its best child
 would have, and sits where that child would have sat. In the TUI the digest folds open on Enter, listing its
 constituents as ordinary selectable rows for rapid triage; on the CLI the row is
@@ -1931,9 +1920,8 @@ verb therefore degrades: on a `review` task with no tracked PR whose checkout
 has no git remote, every surface that names a next action — the cockpit's
 detail card, the browser and `list` suffixes, `show`, and the `inbox` verb
 column — reads `open` instead of `pr`, and the card's hint names `o` rather
-than `g`. Only the advertisement moves; the keys, the create-PR flow, and its
-refusal are exactly as above, and the attention price is unchanged because
-reading a diff costs the same whatever medium it arrives on (§7). The question the advertisement asks is blunter than the one the create asks. It
+than `g`. Only the advertisement moves; the keys, the create-PR flow, its
+refusal and the row's rank are exactly as above. The question the advertisement asks is blunter than the one the create asks. It
 rides a rendered row, so it must be network-free and cheap: it asks git alone
 whether the checkout has *any* remote, since a repository with nowhere to push
 has no forge to open a pull request on. The sharper question — whether `gh` can address the checkout as a GitHub

@@ -169,19 +169,18 @@ tasks
                                   triaged like any proposal, but opened and
                                   closed only from the TUI
   inbox                           the next-action queue: questions, reviews,
-                                  proposals, top ready tasks — ranked by score
-                                  divided by what each action costs your
-                                  attention. Proposals ride as one digest row
-                                  per project; dispatch rows give way to a
-                                  capacity line once max_running are in flight
+                                  proposals, top ready tasks — ranked by score.
+                                  Proposals ride as one digest row per project;
+                                  dispatch rows give way to a capacity line
+                                  once max_running are in flight; rows cut at
+                                  a tie with the last one are counted
   next                            the single highest-scoring ready task,
                                   never a milestone
   stats                           task counts by state — the triage backlog
                                   (§12) plus ready, running, needs-input,
                                   review, waiting, stalled, done; excludes
                                   parked projects
-  explain <task-id>               score decomposition, and the divisor the
-                                  inbox ranks it by
+  explain <task-id>               score decomposition
   seed [--force]                  fill the dev store with fixture data — a
                                   board covering every task state. A build run
                                   from a target/ directory seeds it by itself
@@ -764,7 +763,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Stats => stats_verb(store),
         Verb::Seed { force } => seed_verb(store, ctx, force),
         Verb::Migrate { .. } => migrate_verb(store, ctx),
-        Verb::Explain { task_id } => explain_verb(store, task_id, ctx),
+        Verb::Explain { task_id } => explain_verb(store, task_id),
         Verb::Agent { cmd } => agent_verb(cmd, ctx),
         Verb::Dispatch { task_id, agent } => {
             dispatch::dispatch(store, ctx, task_id, agent.as_deref())
@@ -2117,7 +2116,7 @@ fn inbox_verb(store: &mut Store, ctx: &DispatchCtx) -> Result<String, String> {
         running: store.state_counts().map_err(|e| e.to_string())?.running,
         max_running: config.max_running(),
     };
-    let queue = scheduler::queue(&candidates, &config.costs(), gate);
+    let queue = scheduler::queue(&candidates, gate);
     let mut forges = ForgeMemo::default();
     let mut out = String::new();
     // The capacity line stands in for the dispatch rows the gate suppressed,
@@ -2154,7 +2153,7 @@ fn inbox_verb(store: &mut Store, ctx: &DispatchCtx) -> Result<String, String> {
                 writeln!(
                     out,
                     "{:5.1}  ▲ {} awaiting triage ({}){}{}",
-                    digest.effective,
+                    digest.score,
                     plural(digest.tasks.len(), "proposal"),
                     digest.project_name,
                     if refined > 0 {
@@ -2174,12 +2173,10 @@ fn inbox_verb(store: &mut Store, ctx: &DispatchCtx) -> Result<String, String> {
                 let c = &row.candidate;
                 // The queue row carries the verb instead of the state: every
                 // inbox row is a next action (DESIGN.md §3), like the TUI queue.
-                // The score is the effective one the row is ranked by; `explain`
-                // is where the division back to the raw score is shown.
                 write!(
                     out,
                     "{:5.1}  #{} {:10} {} {}: {}",
-                    row.effective,
+                    c.score.total,
                     c.task.id,
                     advertised(store, &mut forges, &c.task, row.action),
                     c.task.priority,
@@ -2195,6 +2192,9 @@ fn inbox_verb(store: &mut Store, ctx: &DispatchCtx) -> Result<String, String> {
                 writeln!(out).unwrap();
             }
         }
+    }
+    if let Some(cut) = queue.tied_cut {
+        writeln!(out, "{cut}").unwrap();
     }
     if out.is_empty() {
         out = "nothing needs you\n".to_string();
@@ -2319,8 +2319,7 @@ fn refined_suffix(store: &Store, task_id: i64) -> &'static str {
     }
 }
 
-fn explain_verb(store: &mut Store, id: i64, ctx: &DispatchCtx) -> Result<String, String> {
-    let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
+fn explain_verb(store: &mut Store, id: i64) -> Result<String, String> {
     let task = store.task(id).map_err(|e| e.to_string())?;
     let b = store.explain(id).map_err(|e| e.to_string())?;
     let mut out = String::new();
@@ -2356,18 +2355,6 @@ fn explain_verb(store: &mut Store, id: i64, ctx: &DispatchCtx) -> Result<String,
     )
     .unwrap();
     writeln!(out, "total           {:>6.2}", b.total).unwrap();
-    // What the inbox actually ranks by: the total priced by what the row asks
-    // of the operator (DESIGN.md §7).
-    if let Some(e) = scheduler::effective_score(&task, b.total, &config.costs()) {
-        writeln!(
-            out,
-            "action          {:>6}  (cost ÷{})",
-            e.action.as_str(),
-            e.cost
-        )
-        .unwrap();
-        writeln!(out, "effective       {:>6.2}  (inbox rank)", e.effective).unwrap();
-    }
     if !matches!(
         task.state,
         TaskState::Ready | TaskState::NeedsInput | TaskState::Review | TaskState::Stalled
@@ -3523,15 +3510,14 @@ mod tests {
         assert!(out.contains("#4 answer"), "{out}");
     }
 
-    /// The inbox ranks by attention price, not raw score (DESIGN.md §7): a
-    /// question outranks a review worth more on paper, and the digest sits
-    /// where its best proposal would.
+    /// The inbox ranks by raw score (DESIGN.md §7): a P0 review outranks a P2
+    /// question in the same project, whatever the rows ask of the operator.
     #[test]
-    fn inbox_ranks_a_question_above_a_higher_scoring_review() {
+    fn inbox_ranks_by_raw_score() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["weight", "demo", "3"]);
-        // P0 review: 3×(8+2) = 30 raw, ÷1.4 = 21.4
+        // P0 review: 3×(8+2) = 30
         ok(
             &mut s,
             &[
@@ -3549,52 +3535,133 @@ mod tests {
             &mut s,
             &["done", "1", "--summary", "did it", "--branch", "b"],
         );
-        // P2 question: 3×(2+4) = 18 raw, ÷0.8 = 22.5
+        // P2 question: 3×(2+4) = 18
         ok(&mut s, &["add", "demo", "Blocked", "--state", "ready"]);
         ok(&mut s, &["start", "2"]);
         ok(&mut s, &["ask", "2", "--question", "A or B?"]);
 
         let out = ok(&mut s, &["inbox"]);
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[0].contains("#2 answer"), "{out}");
-        assert!(
-            lines[1].contains("#1 review PR") || lines[1].contains("#1 pr"),
-            "{out}"
-        );
+        assert!(lines[0].starts_with(" 30.0  #1 "), "{out}");
+        assert!(lines[1].starts_with(" 18.0  #2 answer"), "{out}");
     }
 
-    /// The `[costs]` table re-prices the same queue (DESIGN.md §7).
+    /// A `voro.toml` still carrying `[costs]` loads, and the table changes
+    /// nothing about the order.
     #[test]
-    fn costs_overrides_in_voro_toml_change_the_inbox_order() {
+    fn a_costs_table_in_voro_toml_is_ignored() {
         let mut s = store();
-        let ctx = ctx_with_toml("[costs]\nreview = 0.5\n");
+        let ctx = ctx_with_toml("[costs]\nreview = 0.5\nanswer = 9.0\n");
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["weight", "demo", "3"]);
+        ok(&mut s, &["add", "demo", "Blocked", "--state", "ready"]);
+        ok(&mut s, &["start", "1"]);
+        ok(&mut s, &["ask", "1", "--question", "A or B?"]);
+        ok(&mut s, &["add", "demo", "Startable", "--state", "ready"]);
+
+        let out = run_with(&mut s, &["inbox"], &ctx).unwrap();
+        assert_eq!(out, ok(&mut s, &["inbox"]));
+        assert!(out.lines().next().unwrap().contains("#1 answer"), "{out}");
+    }
+
+    /// A store on disk with a second connection that can backdate a task's
+    /// `state_since`, which no verb can do, so a fixture can sit at the age
+    /// cap.
+    fn aged_store() -> (Store, std::path::PathBuf) {
+        let path = tempfile::Builder::new()
+            .prefix("voro-cli-aged-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("voro.db");
+        (Store::open(&path).unwrap(), path)
+    }
+
+    fn backdate(path: &std::path::Path, days: f64) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET state_since = datetime('now', ?1 || ' days')",
+                [format!("-{days}")],
+            )
+            .unwrap();
+    }
+
+    /// The id a line of `inbox` or `next` names.
+    fn line_id(line: &str) -> &str {
+        line.split_whitespace()
+            .find(|word| word.starts_with('#'))
+            .unwrap_or_else(|| panic!("no id in {line:?}"))
+    }
+
+    /// The first `dispatch` or `do` row of the inbox — its first ready row.
+    fn first_ready_row(inbox: &str) -> &str {
+        inbox
+            .lines()
+            .find(|line| line.contains(" dispatch ") || line.contains(" do "))
+            .unwrap_or_else(|| panic!("no ready row in {inbox}"))
+    }
+
+    /// A human P1 (3×4 + 2 = 14) against ten dispatchable P2s at the age cap
+    /// (3×2 + 2 = 8): the P1 leads the ready rows, and `next` names it too.
+    #[test]
+    fn a_human_p1_leads_the_ready_rows_and_matches_next() {
+        let (mut s, path) = aged_store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["weight", "demo", "3"]);
+        for i in 0..10 {
+            ok(
+                &mut s,
+                &[
+                    "add",
+                    "demo",
+                    &format!("Dispatchable {i}"),
+                    "--state",
+                    "ready",
+                ],
+            );
+        }
         ok(
             &mut s,
             &[
                 "add",
                 "demo",
-                "Big diff",
+                "Solder the harness",
                 "--priority",
-                "0",
+                "1",
                 "--state",
                 "ready",
+                "--human",
             ],
         );
-        ok(&mut s, &["start", "1"]);
-        ok(
-            &mut s,
-            &["done", "1", "--summary", "did it", "--branch", "b"],
-        );
-        ok(&mut s, &["add", "demo", "Blocked", "--state", "ready"]);
-        ok(&mut s, &["start", "2"]);
-        ok(&mut s, &["ask", "2", "--question", "A or B?"]);
+        backdate(&path, 25.0);
 
-        // Default costs put the question first; pricing review at 0.5 (30 ÷0.5
-        // = 60 against the question's 22.5) puts the diff back on top.
-        let out = run_with(&mut s, &["inbox"], &ctx).unwrap();
-        assert!(out.lines().next().unwrap().contains("#1 "), "{out}");
+        let inbox = ok(&mut s, &["inbox"]);
+        let first = first_ready_row(&inbox);
+        assert!(first.contains("#11 do"), "{inbox}");
+        let next = ok(&mut s, &["next"]);
+        assert_eq!(line_id(first), line_id(&next), "{inbox}\n{next}");
+    }
+
+    /// Forty P2s at the age cap tie at 8.0: the inbox shows ten and counts
+    /// the thirty it cut.
+    #[test]
+    fn inbox_counts_the_rows_it_cut_at_a_tie() {
+        let (mut s, path) = aged_store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(&mut s, &["weight", "demo", "3"]);
+        for i in 0..40 {
+            ok(
+                &mut s,
+                &["add", "demo", &format!("Tied {i}"), "--state", "ready"],
+            );
+        }
+        backdate(&path, 30.0);
+
+        let out = ok(&mut s, &["inbox"]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 11, "{out}");
+        assert_eq!(lines[10], "+30 more at 8.0", "{out}");
     }
 
     /// The dispatch WIP gate (DESIGN.md §7): at the cap the inbox offers no
@@ -3621,24 +3688,17 @@ mod tests {
         assert!(!out.contains("dispatch   "), "{out}");
     }
 
-    /// `explain` shows the division the inbox ranked by (DESIGN.md §7).
+    /// `explain` ends at the total the inbox ranks by (DESIGN.md §7).
     #[test]
-    fn explain_shows_the_action_divisor_and_effective_score() {
+    fn explain_ends_at_the_total() {
         let mut s = store();
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["weight", "demo", "3"]);
         ok(&mut s, &["add", "demo", "Startable", "--state", "ready"]);
 
         let out = ok(&mut s, &["explain", "1"]);
-        assert!(out.contains("total"), "{out}");
-        assert!(out.contains("dispatch"), "{out}");
-        assert!(out.contains("cost ÷1"), "{out}");
-        assert!(out.contains("effective"), "{out}");
-
-        // A parked task asks nothing of the operator, so there is no action to
-        // price and the effective line is absent.
-        ok(&mut s, &["park", "1"]);
-        let out = ok(&mut s, &["explain", "1"]);
+        assert!(out.lines().last().unwrap().starts_with("total"), "{out}");
+        assert!(!out.contains("action"), "{out}");
         assert!(!out.contains("effective"), "{out}");
     }
 

@@ -587,12 +587,9 @@ pub struct App {
     pub status: Option<String>,
 
     pub projects: Vec<Project>,
-    /// The next-action queue (DESIGN.md §7), ranked by attention price and
-    /// carrying the dispatch gate's state when it is suppressing rows.
+    /// The next-action queue (DESIGN.md §7), ranked by score and carrying the
+    /// dispatch gate's state when it is suppressing rows.
     pub queue: Queue,
-    /// The attention price band the queue was last ranked with (DESIGN.md §7),
-    /// so the score decomposition can show the same division the order used.
-    pub costs: voro_core::AttentionCosts,
     /// Which projects' proposal digests are expanded, so their constituent
     /// rows are selectable for triage. Keyed by project name and held across
     /// refreshes, so triaging one proposal does not collapse the rest.
@@ -732,6 +729,9 @@ pub struct App {
     /// A `voro.toml` that failed to parse, surfaced on the screen rather than
     /// silently rendering an empty config.
     pub config_error: Option<String>,
+    /// What the loaded `voro.toml` carries that does nothing, one sentence
+    /// each — shown on the Config screen and once at startup.
+    pub config_warnings: Vec<String>,
     pub config_sel: usize,
     /// Vertical scroll offset of the Config screen's agents pane (DESIGN.md §9),
     /// driven by `J`/`K` and `PgDn`/`PgUp`. The pane carries no selection of its
@@ -798,8 +798,8 @@ impl App {
             queue: Queue {
                 rows: Vec::new(),
                 at_capacity: None,
+                tied_cut: None,
             },
-            costs: voro_core::AttentionCosts::default(),
             expanded_digests: std::collections::HashSet::new(),
             running: Vec::new(),
             counts: StateCounts::default(),
@@ -841,6 +841,7 @@ impl App {
             config_rows: Vec::new(),
             config_anon_viewer: None,
             config_error: None,
+            config_warnings: Vec::new(),
             config_sel: 0,
             config_agents_scroll: 0,
             config_agents_max_scroll: std::cell::Cell::new(0),
@@ -866,6 +867,8 @@ impl App {
                 "welcome to voro — press a to add your first project, then n to create a task"
                     .into(),
             );
+        } else if let Some(warning) = app.config_warnings.first() {
+            app.status = Some(warning.clone());
         }
         app.last_data_version = app.store.data_version()?;
         Ok(app)
@@ -998,20 +1001,18 @@ impl App {
         self.running = self.store.running_rows()?;
         self.counts = self.store.state_counts()?;
 
-        // The queue is priced by what each row asks of the operator and gated
-        // on how much is already in flight (DESIGN.md §7). A `voro.toml` that
-        // will not parse falls back to the defaults here rather than emptying
-        // the cockpit — the Config screen is where the error is surfaced.
+        // The queue is gated on how much is already in flight (DESIGN.md §7).
+        // A `voro.toml` that will not parse falls back to the default cap here
+        // rather than emptying the cockpit — the Config screen is where the
+        // error is surfaced.
         let config = AgentsConfig::load(&self.dispatch_ctx.agents_path);
-        let costs = config.as_ref().map(AgentsConfig::costs).unwrap_or_default();
         let gate = WipGate {
             running: self.counts.running,
             max_running: config
                 .as_ref()
                 .map_or(scheduler::DEFAULT_MAX_RUNNING, |c| c.max_running()),
         };
-        self.costs = costs;
-        self.queue = scheduler::queue(&candidates, &costs, gate);
+        self.queue = scheduler::queue(&candidates, gate);
         self.cap_targets = self.resolve_cap_targets(config.as_ref().ok());
 
         self.cockpit_rows = self.build_cockpit_rows();
@@ -1048,12 +1049,6 @@ impl App {
         }
         rows.extend((0..self.running.len()).map(CockpitRow::Running));
         rows
-    }
-
-    /// What a task's raw score becomes once priced by its next action
-    /// (DESIGN.md §7) — what the queue actually ranked it by.
-    pub fn effective_score(&self, task: &Task, total: f64) -> Option<voro_core::EffectiveScore> {
-        scheduler::effective_score(task, total, &self.costs)
     }
 
     /// The queue's task rows in order, by id — digests contribute nothing,
@@ -1112,6 +1107,7 @@ impl App {
                 self.config_viewers.clear();
                 self.config_rows.clear();
                 self.config_anon_viewer = None;
+                self.config_warnings.clear();
                 self.config_error = Some(e.to_string());
                 return;
             }
@@ -1156,6 +1152,7 @@ impl App {
             .map(ConfigRow::Setting)
             .chain((0..self.config_viewers.len()).map(ConfigRow::Viewer))
             .collect();
+        self.config_warnings = config.warnings();
         self.config_error = None;
     }
 
