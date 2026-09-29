@@ -117,6 +117,23 @@ is asked the verb question directly. The only pair of verbs the state cannot
 tell apart is *do* versus *dispatch*, and the row already distinguishes those
 with its `[human]` marker.
 
+A **milestone** is an outcome the operator watches happen, such as "Carpet
+crossing". It is a human task carrying a `milestone` flag, and the flag is the
+only extra data: the title stays short and the body holds the acceptance
+statement. Its **members** are the tasks that block it, at any distance along
+`blocks` edges. The walk stops at the next milestone upstream, which counts as
+one member while its own members stay its own, so a milestone may block
+another without either counting the other's work twice. A task's milestone is
+the nearest milestone downstream of it — every one at that distance when
+several tie — and like membership it is derived from the edges and stored
+nowhere. A milestone is created parked and reaches the queue only when its
+last blocker closes, through the ordinary promotion (§5), as an ordinary *do*
+row; `voro next` never returns one. Only the operator creates or closes a
+milestone, and only in the TUI (§6). Regression is not modelled: `done` stays
+terminal, and a capability that breaks later is a new task. Progress is
+reported as counts of open and done members rather than a percentage, because
+filing a follow-up grows the denominator.
+
 A **document** is the plan or design a body of work derives from — a strategy
 doc, a milestone breakdown, an RFC — registered against a project and linked
 to the tasks it spawned. It exists because a plan reliably outlives the session
@@ -327,6 +344,9 @@ CREATE TABLE tasks (
   deep       INTEGER NOT NULL DEFAULT 0 CHECK (deep IN (0,1)),
                                           -- 1 = dispatch on the agent's strongest
                                           -- model rather than its workhorse (§8)
+  milestone  INTEGER NOT NULL DEFAULT 0 CHECK (milestone IN (0,1)),
+                                          -- 1 = an outcome gated on its blockers (§3);
+                                          -- always human, created parked
   question   TEXT,                        -- set iff state = 'needs-input'
   pr_url     TEXT,                        -- optional tracked GitHub PR (§11c); base-repo URL
   branch     TEXT,                        -- optional git branch (§8); intended name dispatch
@@ -776,6 +796,18 @@ a dispatch agent. To keep the unreachability total, a task currently sitting in
 `needs-input` or `review`, or one with an agent session still open, cannot be
 flagged human as it stands — such a task is demonstrably agent-executed;
 resolve it first.
+
+A **milestone** (§3) walks the human path and adds one restriction: the CLI
+cannot move it. `start`, `done`, `abandon`, `park`, `unpark` and every other
+transition verb refuse a milestone with one line naming the TUI's Milestones
+tab, where the operator opens and closes it. The refusal is a CLI guard
+(`Task::refuse_cli_transition` in `voro-core`) rather than an arm of the
+machine, because the TUI drives the same `Store::apply` to close one. No verb
+sets or clears the flag, and clearing `human` on a milestone is refused, so a
+milestone is never dispatchable. The promotion of §5 needs no special case:
+a milestone with blockers readies when the last one closes, one with none
+stays parked, and a `--blocks` naming a ready milestone demotes it to
+`parked` like any other dependent.
 
 `review` carries a *sub-state* in its fields rather than splitting into two
 states: a review task with no `pr_url` is awaiting a PR (the `pr` verb opens one
@@ -1793,6 +1825,15 @@ rather than the task's own, since a task in any project may cite any plan
 the task's own listed first. That picker is the whole of the TUI's
 librarianship: there is no documents screen, and a document's own row remains
 `doc list`/`doc show`, which keeps the cockpit about attention.
+
+**Milestones** (§3) ride the preamble too, in a `{milestones}` slot beside
+`{docs}`. A task with a milestone renders a block naming each nearest
+milestone by id and title, and one sentence: a follow-up the agent proposes
+takes `--blocks <id>` only if the milestone cannot pass without it. A task
+with none renders nothing, so its prompt is byte-for-byte what it was before
+milestones existed. `propose` accepts `--blocks` as `add` does, which is how a
+follow-up joins a milestone; the sentence keeps it from joining one that can
+pass without it, since every member grows the count of open work.
 
 **Branch names** flow through dispatch in both directions, and Voro runs no git
 in either — it only passes a name in and records one back. A task carries an

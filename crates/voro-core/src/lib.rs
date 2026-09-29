@@ -8,6 +8,7 @@ mod cap;
 pub mod config_edit;
 mod error;
 mod import;
+mod milestone;
 mod model;
 mod pr;
 mod review;
@@ -30,6 +31,7 @@ pub use cap::{
 };
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};
+pub use milestone::MilestoneMembers;
 pub use model::{
     Dep, DepKind, DepRef, Doc, Event, LivenessSource, NextAction, Priority, Project, RefineOutcome,
     Repo, RunningRow, Session, SessionOutcome, Task, TaskState, location_is_url,

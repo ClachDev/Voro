@@ -78,6 +78,21 @@ never its place in the queue — that is priority's job — and an agent whose
 config names no models ignores it. It is refused on a `--human` task, which is
 never dispatched at all.
 
+## Milestones
+
+A milestone is an outcome the operator watches happen, such as
+"Carpet crossing". It is a task that waits on the tasks blocking
+it. Only the operator creates or closes one.
+
+    voro milestones        # open milestones: id, title, open tasks
+    voro show <id>         # acceptance statement and member tasks
+
+Before you add or propose a task, read the member tasks of the
+milestone it belongs to and do not file one that is already there.
+Pass `--blocks <milestone id>` if the milestone cannot pass until
+the task is done, and say why in one sentence in the body. If no
+milestone fits, pass nothing.
+
 ## Projects and repos
 
 A **project** allocates attention (name, weight, one queue); a **repo** locates
@@ -120,7 +135,7 @@ separate stream of work.
 Propose follow-up work discovered here against the matched project:
 
 ```
-voro propose <project> <title> --body-file plan.md [--from <task-id>]
+voro propose <project> <title> --body-file plan.md [--from <task-id>] [--blocks IDS]
 ```
 
 `propose` creates a `proposed` task; `--from` links it discovered-from the task

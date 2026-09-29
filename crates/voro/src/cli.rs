@@ -9,8 +9,9 @@ use std::fmt::Write as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use voro_core::{
-    Action, AgentsConfig, DepKind, Doc, Event, NewTask, NextAction, PrRef, Priority, Project,
-    QueueRow, RefineOutcome, Repo, Store, Task, TaskEdit, TaskState, Triage, WipGate, scheduler,
+    Action, AgentsConfig, DepKind, Doc, Event, MilestoneMembers, NewTask, NextAction, PrRef,
+    Priority, Project, QueueRow, RefineOutcome, Repo, Store, Task, TaskEdit, TaskState, Triage,
+    WipGate, scheduler,
 };
 
 use crate::app::viewer_label;
@@ -97,9 +98,12 @@ tasks
                                   agent offers rather than its workhorse;
                                   agents that name no models ignore it
   propose <project> <title> [--body TEXT | --body-file PATH] [--from TASK-ID]
+      [--blocks IDS]
                                   create a proposed task; --from links it
                                   discovered-from that task (dispatch renders
-                                  the flag with the running task's id)
+                                  the flag with the running task's id);
+                                  --blocks makes the listed tasks wait on it,
+                                  as on `add`
   set <task-id> [--title T] [--priority 0-3] [--agent NAME | --no-agent]
       [--body TEXT | --body-file PATH] [--append-body TEXT | --append-body-file PATH]
       [--allow-empty] [--blocked-by IDS] [--blocks IDS] [--unlink KIND:ID]
@@ -141,20 +145,28 @@ tasks
                                   (`voro doc link` adds one without listing the
                                   rest); --no-doc clears it
   show <task-id> [--event EVENT-ID]
-                                  full task: body, docs, deps, events. --event
+                                  full task: body, docs, deps, events, and its
+                                  milestone; a milestone lists its members by
+                                  state. --event
                                   prints one event's recorded detail and nothing
                                   else, which is how a replaced body comes back:
                                   `voro show 62 --event 512 > body.md`
   list [--state STATE] [--project P] [--doc DOC]
                                   --doc answers 'which tasks derive from this
-                                  plan?'
+                                  plan?'. Milestone rows carry [milestone];
+                                  a task in one names it after an arrow
+  milestones [--all]              open milestones: id, state, title, and how
+                                  many member tasks are open and done. --all
+                                  adds done and rejected ones. A milestone is
+                                  opened and closed only from the TUI
   inbox                           the next-action queue: questions, reviews,
                                   proposals, top ready tasks — ranked by score
                                   divided by what each action costs your
                                   attention. Proposals ride as one digest row
                                   per project; dispatch rows give way to a
                                   capacity line once max_running are in flight
-  next                            the single highest-scoring ready task
+  next                            the single highest-scoring ready task,
+                                  never a milestone
   stats                           task counts by state — the triage backlog
                                   (§12) plus ready, running, needs-input,
                                   review, waiting, stalled, done; excludes
@@ -310,6 +322,10 @@ enum Verb {
         event: Option<i64>,
     },
     List(ListArgs),
+    Milestones {
+        #[arg(long)]
+        all: bool,
+    },
     Inbox,
     Next,
     Stats,
@@ -547,6 +563,8 @@ struct ProposeArgs {
     body_file: Option<String>,
     #[arg(long)]
     from: Option<i64>,
+    #[arg(long)]
+    blocks: Option<String>,
     /// Hidden: accepted only so the handler can refuse it with a pointer to
     /// `add --state` instead of a generic unknown-argument error.
     #[arg(long, hide = true)]
@@ -722,6 +740,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
             None => show_verb(store, task_id),
         },
         Verb::List(args) => list_verb(store, &args),
+        Verb::Milestones { all } => milestones_verb(store, all),
         Verb::Inbox => inbox_verb(store, ctx),
         Verb::Next => next_verb(store),
         Verb::Stats => stats_verb(store),
@@ -1481,6 +1500,9 @@ fn propose_verb(store: &mut Store, args: ProposeArgs) -> Result<String, String> 
             .map_err(|e| e.to_string())?;
         write!(out, " (discovered from #{})", source.id).unwrap();
     }
+    if let Some(raw) = &args.blocks {
+        out.push_str(&apply_blocks_flag(store, task.id, raw)?);
+    }
     Ok(out)
 }
 
@@ -1664,6 +1686,7 @@ fn confirm(question: &str) -> Result<bool, String> {
 /// the operator addresses the feedback in that same session (§6/§8).
 fn reject_verb(store: &mut Store, args: RejectArgs) -> Result<String, String> {
     let id = args.task_id;
+    refuse_milestone(store, id)?;
     let feedback = if args.from_pr {
         let pulled = crate::pr::pull_review_feedback(store, id)?;
         let extra = args.text.join(" ");
@@ -1698,6 +1721,7 @@ fn reject_verb(store: &mut Store, args: RejectArgs) -> Result<String, String> {
 /// rather than failing, so both stay optional through the lifecycle.
 fn done_verb(store: &mut Store, args: DoneArgs) -> Result<String, String> {
     let id = args.task_id;
+    refuse_milestone(store, id)?;
     let summary = text_or_file(args.summary, args.summary_file)?;
     let task = store
         .apply(id, Action::Complete(summary))
@@ -1762,6 +1786,17 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
             "human-only: never dispatched; completion goes straight to done"
         )
         .unwrap();
+    }
+    if task.milestone {
+        writeln!(
+            out,
+            "milestone: an outcome gated on the tasks that block it; opened and closed \
+             only from the TUI's Milestones tab"
+        )
+        .unwrap();
+    }
+    for m in store.milestones_of(id).map_err(|e| e.to_string())? {
+        writeln!(out, "in milestone: #{} {}", m.id, m.title).unwrap();
     }
     if let Some(agent) = &task.agent {
         writeln!(out, "agent override: {agent}").unwrap();
@@ -1875,6 +1910,15 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
             _ => writeln!(out, "dep: {} {}", dep.kind, dep.depends_on).unwrap(),
         }
     }
+    if task.milestone {
+        let members = store.milestone_members(id).map_err(|e| e.to_string())?;
+        writeln!(out, "members: {}", member_counts(&members)).unwrap();
+        let mut by_state = members.members.clone();
+        by_state.sort_by_key(|t| (TaskState::ALL.iter().position(|s| *s == t.state), t.id));
+        for member in &by_state {
+            writeln!(out, "  #{} {} {}", member.id, member.state, member.title).unwrap();
+        }
+    }
     if !task.body.is_empty() {
         writeln!(out, "\n{}", task.body).unwrap();
     }
@@ -1923,6 +1967,7 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
         None => None,
     };
     let projects = store.projects().map_err(|e| e.to_string())?;
+    let milestones = store.milestone_ids_by_task().map_err(|e| e.to_string())?;
     let mut forges = ForgeMemo::default();
     let mut out = String::new();
     for task in store.tasks().map_err(|e| e.to_string())? {
@@ -1940,15 +1985,51 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
             .map(|p| p.name.as_str())
             .unwrap_or("?");
         let incomplete = incomplete_report_suffix(store, task.id);
+        let marker = if task.milestone { "  [milestone]" } else { "" };
+        let belongs = milestones
+            .get(&task.id)
+            .map(|ids| {
+                let ids: Vec<String> = ids.iter().map(|id| format!("#{id}")).collect();
+                format!("  → milestone {}", ids.join(", "))
+            })
+            .unwrap_or_default();
         writeln!(
             out,
-            "{}{}{}{}",
+            "{}{marker}{}{}{}{belongs}",
             task_line(&task, name),
             refined_suffix(store, task.id),
             review_next_suffix(store, &mut forges, &task, !incomplete.is_empty()),
             incomplete
         )
         .unwrap();
+    }
+    Ok(out)
+}
+
+/// `N open · M done` for a milestone's members.
+fn member_counts(m: &MilestoneMembers) -> String {
+    format!("{} open · {} done", m.open(), m.done())
+}
+
+fn milestones_verb(store: &mut Store, all: bool) -> Result<String, String> {
+    let mut out = String::new();
+    for m in store.milestones(all).map_err(|e| e.to_string())? {
+        writeln!(
+            out,
+            "#{} {} {}  {}",
+            m.milestone.id,
+            m.milestone.state,
+            m.milestone.title,
+            member_counts(&m)
+        )
+        .unwrap();
+    }
+    if out.is_empty() {
+        out.push_str(if all {
+            "no milestones\n"
+        } else {
+            "no open milestones\n"
+        });
     }
     Ok(out)
 }
@@ -2393,6 +2474,7 @@ fn ask_verb(store: &mut Store, ctx: &DispatchCtx, args: AskArgs) -> Result<Strin
 /// conversation, which is TUI-only for the same reason planning sessions are
 /// (§8) — the CLI is how an LLM drives Voro.
 fn triage_verb(store: &mut Store, args: TriageArgs, ctx: &DispatchCtx) -> Result<String, String> {
+    refuse_milestone(store, args.task_id)?;
     let note = text_or_file(args.note, args.note_file)?;
     match Triage::try_from(args.target) {
         Ok(verdict) => {
@@ -2427,6 +2509,7 @@ fn apply_action(
     action: Action,
     yes: bool,
 ) -> Result<String, String> {
+    refuse_milestone(store, id)?;
     let closes = matches!(action, Action::Accept | Action::Abandon);
     let (task, stopped) = store.apply_closing(id, action).map_err(|e| e.to_string())?;
     if let Some(session) = stopped {
@@ -2438,6 +2521,15 @@ fn apply_action(
         out.push_str(&line);
     }
     Ok(out)
+}
+
+/// Refuse a transition verb on a milestone (DESIGN.md §6): the operator opens
+/// and closes one in the TUI, and nothing on the CLI moves it.
+fn refuse_milestone(store: &Store, id: i64) -> Result<(), String> {
+    store
+        .task(id)
+        .and_then(|task| task.refuse_cli_transition())
+        .map_err(|e| e.to_string())
 }
 
 /// Remove the worktree of a just-closed task after showing the operator what
@@ -3767,6 +3859,131 @@ mod tests {
         assert!(!out.contains("incomplete report:"), "{out}");
 
         std::fs::remove_dir_all(&project).ok();
+    }
+
+    /// Milestone A (#1) behind the chain #5 → #4 → #3 → A; milestone B (#2)
+    /// behind A and #6.
+    fn milestone_fixture() -> Store {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        let p = s.projects().unwrap()[0].id;
+        s.create_milestone(p, "Carpet crossing", "Crosses the carpet.", Priority::P2)
+            .unwrap();
+        s.create_milestone(p, "Room crossing", "", Priority::P2)
+            .unwrap();
+        ok(
+            &mut s,
+            &["add", "demo", "t1", "--state", "ready", "--blocks", "1"],
+        );
+        ok(
+            &mut s,
+            &["add", "demo", "t2", "--state", "ready", "--blocks", "3"],
+        );
+        ok(
+            &mut s,
+            &["add", "demo", "t3", "--state", "ready", "--blocks", "4"],
+        );
+        ok(&mut s, &["set", "1", "--blocks", "2"]);
+        ok(
+            &mut s,
+            &["add", "demo", "t4", "--state", "ready", "--blocks", "2"],
+        );
+        s
+    }
+
+    #[test]
+    fn milestones_lists_members_up_to_the_next_milestone() {
+        let mut s = milestone_fixture();
+        let out = ok(&mut s, &["milestones"]);
+        assert!(
+            out.contains("#1 parked Carpet crossing  3 open · 0 done"),
+            "{out}"
+        );
+        assert!(
+            out.contains("#2 parked Room crossing  2 open · 0 done"),
+            "{out}"
+        );
+        for id in ["3", "4", "5"] {
+            let shown = ok(&mut s, &["show", id]);
+            assert!(
+                shown.contains("in milestone: #1 Carpet crossing"),
+                "{shown}"
+            );
+        }
+        let list = ok(&mut s, &["list"]);
+        assert!(
+            list.contains("Carpet crossing  [milestone]  → milestone #2"),
+            "{list}"
+        );
+        assert!(list.contains(": t3  → milestone #1"), "{list}");
+        let shown = ok(&mut s, &["show", "2"]);
+        assert!(shown.contains("members: 2 open · 0 done"), "{shown}");
+        assert!(shown.contains("  #1 parked Carpet crossing"), "{shown}");
+    }
+
+    #[test]
+    fn a_milestone_readies_as_a_do_row_when_its_last_blocker_closes() {
+        let mut s = milestone_fixture();
+        let inbox = ok(&mut s, &["inbox"]);
+        assert!(!inbox.contains("Carpet crossing"), "{inbox}");
+        for id in ["5", "4", "3"] {
+            ok(&mut s, &["start", id]);
+            ok(&mut s, &["done", id]);
+            ok(&mut s, &["accept", id, "--yes"]);
+        }
+        assert_eq!(s.task(1).unwrap().state, TaskState::Ready);
+        let inbox = ok(&mut s, &["inbox"]);
+        assert!(inbox.contains("#1 do"), "{inbox}");
+        let next = ok(&mut s, &["next"]);
+        assert!(!next.contains("Carpet crossing"), "{next}");
+        let out = ok(&mut s, &["milestones"]);
+        assert!(
+            out.contains("#1 ready Carpet crossing  0 open · 3 done"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_milestone_with_no_blockers_stays_out_of_inbox_and_next() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        let p = s.projects().unwrap()[0].id;
+        let m = s.create_milestone(p, "Alone", "", Priority::P0).unwrap();
+        assert_eq!(m.state, TaskState::Parked);
+        assert!(!ok(&mut s, &["inbox"]).contains("Alone"));
+        assert_eq!(ok(&mut s, &["next"]), "no ready tasks\n");
+    }
+
+    #[test]
+    fn transition_verbs_on_a_milestone_name_the_milestones_tab() {
+        let mut s = milestone_fixture();
+        for verb in ["start", "done", "abandon", "park", "unpark"] {
+            let e = err(&mut s, &[verb, "1"]);
+            assert!(e.contains("Milestones tab"), "{verb}: {e}");
+            assert_eq!(e.lines().count(), 1, "{verb}: {e}");
+        }
+        assert_eq!(s.task(1).unwrap().state, TaskState::Parked);
+        let e = err(&mut s, &["set", "1", "--no-human"]);
+        assert!(e.contains("milestone"), "{e}");
+    }
+
+    #[test]
+    fn propose_blocks_a_ready_milestone_back_to_parked() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        let p = s.projects().unwrap()[0].id;
+        let m = s.create_milestone(p, "M", "", Priority::P2).unwrap().id;
+        assert_eq!(s.task(m).unwrap().state, TaskState::Parked);
+        // The operator readies it in the TUI; the store call stands in for that.
+        s.apply(m, Action::Unpark).unwrap();
+        let out = ok(&mut s, &["propose", "demo", "Follow-up", "--blocks", "1"]);
+        assert!(
+            out.contains("task 2 blocks #1 — #1 demoted to parked"),
+            "{out}"
+        );
+        assert_eq!(s.task(m).unwrap().state, TaskState::Parked);
+        let shown = ok(&mut s, &["show", "2"]);
+        assert!(shown.contains("in milestone: #1 M"), "{shown}");
     }
 
     #[test]

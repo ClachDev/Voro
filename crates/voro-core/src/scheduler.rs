@@ -333,7 +333,7 @@ pub fn effective_score(task: &Task, total: f64, costs: &AttentionCosts) -> Optio
 pub fn focus(candidates: &[Candidate]) -> Option<&Candidate> {
     candidates
         .iter()
-        .filter(|c| c.task.state == TaskState::Ready)
+        .filter(|c| c.task.state == TaskState::Ready && !c.task.milestone)
         .min_by(|a, b| rank(a, b))
 }
 
@@ -370,7 +370,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.project_id, t.title, t.body, t.priority, t.state, t.agent,
                     t.question, t.pr_url, t.branch, t.state_since, t.created_at, t.closed_at,
-                    t.human, t.repo_id, t.deep, p.name, p.weight,
+                    t.human, t.repo_id, t.deep, t.milestone, p.name, p.weight,
                     julianday('now') - julianday(t.state_since),
                     COALESCE(b.open_dependents, 0)
              FROM tasks t JOIN projects p ON p.id = t.project_id
@@ -383,10 +383,10 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |row| {
             let task = task_from_row(row)?;
-            let project_name: String = row.get(16)?;
-            let weight: i64 = row.get(17)?;
-            let age_days: f64 = row.get(18)?;
-            let open_dependents: i64 = row.get(19)?;
+            let project_name: String = row.get(17)?;
+            let weight: i64 = row.get(18)?;
+            let age_days: f64 = row.get(19)?;
+            let open_dependents: i64 = row.get(20)?;
             let score = score(weight, task.priority, task.state, age_days, open_dependents);
             Ok(Candidate {
                 task,

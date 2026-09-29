@@ -467,6 +467,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
             question: None,
             pr_url: None,
             branch: branch.map(str::to_string),

@@ -30,6 +30,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0018_project_viewer.sql"),
     include_str!("../migrations/0019_session_liveness_source.sql"),
     include_str!("../migrations/0020_store_meta.sql"),
+    include_str!("../migrations/0021_add_milestone.sql"),
 ];
 
 /// Whether a path lies inside a Cargo build directory — a `target` component
@@ -1193,6 +1194,11 @@ impl Store {
 
     pub fn update_task(&mut self, id: i64, edit: TaskEdit) -> Result<Task> {
         let current = self.task(id)?;
+        if current.milestone && !edit.human {
+            return Err(Error::Invalid(format!(
+                "task {id} is a milestone, which is always a human task"
+            )));
+        }
         if edit.human && edit.agent.is_some() {
             return Err(Error::HumanTask {
                 id,
@@ -1837,7 +1843,7 @@ impl Store {
 
 pub(crate) const TASK_COLUMNS: &str = "id, project_id, title, body, priority, state, agent, \
                                        question, pr_url, branch, state_since, created_at, \
-                                       closed_at, human, repo_id, deep";
+                                       closed_at, human, repo_id, deep, milestone";
 
 pub(crate) fn get_task(conn: &Connection, id: i64) -> Result<Option<Task>> {
     Ok(conn
@@ -1867,6 +1873,7 @@ pub(crate) fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         human: row.get(13)?,
         repo_id: row.get(14)?,
         deep: row.get(15)?,
+        milestone: row.get(16)?,
     })
 }
 
