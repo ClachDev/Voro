@@ -1634,11 +1634,11 @@ fn draw_tasks(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     let mut state =
         ListState::default().with_selected(if empty { None } else { Some(app.tasks_sel) });
     let title = if app.browse_by_milestone {
-        "All tasks — by milestone"
+        "All tasks — by milestone".to_string()
     } else if app.browse_tree {
-        "All tasks — by blockers"
+        format!("All tasks — by blockers — {}", tree::hidden(app))
     } else {
-        "All tasks"
+        "All tasks".to_string()
     };
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))

@@ -49,7 +49,7 @@ pub use scheduler::{
 pub use store::{NewTask, Store, TaskEdit};
 pub use template::{render, shell_quote};
 pub use transition::{Action, Triage};
-pub use tree::{TreeRow, blocker_tree, blocks_tree};
+pub use tree::{Tree, TreeRow, blocker_tree, blocks_tree};
 
 #[cfg(test)]
 mod tests {

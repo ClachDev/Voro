@@ -2075,10 +2075,11 @@ fn tree_verb(store: &mut Store, task_id: i64) -> Result<String, String> {
             writeln!(out, "{indent}↑ #{} {}", task.id, task.title).unwrap();
             continue;
         }
-        let marker = if task.milestone { "  [milestone]" } else { "" };
+        let milestone = if task.milestone { "  [milestone]" } else { "" };
+        let cycle = if row.cycle { "  [cycle]" } else { "" };
         writeln!(
             out,
-            "{indent}#{} {} {}{marker}",
+            "{indent}#{} {} {}{milestone}{cycle}",
             task.id, task.state, task.title
         )
         .unwrap();

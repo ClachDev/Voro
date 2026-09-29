@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use voro_core::{DepKind, DepRef, TaskState, TreeRow};
+use voro_core::{DepKind, DepRef, TaskState, Tree, TreeRow};
 
 use super::{App, BrowserRow};
 
@@ -24,21 +24,20 @@ pub(crate) fn blocks_edges(deps: &HashMap<i64, Vec<DepRef>>) -> HashMap<i64, Vec
 }
 
 impl App {
-    /// The browser's tasks as a tree, every fold open, siblings in browse
-    /// order.
-    pub(super) fn build_tree(&self) -> Vec<TreeRow> {
+    /// The browser's open work that has blockers, as a tree, every fold
+    /// open, siblings in browse order.
+    pub(super) fn build_tree(&self) -> Tree {
         let order: Vec<i64> = self.all.iter().map(|r| r.task.id).collect();
-        voro_core::blocks_tree(&order, &blocks_edges(&self.deps))
+        voro_core::blocks_tree(&order, &blocks_edges(&self.deps), |id| {
+            self.all_index
+                .get(&id)
+                .is_some_and(|&i| !self.all[i].task.state.is_terminal())
+        })
     }
 
     /// The tree's rows left showing by the closed folds.
     pub(super) fn tree_browser_rows(&self) -> Vec<BrowserRow> {
-        let index: HashMap<i64, usize> = self
-            .all
-            .iter()
-            .enumerate()
-            .map(|(i, r)| (r.task.id, i))
-            .collect();
+        let index = &self.all_index;
         let mut rows = Vec::new();
         let mut closed_at = None;
         for (k, node) in self.tree_rows.iter().enumerate() {
@@ -63,14 +62,20 @@ impl App {
         self.rebuild_browser();
     }
 
-    /// Space on a tree row with children: open its fold, or close it.
+    /// Space on a tree row with children: open its fold, or close it. On a
+    /// reference: open the folds above the task's full copy and select it.
     pub(super) fn toggle_selected_fold(&mut self) {
-        let Some(BrowserRow::Node { row, .. }) = self.browser_rows.get(self.tasks_sel) else {
+        let Some(&BrowserRow::Node { row, task }) = self.browser_rows.get(self.tasks_sel) else {
             return;
         };
-        let Some(node) = self.tree_rows.get(*row).filter(|n| n.is_fold()) else {
+        let node = &self.tree_rows[row];
+        if node.reference {
+            self.follow_reference(node.id, task);
             return;
-        };
+        }
+        if !node.is_fold() {
+            return;
+        }
         let id = node.id;
         if !self.open_folds.remove(&id) {
             self.open_folds.insert(id);
@@ -78,13 +83,38 @@ impl App {
         self.rebuild_browser();
     }
 
+    fn follow_reference(&mut self, id: i64, task: usize) {
+        let Some(full) = self
+            .tree_rows
+            .iter()
+            .position(|n| n.id == id && !n.reference)
+        else {
+            return;
+        };
+        let mut depth = self.tree_rows[full].depth;
+        for node in self.tree_rows[..full].iter().rev() {
+            if depth == 0 {
+                break;
+            }
+            if node.depth < depth {
+                depth = node.depth;
+                self.open_folds.insert(node.id);
+            }
+        }
+        self.rebuild_browser();
+        let target = BrowserRow::Node { row: full, task };
+        if let Some(sel) = self.browser_rows.iter().position(|r| *r == target) {
+            self.tasks_sel = sel;
+        }
+    }
+
     /// A fold's `open` and `done` counts over the tasks it nests.
     pub fn fold_counts(&self, node: &TreeRow) -> (usize, usize) {
         let states: Vec<TaskState> = node
             .under
             .iter()
-            .filter_map(|id| self.all.iter().find(|r| r.task.id == *id))
-            .map(|r| r.task.state)
+            .filter_map(|id| self.all_index.get(id))
+            .map(|&i| self.all[i].task.state)
             .collect();
         (
             states.iter().filter(|s| !s.is_terminal()).count(),
@@ -224,9 +254,91 @@ mod tests {
             .filter(|r| !r.task.state.is_terminal())
             .map(|r| r.task.id)
             .collect();
-        let rows = voro_core::blocks_tree(&open, &blocks_edges(&app.deps));
+        let rows = voro_core::blocks_tree(&open, &blocks_edges(&app.deps), |_| true).rows;
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         assert_eq!(ids, vec![top, a, b]);
+    }
+
+    fn close(store: &mut Store, task: i64) {
+        for action in [Action::Start, Action::Complete(None), Action::Accept] {
+            store.apply(task, action).unwrap();
+        }
+    }
+
+    /// Two open tasks joined by an edge, three open tasks with none, and a
+    /// closed task blocked by another closed one.
+    #[test]
+    fn the_tree_shows_open_work_with_edges_and_counts_the_rest() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap().id;
+        let top = new_task(&mut store, p, "top", TaskState::Ready);
+        let under = new_task(&mut store, p, "under", TaskState::Ready);
+        for title in ["lone 1", "lone 2", "lone 3"] {
+            new_task(&mut store, p, title, TaskState::Ready);
+        }
+        let old = new_task(&mut store, p, "old", TaskState::Ready);
+        let older = new_task(&mut store, p, "older", TaskState::Ready);
+        store.block_tasks(under, &[top]).unwrap();
+        store.block_tasks(older, &[old]).unwrap();
+        close(&mut store, older);
+        close(&mut store, old);
+        let mut app = browser(app_from(store));
+        key(&mut app, KeyCode::Char('t'));
+        unfold(&mut app);
+        assert_eq!(shape(&app), vec![(top, 0, false), (under, 1, false)]);
+        assert_eq!((app.tree_no_edges, app.tree_closed), (3, 1));
+    }
+
+    /// Space on a reference whose full copy sits inside a closed fold opens
+    /// the folds down to it and selects it.
+    #[test]
+    fn space_on_a_reference_opens_the_way_to_the_full_copy() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap().id;
+        let x = new_task(&mut store, p, "x", TaskState::Ready);
+        let mid = new_task(&mut store, p, "mid", TaskState::Ready);
+        let y = new_task(&mut store, p, "y", TaskState::Ready);
+        let shared = new_task(&mut store, p, "shared", TaskState::Ready);
+        let leaf = new_task(&mut store, p, "leaf", TaskState::Ready);
+        store.block_tasks(mid, &[x]).unwrap();
+        store.block_tasks(shared, &[mid, y]).unwrap();
+        store.block_tasks(leaf, &[shared]).unwrap();
+        let mut app = browser(app_from(store));
+        key(&mut app, KeyCode::Char('t'));
+        assert_eq!(shape(&app), vec![(x, 0, false), (y, 0, false)]);
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char(' '));
+        assert_eq!(
+            shape(&app),
+            vec![(x, 0, false), (y, 0, false), (shared, 1, true)]
+        );
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char(' '));
+        assert_eq!(
+            shape(&app),
+            vec![
+                (x, 0, false),
+                (mid, 1, false),
+                (shared, 2, false),
+                (y, 0, false),
+                (shared, 1, true)
+            ]
+        );
+        assert_eq!(app.tasks_sel, 2);
+        assert_eq!(app.selected_task_id(), Some(shared));
+    }
+
+    /// `voro tree` prints a done task's tree, though the browser's tree
+    /// leaves closed trees out.
+    #[test]
+    fn the_cli_prints_a_done_tasks_tree() {
+        let (mut app, [.., c, d]) = chain();
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        let out =
+            crate::cli::run(&mut app.store, vec!["tree".into(), c.to_string()], &ctx).unwrap();
+        assert_eq!(out, format!("#{c} done c\n  #{d} done d\n"));
     }
 
     #[test]
