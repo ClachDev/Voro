@@ -310,9 +310,11 @@ pub(super) fn key_map(screens: KeySection) -> Vec<KeySection> {
         (
             "Actions",
             vec![
-                ("⏎", "browse the milestone's tasks"),
-                ("s", "done, or abandon"),
-                ("n", "new milestone, parked"),
+                ("⏎", "browse its tasks, or triage a proposal"),
+                ("s", "triage, done, or abandon"),
+                ("n", "new milestone, proposed headless"),
+                ("N", "new milestone, planned with an agent"),
+                ("ctrl-n", "new milestone, by hand in $EDITOR"),
                 ("e", "edit the milestone's body"),
             ],
         ),
@@ -369,7 +371,12 @@ mod tests {
             let t = new_task(&mut store, p, title, TaskState::Ready);
             let ms: Vec<i64> = milestones
                 .iter()
-                .map(|m| store.create_milestone(p, m, "", Priority::P2).unwrap().id)
+                .map(|m| {
+                    store
+                        .create_milestone(p, m, "", Priority::P2, TaskState::Parked)
+                        .unwrap()
+                        .id
+                })
                 .collect();
             if !ms.is_empty() {
                 store.block_tasks(t, &ms).unwrap();
@@ -525,7 +532,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let p = store.create_project("voro", "/tmp/voro").unwrap().id;
         let m = store
-            .create_milestone(p, "Carpet crossing", "", Priority::P2)
+            .create_milestone(p, "Carpet crossing", "", Priority::P2, TaskState::Parked)
             .unwrap()
             .id;
         let proposal = new_task(&mut store, p, "follow-up", TaskState::Proposed);

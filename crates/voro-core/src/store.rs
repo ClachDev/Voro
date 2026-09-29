@@ -172,6 +172,8 @@ pub struct NewTask {
     pub agent: Option<String>,
     pub human: bool,
     pub deep: bool,
+    /// A milestone (DESIGN.md §3) is always human, so the flag implies `human`.
+    pub milestone: bool,
 }
 
 /// Content edits. State is deliberately absent — use `Store::apply`.
@@ -1116,7 +1118,8 @@ impl Store {
 
     // --- tasks ---
 
-    pub fn create_task(&mut self, new: NewTask) -> Result<Task> {
+    pub fn create_task(&mut self, mut new: NewTask) -> Result<Task> {
+        new.human |= new.milestone;
         if !matches!(
             new.state,
             TaskState::Proposed | TaskState::Parked | TaskState::Ready
@@ -1157,11 +1160,16 @@ impl Store {
                 )));
             }
         }
+        if new.milestone
+            && let Some((id, title)) = self.open_milestone_titled(new.project_id, &new.title)?
+        {
+            return Err(Error::MilestoneExists { id, title });
+        }
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO tasks (project_id, repo_id, title, body, priority, state, agent, human,
-                                deep, state_since, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now'))",
+                                deep, milestone, state_since, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), datetime('now'))",
             params![
                 new.project_id,
                 new.repo_id,
@@ -1171,11 +1179,15 @@ impl Store {
                 new.state,
                 new.agent,
                 new.human,
-                new.deep
+                new.deep,
+                new.milestone
             ],
         )?;
         let id = tx.last_insert_rowid();
         log_event(&tx, id, "created", Some(new.state.as_str()))?;
+        if new.milestone {
+            log_event(&tx, id, "milestone", Some("set"))?;
+        }
         tx.commit()?;
         self.task(id)
     }
@@ -2383,6 +2395,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         }
     }
 
@@ -2401,6 +2414,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
 
@@ -2508,6 +2522,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         assert!(s.task(t.id).unwrap().pr_url.is_none());
@@ -2546,6 +2561,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
 
@@ -2580,6 +2596,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         assert!(s.task(t.id).unwrap().branch.is_none());
@@ -2625,6 +2642,7 @@ mod tests {
             agent: agent.map(str::to_string),
             human,
             deep: false,
+            milestone: false,
         }
     }
 
@@ -2794,6 +2812,7 @@ mod tests {
     fn deep_new(project_id: i64, human: bool, deep: bool) -> NewTask {
         NewTask {
             deep,
+            milestone: false,
             ..new_with(project_id, None, human)
         }
     }
@@ -2904,6 +2923,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
 
@@ -2950,6 +2970,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         s.apply(t.id, Action::Start).unwrap();
@@ -2978,6 +2999,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         let err = s.set_summary(t.id, "too early").unwrap_err();
@@ -3190,6 +3212,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap()
             .id
@@ -3313,6 +3336,7 @@ mod tests {
                     agent: None,
                     human: false,
                     deep: false,
+                    milestone: false,
                 })
                 .unwrap_err();
             assert!(
@@ -3334,6 +3358,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .is_ok()
         );
@@ -3809,6 +3834,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         s.apply(task.id, Action::Start).unwrap();
@@ -3842,6 +3868,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         assert_eq!(s.latest_summary(t.id).unwrap(), None);
@@ -3882,6 +3909,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         assert_eq!(s.last_reviewed(t.id).unwrap(), None);
@@ -3916,6 +3944,7 @@ mod tests {
                     agent: None,
                     human: false,
                     deep: false,
+                    milestone: false,
                 })
                 .unwrap();
             s.apply(t.id, Action::Start).unwrap();
@@ -3973,6 +4002,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         s.set_branch(t.id, Some("feat/x")).unwrap();
@@ -4007,6 +4037,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         })
         .unwrap()
     }
@@ -4382,6 +4413,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         let (_, dispatched) = s
@@ -4400,6 +4432,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap();
         let (_, headless) = s
@@ -4721,6 +4754,7 @@ mod tests {
                 agent: None,
                 human: false,
                 deep: false,
+                milestone: false,
             })
             .unwrap()
             .id;
@@ -4811,6 +4845,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         };
 
         // review keeps its session open, yet must not appear in the strip
@@ -4917,6 +4952,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         };
         let blocker = s.create_task(new("blocker")).unwrap();
         s.apply(blocker.id, Action::Start).unwrap();

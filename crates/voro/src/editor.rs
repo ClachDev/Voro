@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use voro_core::{Priority, Task, TaskState};
 
+use crate::dispatch::Filing;
+
 #[derive(Debug, Clone)]
 pub struct TaskForm {
     pub title: String,
@@ -16,11 +18,24 @@ pub struct TaskForm {
     pub state: Option<TaskState>,
     pub agent: Option<String>,
     pub human: bool,
+    pub milestone: bool,
     pub blocked_by: Vec<i64>,
     pub body: String,
 }
 
-pub fn template_new() -> String {
+pub fn template_new(filing: Filing) -> String {
+    if filing == Filing::Milestone {
+        return "# New milestone. The body below --- is its acceptance statement: what\n\
+                # you will watch happen. Save an empty file to cancel.\n\
+                # state: proposed | parked | ready. A milestone is always human.\n\
+                title: \n\
+                priority: 2\n\
+                state: parked\n\
+                milestone: true\n\
+                blocked-by: \n\
+                ---\n"
+            .to_string();
+    }
     "# New task. The body below --- is the dispatchable prompt.\n\
      # Save an empty file to cancel. state: proposed | parked | ready\n\
      # human: true marks a task no agent can execute (never dispatched)\n\
@@ -84,6 +99,7 @@ pub fn parse(text: &str, allow_state: bool) -> Result<TaskForm, String> {
         state: None,
         agent: None,
         human: false,
+        milestone: false,
         blocked_by: Vec::new(),
         body: String::new(),
     };
@@ -130,6 +146,20 @@ pub fn parse(text: &str, allow_state: bool) -> Result<TaskForm, String> {
                     "" | "false" | "no" | "0" => false,
                     "true" | "yes" | "1" => true,
                     other => return Err(format!("human must be true or false, got '{other}'")),
+                }
+            }
+            "milestone" => {
+                if !allow_state {
+                    return Err("an existing task is flagged with `voro set --milestone`, \
+                                not the editor"
+                        .into());
+                }
+                form.milestone = match value {
+                    "" | "false" | "no" | "0" => false,
+                    "true" | "yes" | "1" => true,
+                    other => {
+                        return Err(format!("milestone must be true or false, got '{other}'"));
+                    }
                 }
             }
             "blocked-by" => {
@@ -283,7 +313,13 @@ mod tests {
                 .contains("true or false")
         );
         // the new-task template carries the field ready to flip
-        assert!(template_new().contains("human: false"));
+        assert!(template_new(Filing::Task).contains("human: false"));
+        let filled = template_new(Filing::Milestone).replace("title: \n", "title: Dock\n");
+        let form = parse(&filled, true).unwrap();
+        assert!(form.milestone);
+        assert_eq!(form.state, Some(TaskState::Parked));
+        assert!(!parse(VALID, true).unwrap().milestone);
+        assert!(parse("title: T\nmilestone: true\n---\n", false).is_err());
     }
 
     #[test]

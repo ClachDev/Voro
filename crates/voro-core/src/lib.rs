@@ -69,6 +69,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         }
     }
 

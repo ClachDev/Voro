@@ -648,6 +648,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         })
         .unwrap()
         .id
@@ -687,6 +688,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         })
         .unwrap()
         .id
@@ -1211,6 +1213,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         })
         .unwrap();
         let visible = add_task(&mut s, active, "visible", Priority::P3);
@@ -1287,6 +1290,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         })
         .unwrap();
         let question = add_task(&mut s, active, "blocked on me", Priority::P2);
@@ -1309,6 +1313,7 @@ mod tests {
             agent: None,
             human: false,
             deep: false,
+            milestone: false,
         })
         .unwrap();
 
