@@ -1082,7 +1082,9 @@ fn session_lines(session: &Session, state: TaskState) -> Vec<Line<'static>> {
 /// One task's queue row: the effective score it was ranked by, its state, and
 /// the markers the row carries. Shared by the top-level rows and the proposals
 /// listed under an expanded digest, which differ only in indent and dimming.
-fn action_row_line(app: &App, row: &ActionRow, indent: &str) -> Line<'static> {
+/// `width` is the pane's inner width, whose right edge the milestone label
+/// sits against.
+fn action_row_line(app: &App, row: &ActionRow, indent: &str, width: u16) -> Line<'static> {
     let c = &row.candidate;
     let untriaged = c.task.state == TaskState::Proposed;
     let style = if untriaged {
@@ -1095,16 +1097,16 @@ fn action_row_line(app: &App, row: &ActionRow, indent: &str) -> Line<'static> {
     } else {
         score_span(row.effective)
     };
-    let mut spans = vec![
+    let head = vec![
         score,
         Span::styled(format!("{indent}{} ", task_ref(c.task.id)), style),
         state_span(c.task.state),
         Span::styled(format!(" {}", c.task.priority), style),
         deep_marker(c.task.deep),
-        Span::raw(" "),
-        milestones::column_span(app, c.task.id),
-        Span::styled(format!(" {}: {}", c.project_name, c.task.title), style),
+        Span::styled(format!(" {}: ", c.project_name), style),
     ];
+    let title = Span::styled(c.task.title.clone(), style);
+    let mut spans = Vec::new();
     if c.task.human {
         spans.push(human_span());
     }
@@ -1125,7 +1127,7 @@ fn action_row_line(app: &App, row: &ActionRow, indent: &str) -> Line<'static> {
         // nothing else on the row says so, so name the gap.
         spans.push(incomplete_report_span());
     }
-    Line::from(spans)
+    milestones::row_line(app, c.task.id, width, head, title, spans)
 }
 
 /// A project's collapsed proposals (DESIGN.md §7): one row scored as its best
@@ -1179,6 +1181,7 @@ fn pluralise(n: usize, noun: &str) -> String {
 }
 
 fn draw_queue(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
+    let width = area.width.saturating_sub(2);
     let mut items: Vec<ListItem> = Vec::new();
     let mut selected: Option<usize> = None;
     // The pane skips the running rows, so a rendered line stands for the
@@ -1187,12 +1190,12 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     for (i, row) in app.cockpit_rows.iter().enumerate() {
         let item = match row {
             CockpitRow::Queue(idx) => match app.queue.rows.get(*idx) {
-                Some(QueueRow::Action(row)) => ListItem::new(action_row_line(app, row, "")),
+                Some(QueueRow::Action(row)) => ListItem::new(action_row_line(app, row, "", width)),
                 Some(QueueRow::Digest(digest)) => ListItem::new(digest_line(app, digest)),
                 None => continue,
             },
             CockpitRow::Proposal(i, j) => match app.digest_child(*i, *j) {
-                Some(row) => ListItem::new(action_row_line(app, row, "  ↳ ")),
+                Some(row) => ListItem::new(action_row_line(app, row, "  ↳ ", width)),
                 None => continue,
             },
             CockpitRow::Running(_) => continue,
@@ -1461,6 +1464,7 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     if area.height == 0 {
         return;
     }
+    let width = area.width.saturating_sub(2);
     let mut items: Vec<ListItem> = Vec::new();
     let mut selected: Option<usize> = None;
     let mut rows: Vec<usize> = Vec::new();
@@ -1481,7 +1485,7 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                 TaskState::Waiting => waiting_span(),
                 other => Span::raw(format!("{other:11} ")),
             };
-            let mut spans = vec![
+            let head = vec![
                 Span::raw(format!("{} ", task_ref(r.task_id))),
                 agent,
                 state,
@@ -1489,9 +1493,9 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                     format!("{:>6}  ", format_elapsed(r.elapsed_secs)),
                     Style::new().dim(),
                 ),
-                milestones::column_span(app, r.task_id),
-                Span::raw(format!(" {}", r.task_title)),
             ];
+            let title = Span::raw(r.task_title.clone());
+            let mut spans = Vec::new();
             if waiting {
                 let open = app.dependents.get(&r.task_id).map_or(0, |d| {
                     d.iter()
@@ -1516,7 +1520,9 @@ fn draw_running(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                     Style::new().fg(Color::Yellow),
                 ));
             }
-            items.push(ListItem::new(Line::from(spans)));
+            items.push(ListItem::new(milestones::row_line(
+                app, r.task_id, width, head, title, spans,
+            )));
         }
     }
     let mut state = ListState::default().with_selected(selected);
@@ -4368,11 +4374,11 @@ mod tests {
 
         let cockpit = render(&app, &mut terminal);
         assert!(
-            cockpit.contains(&format!("P2! {:16} voro: the hard one", "")),
+            cockpit.contains("P2! voro: the hard one"),
             "queue row should mark the deep task: {cockpit}"
         );
         assert!(
-            cockpit.contains(&format!("P2  {:16} voro: the ordinary one", "")),
+            cockpit.contains("P2  voro: the ordinary one"),
             "a workhorse row keeps the column blank: {cockpit}"
         );
         assert!(
