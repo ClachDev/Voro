@@ -501,6 +501,25 @@ pub(crate) mod tests {
             .unwrap()
             .id;
         let mut app = app_from(store);
+        let dir = tempfile::Builder::new()
+            .prefix("voro-milestone-refine-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let agents_path = dir.join("voro.toml");
+        std::fs::write(
+            &agents_path,
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file}\"\nplan = \"stub --interactive {prompt_file}\"\n",
+        )
+        .unwrap();
+        app.dispatch_ctx = crate::dispatch::DispatchCtx {
+            db_path: dir.join("voro.db"),
+            agents_path,
+            runtime_dir: dir.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
+            message_grace: std::time::Duration::from_millis(300),
+        };
         alt_key(&mut app, KeyCode::Char('2'));
         app.tasks_sel = app
             .browser_rows
@@ -519,14 +538,16 @@ pub(crate) mod tests {
         );
         key(&mut app, KeyCode::Esc);
 
-        // The test context configures no plan verb, so the launch fails on the
-        // status line; what matters is that it got that far.
         key(&mut app, KeyCode::Char('R'));
-        let status = app.status.as_deref().unwrap_or("");
-        assert!(
-            app.pending_plan.is_some() || !status.contains("milestone"),
-            "{status}"
-        );
+        let launch = app.pending_plan.take().expect("R queues a refine session");
+        assert_eq!(launch.label, "refine");
+        assert_eq!(launch.refine.as_ref().map(|r| r.task_id), Some(m));
+        let prompt_file = launch
+            .command
+            .strip_prefix("stub --interactive ")
+            .expect("the stub's plan verb");
+        let prompt = std::fs::read_to_string(prompt_file.trim_matches('\'')).unwrap();
+        assert!(prompt.contains("This task is a milestone"), "{prompt}");
     }
 
     #[test]

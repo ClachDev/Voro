@@ -217,8 +217,8 @@ A milestone is something the operator can watch the robot or the system do; a
 fix or a refactor is a task, so say so if that is what the operator describes.
 Run `voro milestones{db}` before drafting and tell the operator if one listed
 already covers the outcome. Keep the title to four words or fewer, because it
-fills a 16-character column. Write the body as the acceptance statement: what
-the operator will watch happen, in measurable terms. No agent executes a
+is a label cut to 16 characters. Write the body as the acceptance statement:
+what the operator will watch happen, in measurable terms. No agent executes a
 milestone, so the body is not a prompt; the tasks that reach it are filed
 later and block it.";
 
@@ -269,8 +269,8 @@ its brief is the job.";
 /// §3).
 const PROPOSE_MILESTONE_SHAPE: &str = "\
 Expand it into a milestone: something the operator can watch the robot or the
-system do. Keep the title to four words or fewer, because it fills a
-16-character column. Write the body as the acceptance statement: what the
+system do. Keep the title to four words or fewer, because it is a label cut to
+16 characters. Write the body as the acceptance statement: what the
 operator will watch happen, in measurable terms. No agent executes a milestone,
 so the body is not a prompt; the tasks that reach it are filed later and block
 it. The checkout you are running in is there to read, so the statement can name
@@ -383,10 +383,10 @@ const REFINE_MILESTONE_SHAPE: &str = "\
 so that it reads as the milestone's acceptance statement: what the operator will
 watch the robot or the system do, in measurable terms. No agent executes a
 milestone, so the body is not a prompt; the tasks that reach it are filed
-separately and block it. Keep the title to four words or fewer, because it fills
-a 16-character column, and retitle a longer one. The checkout you are running in
-is there to read, so the statement can name real behaviour. Do not modify the
-project's files, and do not do the work itself.";
+separately and block it. Keep the title to four words or fewer, because it is
+a label cut to 16 characters, and retitle a longer one. The checkout you are
+running in is there to read, so the statement can name real behaviour. Do not
+modify the project's files, and do not do the work itself.";
 
 /// The body guidance of an interactive refine of a task.
 const REFINE_PLAN_TASK_SHAPE: &str = "\
@@ -397,8 +397,8 @@ decisions already made, and give concrete acceptance criteria.";
 /// The body guidance of an interactive refine of a milestone (DESIGN.md §3).
 const REFINE_PLAN_MILESTONE_SHAPE: &str = "\
 This task is a milestone: something the operator can watch the robot or the
-system do. Keep the title to four words or fewer, because it fills a
-16-character column, and retitle a longer one. Write the body as the
+system do. Keep the title to four words or fewer, because it is a label cut to
+16 characters, and retitle a longer one. Write the body as the
 acceptance statement: what the operator will watch happen, in measurable terms.
 No agent executes a milestone, so the body is not a prompt; the tasks that
 reach it are filed separately and block it.";
