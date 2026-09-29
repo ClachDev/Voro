@@ -2521,15 +2521,6 @@ fn triage_verb(store: &mut Store, args: TriageArgs, ctx: &DispatchCtx) -> Result
             apply_unguarded(store, ctx, args.task_id, Action::Triage(verdict), false)
         }
         Err(()) => {
-            if store
-                .task(args.task_id)
-                .map_err(|e| e.to_string())?
-                .milestone
-            {
-                return Err(
-                    dispatch::MILESTONE_REFINE_REFUSAL.replace("{id}", &args.task_id.to_string())
-                );
-            }
             let Some(note) = note else {
                 return Err(format!(
                     "refine needs a note saying what to fix: `voro triage {} refine --note \
@@ -3344,6 +3335,45 @@ mod tests {
         assert_eq!(session.outcome, Some(voro_core::SessionOutcome::Completed));
     }
 
+    /// A milestone's round ends the same way, retitle included: `set` is not a
+    /// transition verb, so the CLI guard on milestones does not stand in its way.
+    #[test]
+    fn a_milestone_refine_round_ends_through_set() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "demo", "/tmp"]);
+        ok(
+            &mut s,
+            &["propose", "demo", "Carpet crossing", "--milestone"],
+        );
+        s.record_refine_launch(1, "measurable", "claude", None, LivenessSource::Pid, None)
+            .unwrap();
+
+        let dir = tempfile::Builder::new()
+            .prefix("voro-refine-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let path = dir.join("statement.md");
+        std::fs::write(&path, "The robot crosses 3 m of carpet unaided.\n").unwrap();
+        ok(
+            &mut s,
+            &[
+                "set",
+                "1",
+                "--body-file",
+                path.to_str().unwrap(),
+                "--title",
+                "Crosses carpet",
+            ],
+        );
+
+        let task = s.task(1).unwrap();
+        assert!(task.milestone);
+        assert_eq!(task.state, TaskState::Proposed);
+        assert_eq!(task.title, "Crosses carpet");
+        assert!(s.refined_flag(1).unwrap());
+    }
+
     /// Only a body *replacement* ends the round: a `set` touching anything else
     /// leaves the agent to carry on, since the rewrite has not landed yet.
     #[test]
@@ -4139,15 +4169,6 @@ mod tests {
     }
 
     #[test]
-    fn refine_without_a_note_on_a_milestone_names_the_milestone_refusal() {
-        let mut s = store();
-        ok(&mut s, &["project", "add", "p", "/tmp"]);
-        ok(&mut s, &["propose", "p", "Carpet crossing", "--milestone"]);
-        let e = err(&mut s, &["triage", "1", "refine"]);
-        assert!(e.contains("acceptance statement"), "{e}");
-    }
-
-    #[test]
     fn the_start_help_line_sits_in_the_description_column() {
         let line = HELP
             .lines()
@@ -4163,12 +4184,15 @@ mod tests {
     }
 
     #[test]
-    fn refine_is_refused_on_a_proposed_milestone() {
+    fn refine_on_a_proposed_milestone_reaches_the_dispatch() {
         let mut s = store();
         ok(&mut s, &["project", "add", "p", "/tmp"]);
         ok(&mut s, &["propose", "p", "Carpet crossing", "--milestone"]);
+        let e = err(&mut s, &["triage", "1", "refine"]);
+        assert!(e.contains("--note"), "{e}");
+        // The test context names no agent config, so the launch is what fails.
         let e = err(&mut s, &["triage", "1", "refine", "--note", "shorter"]);
-        assert!(e.contains("acceptance statement"), "{e}");
+        assert!(!e.contains("milestone"), "{e}");
         assert_eq!(s.task(1).unwrap().state, TaskState::Proposed);
     }
 

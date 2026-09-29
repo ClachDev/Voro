@@ -493,7 +493,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn refine_is_refused_on_a_milestone() {
+    fn r_and_capital_r_refine_a_proposed_milestone() {
         let mut store = Store::open_in_memory().unwrap();
         let p = store.create_project("voro", "/tmp/voro").unwrap().id;
         let m = store
@@ -507,10 +507,26 @@ pub(crate) mod tests {
             .iter()
             .position(|r| matches!(r, BrowserRow::Task(i) if app.all[*i].task.id == m))
             .unwrap();
+        assert!(app.is_refinable(m));
         key(&mut app, KeyCode::Char('r'));
-        assert!(matches!(app.mode, Mode::Normal));
+        assert!(
+            matches!(
+                app.mode,
+                Mode::Prompt { task_id, kind: crate::app::PromptKind::RefineNote, .. }
+                    if task_id == m
+            ),
+            "r collects the refine note"
+        );
+        key(&mut app, KeyCode::Esc);
+
+        // The test context configures no plan verb, so the launch fails on the
+        // status line; what matters is that it got that far.
+        key(&mut app, KeyCode::Char('R'));
         let status = app.status.as_deref().unwrap_or("");
-        assert!(status.contains("acceptance statement"), "{status}");
+        assert!(
+            app.pending_plan.is_some() || !status.contains("milestone"),
+            "{status}"
+        );
     }
 
     #[test]
