@@ -2348,9 +2348,7 @@ impl App {
     /// it back through triage (DESIGN.md §6).
     pub fn is_refinable(&self, task_id: i64) -> bool {
         self.all.iter().any(|r| {
-            r.task.id == task_id
-                && !r.task.milestone
-                && matches!(r.task.state, TaskState::Proposed | TaskState::Ready)
+            r.task.id == task_id && matches!(r.task.state, TaskState::Proposed | TaskState::Ready)
         })
     }
 
@@ -2365,12 +2363,6 @@ impl App {
             return;
         };
         let (task_id, state) = (task.id, task.state);
-        if task.milestone {
-            self.status = Some(
-                crate::dispatch::MILESTONE_REFINE_REFUSAL.replace("{id}", &task_id.to_string()),
-            );
-            return;
-        }
         if state == TaskState::Refining {
             self.status = Some(format!(
                 "task {task_id} is already being refined — C cancels the round"

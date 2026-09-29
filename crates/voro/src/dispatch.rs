@@ -308,11 +308,7 @@ impl Filing {
 const REFINE_PROMPT_TEMPLATE: &str = "\
 <!-- Voro refine: the deliverable is a rewritten task body -->
 You are an agent launched by Voro to rewrite the body of proposed task {task_id}
-so that it reads as a dispatchable prompt: the agent that picks the task up later
-gets no other context, so name the relevant files, spell out the decisions
-already made, and give concrete acceptance criteria. The checkout you are running
-in is there to read, so the body can name real files and code. Do not modify the
-project's files, and do not do the task itself — writing its brief is the job.
+{shape}
 
 The operator's note is what they want fixed. It is the brief; honour it:
 
@@ -351,9 +347,7 @@ modify the project's files; the checkout is there to read, so the task can name
 real files and code. Do not do the task itself — writing its brief is the job.
 
 {seed}
-Write the body as a self-contained dispatchable prompt: the agent that picks it
-up later gets no other context, so name the relevant files, spell out the
-decisions already made, and give concrete acceptance criteria.
+{shape}
 
 When the operator confirms the rewrite, write the body to a file outside the
 checkout and apply it with:
@@ -373,6 +367,41 @@ anything, end the session without applying a body — that is a no-op, not a
 failure. Never modify Voro's database with raw SQL, which would bypass the state
 machine and event log.
 ";
+
+/// The body guidance of a note-driven refine of a task, continuing the
+/// template's opening sentence.
+const REFINE_TASK_SHAPE: &str = "\
+so that it reads as a dispatchable prompt: the agent that picks the task up later
+gets no other context, so name the relevant files, spell out the decisions
+already made, and give concrete acceptance criteria. The checkout you are running
+in is there to read, so the body can name real files and code. Do not modify the
+project's files, and do not do the task itself — writing its brief is the job.";
+
+/// The body guidance of a note-driven refine of a milestone (DESIGN.md §3),
+/// continuing the template's opening sentence.
+const REFINE_MILESTONE_SHAPE: &str = "\
+so that it reads as the milestone's acceptance statement: what the operator will
+watch the robot or the system do, in measurable terms. No agent executes a
+milestone, so the body is not a prompt; the tasks that reach it are filed
+separately and block it. Keep the title to four words or fewer, because it fills
+a 16-character column, and retitle a longer one. The checkout you are running in
+is there to read, so the statement can name real behaviour. Do not modify the
+project's files, and do not do the work itself.";
+
+/// The body guidance of an interactive refine of a task.
+const REFINE_PLAN_TASK_SHAPE: &str = "\
+Write the body as a self-contained dispatchable prompt: the agent that picks it
+up later gets no other context, so name the relevant files, spell out the
+decisions already made, and give concrete acceptance criteria.";
+
+/// The body guidance of an interactive refine of a milestone (DESIGN.md §3).
+const REFINE_PLAN_MILESTONE_SHAPE: &str = "\
+This task is a milestone: something the operator can watch the robot or the
+system do. Keep the title to four words or fewer, because it fills a
+16-character column, and retitle a longer one. Write the body as the
+acceptance statement: what the operator will watch happen, in measurable terms.
+No agent executes a milestone, so the body is not a prompt; the tasks that
+reach it are filed separately and block it.";
 
 /// How often the session-ref capture re-polls the agent's `sessions` command
 /// while waiting for the freshly-launched session to appear in the listing.
@@ -626,6 +655,7 @@ fn refine_seed(store: &Store, task: &voro_core::Task) -> Result<String, String> 
 /// and rewriting the subject of a rewrite is the one thing this must not do.
 fn render_refine_prompt(
     template: &str,
+    shape: &str,
     task_id: i64,
     db_path: &Path,
     seed: &str,
@@ -634,6 +664,7 @@ fn render_refine_prompt(
     render(
         template,
         &[
+            ("{shape}", shape),
             ("{seed}", seed),
             ("{note}", note.trim()),
             ("{task_id}", task_id.to_string().as_str()),
@@ -733,6 +764,11 @@ pub fn plan_session(
                 repo.path,
                 render_refine_prompt(
                     REFINE_PLAN_PROMPT_TEMPLATE,
+                    if task.milestone {
+                        REFINE_PLAN_MILESTONE_SHAPE
+                    } else {
+                        REFINE_PLAN_TASK_SHAPE
+                    },
                     task_id,
                     &ctx.db_path,
                     &seed,
@@ -761,10 +797,6 @@ pub fn plan_session(
     })
 }
 
-/// Why refine is refused on a milestone (DESIGN.md §6); `{id}` is its id.
-pub const MILESTONE_REFINE_REFUSAL: &str = "task {id} is a milestone — refine rewrites a \
-     dispatchable brief, and a milestone's body is its acceptance statement; e edits it";
-
 /// The precondition both refine flavours share: a refine round starts from
 /// `proposed` or `ready` (DESIGN.md §6), so anything else is refused before a
 /// prompt is written or a process spawned. The transition API refuses it again
@@ -773,9 +805,6 @@ pub const MILESTONE_REFINE_REFUSAL: &str = "task {id} is a milestone — refine 
 /// cancel.
 fn guard_refinable(store: &Store, task_id: i64) -> Result<voro_core::Task, String> {
     let task = store.task(task_id).map_err(|e| e.to_string())?;
-    if task.milestone {
-        return Err(MILESTONE_REFINE_REFUSAL.replace("{id}", &task_id.to_string()));
-    }
     if task.state == TaskState::Refining {
         return Err(format!(
             "task {task_id} is already being refined — cancel that round first"
@@ -976,7 +1005,19 @@ pub fn refine(
     let config = AgentsConfig::load(&ctx.agents_path).map_err(|e| e.to_string())?;
     let agent = config.resolve(None).map_err(|e| e.to_string())?;
     let seed = refine_seed(store, &task)?;
-    let prompt = render_refine_prompt(REFINE_PROMPT_TEMPLATE, task_id, &ctx.db_path, &seed, note);
+    let shape = if task.milestone {
+        REFINE_MILESTONE_SHAPE
+    } else {
+        REFINE_TASK_SHAPE
+    };
+    let prompt = render_refine_prompt(
+        REFINE_PROMPT_TEMPLATE,
+        shape,
+        task_id,
+        &ctx.db_path,
+        &seed,
+        note,
+    );
 
     let cwd = repo.path.clone();
     let spawn_ms = now_ms();
@@ -3798,6 +3839,37 @@ mod tests {
         assert!(err.contains("already being refined"), "{err}");
         // one round, one session
         assert_eq!(store.sessions_for(id).unwrap().len(), 1);
+    }
+
+    /// A milestone refines into its acceptance statement, not a brief
+    /// (DESIGN.md §3/§6), in both flavours.
+    #[test]
+    fn a_milestone_refines_into_its_acceptance_statement() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"cat {prompt_file} > refine-prompt.txt\"\n\
+             plan = \"stub --interactive {prompt_file}\"\n",
+        );
+        let p = store
+            .create_project("proj", project.to_str().unwrap())
+            .unwrap()
+            .id;
+        let m = store
+            .create_milestone(p, "Dock", "it docks", Priority::P2, TaskState::Proposed)
+            .unwrap()
+            .id;
+
+        plan_session(&store, &ctx, PlanTarget::Refine { task_id: m }).unwrap();
+        let prompt = std::fs::read_to_string(prompt_files(&ctx).pop().unwrap()).unwrap();
+        assert!(prompt.contains("acceptance statement"), "{prompt}");
+        assert!(!prompt.contains("dispatchable"), "{prompt}");
+
+        refine(&mut store, &ctx, m, "say how far it docks").unwrap();
+        let prompt = read_captured_prompt(&project.join("refine-prompt.txt"));
+        assert!(prompt.contains("acceptance statement"), "{prompt}");
+        assert!(!prompt.contains("dispatchable"), "{prompt}");
+        assert!(prompt.contains("four words or fewer"), "{prompt}");
+        assert_eq!(store.task(m).unwrap().state, TaskState::Refining);
     }
 
     // --- planning sessions ---

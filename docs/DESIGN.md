@@ -804,14 +804,16 @@ resolve it first.
 
 A **milestone** (§3) walks the human path and adds one restriction: past
 triage, the CLI cannot move it. A proposed milestone takes the three verdicts
-from `voro triage` as from the TUI's triage menu, with the same effects as on
-a task. After that, `start`, `done`, `abandon`, `park`, `unpark` and every
+and refine from `voro triage` as from the TUI's triage menu, with the same
+effects as on a task. After that, `start`, `done`, `abandon`, `park`, `unpark` and every
 other transition verb refuse it with one line naming the TUI's Milestones tab,
 where the operator moves it. There the menu offers a human task's transitions,
 park and unpark included, except that a ready milestone is passed as *done*
-in one step in place of `start`. Refine is refused on
-one, because its prompt rewrites a body into a dispatchable brief and a
-milestone's body is an acceptance statement. The refusal is a CLI guard
+in one step in place of `start`. Refine on a milestone swaps the body guidance
+in both prompts: the agent rewrites the body as the acceptance statement, what
+the operator will watch happen in measurable terms, and keeps the title to four
+words or fewer, where a task's refine writes a dispatchable brief. The
+transition verbs' refusal is a CLI guard
 (`Task::refuse_cli_transition` in `voro-core`) rather than an arm of the
 machine, because the TUI closes one through the same machine: its *done* runs
 `start` then `complete` in one transaction (`Store::close_milestone`), since
