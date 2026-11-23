@@ -416,7 +416,7 @@ mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            message_grace: std::time::Duration::from_millis(300),
+            launch_grace: std::time::Duration::from_millis(300),
         };
         let mut app = crate::app::App::new(store, ctx).unwrap();
         let mut terminal = TestTerminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();

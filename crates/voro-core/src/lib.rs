@@ -46,7 +46,7 @@ pub use review::{
 pub use scheduler::{
     ActionRow, Candidate, DigestRow, Queue, QueueRow, ScoreBreakdown, StateCounts, TiedCut, WipGate,
 };
-pub use store::{NewTask, Store, TaskEdit};
+pub use store::{LAUNCH_FAILED_EVENT, NewTask, Store, TaskEdit};
 pub use template::{render, shell_quote};
 pub use transition::{Action, Triage};
 pub use tree::{Tree, TreeRow, blocker_tree, blocks_tree};

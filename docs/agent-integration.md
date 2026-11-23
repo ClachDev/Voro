@@ -266,7 +266,29 @@ one-time `claude --dangerously-skip-permissions` disclaimer that `--bg` requires
 `acceptEdits` auto-accepts edits but still blocks on every bash command — and use
 `attach` to answer prompts in a live session.
 
-Three behaviours hang off these verbs.
+Four behaviours hang off these verbs.
+
+**Started or refused.** Voro tells a started session from a failed launch by
+the spawned process's exit status, read before the task is moved to
+`running`. An agent with a `sessions` verb is assumed to launch through a
+launcher that exits at birth, as `claude --bg` does, so Voro waits up to ten
+seconds for that launcher to exit. An agent without one is assumed to run in
+the foreground, as `codex exec` does, so it gets a two-second grace and is
+treated as started if still running at the end of it. Exit 0 is a start
+either way. Any other exit is a refused launch: the task stays `ready` (or
+`stalled`), no session is recorded, and a `launch-failed` event keeps the
+launcher's output verbatim. The same text is the error the TUI's status line
+and the CLI's `voro dispatch` print, and `voro show` repeats it on a `launch
+failed:` line. `refine` and quick propose are checked the same way. Both
+built-in launchers refuse with exit 1: `claude --bg` in a checkout it has
+not been trusted in prints `Workspace not trusted. Run claude in <path> once
+and accept the trust prompt, then retry.`, and `codex exec` outside a trusted
+directory prints `Not inside a trusted directory and --skip-git-repo-check was
+not specified.` A failure after `claude --bg` has handed off, such as an
+unknown model, leaves a listed session whose state is `failed`, which
+reconcile stalls in the usual way. A custom agent's `dispatch` template must
+therefore exit non-zero when it starts nothing; one that exits 0 having
+started nothing is indistinguishable from a successful hand-off.
 
 **Session-ref capture.** Launchers like `claude --bg` ignore any caller-chosen
 session id, so dispatch captures the reference after the fact: it polls the
