@@ -22,7 +22,10 @@
 //! a false one would badge healthy work as stuck and teach the operator to
 //! disbelieve the badge. That asymmetry is why [`NOT_CAP_QUALIFIERS`] exists —
 //! the agent says "approaching" and "not your usage limit" in text that
-//! otherwise matches, and both mean the session is working fine.
+//! otherwise matches, and both mean the session is working fine. It is also
+//! why a signature must be *reported* rather than mentioned: the screen of a
+//! session reading this very file is full of the phrases, none of them about
+//! that session.
 //!
 //! A matched cap is then read for one thing beyond its reset time: whether the
 //! agent is *retrying* the rejected request ([`CapReading::retrying`]). A
@@ -82,7 +85,35 @@ const NOT_CAP_QUALIFIERS: [&str; 4] = ["approaching", "% of your", "not your", "
 /// signature speaks, rather than negating like a qualifier — a qualifier means
 /// "this one is not a cap", and skipping instead would let a genuine earlier cap
 /// speak past a warning that had since replaced it.
-const MENTION_PREFIXES: [&str; 2] = ["/upgrade", "increase your"];
+///
+/// The same holds for the options menu the agent renders under a cap, whose
+/// upgrade entry reads "for higher session limits every month".
+const MENTION_PREFIXES: [&str; 3] = ["/upgrade", "increase your", "higher"];
+
+/// Words that, directly before a signature, make it a report: "You've hit your
+/// session limit", "exceeded your rate limit", "new messages wait for your
+/// usage limit to reset".
+const REPORTED_BEFORE: [&str; 4] = ["hit your", "hit the", "exceeded your", "wait for your"];
+
+/// Words that, directly after a signature, make it a report: "Session limit
+/// reached", "repeated usage limit hits". A signature ending in one of these
+/// ("quota exceeded") reports by itself.
+const REPORTED_AFTER: [&str; 3] = ["reached", "exceeded", "hit"];
+
+/// How far before a signature [`REPORTED_BEFORE`] is looked for. Wide enough
+/// for "hit the 5-hour usage limit", and no wider: the verb has to belong to
+/// the same clause as the limit it reports.
+const REPORT_WINDOW: usize = 16;
+
+/// Characters that open a quotation. A report directly behind one is being
+/// quoted — a string literal, a code span, a test fixture — rather than said.
+const QUOTES: [char; 3] = ['"', '`', '\''];
+
+/// A quote closing into code punctuation. A fixture whose opening quote sits
+/// several words before the report — `"429 Number of requests has exceeded
+/// your rate limit · …",` — still ends in one of these within the window read
+/// after it, where an agent's rendered message does not.
+const CLOSING_QUOTES: [&str; 3] = ["\",", "\";", "\")"];
 
 /// Phrases that mean the agent is *retrying* the request the cap rejected
 /// rather than having ended its turn on it. Read in the same window as the
@@ -319,22 +350,32 @@ impl CapWindow {
 /// The *last* signature in the text decides, since a session that hit a cap,
 /// was continued, and hit another has the live one at the end — and a warning
 /// earlier in the same tail must not speak for a genuine cap later.
+///
+/// That signature badges only if it is a *report*: a verb adjacent to it says
+/// the limit was hit ([`reported_at`]), and the report is not quoted
+/// ([`quoted`]). A session reading this module's source, grepping its signature
+/// list or discussing caps in prose has the phrases on screen without being
+/// held by any of them, and its last word about a limit is a mention.
 pub fn read_cap(tail: &str) -> Option<CapReading> {
     let text = strip_ansi(tail).to_lowercase();
     let (at, signature) = last_signature(&text)?;
     if look_back(&text, at, &NOT_CAP_QUALIFIERS) {
         return None;
     }
+    let start = reported_at(&text, at, signature)?;
     let after = &text[at..ceil_boundary(&text, (at + signature.len() + WINDOW).min(text.len()))];
+    if quoted(&text, start, after) {
+        return None;
+    }
     Some(CapReading {
         reset_minutes: parse_clock(after),
         retrying: RETRYING.iter().any(|p| after.contains(p)),
     })
 }
 
-/// The position and text of the last cap signature in `text` that reports
-/// something, which must already be lowercased. Signatures the upgrade prompt
-/// merely mentions ([`MENTION_PREFIXES`]) are not candidates.
+/// The position and text of the last cap signature in `text`, which must
+/// already be lowercased. Signatures in the boilerplate that rides a real cap
+/// ([`MENTION_PREFIXES`]) are not candidates.
 fn last_signature(text: &str) -> Option<(usize, &'static str)> {
     CAP_SIGNATURES
         .iter()
@@ -347,6 +388,43 @@ fn last_signature(text: &str) -> Option<(usize, &'static str)> {
 fn look_back(text: &str, at: usize, phrases: &[&str]) -> bool {
     let before = &text[floor_boundary(text, at.saturating_sub(QUALIFIER_WINDOW))..at];
     phrases.iter().any(|p| before.contains(p))
+}
+
+/// Where the report of the signature at `at` begins, or `None` when nothing
+/// adjacent to it says the limit was hit. The report begins at the verb when
+/// the verb comes first ("hit your session limit"), else at the signature.
+fn reported_at(text: &str, at: usize, signature: &str) -> Option<usize> {
+    let end = at + signature.len();
+    let after = &text[end..];
+    let next_word = after.trim_start();
+    if REPORTED_AFTER
+        .iter()
+        .any(|v| signature.ends_with(v) || next_word.starts_with(v))
+        || after.starts_with("ed")
+    {
+        return Some(at);
+    }
+    let from = floor_boundary(text, at.saturating_sub(REPORT_WINDOW));
+    let before = &text[from..at];
+    REPORTED_BEFORE
+        .iter()
+        .filter_map(|v| before.rfind(v))
+        .min()
+        .map(|i| from + i)
+}
+
+/// Whether the report beginning at `start` is quoted: a quote opens directly
+/// before it, allowing one word between (`"You've hit your session limit`), or
+/// one closes into code punctuation in the text read `after` it.
+fn quoted(text: &str, start: usize, after: &str) -> bool {
+    if CLOSING_QUOTES.iter().any(|q| after.contains(q)) {
+        return true;
+    }
+    let before = text[..start].trim_end();
+    let outside =
+        before.trim_end_matches(|c: char| c.is_alphanumeric() || matches!(c, '\'' | ',' | '-'));
+    let word = &before[outside.len()..];
+    outside.ends_with(QUOTES) || word.starts_with('\'')
 }
 
 /// Drop terminal escape sequences, keeping the spacing the surviving text had
@@ -902,6 +980,69 @@ mod tests {
     fn windows_never_split_a_multibyte_glyph() {
         let padding = "·".repeat(400);
         assert!(read_cap(&format!("{padding}session limit reached{padding}")).is_some());
-        assert!(read_cap("session limit").is_some());
+        assert!(read_cap("session limit reached").is_some());
+    }
+
+    /// The operator's case: a session with this module open badged itself
+    /// capped, because its own source is full of the phrases it looks for.
+    #[test]
+    fn this_modules_source_is_not_a_cap() {
+        assert_eq!(read_cap(include_str!("cap.rs")), None);
+    }
+
+    /// The same, for the screen of a session scrolling through this module:
+    /// the probe reads a 20 KB tail, so every tail ending at a line of the
+    /// source is read too. A whole-file pass only tests the file's last
+    /// signature, and the badge flickers on whichever tail is on screen.
+    #[test]
+    fn no_tail_of_this_modules_source_is_a_cap() {
+        let source = include_str!("cap.rs");
+        for (end, _) in source.match_indices('\n') {
+            let start = ceil_boundary(source, end.saturating_sub(20_000));
+            let tail = &source[start..end];
+            assert_eq!(
+                read_cap(tail),
+                None,
+                "tail ending at line {}",
+                source[..end].lines().count()
+            );
+        }
+    }
+
+    /// Text that names a limit without reporting one: a signature list, a grep
+    /// hit on it, prose about the badge, and reports quoted in code.
+    #[test]
+    fn a_mention_is_not_a_cap() {
+        for text in [
+            r#"pub const CAP_SIGNATURES: [&str; 3] = ["usage limit", "rate limit", "quota exceeded"];"#,
+            r#"crates/voro-core/src/cap.rs:36: "usage limit","#,
+            "the capped badge keys on a rate limit message scraped off the screen",
+            r#"assert!(read_cap("Session limit reached").is_some());"#,
+            r#"read_cap("You've hit your session limit · resets 9pm")"#,
+            "`Weekly limit reached` is the weekly wording",
+            "x = 'usage limit reached'",
+            r#"read_cap("429 Number of requests has exceeded your rate limit · Retrying in 30s"),"#,
+        ] {
+            assert_eq!(read_cap(text), None, "{text}");
+        }
+    }
+
+    /// A real cap followed by a later mention is no longer the last word about
+    /// a limit, so the session has moved on. The menu the agent renders under
+    /// a cap is boilerplate, as the upgrade prompt is, and does not count.
+    #[test]
+    fn a_later_mention_decides_but_cap_chrome_does_not() {
+        assert_eq!(
+            read_cap(
+                "Session limit reached · resets 9pm\n... the rate limit handling in cap.rs ..."
+            ),
+            None
+        );
+        let reading = read_cap(
+            "You've hit your session limit · resets 6:40pm\n\
+             1. Wait for limit to reset  2. Upgrade to Max or Ultra for higher session limits every month",
+        )
+        .expect("a cap");
+        assert_eq!(reading.reset_label().as_deref(), Some("18:40"));
     }
 }

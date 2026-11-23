@@ -1537,7 +1537,29 @@ last, and being the one signature with no reset time after it, the badge
 would lose the time the agent actually named. It would also let a mere
 warning badge as a cap on any screen where the same prompt trailed it. Skipping is not the same as qualifying it: a qualifier means "this
 one is not a cap" and would let an earlier, superseded cap speak past the
-warning that had replaced it.
+warning that had replaced it. The options menu rendered under a cap ("for
+higher session limits every month") is the same kind of boilerplate and is
+skipped the same way.
+
+A signature must also be *reported*, not merely mentioned. The scanned text is
+a whole screen, and a screen shows whatever the agent is working on: the
+source of the module that does this matching, a grep over its signature list,
+a log quoting a limit error, a task body about caps. Task #441's session
+badged itself capped for an evening because `cap.rs` was on its screen, and
+its own source read as a cap. Every genuine wording carries a verb adjacent
+to the signature — "Session limit reached", "You've hit your session limit",
+"rate limited", "quota exceeded", "exceeded your rate limit" — and a mention
+carries none, so the last signature speaks only if such a verb sits next to
+it. Two quoting checks catch the reports that code displays rather than says:
+a quote opening at most one word before the report, and a quote closing into
+code punctuation (`",`, `";`, `")`) in the text read after it. A last
+signature that fails any of these takes the reading back, as a qualifier
+does, because a session whose latest words about a limit are discussion has
+moved on. Corroborating against the account's `cap` verb was considered and
+rejected as the sole check: `codex` has no such verb, and a session can be held
+by a window the account reading does not name. Reading only the agent's status
+chrome would discriminate by position, but `strip_ansi` has already flattened
+the screen's line structure, and recovering it means emulating a terminal.
 
 *Which text* is scanned is the substantive question, and Voro's own launch log
 is the wrong answer for the launches that matter. Under a supervisor-owned
