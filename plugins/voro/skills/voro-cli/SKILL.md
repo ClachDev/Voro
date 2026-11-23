@@ -69,9 +69,19 @@ it back (`voro show <id> --event <event-id> > body.md`).
 
 `add` defaults to state `proposed`, which is what an agent should almost
 always want: proposed tasks wait for human triage and never enter the queues
-untriaged. Write the body as a **dispatchable prompt** — self-contained
-enough that an agent could execute the task from the body alone (name files,
-state the acceptance criteria).
+untriaged.
+
+Write the body as a dispatchable prompt. The agent starts in the project
+checkout, so its harness loads the repo's agent instructions, and Voro also
+gives it: how to report back, the branch and worktree rules, the linked
+documents by location, the milestones the task counts toward, and a notice when
+the task was sent back from review. It gets nothing from your session and
+nothing from the tasks this one waits on.
+
+The body states what is specific to this task: the outcome, the files, the
+decisions already made, and concrete acceptance criteria. It does not restate
+the repo's working rules (those belong in the repo's agent instructions), the
+plan (link the document), or how to report back.
 
 `--deep` marks work that warrants the strongest model the dispatching agent
 offers rather than its workhorse. It changes only which model runs the task,
