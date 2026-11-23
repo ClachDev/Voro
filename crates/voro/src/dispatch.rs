@@ -166,6 +166,32 @@ Pick a git branch for this work. You are spawned in the project checkout — nev
 modify it. {isolate} Voro runs no git, so the branch and its worktree are yours
 to make; {register}; `<name>` is the name you choose. {rebase}";
 
+/// The guidance every task-drafting prompt gives on what a task body must
+/// carry, kept in one place so the four templates and the `voro-cli` skill
+/// cannot drift apart (a test ties the skill to it). The list of what the agent
+/// is given mirrors what [`spawn_session`] and [`render_preamble`] put in front
+/// of the body; change it when they change.
+macro_rules! body_guidance {
+    () => {
+        "\
+Write the body as a dispatchable prompt. The agent starts in the project
+checkout, so its harness loads the repo's agent instructions, and Voro also
+gives it: how to report back, the branch and worktree rules, the linked
+documents by location, the milestones the task counts toward, and a notice when
+the task was sent back from review. It gets nothing from your session and
+nothing from the tasks this one waits on.
+
+The body states what is specific to this task: the outcome, the files, the
+decisions already made, and concrete acceptance criteria. It does not restate
+the repo's working rules (those belong in the repo's agent instructions), the
+plan (link the document), or how to report back."
+    };
+}
+
+/// [`body_guidance!`] as a value, for the test that checks the skill against it.
+#[cfg(test)]
+const BODY_GUIDANCE: &str = body_guidance!();
+
 /// Rendered per planning session (DESIGN.md §8) and written as the whole
 /// prompt — unlike dispatch there is no task body to prepend it to, because
 /// producing one is the session's job. `{project}` is the project's name,
@@ -197,10 +223,9 @@ machine and event log.
 ";
 
 /// The body guidance of a planning session that drafts a task.
-const PLANNING_TASK_SHAPE: &str = "\
-Write the task body as a self-contained dispatchable prompt: the agent that
-picks it up later gets no other context, so name the relevant files, spell out
-the decisions already made, and give concrete acceptance criteria.
+const PLANNING_TASK_SHAPE: &str = concat!(
+    body_guidance!(),
+    "
 
 Say in the body where the task's evidence and outputs land — the pull request
 description, a decision record, a gitignored results directory, whatever the
@@ -208,7 +233,8 @@ project's own conventions call for — so the agent does not default to
 committing verification write-ups and work logs as new files. Ask the operator
 where they belong if the project states no convention. Say too what the task
 makes obsolete — existing files, docs, or tooling it replaces — and put
-retiring them in the same task's scope.";
+retiring them in the same task's scope."
+);
 
 /// The body guidance of a planning session that drafts a milestone (DESIGN.md
 /// §3). `{db}` is rendered before the shape is.
@@ -256,14 +282,19 @@ with raw SQL, which would bypass the state machine and event log.
 ";
 
 /// The expansion guidance of a quick propose that files a task.
-const PROPOSE_TASK_SHAPE: &str = "\
+const PROPOSE_TASK_SHAPE: &str = concat!(
+    "\
 Expand it into a title and a body. The title names what the task achieves, in
-one imperative line. The body is a self-contained dispatchable prompt: the agent
-that picks the task up later gets no other context, so name the relevant files,
-spell out the decisions the intent already settles, and give concrete acceptance
-criteria. The checkout you are running in is there to read, so the body can name
-real files and code. Do not modify it, and do not do the task itself — writing
-its brief is the job.";
+one imperative line.
+
+",
+    body_guidance!(),
+    "
+
+The decisions already made are those the intent settles. The checkout you are
+running in is there to read, so the body can name real files and code. Do not
+modify it, and do not do the task itself — writing its brief is the job."
+);
 
 /// The expansion guidance of a quick propose that files a milestone (DESIGN.md
 /// §3).
@@ -370,12 +401,18 @@ machine and event log.
 
 /// The body guidance of a note-driven refine of a task, continuing the
 /// template's opening sentence.
-const REFINE_TASK_SHAPE: &str = "\
-so that it reads as a dispatchable prompt: the agent that picks the task up later
-gets no other context, so name the relevant files, spell out the decisions
-already made, and give concrete acceptance criteria. The checkout you are running
-in is there to read, so the body can name real files and code. Do not modify the
-project's files, and do not do the task itself — writing its brief is the job.";
+const REFINE_TASK_SHAPE: &str = concat!(
+    "\
+as the operator's note below asks.
+
+",
+    body_guidance!(),
+    "
+
+The checkout you are running in is there to read, so the body can name real
+files and code. Do not modify the project's files, and do not do the task
+itself — writing its brief is the job."
+);
 
 /// The body guidance of a note-driven refine of a milestone (DESIGN.md §3),
 /// continuing the template's opening sentence.
@@ -389,10 +426,7 @@ running in is there to read, so the statement can name real behaviour. Do not
 modify the project's files, and do not do the work itself.";
 
 /// The body guidance of an interactive refine of a task.
-const REFINE_PLAN_TASK_SHAPE: &str = "\
-Write the body as a self-contained dispatchable prompt: the agent that picks it
-up later gets no other context, so name the relevant files, spell out the
-decisions already made, and give concrete acceptance criteria.";
+const REFINE_PLAN_TASK_SHAPE: &str = body_guidance!();
 
 /// The body guidance of an interactive refine of a milestone (DESIGN.md §3).
 const REFINE_PLAN_MILESTONE_SHAPE: &str = "\
@@ -2117,6 +2151,29 @@ mod tests {
             .keep()
     }
 
+    /// The `voro-cli` skill states the same body guidance the prompt templates
+    /// render, so an edit to one cannot leave the other behind. Wrapping is
+    /// free to differ; the words are not.
+    #[test]
+    fn the_skill_carries_the_body_guidance_the_templates_render() {
+        let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let skill = squash(include_str!(
+            "../../../plugins/voro/skills/voro-cli/SKILL.md"
+        ));
+        let guidance = squash(BODY_GUIDANCE);
+        assert!(
+            skill.contains(&guidance),
+            "SKILL.md must contain the body guidance verbatim:\n{guidance}"
+        );
+        for shape in [
+            PLANNING_TASK_SHAPE,
+            PROPOSE_TASK_SHAPE,
+            REFINE_TASK_SHAPE,
+            REFINE_PLAN_TASK_SHAPE,
+        ] {
+            assert!(squash(shape).contains(&guidance), "{shape}");
+        }
+    }
     #[test]
     fn fixtures_built_at_once_on_many_threads_get_distinct_roots() {
         const THREADS: usize = 8;

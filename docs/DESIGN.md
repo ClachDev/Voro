@@ -82,6 +82,19 @@ naming no repo runs in its project's default, which is why a single-repo project
 needs no repo vocabulary at all: `voro project add` creates the default repo,
 `voro project path` re-points it, and nothing else ever has to mention repos.
 
+A dispatchable body is not the agent's whole context. The agent starts in the
+task's checkout, where its harness loads the repo's agent instructions, and the
+dispatch preamble (§8) gives it the report-back verbs, the branch and worktree
+rules, the linked documents by location, the milestones the task counts
+toward, and a rework notice when the task was sent back. It gets nothing from
+the session that wrote the task and nothing from the tasks it waits on. The
+body therefore states what is specific to the task — the outcome, the files,
+the decisions already made, the acceptance criteria — and leaves the repo's
+working rules, the plan, and the report-back instructions to those other
+channels. Every prompt that drafts a body renders this guidance from one
+constant in `dispatch.rs`, and a test holds the `voro-cli` skill to the same
+words.
+
 A task may additionally be flagged **human**, marking work no agent can
 execute at all: hands-on work at real hardware ("capture a bag on the robot"),
 an errand, a phone call. The queue is a list of human next-actions either way,
@@ -2256,7 +2269,7 @@ command carrying `{prompt_file}`, built in for `claude` — that degrades like
 the other optional verbs, an agent without one yielding a status line saying
 what to configure. The prompt seeds the session with its job: it is drafting a
 task for that project; interview the operator as needed; write the body as a
-self-contained dispatchable prompt; and when the operator confirms, create the
+dispatchable prompt (§3 says what it carries); and when the operator confirms, create the
 task with `voro add` — the CLI is the agent's interface exactly as in
 dispatch, down to the rendered `--db` flag for a non-default store, so Voro
 gains no new store write path and parses no agent output. When the session
