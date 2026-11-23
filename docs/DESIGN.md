@@ -2691,7 +2691,11 @@ shift-drag, the usual bypass, is not honoured by every terminal, and it is not
 by the operator's. `p`, on every screen, turns reporting off and back on. Off,
 a drag selects text the way the terminal always does, which is how a command
 in a task body, a branch name or a PR URL leaves the TUI; clicks do nothing
-until `p` is pressed again. The setting is the operator's, not the terminal's:
+until `p` is pressed again. It is a key rather than a `voro.toml` setting
+because the two states are not chosen once: clicking a row is the everyday
+input and copying text the occasional one, so reporting goes off for one
+copy and comes straight back, and a setting would mean a trip to the Config
+screen and back for every copy. The state is the operator's, not the terminal's:
 each round-trip that hands the terminal to `$EDITOR`, an attached session or a
 planning session re-takes it in whichever state `p` left. While reporting is
 off the right end of the key line says `mouse off`, because a click that does
