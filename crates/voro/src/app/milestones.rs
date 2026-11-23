@@ -528,7 +528,7 @@ pub(crate) mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            message_grace: std::time::Duration::from_millis(300),
+            launch_grace: std::time::Duration::from_millis(300),
         };
         alt_key(&mut app, KeyCode::Char('2'));
         app.tasks_sel = app

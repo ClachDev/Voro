@@ -1760,7 +1760,7 @@ pub(crate) mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            message_grace: std::time::Duration::from_millis(300),
+            launch_grace: std::time::Duration::from_millis(300),
         };
         app
     }
@@ -1804,6 +1804,39 @@ pub(crate) mod tests {
             .unwrap();
         app.refresh().unwrap();
         app
+    }
+
+    /// A dispatch the launcher refuses puts the launcher's own words on the
+    /// status line and leaves the task in the queue (DESIGN.md §8).
+    #[test]
+    fn a_refused_dispatch_puts_the_launchers_words_on_the_status_line() {
+        let mut app = app_with_agents(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \": {prompt_file}; echo 'Workspace not trusted. Run claude once, then retry.'; exit 1\"\n",
+        );
+        let checkout = app.dispatch_ctx.runtime_dir.with_file_name("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let project_id = app.projects[0].id;
+        app.store
+            .set_default_repo_path(project_id, checkout.to_str().unwrap())
+            .unwrap();
+        let task_id = app.store.tasks().unwrap()[0].id;
+
+        app.dispatch_task(task_id, None);
+
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("was not dispatched"), "{status}");
+        assert!(
+            status.contains("Workspace not trusted. Run claude once, then retry."),
+            "{status}"
+        );
+        assert_eq!(app.store.task(task_id).unwrap().state, TaskState::Ready);
     }
 
     /// Every prompt the app's dispatch context has written, newest last.

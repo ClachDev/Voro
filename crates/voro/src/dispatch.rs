@@ -14,12 +14,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voro_core::{
-    AgentsConfig, Launch, LaunchSpec, ResolvedAgent, ReviewDiff, Session, Store, TaskState,
-    VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, render,
+    AgentsConfig, Launch, LaunchSpec, LivenessSource, ResolvedAgent, ReviewDiff, Session, Store,
+    TaskState, VIEWER_BASE_PLACEHOLDER, VIEWER_BRANCH_PLACEHOLDER, VIEWER_PATH_PLACEHOLDER, render,
 };
 
 /// Command assembly owns its own quoting, so this is voro-core's; re-exported
@@ -867,6 +867,24 @@ struct Spawned {
     child: Child,
 }
 
+impl Spawned {
+    /// [`launch_refusal`] for an expansion, leaving the exit in the launch log
+    /// beside the spawn line [`spawn_logged`] wrote, as the reaper would have.
+    fn refusal(
+        &mut self,
+        ctx: &DispatchCtx,
+        source: LivenessSource,
+        agent: &str,
+    ) -> Option<String> {
+        let text = launch_refusal(&mut self.child, source, ctx, agent, &self.log_path)?;
+        append_launch_log(
+            &ctx.launch_log_path(),
+            &format!("{}: refused before starting", self.label),
+        );
+        Some(text)
+    }
+}
+
 /// Spawn an [`Expansion`] detached, with its output captured to a log beside the
 /// session logs. Both the log and the session name matter to the operator: the
 /// launcher exits at birth, so the log holds its banner rather than the rewrite,
@@ -1021,7 +1039,7 @@ pub fn refine(
 
     let cwd = repo.path.clone();
     let spawn_ms = now_ms();
-    let spawned = spawn_expansion(
+    let mut spawned = spawn_expansion(
         ctx,
         Expansion {
             launch: Launch::Refine { task_id },
@@ -1031,6 +1049,15 @@ pub fn refine(
             cwd: repo.path,
         },
     )?;
+    let source = agent.dispatch_liveness_source();
+    if let Some(text) = spawned.refusal(ctx, source, &agent.name) {
+        store
+            .record_launch_failure(task_id, &text)
+            .map_err(|e| e.to_string())?;
+        return Err(format!(
+            "task {task_id} was not sent for refinement: {text}"
+        ));
+    }
     let pid = spawned.pid;
     let log_path = spawned.log_path.clone();
     let session_name = spawned.session_name.clone();
@@ -1044,7 +1071,7 @@ pub fn refine(
         note,
         &agent.name,
         Some(pid),
-        agent.dispatch_liveness_source(),
+        source,
         Some(log_path.to_string_lossy().as_ref()),
     );
     let session = match recorded {
@@ -1094,9 +1121,10 @@ pub fn refine(
 /// files the task itself with `voro add`. The third instance of the Expansion
 /// shape, and the thinnest — there is no task yet, so unlike a refine this opens
 /// no session row, moves no state, and captures no session reference. Nothing
-/// waits on it: the proposal appears in the queue on a later refresh, and a
-/// failure leaves its trace in the launch log and the session log rather than in
-/// the UI, since there is no row to hang it on.
+/// waits on it past its launch: a launcher that refuses is reported as an error
+/// (DESIGN.md §8), and the proposal otherwise appears in the queue on a later
+/// refresh. A failure after launch leaves its trace in the launch log and the
+/// session log rather than in the UI, since there is no row to hang it on.
 ///
 /// The *default* agent runs it whatever the queue holds, for the same reason a
 /// refine's does: writing a brief is not executing it. The session is named
@@ -1141,7 +1169,7 @@ pub fn propose(
         ));
     }
 
-    let spawned = spawn_expansion(
+    let mut spawned = spawn_expansion(
         ctx,
         Expansion {
             launch: Launch::Propose {
@@ -1153,6 +1181,9 @@ pub fn propose(
             cwd: repo.path,
         },
     )?;
+    if let Some(text) = spawned.refusal(ctx, agent.dispatch_liveness_source(), &agent.name) {
+        return Err(format!("the proposal was not started: {text}"));
+    }
     reap_expansion(spawned, ctx.launch_log_path());
 
     Ok(format!(
@@ -1162,13 +1193,20 @@ pub fn propose(
     ))
 }
 
-/// How long [`send_message`] watches a spawned send before calling it started.
-const MESSAGE_GRACE: Duration = Duration::from_secs(2);
+/// How long a spawned process that stays in the foreground — a send, or a
+/// dispatch like `codex exec` — is watched before it is called started.
+const LAUNCH_GRACE: Duration = Duration::from_secs(2);
 
-/// How often that window is polled.
+/// How long a launcher that exits at birth (`claude --bg`) is waited on for
+/// that exit. Its refusals and its successful hand-offs both take a few seconds,
+/// so the window is generous; a launcher still running at its end is treated as
+/// started, as a foreground agent is.
+const LAUNCHER_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often those windows are polled.
 const MESSAGE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// How much of a failed send's log to look at for the line to quote back.
+/// How much of a failed launch's log to look at for the text to quote back.
 const LOG_TAIL_BYTES: u64 = 4096;
 
 /// How long the send path's release is waited on before the send is refused
@@ -1270,7 +1308,7 @@ pub fn send_message(ctx: &DispatchCtx, msg: SessionMessage) -> Result<SentMessag
     )?;
     // An exit inside the window is only a failure if it failed: a verb that
     // says its piece and returns cleanly has delivered the message.
-    if let Some(status) = wait_for_early_exit(&mut spawned.child, ctx.message_grace)
+    if let Some(status) = wait_for_early_exit(&mut spawned.child, ctx.launch_grace)
         && !status.success()
     {
         append_launch_log(
@@ -1315,6 +1353,15 @@ fn wait_for_early_exit(child: &mut Child, grace: Duration) -> Option<std::proces
 /// account of why it refused, which is otherwise only in the log file. Empty
 /// when there is nothing to quote.
 fn log_tail_note(path: &Path) -> String {
+    match log_tail(path).lines().rev().find(|l| !l.trim().is_empty()) {
+        Some(line) => format!(": {}", line.trim().chars().take(160).collect::<String>()),
+        None => String::new(),
+    }
+}
+
+/// The last [`LOG_TAIL_BYTES`] of a launch log, colour codes stripped and
+/// trimmed. Empty when the log cannot be read or holds nothing.
+fn log_tail(path: &Path) -> String {
     let Ok(mut file) = File::open(path) else {
         return String::new();
     };
@@ -1325,14 +1372,53 @@ fn log_tail_note(path: &Path) -> String {
     {
         return String::new();
     }
-    let mut tail = String::new();
-    if file.read_to_string(&mut tail).is_err() {
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
         return String::new();
     }
-    match tail.lines().rev().find(|l| !l.trim().is_empty()) {
-        Some(line) => format!(": {}", line.trim().chars().take(160).collect::<String>()),
-        None => String::new(),
+    strip_ansi(&String::from_utf8_lossy(&bytes))
+        .trim()
+        .to_string()
+}
+
+/// Watch a freshly spawned launch long enough to know whether it started
+/// (DESIGN.md §8), returning the account of a refusal in the launcher's own
+/// words, or `None` for a launch that started. The verdict is the exit status,
+/// read over a window chosen by whose pid the child is — which the liveness
+/// source already records. A launcher that hands the work to a supervisor
+/// (`claude --bg`) exits at birth whether it succeeded or not, so it is waited
+/// on for that exit. A foreground agent (`codex exec`) is the work itself, so
+/// it gets the short grace a refusal needs, and one still running past it has
+/// started. A clean exit is a start in both cases.
+fn launch_refusal(
+    child: &mut Child,
+    source: LivenessSource,
+    ctx: &DispatchCtx,
+    agent: &str,
+    log_path: &Path,
+) -> Option<String> {
+    let window = match source {
+        LivenessSource::Listing => LAUNCHER_EXIT_TIMEOUT,
+        LivenessSource::Pid => ctx.launch_grace,
+    };
+    let status = wait_for_early_exit(child, window).filter(|s| !s.success())?;
+    Some(refusal_text(agent, status, log_path))
+}
+
+/// A refused launch as the operator reads it: what exited and how, where the
+/// log is, then the launcher's output verbatim — the untrusted-workspace
+/// refusal names its own remedy, so it is passed through rather than reworded.
+fn refusal_text(agent: &str, status: ExitStatus, log_path: &Path) -> String {
+    let mut text = format!(
+        "'{agent}' exited with {status} before a session started — log {}",
+        log_path.display()
+    );
+    let output = log_tail(log_path);
+    if !output.is_empty() {
+        text.push('\n');
+        text.push_str(&output);
     }
+    text
 }
 
 /// Where dispatch finds its inputs and puts its artefacts. Built from the
@@ -1350,11 +1436,12 @@ pub struct DispatchCtx {
     /// agent that defines a `sessions` verb, before giving up (the ref stays
     /// NULL and the summary says so). Zero means a single attempt.
     pub ref_capture_timeout: Duration,
-    /// How long a quick message's process gets to prove it started before the
-    /// send is treated as having landed (DESIGN.md §8). Long enough for a
-    /// refusal — which is immediate — to be caught, short enough that the TUI
-    /// does not visibly stall. Zero means a single look.
-    pub message_grace: Duration,
+    /// How long a quick message's process, or a dispatch that stays in the
+    /// foreground, gets to prove it started before it is treated as running
+    /// (DESIGN.md §8). Long enough for a refusal — which is immediate — to be
+    /// caught, short enough that the TUI does not visibly stall. Zero means a
+    /// single look.
+    pub launch_grace: Duration,
 }
 
 impl DispatchCtx {
@@ -1371,7 +1458,7 @@ impl DispatchCtx {
             agents_path: AgentsConfig::default_path(),
             runtime_dir,
             ref_capture_timeout: Duration::from_secs(5),
-            message_grace: MESSAGE_GRACE,
+            launch_grace: LAUNCH_GRACE,
         }
     }
 
@@ -1862,11 +1949,23 @@ fn spawn_session(
         .map_err(|e| format!("cannot spawn agent '{}': {e}", agent.name))?;
     let pid = i64::from(child.id());
 
+    // A launch the agent refused never reaches the state machine: the task
+    // stays where it was, dispatchable, and the refusal is logged against it
+    // (DESIGN.md §8). Recording first and stalling after would leave a
+    // listing-sourced session with no ref to probe, running forever.
+    let source = agent.dispatch_liveness_source();
+    if let Some(text) = launch_refusal(&mut child, source, ctx, &agent.name, &log_path) {
+        store
+            .record_launch_failure(task_id, &text)
+            .map_err(|e| e.to_string())?;
+        return Err(format!("task {task_id} was not dispatched: {text}"));
+    }
+
     let recorded = store.record_dispatch(
         task_id,
         &agent.name,
         Some(pid),
-        agent.dispatch_liveness_source(),
+        source,
         Some(log_path.to_string_lossy().as_ref()),
     );
     let (task, session) = match recorded {
@@ -2101,7 +2200,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: Duration::ZERO,
-            message_grace: std::time::Duration::from_millis(300),
+            launch_grace: std::time::Duration::from_millis(300),
         };
         (store, ctx, project)
     }
@@ -2337,6 +2436,150 @@ mod tests {
         assert!(err.contains("{task_id}"), "{err}");
         assert!(err.contains("stub"), "{err}");
         assert!(!ctx.runtime_dir.exists(), "nothing was written");
+    }
+
+    /// A launcher refusing before any session exists, in the words and with the
+    /// status `claude --bg` uses for a checkout it has never been trusted in.
+    const REFUSING_LAUNCHER: &str = ": {prompt_file}; echo 'Workspace not trusted. Run claude in \
+                                     this checkout once and accept the trust prompt, then retry.'; \
+                                     exit 1";
+
+    fn assert_refused_with_the_launchers_words(store: &Store, id: i64, err: &str) {
+        assert!(err.contains("exit status: 1"), "{err}");
+        assert!(err.contains("Workspace not trusted. Run claude"), "{err}");
+        assert!(err.contains("then retry."), "{err}");
+        assert!(store.sessions_for(id).unwrap().is_empty(), "no session row");
+        let events = store.events_for(id).unwrap();
+        let failure = events
+            .iter()
+            .find(|e| e.kind == voro_core::LAUNCH_FAILED_EVENT)
+            .expect("a launch-failed event");
+        assert!(
+            failure
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("accept the trust prompt, then retry.")),
+            "{failure:?}"
+        );
+        assert!(store.launch_failure(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_refused_foreground_launch_leaves_the_task_dispatchable() {
+        let (mut store, ctx, project) = fixture(REFUSING_LAUNCHER);
+        let id = ready_task(&mut store, &project);
+
+        let err = dispatch(&mut store, &ctx, id, None).unwrap_err();
+        assert!(
+            err.contains(&format!("task {id} was not dispatched")),
+            "{err}"
+        );
+        assert_eq!(store.task(id).unwrap().state, TaskState::Ready);
+        assert_refused_with_the_launchers_words(&store, id, &err);
+
+        // nothing is left behind that blocks the next attempt
+        let (_, ctx_ok, _) = fixture("cat {prompt_file}");
+        let ctx = DispatchCtx {
+            agents_path: ctx_ok.agents_path,
+            ..ctx
+        };
+        dispatch(&mut store, &ctx, id, None).unwrap();
+        assert_eq!(store.task(id).unwrap().state, TaskState::Running);
+        assert_eq!(store.launch_failure(id).unwrap(), None);
+    }
+
+    /// An agent with a `sessions` verb records a listing-sourced session, whose
+    /// spawned pid is a launcher: the refusal is read from that launcher's exit,
+    /// not from an absent banner.
+    #[test]
+    fn a_refused_backgrounding_launch_leaves_a_stalled_task_stalled() {
+        let (mut store, ctx, project) = fixture_toml(&format!(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"{REFUSING_LAUNCHER}\"\nsessions = \"echo []\"\n"
+        ));
+        let id = ready_task(&mut store, &project);
+        let session = store
+            .record_dispatch(id, "stub", Some(1), LivenessSource::Pid, None)
+            .unwrap()
+            .1;
+        store.reconcile_session(session.id, false, false).unwrap();
+        assert_eq!(store.task(id).unwrap().state, TaskState::Stalled);
+
+        let err = dispatch(&mut store, &ctx, id, None).unwrap_err();
+        assert_eq!(store.task(id).unwrap().state, TaskState::Stalled);
+        assert_eq!(store.sessions_for(id).unwrap().len(), 1, "no new session");
+        let events = store.events_for(id).unwrap();
+        assert_eq!(
+            events.last().map(|e| e.kind.as_str()),
+            Some(voro_core::LAUNCH_FAILED_EVENT)
+        );
+        assert!(err.contains("Workspace not trusted"), "{err}");
+    }
+
+    #[test]
+    fn a_backgrounding_launch_that_hands_off_still_dispatches() {
+        let (mut store, ctx, project) = fixture_toml(
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             dispatch = \"sleep 0.2; echo backgrounded · job42; : {prompt_file}\"\n\
+             sessions = \"echo []\"\n",
+        );
+        let id = ready_task(&mut store, &project);
+
+        let summary = dispatch(&mut store, &ctx, id, None).unwrap();
+        assert_eq!(store.task(id).unwrap().state, TaskState::Running);
+        let session = &store.sessions_for(id).unwrap()[0];
+        assert_eq!(session.liveness_source, LivenessSource::Listing);
+        // the launcher has exited by the time capture looks, so even a single
+        // attempt finds its banner
+        assert_eq!(session.session_ref.as_deref(), Some("job42"), "{summary}");
+    }
+
+    #[test]
+    fn a_foreground_launch_still_running_past_the_grace_dispatches() {
+        let (mut store, ctx, project) = fixture("sleep 5; : {prompt_file}");
+        let id = ready_task(&mut store, &project);
+
+        let started = Instant::now();
+        dispatch(&mut store, &ctx, id, None).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "did not wait it out"
+        );
+        assert_eq!(store.task(id).unwrap().state, TaskState::Running);
+        assert_eq!(store.launch_failure(id).unwrap(), None);
+        let session = &store.sessions_for(id).unwrap()[0];
+        assert_eq!(session.liveness_source, LivenessSource::Pid);
+        let _ = Command::new("kill")
+            .args(["-TERM", "--"])
+            .arg(format!("-{}", session.pid.unwrap()))
+            .status();
+    }
+
+    #[test]
+    fn a_refused_refine_opens_no_round_and_says_why() {
+        let (mut store, ctx, project) = fixture(REFUSING_LAUNCHER);
+        let id = proposal(&mut store, &project, false);
+
+        let err = refine(&mut store, &ctx, id, "name the files").unwrap_err();
+        assert!(err.contains("was not sent for refinement"), "{err}");
+        assert_eq!(store.task(id).unwrap().state, TaskState::Proposed);
+        assert!(!store.refine_failed_flag(id).unwrap());
+        assert_refused_with_the_launchers_words(&store, id, &err);
+    }
+
+    #[test]
+    fn a_refused_propose_says_why() {
+        let (mut store, ctx, project) = fixture(REFUSING_LAUNCHER);
+        let p = store
+            .create_project("proj", project.to_str().unwrap())
+            .unwrap();
+
+        let err = propose(&store, &ctx, p.id, "cache the score view", Filing::Task).unwrap_err();
+        assert!(err.contains("the proposal was not started"), "{err}");
+        assert!(
+            err.contains("accept the trust prompt, then retry."),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2920,7 +3163,7 @@ mod tests {
         // give the stub time to write the line before capture's single poll
         let ctx = DispatchCtx {
             ref_capture_timeout: Duration::from_secs(3),
-            message_grace: std::time::Duration::from_millis(300),
+            launch_grace: std::time::Duration::from_millis(300),
             ..ctx
         };
         let summary = dispatch(&mut store, &ctx, id, None).unwrap();

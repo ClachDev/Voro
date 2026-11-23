@@ -1447,7 +1447,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            message_grace: std::time::Duration::from_millis(300),
+            launch_grace: std::time::Duration::from_millis(300),
         };
         (store, ctx, project_path)
     }
@@ -1496,7 +1496,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            message_grace: std::time::Duration::from_millis(300),
+            launch_grace: std::time::Duration::from_millis(300),
         };
         let project = store
             .create_project("demo", project_path.to_str().unwrap())

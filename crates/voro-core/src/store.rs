@@ -1897,7 +1897,39 @@ impl Store {
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
+
+    /// Record a launch that never started (DESIGN.md §8): the agent's launcher
+    /// refused before any session existed, so no session row or transition is
+    /// written and the task stays where it was. `detail` carries the launcher's
+    /// own output, which is the only account of why.
+    pub fn record_launch_failure(&mut self, task_id: i64, detail: &str) -> Result<()> {
+        self.task(task_id)?;
+        log_event(&self.conn, task_id, LAUNCH_FAILED_EVENT, Some(detail))
+    }
+
+    /// The newest launch failure's detail while it is still the task's latest
+    /// word on a launch, `None` once any transition has followed it — a
+    /// successful relaunch, a park, a refine round — or when there was none.
+    pub fn launch_failure(&self, task_id: i64) -> Result<Option<String>> {
+        let latest = self
+            .conn
+            .query_row(
+                "SELECT kind, detail FROM events
+                 WHERE task_id = ?1 AND kind IN (?2, 'transition')
+                 ORDER BY id DESC LIMIT 1",
+                params![task_id, LAUNCH_FAILED_EVENT],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(match latest {
+            Some((kind, detail)) if kind == LAUNCH_FAILED_EVENT => Some(detail.unwrap_or_default()),
+            _ => None,
+        })
+    }
 }
+
+/// The event kind [`Store::record_launch_failure`] writes.
+pub const LAUNCH_FAILED_EVENT: &str = "launch-failed";
 
 pub(crate) const TASK_COLUMNS: &str = "id, project_id, title, body, priority, state, agent, \
                                        question, pr_url, branch, state_since, created_at, \
@@ -2443,6 +2475,27 @@ mod tests {
             deep: false,
             milestone: false,
         }
+    }
+
+    #[test]
+    fn a_launch_failure_stands_until_a_transition_follows_it() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.create_project("p", "/tmp/p").unwrap();
+        let task = s.create_task(new_ready(p.id)).unwrap();
+        assert_eq!(s.launch_failure(task.id).unwrap(), None);
+
+        s.record_launch_failure(task.id, "Workspace not trusted.")
+            .unwrap();
+        assert_eq!(s.task(task.id).unwrap().state, TaskState::Ready);
+        assert_eq!(
+            s.launch_failure(task.id).unwrap().as_deref(),
+            Some("Workspace not trusted.")
+        );
+
+        s.record_dispatch(task.id, "claude", Some(1), LivenessSource::Pid, None)
+            .unwrap();
+        assert_eq!(s.launch_failure(task.id).unwrap(), None);
+        assert!(s.record_launch_failure(9999, "x").is_err());
     }
 
     #[test]

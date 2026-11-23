@@ -1909,6 +1909,11 @@ fn show_verb(store: &mut Store, id: i64) -> Result<String, String> {
         )
         .unwrap();
     }
+    // A launch the agent refused (DESIGN.md §8) left no session and no
+    // transition, so nothing else on the page says it happened.
+    if let Some(detail) = store.launch_failure(id).map_err(|e| e.to_string())? {
+        writeln!(out, "launch failed: {detail}").unwrap();
+    }
     // The stale-branch marker (DESIGN.md §8): one on-demand `gh` probe of the
     // tracked PR's mergeability, only for a review task that has one. Purely
     // informational — a CONFLICTING verdict flags that the branch needs
@@ -2779,7 +2784,7 @@ mod tests {
             agents_path: agents_path.clone(),
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            message_grace: std::time::Duration::from_millis(300),
+            launch_grace: std::time::Duration::from_millis(300),
         };
         let mut s = store();
         let call = |s: &mut Store, args: &[&str]| {
@@ -2828,7 +2833,7 @@ mod tests {
             agents_path,
             runtime_dir: dir.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            message_grace: std::time::Duration::from_millis(300),
+            launch_grace: std::time::Duration::from_millis(300),
         };
         let mut s = store();
         let call = |s: &mut Store, args: &[&str]| {
@@ -5167,7 +5172,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            message_grace: std::time::Duration::from_millis(300),
+            launch_grace: std::time::Duration::from_millis(300),
         }
     }
 
@@ -5629,6 +5634,82 @@ mod tests {
     /// purely by a later CLI verb reading state — no code here ever calls the
     /// reconciliation function directly. The task lands in `stalled`,
     /// recording a `reconcile` event that the history surfaces.
+    /// A dispatch the agent's launcher refuses prints the launcher's own words
+    /// as the verb's error, leaves the task `ready`, and `show` carries the
+    /// refusal until a later launch supersedes it (DESIGN.md §8).
+    #[test]
+    fn a_refused_dispatch_is_reported_by_dispatch_and_by_show() {
+        use std::process::{Command, Stdio};
+
+        let root = tempfile::Builder::new()
+            .prefix("voro-cli-refused-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["init", "-q"])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let db_path = root.join("voro.db");
+        let agents_path = root.join("voro.toml");
+        std::fs::write(
+            &agents_path,
+            "default_agent = \"stub\"\n\n[agents.stub]\n\
+             cmd = \": {prompt_file}; echo 'Workspace not trusted. Run claude once, then retry.'; exit 1\"\n",
+        )
+        .unwrap();
+        let mut store = Store::open(&db_path).unwrap();
+        let ctx = crate::dispatch::DispatchCtx {
+            db_path,
+            agents_path,
+            runtime_dir: root.join("sessions"),
+            ref_capture_timeout: std::time::Duration::ZERO,
+            launch_grace: std::time::Duration::from_millis(300),
+        };
+        ok(
+            &mut store,
+            &["project", "add", "demo", project.to_str().unwrap()],
+        );
+        ok(
+            &mut store,
+            &["add", "demo", "Do the thing", "--state", "ready"],
+        );
+
+        let err = run(
+            &mut store,
+            vec!["dispatch".to_string(), "1".to_string()],
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(err.contains("task 1 was not dispatched"), "{err}");
+        assert!(
+            err.contains("Workspace not trusted. Run claude once, then retry."),
+            "{err}"
+        );
+
+        let out = run(&mut store, vec!["show".to_string(), "1".to_string()], &ctx).unwrap();
+        assert!(out.contains("#1 ready"), "{out}");
+        assert!(
+            out.contains("launch failed: 'stub' exited with exit status: 1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Workspace not trusted. Run claude once, then retry."),
+            "{out}"
+        );
+        assert!(
+            out.contains("launch-failed"),
+            "the event is in the history: {out}"
+        );
+    }
+
     #[test]
     fn a_dead_dispatched_session_is_finalised_and_stalled_on_read() {
         use std::process::{Command, Stdio};
@@ -5655,10 +5736,11 @@ mod tests {
 
         let db_path = root.join("voro.db");
         let agents_path = root.join("voro.toml");
-        // an agent command that exits immediately with failure, as if it crashed
+        // an agent command that outlives the launch grace, then exits with
+        // failure, as if it crashed mid-task
         std::fs::write(
             &agents_path,
-            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"false {prompt_file}\"\n",
+            "default_agent = \"stub\"\n\n[agents.stub]\ncmd = \"sleep 0.6; false {prompt_file}\"\n",
         )
         .unwrap();
 
@@ -5668,7 +5750,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            message_grace: std::time::Duration::from_millis(300),
+            launch_grace: std::time::Duration::from_millis(300),
         };
         ok(
             &mut store,
@@ -5684,7 +5766,7 @@ mod tests {
         assert_eq!(store.task(1).unwrap().state, TaskState::Running);
 
         // give the spawned shell a moment to actually exit
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(700));
 
         // a plain read-only verb — not a direct call to the reconciler —
         // must notice the dead process, finalise the session, and land the
@@ -5745,7 +5827,7 @@ mod tests {
             agents_path,
             runtime_dir: root.join("sessions"),
             ref_capture_timeout: std::time::Duration::ZERO,
-            message_grace: std::time::Duration::from_millis(300),
+            launch_grace: std::time::Duration::from_millis(300),
         };
         (store, ctx, project)
     }

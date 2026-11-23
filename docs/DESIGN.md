@@ -2151,6 +2151,34 @@ Spawning happens only after every check that can fail (task is `ready`, agent
 resolves, path is a git repository, prompt writes); the `ready → running`
 transition and the session insert then land together in one transaction, so a
 running task always has a session and a session always names a live dispatch.
+
+That transaction waits until the launch has shown it started, and the
+evidence is the spawned process's exit status. Which window it is read over
+follows the liveness source the launch is about to record. A
+listing-authoritative launch (`claude --bg`) spawns a launcher that exits at
+birth whether or not it handed off, so Voro waits for that exit, up to ten
+seconds. A pid-authoritative launch (`codex exec`) is the work itself and stays
+in the foreground, so it gets the same two-second grace a quick message does;
+one still running at the end of it has started. A clean exit is a start in
+both cases. A non-zero exit is a refused launch: the agent never ran, so no
+session is opened and no transition fires. The task stays `ready` (or
+`stalled`), dispatchable as before, and a `launch-failed` event records the
+exit status, the log path and the launcher's output verbatim. The caller
+returns that text as its error, so it reaches the TUI's status line and the
+CLI's stderr, and `voro show` repeats it on a `launch failed:` line until a
+transition supersedes it. The refusal that prompted this is Claude's
+`Workspace not trusted. Run claude in <path> once and accept the trust prompt,
+then retry.`, which every newly registered checkout hits on its first
+dispatch; it exits 1 after about three and a half seconds and names its own
+remedy, so the text is passed through rather than reworded. Recording the
+session first and stalling it afterwards would not do: a listing-authoritative
+session with no captured ref is unanswerable to reconcile, so it would sit in
+`running` indefinitely. A refine and a quick propose run the same `dispatch`
+template and take the same check. A refused refine opens no round and logs
+the same event against the task, which stays where it was; a refused propose
+has no task to log against, so its refusal is reported only as the error. A
+planning session is not checked: it runs in the operator's own terminal,
+where any refusal is in front of them.
 Every template Voro fills — those command lines, the dispatch preamble,
 the planning and refine prompts — goes through one substitution routine that
 makes a single left-to-right pass and emits each bound value verbatim, never
