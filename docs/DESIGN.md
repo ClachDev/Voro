@@ -4,8 +4,8 @@
 **Author:** Michael Johnson (with Claude)
 
 This document is the authoritative description of Voro's design: its concepts
-(§3), store schema (§5), task state machine (§6), scoring (§7), and dispatch
-semantics (§8). It describes the tool as it is; the version history lives in
+(§3), store schema (§5), task state machine (§6), scoring (§7), dispatch
+semantics (§8), and tracker sync (§13). It describes the tool as it is; the version history lives in
 `CHANGELOG.md` and git.
 
 ## 1. Problem
@@ -48,9 +48,9 @@ loop between the queue and running work.
 **Non-goals**, at least for v1. No automatic task generation — agents may
 *propose* tasks, but nothing enters the priority queues without explicit human
 triage. No team features, sync servers, or cloud components; this is a
-single-operator tool. No two-way sync with GitHub issues in v1 — issues can be
-imported as tasks, but Voro's store is the source of truth for priority and
-state. No terminal multiplexing: Voro tracks and steers sessions at the task
+single-operator tool; the one network partner is an upstream issue tracker,
+reached by an operator-run `voro sync` (§13), which divides ownership by
+field rather than making either side the source of truth. No terminal multiplexing: Voro tracks and steers sessions at the task
 level, but attaching to a live agent is the agent's own tooling's job.
 
 ## 3. Concepts
@@ -343,6 +343,8 @@ CREATE TABLE repos (            -- execution targets under a project (§3)
   name       TEXT NOT NULL,        -- what `--repo` and the `repo` verbs name
   path       TEXT NOT NULL,        -- checkout location; third-party repos welcome
   is_default INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0,1)),
+  upstream   TEXT UNIQUE,            -- issue tracker this checkout syncs with (§13):
+                                     -- 'owner/name' on GitHub; NULL = local only
   UNIQUE (project_id, name)
 );
 CREATE UNIQUE INDEX repos_one_default ON repos(project_id) WHERE is_default = 1;
@@ -392,6 +394,27 @@ CREATE TABLE task_docs (         -- deliberately not constrained to one project
   PRIMARY KEY (task_id, doc_id)
 );
 CREATE INDEX task_docs_by_doc ON task_docs(doc_id);
+
+CREATE TABLE task_links (        -- a task's upstream issue (§13); absent = local only
+  task_id      INTEGER PRIMARY KEY REFERENCES tasks(id),
+  tracker      TEXT NOT NULL,        -- 'github'; 'linear' later; validated in the store API
+  external_id  TEXT NOT NULL,        -- canonical id: 'owner/name#123' on GitHub
+  url          TEXT NOT NULL,
+  origin       TEXT NOT NULL CHECK (origin IN ('down','promoted')),
+                                     -- arrived by down-sync, or created by `voro promote`
+  seen_title   TEXT NOT NULL,        -- upstream's title, body and open/closed state
+  seen_body    TEXT NOT NULL,        -- as the last sync read them
+  seen_state   TEXT NOT NULL CHECK (seen_state IN ('open','closed')),
+  seen_assigned INTEGER NOT NULL CHECK (seen_assigned IN (0,1)),
+                                     -- 1 = assigned to the operator at the last read
+  applied_body TEXT NOT NULL,        -- the upstream description last copied into tasks.body
+  pushed_projection TEXT CHECK (pushed_projection IN
+                     ('open','in-progress','in-review','closed')),
+                                     -- last projection written upstream; NULL = never
+  pushed_pr_url TEXT,                -- last pr_url announced upstream; NULL = never
+  synced_at    TEXT NOT NULL,
+  UNIQUE (tracker, external_id)
+);
 
 CREATE TABLE deps (              -- taxonomy borrowed from beads
   task_id    INTEGER NOT NULL REFERENCES tasks(id),
@@ -481,6 +504,19 @@ project, checked on both create and re-point. One helper —
 `Store::repo_for_task` — resolves a task's checkout, its own repo when set and
 the project's default otherwise, and every consumer that wants a working
 directory goes through it rather than reading `repo_id` itself.
+
+The **sync** additions (§13) are additive too: one nullable column on
+`repos` and one table keyed by task. They sit in their own table rather than
+on `tasks` because most tasks never leave the machine, and because the link
+carries a snapshot of the far side that has nothing to do with the task's own
+fields. The snapshot stores text, not hashes, for the reason the migration
+journal does: a hash says upstream changed but never how, and `show` on a
+task marked upstream-changed is expected to print the difference. Two
+columns hold upstream's description, `seen_body` and `applied_body`, because
+they diverge exactly when the task is in flight and the change has been read
+but deliberately not applied (§13); the marker that says so is derived from
+their difference and stored nowhere. `repos.upstream` is unique because two
+checkouts claiming one tracker would give each arriving issue two homes.
 
 The **docs** tables (§3) are purely additive — no existing row changes shape
 — and the invariants that matter live in the store API beside the repo ones,
@@ -654,10 +690,10 @@ max_running = 5
 
 | State | Meaning | Enters by | Leaves by |
 |---|---|---|---|
-| `proposed` | Suggested (often by an agent post-task); not yet triaged. In the queue for triage; never dispatched. | agent proposal, quick capture; a refine round concluding | human triage → `ready`/`parked`, or → `rejected`; *refine* (below) → `refining` |
+| `proposed` | Suggested (often by an agent post-task); not yet triaged. In the queue for triage; never dispatched. | agent proposal, quick capture; down-sync of an assigned issue (§13); a refine round concluding; an upstream description change (§13) | human triage → `ready`/`parked`, or → `rejected`; *refine* (below) → `refining` |
 | `refining` | An agent is rewriting this task's body right now (below). Out of the queue — the body a triage verdict would judge, or a dispatch would hand an agent, does not exist yet — and on the running strip instead. | *refine*, either flavour, from `proposed` or from `ready` | the rewritten body lands, the agent dies, the session is quit, or the operator cancels → `proposed`, whichever state the round began in |
-| `parked` | Triaged, real, but out of the running: dependencies open or deliberately deferred. Invisible to scheduler. | triage; dependency added | dependencies close → `ready`; manual unpark → `ready`; abandon → `rejected` |
-| `ready` | Actionable now. Eligible for the queue's start rows and for `voro next`. | triage; last blocker closes | dispatch or manual start → `running`; *refine* (below) → `refining`; park → `parked`; abandon → `rejected` |
+| `parked` | Triaged, real, but out of the running: dependencies open or deliberately deferred. Invisible to scheduler. | triage; dependency added | dependencies close → `ready`; manual unpark → `ready`; upstream description changes → `proposed` (§13); abandon → `rejected` |
+| `ready` | Actionable now. Eligible for the queue's start rows and for `voro next`. | triage; last blocker closes | dispatch or manual start → `running`; *refine* (below) → `refining`; upstream description changes → `proposed` (§13); park → `parked`; abandon → `rejected` |
 | `running` | An agent (or the human) is actively on it. | dispatch | agent raises question → `needs-input`; work lands → `review`; abort → `ready`; session dies without reporting → `stalled` (reconcile, §8). |
 | `needs-input` | Blocked on a human decision; `question` is set. **First among equals in the queue.** | agent verb; manual flag | question answered in the agent's own session, then `resume` → `running` (no answer text is recorded — the exchange lives in the session transcript; §8); abandon → `rejected` |
 | `review` | Agent believes it is done; awaiting human acceptance. | agent completion | accept → `done`; reject with feedback → `running`; hand off → `waiting`; abandon → `rejected` |
@@ -787,6 +823,16 @@ rather than having received one. Refresh
 moves to `ctrl-r` to free the letter. The two intensities share the note-driven
 path's guards — both are refused on anything but a `proposed` or `ready`
 task, before a prompt is written or a process spawned.
+
+A round is one of two ways a triage verdict is invalidated by its body
+changing underneath it. The other is upstream: a synced task (§13) whose
+issue description is edited after acceptance returns from `ready` or `parked`
+to `proposed` on the next `voro sync`, with the new description as its body,
+and reads `⇅ upstream changed` until triage takes it out again. It takes the
+same edge for the same reason a concluded round does — the verdict was passed
+on a body that no longer exists — and the marker is derived the same way,
+from the transition that last brought the task into `proposed`. It is an
+edge, not a round: no agent runs, and nothing passes through `refining`.
 
 The note-driven path is one instance of a general shape: a terse human intent,
 expanded by an agent into a formal artefact, applied back through an ordinary
@@ -2744,13 +2790,16 @@ issue *import* for owned repos, the human CLI surface, worktrees if parallel
 dispatch has become real.
 
 **Milestone D — maybe.** GUI cockpit over the same core, richer session
-steering, two-way issue sync, smarter proposal triage.
+steering, smarter proposal triage. Two-way issue sync left this list for a
+design of its own (§13).
 
 ## 11. Open questions
 
-The questions this section once held are settled; each note below records the
-resolution and points at the section that owns the mechanics. The lettered
-anchors stay because code comments cite them (§11a, §11c).
+The first four questions below are settled; each note records the resolution
+and points at the section that owns the mechanics. The lettered anchors stay
+because code comments cite them (§11a, §11c). The questions after them are
+open, left by the tracker-sync design (§13); each states the position the
+first version takes and what would change it.
 
 *Voro-managed worktrees per dispatch, or let the agent make its own?* The
 dispatched agent creates its own throwaway worktree (the dispatch preamble
@@ -2779,6 +2828,47 @@ keeps the queue honest about what an agent can pick up. If hands-on rows ever
 clutter desk-time use of the queue, tags would be a filter over the same score,
 not a new scheduling input.
 
+*Should an upstream edit overwrite a refined brief?* §13 replaces the body of
+a `ready` or `parked` task with the new description and returns it to triage,
+leaving the old brief in the event log. That is the ownership rule taken
+literally, and it costs a refined brief every time an issue's typo is fixed.
+The alternative keeps the brief and appends the upstream change under a
+heading for the operator to fold in or refine away. Usage will show which
+edits upstream actually makes.
+
+*Does unassignment end a task?* Reassigning an issue to someone else plausibly
+says "not yours", which is the existence the upstream owns; it may also be
+bookkeeping on a team that reassigns freely. The first version reports it and
+moves nothing.
+
+*Should a closed issue close a task in flight?* An issue closed by the merge
+of the task's own PR is the return-path automation §6 defers for `waiting`:
+sync could pull such a task to `done`. The first version marks it and leaves
+the move to the operator, keeping `done` an operator verdict.
+
+*Where do the middle projections live on GitHub?* Labels are the first
+version's answer and are opt-in. A GitHub Projects status field is the
+native home but belongs to a project board, not the issue, and needs a board
+chosen per repo. Linear has native workflow states (unstarted, started,
+completed, canceled), so the projection maps without configuration there.
+
+*Where does a Linear upstream attach?* `repos.upstream` fits GitHub, where
+an issue lives in a repository. A Linear team spans repositories, so its
+natural attachment is the project, with each arriving issue landing in the
+project's default repo until the operator re-points it. The link table is
+tracker-agnostic already; the attachment point is not.
+
+*What does promotion publish?* A body written as a dispatchable prompt can
+carry local paths, agent instructions and the operator's shorthand, none of it
+meant for the issue's readers. The first version sends it as it stands; an
+expansion (§6) that drafts a public description for the operator to confirm is
+the likely second.
+
+*Do comments sync?* Neither direction carries them. Review comments on a PR
+already reach the agent through `pr` (§8); issue comments are discussion the
+operator reads upstream. If a comment routinely changes what a task means, it
+belongs in the description, which does sync.
+
 ## 12. Risks
 
 The tool becoming a procrastination object — mitigated by Milestone A's brutal
@@ -2795,3 +2885,140 @@ individual rows would otherwise swamp the queue (§7), backed by an
 always-visible untriaged count so the backlog stays felt even when the digest
 itself drops below the cap; if either stops working, that is signal about the
 design, not the user.
+
+## 13. Tracker sync
+
+Some of a project's work is born in an issue tracker someone else reads:
+GitHub issues today, Linear later. Voro neither mirrors that tracker nor
+ignores it. It divides ownership by field. **The upstream tracker owns the
+existence and the description of a task that came from upstream; Voro owns
+the operator's priority and the pipeline state.** Neither side is the source
+of truth for the whole task, so neither side ever overwrites a field the
+other owns, and every rule below is that sentence applied to one case.
+
+**Which tasks sync.** A task syncs if and only if it has a `task_links` row
+(§5), and it gets one in exactly two ways: it arrived by down-sync, or the
+operator promoted it. Every other task — a quick capture, an agent proposal,
+a planning session's draft — is local and stays local. A checkout takes part
+only once the operator names its tracker with `voro repo upstream
+<project> <repo> owner/name`, so a third-party clone is never queried or
+written to by accident, and the repo a link's issue lives in is the repo its
+task dispatches into.
+
+**Down-sync: arrival.** `voro sync` asks the tracker for every open issue
+assigned to the operator in the repos that name an upstream (`gh search
+issues --assignee @me --state open`, one `--repo` per upstream). An issue with
+no link row becomes a task in `proposed`, in that repo's project, with its
+link recorded — exactly the path an agent proposal takes. Triage is the seam,
+as it is for agent work: nothing from upstream reaches the queue's start rows
+or `voro next` without a verdict, and no new state is needed. The body is
+composed as `voro import` composes one, a line naming the issue's URL above
+the issue's own description, and `applied_body` keeps the description alone
+so later comparisons are not confused by the header. Assignment governs
+arrival only. An issue already linked is tracked whoever it is assigned to
+now.
+
+`voro import` predates sync and keeps its job, a one-shot bulk capture of
+every open issue whether assigned or not, but now records a `down` link for
+each task it creates, so sync tracks what import brought in. Tasks imported
+before links existed carry the issue URL only in their body. Sync adopts
+them: an arriving issue whose URL a task in that project already cites gains a
+link to that task rather than a duplicate, which is the check import has
+always made, run once more.
+
+**Down-sync: an edited issue.** A title change upstream is applied to the task
+in place and logged, whatever its state. A title moves no verdict. A
+description change is judged against `applied_body`, not against the task's
+body, because the body may legitimately differ: the operator may have refined
+a thin issue into a dispatchable brief (§6), and that rewrite is Voro's own
+business, never synced back. What happens to a changed description depends
+on whether anything is built on the body yet. On a `proposed` task the body
+is replaced and the task stays put. On a `ready` or `parked` task the body is
+replaced and the task returns to `proposed`, marked `⇅ upstream changed` —
+the refine edge of §6, for the refine reason: the verdict was passed on a
+body that no longer exists, and re-asking costs one keypress. On a `refining`
+task the change is skipped this run and read again next run, since the
+round's agent is about to replace the body anyway and two writers would race.
+On a task in flight — `running`, `needs-input`, `stalled`, `review`,
+`waiting` — the body is left alone. An agent is working from it or a review
+is being judged against it, and yanking it would invalidate work rather than
+a verdict. `seen_body` advances and `applied_body` does not, so the row reads
+`⇅ upstream changed` for as long as the two differ, and `show` prints the
+difference; the operator decides whether the change matters to the work in
+hand. Replaced bodies go to the event log, as every replaced body does, so a
+refined brief overwritten by an upstream edit is recoverable.
+
+**Down-sync: a closed issue.** Upstream owns existence, so a closed issue
+ends a task that has not started. A `proposed` task is rejected, and a
+`ready` or `parked` one abandoned to `rejected`, each through its ordinary
+edge with an `upstream-closed` event naming why. A task in flight is not
+moved — the work may still be wanted, as when an issue is closed by the very
+PR the task produced — and carries `⇅ closed upstream` until the operator
+moves it. A reopened issue whose task is closed is reported and changes
+nothing: `done` stays terminal (§3), and the operator files new work if the
+reopening is real. An issue unassigned from the operator is reported the same
+way and moves nothing.
+
+**Up-sync: a coarse projection.** What leaves Voro is one of four values
+computed from the task's state, plus the PR link the task records. Weights,
+scores, priorities and the intermediate states never sync. They are the
+operator's arithmetic, meaningless to anyone reading the issue.
+
+| Voro state | Projection |
+|---|---|
+| `proposed`, `refining`, `parked`, `ready` | open |
+| `running`, `needs-input`, `stalled` | in progress |
+| `review`, `waiting` | in review |
+| `done` | closed |
+| `rejected` | nothing written |
+
+A projection is written only when it differs from `pushed_projection`, which
+is what makes repeated runs cheap and idempotent. On GitHub *open* and
+*closed* are the issue's own state; *closed* closes as completed. *In
+progress* and *in review* have no native home on a GitHub issue, so each is
+a label named in `voro.toml` (`[sync] in_progress_label`, `in_review_label`)
+and is skipped while unnamed. Voro does not invent labels in someone else's
+repository. A label is removed when the projection moves past it. `rejected`
+writes nothing because rejecting is a priority call — "not mine, not now" —
+which Voro owns and the issue's other readers have no stake in; an operator
+who means "won't fix" closes the issue upstream, and the next sync sees it.
+For the same reason **up-sync never reopens an issue**: if the issue is
+closed upstream and Voro's projection says otherwise, upstream's existence
+wins and the task carries `⇅ closed upstream` instead.
+
+The PR link travels by the tracker's own mechanism where one exists. `voro
+pr` appends a `Closes owner/name#123` line to the PR body for a linked task,
+so GitHub links the two and closes the issue on merge without Voro writing
+anything. A `pr_url` recorded any other way — `voro set --pr` on a PR opened
+by hand — is announced by sync as one issue comment, recorded in
+`pushed_pr_url` so it is posted once.
+
+**Promotion.** `voro promote <id>` creates the upstream issue for a local
+task in its repo's tracker, assigns it to the operator, and records a
+`promoted` link, after which the task syncs exactly as an arrived one does:
+upstream now owns its existence and description. It refuses a task that is
+`proposed` or `refining`, so an agent proposal reaches upstream only through
+triage; a task already linked; a closed task; and a task whose repo names no
+upstream. The issue's title and description are the task's, sent as they
+stand. Promotion is operator-invoked for the same reason `pr` is (§8): it
+publishes on the operator's behalf, and the dispatched agent may not
+publish.
+
+**The verb.** First version: `voro sync [<project>] [--dry-run]`, run by
+hand, idempotent, CLI only. It reads first and writes second. The reading is
+one `gh` call per upstream for arrivals plus one batched query for every
+linked issue whose task is not closed; the planning — which tasks arrive,
+change, close, and which projections are owed — is a pure function in
+`voro-core` over the store and the fetched issues, testable against canned
+JSON exactly as import's mapping is. Its output is a plan that `--dry-run`
+prints and the `voro` crate applies. Down-sync applies before up-sync, so a
+close read this run is never contradicted by a projection written this run.
+Each item applies in its own transaction after its network call succeeds,
+recording what it wrote in the link row; a failure leaves that row as it was
+and is reported, so the next run retries exactly what did not land. Events
+are logged per item (`synced-down`, `upstream-changed`, `upstream-closed`,
+`synced-up`, `promoted`). Every state change goes through the transition
+API; sync is a caller of the state machine, not a writer beside it. A
+background poller that runs this on a timer is a separate, later decision.
+The TUI renders the `⇅` markers from the first version, but has no sync key,
+so the event loop gains no network call.
