@@ -6,6 +6,7 @@
 mod agent;
 mod cap;
 pub mod config_edit;
+pub mod cost;
 mod error;
 mod import;
 mod milestone;

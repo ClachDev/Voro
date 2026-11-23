@@ -152,6 +152,16 @@ fn confirm(question: &str) -> bool {
     matches!(answer.trim(), "y" | "Y" | "yes" | "Yes")
 }
 
+/// Where Claude Code keeps session transcripts, read for the `cost` event a
+/// task logs when it leaves `running` (DESIGN.md §8).
+fn claude_projects_dir() -> Option<std::path::PathBuf> {
+    let config = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".claude"),
+    };
+    Some(config.join("projects"))
+}
+
 /// Report a startup failure the way the CLI verbs report theirs: the error's
 /// own message, on stderr. Returning it from `main` would print the derived
 /// `Debug` form instead, which buries the sentence the operator has to read.
@@ -184,6 +194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             summary.tasks
         );
     }
+    store.set_transcripts_root(claude_projects_dir());
     let ctx = dispatch::DispatchCtx::from_db_path(&path);
 
     if !verb_args.is_empty() {
