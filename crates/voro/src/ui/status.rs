@@ -79,13 +79,14 @@ pub(super) fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     // slot budget is fixed and documented (DESIGN.md §9), a store path's length
     // is not, so the occupant that cannot be bounded is the one that yields. On
     // the operator's own store there is no indicator, the reserved width is
-    // zero, and the key line gets the row back byte for byte.
+    // zero, and the key line gets the row back byte for byte. The mouse marker
+    // is the exception, taking its columns whatever the key line wanted.
     let keys_line = Line::from(spans);
     let leftover = area
         .width
         .saturating_sub(keys_line.width() as u16)
         .saturating_sub(1);
-    let indicator = db_indicator(app.db_path(), leftover);
+    let indicator = footer_indicator(app, leftover);
     let reserved = indicator
         .as_deref()
         .map_or(0, |text| Span::raw(text).width() as u16 + 1);
@@ -98,6 +99,23 @@ pub(super) fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             store,
         );
     }
+}
+
+/// The right end of the key line: `mouse off` while `p` has handed drags to
+/// the terminal, then the store if it fits in what the keys left (DESIGN.md
+/// §9). The marker is the one occupant that does not yield: with reporting off
+/// a click on a row does nothing, and nothing else on screen says why, so on a
+/// line already full it clips the key line's last slots instead.
+fn footer_indicator(app: &App, budget: u16) -> Option<String> {
+    const MOUSE_OFF: &str = "mouse off";
+    if app.mouse {
+        return db_indicator(app.db_path(), budget);
+    }
+    let rest = budget.saturating_sub(MOUSE_OFF.len() as u16 + 2);
+    Some(match db_indicator(app.db_path(), rest) {
+        Some(db) => format!("{MOUSE_OFF}  {db}"),
+        None => MOUSE_OFF.to_string(),
+    })
 }
 
 /// The store to name in the footer within `budget` columns — the ones the key
@@ -359,6 +377,7 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
                         ("J/K", "scroll the card"),
                         ("PgUp/PgDn", "page the card"),
                         ("ctrl-r", "refresh"),
+                        ("p", "mouse off/on"),
                         ("?", "this key map"),
                         ("q", "quit"),
                     ],
@@ -399,6 +418,7 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
                         ("t", "tree by blockers"),
                         ("space", "toggle a tree fold"),
                         ("ctrl-r", "refresh"),
+                        ("p", "mouse off/on"),
                         ("?", "this key map"),
                         ("q", "quit"),
                     ],
@@ -423,6 +443,7 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
                 "Navigation",
                 vec![
                     ("j/k", "move the selection"),
+                    ("p", "mouse off/on"),
                     ("?", "this key map"),
                     ("q", "quit"),
                 ],
@@ -444,6 +465,7 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
                     ("j/k", "move the selection"),
                     ("J/K", "scroll the agents pane"),
                     ("PgUp/PgDn", "page the agents pane"),
+                    ("p", "mouse off/on"),
                     ("?", "this key map"),
                     ("q", "quit"),
                 ],
@@ -704,6 +726,39 @@ mod tests {
             assert!(
                 screen_text(&terminal).contains(&normalised),
                 "{screen:?} truncated the message:\n{}",
+                screen_text(&terminal)
+            );
+        }
+    }
+
+    /// With `p` off, the footer says so on every screen, since a click on a row
+    /// does nothing and nothing else on screen explains why (DESIGN.md §9).
+    #[test]
+    fn the_footer_marks_mouse_reporting_off() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with_status("", 1, 0);
+        app.status = None;
+        for screen in Screen::ALL {
+            app.screen = screen;
+            let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            app.mouse = true;
+            terminal
+                .draw(|f| {
+                    draw(f, &app);
+                })
+                .unwrap();
+            assert!(!screen_text(&terminal).contains("mouse off"));
+            app.mouse = false;
+            terminal
+                .draw(|f| {
+                    draw(f, &app);
+                })
+                .unwrap();
+            assert!(
+                screen_text(&terminal).contains("mouse off"),
+                "{screen:?}: no marker:\n{}",
                 screen_text(&terminal)
             );
         }

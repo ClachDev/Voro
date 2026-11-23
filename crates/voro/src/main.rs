@@ -207,7 +207,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(store, ctx)?;
 
-    let mut terminal = init_terminal();
+    let mut terminal = init_terminal(app.mouse);
+    // Whether mouse reporting is on in the terminal right now, so a toggle of
+    // `app.mouse` is applied once rather than re-sent on every tick.
+    let mut reporting = app.mouse;
     // The click targets of the frame on screen, rebuilt by every draw, since
     // the key handlers deliberately run without geometry (DESIGN.md §9).
     let mut hits = ui::HitMap::default();
@@ -226,6 +229,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             Ok(false) => {}
             Err(e) => break Err(e.into()),
+        }
+        if app.mouse != reporting {
+            reporting = app.mouse;
+            let _ = if reporting {
+                execute!(std::io::stdout(), EnableMouseCapture)
+            } else {
+                execute!(std::io::stdout(), DisableMouseCapture)
+            };
         }
         if let Err(e) = app.poll_external() {
             break Err(e.into());
@@ -255,14 +266,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // around it rather than fighting over raw mode.
             restore_terminal();
             editor_session(&mut app, request);
-            terminal = init_terminal();
+            terminal = init_terminal(app.mouse);
         }
         if let Some(request) = app.pending_attach.take() {
             // attach/resume are full-screen interactive sessions that own the
             // terminal until the user detaches, same treatment as $EDITOR.
             restore_terminal();
             foreground_session(&mut app, "attach", &request.command, &request.cwd, None);
-            terminal = init_terminal();
+            terminal = init_terminal(app.mouse);
         }
         if let Some(launch) = app.pending_plan.take() {
             // a planning session is interactive in the same way; the refresh
@@ -275,7 +286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &launch.cwd,
                 launch.refine,
             );
-            terminal = init_terminal();
+            terminal = init_terminal(app.mouse);
         }
         if app.should_quit {
             break Ok(());
@@ -285,20 +296,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-/// Take the terminal for the TUI: ratatui's own setup plus mouse reporting,
-/// which is what turns a click into an event the loop can route (DESIGN.md §9).
-/// Every teardown must undo both, so this is paired with [`restore_terminal`] at
-/// each of the round-trips that hand the terminal to another program.
-fn init_terminal() -> DefaultTerminal {
+/// Take the terminal for the TUI: ratatui's own setup plus, when `mouse` is on,
+/// mouse reporting, which is what turns a click into an event the loop can
+/// route (DESIGN.md §9). Every teardown must undo both, so this is paired with
+/// [`restore_terminal`] at each of the round-trips that hand the terminal to
+/// another program, and each passes the operator's `p` setting back in.
+fn init_terminal(mouse: bool) -> DefaultTerminal {
     let terminal = ratatui::init();
     install_mouse_panic_hook();
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    if mouse {
+        let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    }
     terminal
 }
 
 /// Hand the terminal back, mouse reporting first. A terminal left reporting
 /// spews escape bytes on every mouse move, so this runs even where the caller
-/// only means to borrow the screen for an $EDITOR or attach round-trip.
+/// only means to borrow the screen for an $EDITOR or attach round-trip, and
+/// even when `p` has already turned reporting off: the disable sequences only
+/// reset modes, so sending them twice is harmless.
 fn restore_terminal() {
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
