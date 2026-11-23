@@ -324,6 +324,7 @@ pub(super) fn key_map(screens: KeySection) -> Vec<KeySection> {
             vec![
                 ("j/k", "move the selection"),
                 ("ctrl-r", "refresh"),
+                ("p", "mouse off/on"),
                 ("?", "this key map"),
                 ("q", "quit"),
             ],

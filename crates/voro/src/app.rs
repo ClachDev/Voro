@@ -343,6 +343,10 @@ pub struct App {
     /// key handler has no geometry of its own, so `draw_detail` records the
     /// overflow here for `scroll_detail` to clamp against.
     pub detail_max_scroll: std::cell::Cell<u16>,
+    /// Whether the terminal reports the mouse to Voro (DESIGN.md §9), toggled
+    /// by `p`. Off hands drags back to the terminal's own text selection; the
+    /// main loop owns the terminal and applies the flag after each key.
+    pub mouse: bool,
     pub pending_editor: Option<EditorRequest>,
     pub pending_attach: Option<AttachRequest>,
     /// A planning session waiting for main() to suspend the terminal and run
@@ -442,6 +446,7 @@ impl App {
             show_history: false,
             detail_scroll: 0,
             detail_max_scroll: std::cell::Cell::new(0),
+            mouse: true,
             pending_editor: None,
             pending_attach: None,
             pending_plan: None,
@@ -974,6 +979,10 @@ impl App {
                 self.toggle_screen();
                 return;
             }
+            KeyCode::Char('p') => {
+                self.mouse = !self.mouse;
+                return;
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_selection(1);
                 return;
@@ -1312,6 +1321,23 @@ mod tests {
         assert_eq!(app.screen, Screen::Milestones);
         key(&mut app, KeyCode::Tab);
         assert_eq!(app.screen, Screen::Cockpit);
+    }
+
+    /// `p` flips mouse reporting on every screen and leaves the selection and
+    /// the screen alone; a second press restores it (DESIGN.md §9).
+    #[test]
+    fn p_toggles_mouse_reporting_on_every_screen() {
+        let mut app = app_with(&[TaskState::Ready]);
+        assert!(app.mouse, "reporting starts on");
+        for screen in Screen::ALL {
+            app.screen = screen;
+            key(&mut app, KeyCode::Char('p'));
+            assert!(!app.mouse, "{screen:?}: p left reporting on");
+            assert_eq!(app.screen, screen);
+            assert!(matches!(app.mode, Mode::Normal));
+            key(&mut app, KeyCode::Char('p'));
+            assert!(app.mouse, "{screen:?}: a second p left reporting off");
+        }
     }
 
     /// The gate's only refusal: the alt-digit jumps to the cockpit, the

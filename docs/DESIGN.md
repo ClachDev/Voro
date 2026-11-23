@@ -2685,9 +2685,25 @@ Core interactions:
 The mouse is a secondary input over the same keys: a left click on any list row
 or picker option moves the selection there, exactly as `j`/`k` would, and a
 second click on an option already under the cursor picks it, as ⏎ would — a
-click never fires a row's action, and mouse reporting stays on for the whole
-session, which trades away the terminal's own text selection (shift-drag still
-bypasses it).
+click never fires a row's action. Mouse reporting starts on, and while it is on
+the terminal hands every drag to Voro, so its own text selection is gone —
+shift-drag, the usual bypass, is not honoured by every terminal, and it is not
+by the operator's. `p`, on every screen, turns reporting off and back on. Off,
+a drag selects text the way the terminal always does, which is how a command
+in a task body, a branch name or a PR URL leaves the TUI; clicks do nothing
+until `p` is pressed again. It is a key rather than a `voro.toml` setting
+because the two states are not chosen once: clicking a row is the everyday
+input and copying text the occasional one, so reporting goes off for one
+copy and comes straight back, and a setting would mean a trip to the Config
+screen and back for every copy. The state is the operator's, not the terminal's:
+each round-trip that hands the terminal to `$EDITOR`, an attached session or a
+planning session re-takes it in whichever state `p` left. While reporting is
+off the right end of the key line says `mouse off`, because a click that does
+nothing has no other explanation on screen. That marker is the one footer
+occupant that does not yield to the key line: on a line already full it clips
+the last slots, where the store indicator above gives up its own columns
+instead. `p` is a display toggle, so like `x` and `h` it lives in the `?` key
+map and not on the key line, which keeps the eleven-slot budget whole.
 
 Every action ultimately gets a CLI equivalent so the whole tool is scriptable
 and agent-legible, but the human-facing CLI trails the TUI rather than preceding

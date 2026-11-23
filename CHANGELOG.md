@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/ClachDev/Voro/compare/v0.2.0...HEAD) - ReleaseDate
 
+### Added
+
+- **`p` turns mouse reporting off so text can be selected.** The TUI captured
+  every drag for click-to-select, so a command, branch name or PR URL could
+  not be copied out of it. `p` on any screen hands drags back to the
+  terminal's own selection, and the footer reads `mouse off` until `p` turns
+  clicks back on. The setting survives `e`, attach and planning round-trips.
+
 ### Changed
 
 - **The queue ranks by raw score again.** The attention price divided each
