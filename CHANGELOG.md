@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not be copied out of it. `p` on any screen hands drags back to the
   terminal's own selection, and the footer reads `mouse off` until `p` turns
   clicks back on. The setting survives `e`, attach and planning round-trips.
+- **Tasks record what their agent sessions cost.** `voro ask`, `voro done`
+  and `voro abort` read the task's Claude Code transcripts and log a `cost`
+  event: messages, the four token counts, wall time, and a `weighted` total in
+  input-token equivalents (`input + 5·output + 1.25·cache_write +
+  0.1·cache_read`). `voro show` prints it in the history, `voro list --cost`
+  leads each row with the total in millions, and `voro stats --since 7d`
+  totals by project and week and names the ten most expensive tasks. Each
+  API response counts once, though Claude Code repeats its usage on every
+  line it writes for it. A task with no transcript closes as before, with a
+  `cost` event marked missing.
 
 ### Changed
 

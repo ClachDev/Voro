@@ -103,6 +103,13 @@ impl Action {
     pub fn stops_session(&self) -> bool {
         matches!(self, Action::Accept | Action::Abort | Action::Abandon)
     }
+
+    /// Whether this transition ends a stretch of agent work, so the task's
+    /// transcripts are read and a `cost` event logged (DESIGN.md §8): `ask`,
+    /// `done` (including reporting a stalled session's work) and `abort`.
+    pub fn leaves_running(&self) -> bool {
+        matches!(self, Action::Ask(_) | Action::Complete(_) | Action::Abort)
+    }
 }
 
 impl Store {
@@ -185,8 +192,16 @@ impl Store {
         } else {
             None
         };
+        let costed = action.leaves_running()
+            && get_task(&tx, task_id)?.is_some_and(|t| {
+                !t.human && matches!(t.state, TaskState::Running | TaskState::Stalled)
+            });
         apply_action(&tx, task_id, action)?;
         tx.commit()?;
+        if costed {
+            // Never fails the transition: the cost is a reading, not a gate.
+            let _ = self.record_cost(task_id);
+        }
         Ok((
             self.task(task_id)?,
             closing.map(|id| self.session(id)).transpose()?,

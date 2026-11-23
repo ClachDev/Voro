@@ -158,10 +158,12 @@ tasks
                                   prints one event's recorded detail and nothing
                                   else, which is how a replaced body comes back:
                                   `voro show 62 --event 512 > body.md`
-  list [--state STATE] [--project P] [--doc DOC]
+  list [--state STATE] [--project P] [--doc DOC] [--cost]
                                   --doc answers 'which tasks derive from this
                                   plan?'. Milestone rows carry [milestone];
-                                  a task in one names it after an arrow
+                                  a task in one names it after an arrow.
+                                  --cost leads each row with the task's
+                                  weighted token cost in millions
   milestones [--all]              open milestones: id, state, title, and how
                                   many member tasks are open and done. --all
                                   adds done and rejected ones, and proposed
@@ -180,10 +182,15 @@ tasks
                                   a tie with the last one are counted
   next                            the single highest-scoring ready task,
                                   never a milestone
-  stats                           task counts by state — the triage backlog
+  stats [--since WINDOW]          task counts by state — the triage backlog
                                   (§12) plus ready, running, needs-input,
                                   review, waiting, stalled, done; excludes
-                                  parked projects
+                                  parked projects. Then token cost from the
+                                  `cost` events tasks log on leaving running:
+                                  per project, per week, and the ten most
+                                  expensive tasks. --since 7d (or 2w, or a
+                                  number of days) limits the cost to events
+                                  logged in that window
   explain <task-id>               score decomposition
   seed [--force]                  fill the dev store with fixture data — a
                                   board covering every task state. A build run
@@ -344,7 +351,11 @@ enum Verb {
     },
     Inbox,
     Next,
-    Stats,
+    Stats {
+        /// Only cost events logged within this window: `7d`, `2w`, or days.
+        #[arg(long, value_name = "WINDOW")]
+        since: Option<String>,
+    },
     /// Fill the dev store with fixture data.
     Seed {
         /// Discard what is there and rebuild it.
@@ -660,6 +671,9 @@ struct ListArgs {
     project: Option<String>,
     #[arg(long)]
     doc: Option<String>,
+    /// Lead each row with the task's summed weighted token cost.
+    #[arg(long)]
+    cost: bool,
 }
 
 #[derive(Args)]
@@ -768,7 +782,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Tree { task_id } => tree_verb(store, task_id),
         Verb::Inbox => inbox_verb(store, ctx),
         Verb::Next => next_verb(store),
-        Verb::Stats => stats_verb(store),
+        Verb::Stats { since } => stats_verb(store, since.as_deref()),
         Verb::Seed { force } => seed_verb(store, ctx, force),
         Verb::Migrate { .. } => migrate_verb(store, ctx),
         Verb::Explain { task_id } => explain_verb(store, task_id),
@@ -943,6 +957,11 @@ fn appended_body(current: &str, added: &str) -> String {
 /// line says what is there and how to get it back instead of unrolling it.
 pub(crate) fn event_detail(event: &Event) -> String {
     let detail = event.detail.clone().unwrap_or_default();
+    if event.kind == voro_core::cost::COST_EVENT
+        && let Some(cost) = voro_core::cost::Cost::parse(&detail)
+    {
+        return cost.summary_line();
+    }
     if event.kind != "body" {
         return detail;
     }
@@ -2019,6 +2038,11 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
     let projects = store.projects().map_err(|e| e.to_string())?;
     let milestones = store.milestone_ids_by_task().map_err(|e| e.to_string())?;
     let mut forges = ForgeMemo::default();
+    let costs = if args.cost {
+        store.cost_totals().map_err(|e| e.to_string())?
+    } else {
+        Default::default()
+    };
     let mut out = String::new();
     for task in store.tasks().map_err(|e| e.to_string())? {
         if state_filter.is_some_and(|s| task.state != s)
@@ -2043,6 +2067,14 @@ fn list_verb(store: &mut Store, args: &ListArgs) -> Result<String, String> {
                 format!("  → milestone {}", ids.join(", "))
             })
             .unwrap_or_default();
+        if args.cost {
+            match costs.get(&task.id) {
+                Some(c) if c.messages > 0 => {
+                    write!(out, "{:>7.1}M  ", c.weighted as f64 / 1e6).unwrap()
+                }
+                _ => write!(out, "{:>8}  ", "-").unwrap(),
+            }
+        }
         writeln!(
             out,
             "{}{marker}{}{}{}{belongs}",
@@ -2295,7 +2327,8 @@ fn migrate_verb(store: &Store, ctx: &DispatchCtx) -> Result<String, String> {
     ))
 }
 
-fn stats_verb(store: &mut Store) -> Result<String, String> {
+fn stats_verb(store: &mut Store, since: Option<&str>) -> Result<String, String> {
+    let since_days = since.map(parse_window).transpose()?;
     let c = store.state_counts().map_err(|e| e.to_string())?;
     let mut out = String::new();
     for (label, n) in [
@@ -2310,6 +2343,118 @@ fn stats_verb(store: &mut Store) -> Result<String, String> {
         ("done", c.done),
     ] {
         writeln!(out, "{label:<12}{n}").unwrap();
+    }
+    out.push_str(&cost_report(store, since, since_days)?);
+    Ok(out)
+}
+
+/// `7d`, `2w`, or a bare number of days.
+fn parse_window(raw: &str) -> Result<u32, String> {
+    let raw = raw.trim();
+    let (digits, scale) = match raw.strip_suffix('w') {
+        Some(n) => (n, 7),
+        None => (raw.strip_suffix('d').unwrap_or(raw), 1),
+    };
+    digits
+        .parse::<u32>()
+        .ok()
+        .and_then(|n| n.checked_mul(scale))
+        .ok_or_else(|| format!("--since takes a window such as 7d or 2w, not '{raw}'"))
+}
+
+/// Token cost totals from the `cost` events (DESIGN.md §8): per project, per
+/// week (weeks start on Monday, UTC), and the ten most expensive tasks.
+fn cost_report(
+    store: &Store,
+    since: Option<&str>,
+    since_days: Option<u32>,
+) -> Result<String, String> {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use voro_core::cost::{Cost, human_count};
+
+    #[derive(Default)]
+    struct Row {
+        sessions: BTreeSet<(i64, String)>,
+        cost: Cost,
+    }
+    impl Row {
+        fn add(&mut self, task_id: i64, cost: &Cost) {
+            self.sessions
+                .extend(cost.until.keys().map(|r| (task_id, r.clone())));
+            self.cost.add(cost);
+        }
+    }
+
+    let events = store.cost_events(since_days).map_err(|e| e.to_string())?;
+    let window = since.map_or("all time".to_string(), |w| format!("last {w}"));
+    let mut out = format!("\ncost ({window})\n");
+    if events.is_empty() {
+        out.push_str("  none recorded\n");
+        return Ok(out);
+    }
+    let names: HashMap<i64, String> = store
+        .projects()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|p| (p.id, p.name))
+        .collect();
+    let mut by_project: BTreeMap<String, Row> = BTreeMap::new();
+    let mut by_week: BTreeMap<String, Row> = BTreeMap::new();
+    let mut by_task: HashMap<i64, (i64, String, Cost)> = HashMap::new();
+    for e in &events {
+        let project = names.get(&e.project_id).cloned().unwrap_or("?".into());
+        by_project
+            .entry(project)
+            .or_default()
+            .add(e.task_id, &e.cost);
+        let week = voro_core::cost::week_of(&e.at).unwrap_or("?".into());
+        by_week.entry(week).or_default().add(e.task_id, &e.cost);
+        by_task
+            .entry(e.task_id)
+            .or_insert_with(|| (e.project_id, e.title.clone(), Cost::default()))
+            .2
+            .add(&e.cost);
+    }
+    let header = |out: &mut String, first: &str| {
+        writeln!(
+            out,
+            "  {first:<16}{:>9}{:>8}{:>9}{:>12}{:>10}",
+            "sessions", "msgs", "output", "cache-read", "weighted"
+        )
+        .unwrap();
+    };
+    let row = |out: &mut String, label: &str, r: &Row| {
+        writeln!(
+            out,
+            "  {label:<16}{:>9}{:>8}{:>9}{:>12}{:>10}",
+            r.sessions.len(),
+            r.cost.messages,
+            human_count(r.cost.output),
+            human_count(r.cost.cache_read),
+            human_count(r.cost.weighted)
+        )
+        .unwrap();
+    };
+    header(&mut out, "project");
+    for (name, r) in &by_project {
+        row(&mut out, name, r);
+    }
+    out.push('\n');
+    header(&mut out, "week of");
+    for (week, r) in &by_week {
+        row(&mut out, week, r);
+    }
+    let mut top: Vec<_> = by_task.into_iter().collect();
+    top.sort_by(|a, b| b.1.2.weighted.cmp(&a.1.2.weighted).then(a.0.cmp(&b.0)));
+    out.push_str("\n  most expensive\n");
+    for (id, (project_id, title, cost)) in top.into_iter().take(10) {
+        let project = names.get(&project_id).map_or("?", String::as_str);
+        writeln!(
+            out,
+            "  {:>8}  #{id} {project}: {title}",
+            human_count(cost.weighted)
+        )
+        .unwrap();
     }
     Ok(out)
 }
@@ -4340,6 +4485,66 @@ mod tests {
         assert!(out.contains(&format!("{:<12}{}", "review", 0)), "{out}");
         assert!(out.contains(&format!("{:<12}{}", "waiting", 1)), "{out}");
         assert!(out.contains(&format!("{:<12}{}", "done", 0)), "{out}");
+    }
+
+    #[test]
+    fn done_records_cost_that_show_list_and_stats_report() {
+        let root = tempfile::Builder::new()
+            .prefix("voro-cost-cli-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        std::fs::create_dir_all(root.join("-wt")).unwrap();
+        let usage = |id: &str, at: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{at}","message":{{"id":"{id}","usage":{{"input_tokens":4,"output_tokens":372025,"cache_read_input_tokens":93087006,"cache_creation_input_tokens":926535}}}}}}"#
+            ) + "\n"
+        };
+        std::fs::write(
+            root.join("-wt/uuid-7.jsonl"),
+            usage("m1", "2026-11-23T10:00:00Z") + &usage("m1", "2026-11-23T11:42:00Z"),
+        )
+        .unwrap();
+
+        let mut s = store();
+        s.set_transcripts_root(Some(root));
+        ok(&mut s, &["project", "add", "strata", "/tmp"]);
+        ok(
+            &mut s,
+            &["add", "strata", "Pad is store", "--state", "ready"],
+        );
+        ok(&mut s, &["add", "strata", "By hand", "--state", "ready"]);
+        let (_, sess) = s
+            .record_dispatch(1, "claude", Some(1), LivenessSource::Pid, None)
+            .unwrap();
+        s.set_session_ref(sess.id, "uuid-7").unwrap();
+        ok(&mut s, &["done", "1", "--summary", "did it"]);
+        ok(&mut s, &["start", "2"]);
+        ok(&mut s, &["abort", "2"]);
+
+        let show = ok(&mut s, &["show", "1"]);
+        assert!(
+            show.contains("cost  1 msgs  out 372k  cache-read 93.1M  weighted 12.3M  1h42m"),
+            "{show}"
+        );
+        let show = ok(&mut s, &["show", "2"]);
+        assert!(show.contains("cost  no transcript"), "{show}");
+
+        let list = ok(&mut s, &["list", "--cost"]);
+        assert!(list.contains("   12.3M  #1 review"), "{list}");
+        assert!(list.contains("       -  #2 ready"), "{list}");
+
+        let stats = ok(&mut s, &["stats", "--since", "7d"]);
+        assert!(stats.contains("cost (last 7d)"), "{stats}");
+        assert!(
+            stats.contains("  strata                  1       1     372k       93.1M     12.3M"),
+            "{stats}"
+        );
+        assert!(
+            stats.contains("     12.3M  #1 strata: Pad is store"),
+            "{stats}"
+        );
+        assert!(err(&mut s, &["stats", "--since", "soon"]).contains("7d or 2w"));
     }
 
     #[test]

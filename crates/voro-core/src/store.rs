@@ -131,6 +131,10 @@ fn remedy_for_schema_ahead(path: Option<&Path>) -> String {
 /// particular is only ever changed by the transition API in `transition.rs`.
 pub struct Store {
     pub(crate) conn: Connection,
+    /// Where agent transcripts are read from when a task leaves `running`
+    /// (DESIGN.md §8); `None` records no cost, which is what every store a
+    /// test opens wants.
+    pub(crate) transcripts_root: Option<std::path::PathBuf>,
 }
 
 /// Drop every row, leaving the schema in place — the reset behind
@@ -299,7 +303,10 @@ impl Store {
         consent: Option<&str>,
     ) -> Result<Store> {
         conn.pragma_update(None, "foreign_keys", true)?;
-        let mut store = Store { conn };
+        let mut store = Store {
+            conn,
+            transcripts_root: None,
+        };
         let version = store.schema_version()?;
         // Ahead of the version check, which cannot see a divergence.
         store.verify_journal(path)?;

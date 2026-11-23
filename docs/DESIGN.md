@@ -1443,6 +1443,41 @@ would kill the agent that just reported. `voro-core` decides *whether* a close
 stops (`Store::apply_closing` hands back the session a verdict retired); the
 `voro` crate supplies the spawn, beside the other process seams.
 
+**Token cost.** Each time a task leaves `running` through `ask`, `done` or
+`abort` — and when `done` reports a stalled session's work — `Store::apply_closing`
+reads the transcripts of every session the task has had and appends a `cost`
+event whose detail is JSON: `messages`, `input`, `output`, `cache_read`,
+`cache_write`, `wall_secs`, `transcript_bytes`, and `weighted`, which is
+`input + 5·output + 1.25·cache_write + 0.1·cache_read`. The ratios are
+Anthropic's per-token prices in input-token equivalents and live as named
+constants in `voro_core::cost`; prices change and the ratios have not, so the
+event records no dollar figure. A task's total is the sum of its `cost`
+events. Each event also records `until`, the last transcript timestamp it
+counted per session reference, and the next event counts only lines stamped
+after it, so a task that asks, resumes and finishes is counted once.
+`voro show` prints the event as `334 msgs  out 372k  cache-read 93.1M
+weighted 12.3M  1h42m`; `voro list --cost` leads each row with the total in
+millions; `voro stats [--since 7d]` totals by project and by week and names
+the ten most expensive tasks.
+
+The transcripts are Claude Code's: `<ref>.jsonl` under some directory of
+`~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects`), plus the subagent
+transcripts in `<ref>/subagents/`. The directory is searched for the session
+reference rather than derived from the launch cwd, because a session that
+enters a worktree moves its transcript to the worktree's escaped path, which
+Voro never learns; the session reference is therefore the only thing dispatch
+has to keep, and it already does. Claude Code writes one line per content
+block and repeats the response's `usage` on each, so lines are counted once
+per API `message.id` — summing lines overcounts by about the number of blocks
+per response. Lines that do not parse, are not assistant turns, or carry no
+`usage` are skipped. When no transcript is found — a task started by hand, a
+session reference never captured, another agent's session, a moved file — the
+event records `missing: true` and the paths looked for. The read never fails
+the transition, and a store without a transcript root (every test store)
+records nothing. `voro done` runs inside the session it measures, so the
+response that issued it falls after the event and is counted only if the task
+runs again.
+
 **Worktree lifecycle.** A dispatched agent does its work in a throwaway git
 worktree of the project checkout it creates itself — the dispatch preamble
 instructs this, and Voro runs no git during dispatch (below), so the branch and
