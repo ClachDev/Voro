@@ -6,7 +6,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
-use voro_core::{ActionRow, DepKind, DigestRow, QueueRow, StateCounts, TaskState};
+use voro_core::{ActionRow, DepKind, DigestRow, Project, QueueRow, StateCounts, TaskState};
 
 use super::milestones;
 use super::rows::{
@@ -51,25 +51,102 @@ pub(super) fn draw_cockpit(frame: &mut Frame, app: &App, hits: &mut HitMap) {
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![Span::styled("voro", Style::new().bold()), Span::raw("  ")];
-    // Archived projects have left the cockpit (DESIGN.md §5); the projects
-    // screen is where they remain visible.
-    for p in app.projects.iter().filter(|p| !p.archived) {
-        let style = if p.weight == 0 {
-            Style::new().dim()
-        } else {
-            Style::new()
-        };
-        spans.push(Span::styled(format!("{}:{}  ", p.name, p.weight), style));
-    }
     // Projects stay on the left where they are edited every morning; the per-
     // state counts sit right-aligned so they never push the weights around.
     let counts = counts_line(&app.counts);
     let counts_width = counts.width() as u16;
+    let gap = if counts_width == 0 { 0 } else { HEADER_GAP };
+    let budget = area.width.saturating_sub(counts_width + gap);
+    // Archived projects have left the cockpit (DESIGN.md §5); the projects
+    // screen is where they remain visible.
+    let projects: Vec<&Project> = app.projects.iter().filter(|p| !p.archived).collect();
     let [left, right] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(counts_width)]).areas(area);
-    frame.render_widget(Line::from(spans), left);
+    frame.render_widget(header_projects_line(&projects, budget as usize), left);
     frame.render_widget(counts, right);
+}
+
+/// Columns kept clear between the project list and the counts, matching the
+/// separator between projects so a full list still reads as two things.
+const HEADER_GAP: u16 = 2;
+
+/// The header's brand and project weights, fitted into `budget` columns.
+///
+/// A list that overflows drops whole projects and ends in `+N` for the ones
+/// left out; the projects screen is the complete list. Lowest weight drops
+/// first, ties dropping the later name, so the projects carrying weight are
+/// the ones that stay; survivors keep their name order. The marker outranks
+/// the brand: when even `voro  +N` does not fit, the brand goes.
+fn header_projects_line(projects: &[&Project], budget: usize) -> Line<'static> {
+    const SEP: &str = "  ";
+    let brand = Span::styled("voro", Style::new().bold());
+    let tokens: Vec<Span<'static>> = projects
+        .iter()
+        .map(|p| {
+            let style = if p.weight == 0 {
+                Style::new().dim()
+            } else {
+                Style::new()
+            };
+            Span::styled(format!("{}:{}", p.name, p.weight), style)
+        })
+        .collect();
+    let joined = |widths: &[usize]| -> usize {
+        widths.iter().sum::<usize>() + SEP.len() * widths.len().saturating_sub(1)
+    };
+    let fits = |with_brand: bool, kept: &[bool], dropped: usize| -> bool {
+        let mut widths: Vec<usize> = Vec::new();
+        if with_brand {
+            widths.push(brand.width());
+        }
+        widths.extend(
+            tokens
+                .iter()
+                .zip(kept)
+                .filter(|(_, k)| **k)
+                .map(|(t, _)| t.width()),
+        );
+        if dropped > 0 {
+            widths.push(format!("+{dropped}").len());
+        }
+        joined(&widths) <= budget
+    };
+
+    let mut drop_order: Vec<usize> = (0..projects.len()).collect();
+    drop_order.sort_by_key(|&i| (projects[i].weight, std::cmp::Reverse(i)));
+    let mut kept = vec![true; projects.len()];
+    let mut dropped = 0;
+    for &i in &drop_order {
+        if fits(true, &kept, dropped) {
+            break;
+        }
+        kept[i] = false;
+        dropped += 1;
+    }
+    let with_brand = dropped == 0 || fits(true, &kept, dropped);
+
+    let mut parts: Vec<Span<'static>> = Vec::new();
+    if with_brand {
+        parts.push(brand);
+    }
+    parts.extend(
+        tokens
+            .into_iter()
+            .zip(&kept)
+            .filter(|(_, k)| **k)
+            .map(|(t, _)| t),
+    );
+    if dropped > 0 {
+        parts.push(Span::styled(format!("+{dropped}"), Style::new().dim()));
+    }
+    let mut spans = Vec::with_capacity(parts.len() * 2);
+    for (n, part) in parts.into_iter().enumerate() {
+        if n > 0 {
+            spans.push(Span::raw(SEP));
+        }
+        spans.push(part);
+    }
+    Line::from(spans)
 }
 
 /// The persistent header indicator (DESIGN.md §12): a compact per-state tally
@@ -2058,6 +2135,145 @@ pub(crate) mod tests {
 
         // With no work anywhere the indicator collapses to nothing.
         assert_eq!(counts_line(&voro_core::StateCounts::default()).width(), 0);
+    }
+
+    /// The header row of a cockpit drawn `width` columns wide.
+    fn header_row(app: &crate::app::App, width: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, app);
+            })
+            .unwrap();
+        terminal.backend().buffer().content()[..width as usize]
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// A board whose project list (84 columns with the brand) cannot share a
+    /// narrow row with its counts (`triage 2  ready 1`, 17 columns).
+    fn crowded_header_app() -> crate::app::App {
+        use voro_core::{NewTask, Store};
+        let mut store = Store::open_in_memory().unwrap();
+        let mut first = None;
+        for (name, weight) in [
+            ("AugereAI", 2),
+            ("ODM", 1),
+            ("archive-me", 0),
+            ("mote", 3),
+            ("sidequest", 0),
+            ("voro", 3),
+            ("zeta-long-name", 1),
+        ] {
+            let p = store.create_project(name, &format!("/tmp/{name}")).unwrap();
+            store.set_weight(p.id, weight).unwrap();
+            first.get_or_insert(p.id);
+        }
+        let new = |title: &str, state: TaskState| NewTask {
+            project_id: first.unwrap(),
+            repo_id: None,
+            title: title.into(),
+            body: String::new(),
+            priority: Priority::P2,
+            state,
+            agent: None,
+            human: false,
+            deep: false,
+            milestone: false,
+        };
+        store.create_task(new("idea", TaskState::Proposed)).unwrap();
+        store.create_task(new("go", TaskState::Ready)).unwrap();
+        store
+            .create_task(new("idea 2", TaskState::Proposed))
+            .unwrap();
+        let ctx = crate::dispatch::DispatchCtx::without_config(std::path::Path::new(
+            "/nonexistent/voro.db",
+        ));
+        crate::app::App::new(store, ctx).unwrap()
+    }
+
+    #[test]
+    fn an_overflowing_header_drops_whole_projects_and_counts_them() {
+        let app = crowded_header_app();
+        let header = header_row(&app, 60);
+        let counts = "triage 2  ready 1";
+        assert!(header.ends_with(counts), "{header:?}");
+        // Lowest weight drops first, later names first among ties; the
+        // survivors keep their name order and the marker counts the rest.
+        let left = "voro  AugereAI:2  mote:3  voro:3  +4";
+        assert!(header.starts_with(left), "{header:?}");
+        let gap = header.len() - left.len() - counts.len();
+        assert!(gap >= 2, "{header:?}");
+    }
+
+    #[test]
+    fn the_header_never_cuts_a_project_or_crowds_the_counts() {
+        let app = crowded_header_app();
+        let counts = "triage 2  ready 1";
+        let tokens = [
+            "voro",
+            "AugereAI:2",
+            "ODM:1",
+            "archive-me:0",
+            "mote:3",
+            "sidequest:0",
+            "voro:3",
+            "zeta-long-name:1",
+        ];
+        for width in 60..=120u16 {
+            let header = header_row(&app, width);
+            let left = header
+                .strip_suffix(counts)
+                .unwrap_or_else(|| panic!("{width}: {header:?}"));
+            assert!(left.ends_with("  "), "{width}: {header:?}");
+            let shown: Vec<&str> = left.split_whitespace().collect();
+            let (marker, projects) = match shown.split_last() {
+                Some((last, rest)) if last.starts_with('+') => (Some(*last), rest),
+                _ => (None, &shown[..]),
+            };
+            for token in projects {
+                assert!(
+                    tokens.contains(token),
+                    "{width}: cut {token:?} in {header:?}"
+                );
+            }
+            let hidden = tokens.len() - projects.len();
+            assert_eq!(
+                marker
+                    .map(|m| m[1..].parse::<usize>().unwrap())
+                    .unwrap_or(0),
+                hidden,
+                "{width}: {header:?}"
+            );
+        }
+        // Wide enough for everything: no marker.
+        assert!(!header_row(&app, 120).contains('+'));
+    }
+
+    #[test]
+    fn the_overflow_marker_outlasts_the_brand() {
+        let p = |name: &str, weight| Project {
+            id: 0,
+            name: name.into(),
+            weight,
+            viewer: None,
+            archived: false,
+        };
+        let (a, b) = (p("alpha", 1), p("beta", 2));
+        let text = |budget| -> String {
+            header_projects_line(&[&a, &b], budget)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        assert_eq!(text(23), "voro  alpha:1  beta:2");
+        assert_eq!(text(20), "voro  beta:2  +1");
+        assert_eq!(text(9), "voro  +2");
+        assert_eq!(text(5), "+2");
     }
 
     #[test]
