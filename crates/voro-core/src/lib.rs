@@ -13,6 +13,7 @@ mod intent;
 mod milestone;
 mod model;
 mod pr;
+pub mod prompts;
 mod review;
 pub mod scheduler;
 pub mod seed;

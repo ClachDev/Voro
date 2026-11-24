@@ -24,6 +24,9 @@ skill in the Claude Code plugin (README, *Agents*), which activates in any
 directory and teaches the agent the CLI and how to find the right project from
 its cwd.
 
+The preamble and every other prompt Voro writes for an agent live as constants
+in `crates/voro-core/src/prompts.rs`.
+
 Dispatch also exports `VORO_TASK_ID` and `VORO_DB` onto the spawned process.
 `voro` itself reads neither; they exist for the hooks below, which run as
 subprocesses of the session and use them to address the right task.
