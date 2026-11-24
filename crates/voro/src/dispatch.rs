@@ -3237,7 +3237,12 @@ mod tests {
             strip_ansi("\u{1b}[38;5;245mbackgrounded · \u{1b}[1mdeadbeef\u{1b}[0m"),
             "backgrounded · deadbeef"
         );
-        let log = std::env::temp_dir().join(format!("voro-bg-line-{}.log", std::process::id()));
+        let log = tempfile::Builder::new()
+            .prefix("voro-bg-line-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("launch.log");
         std::fs::write(
             &log,
             "warming up\n\u{1b}[2mbackgrounded · \u{1b}[1mcafe1234\u{1b}[0m\nmanage with: claude attach\n",
