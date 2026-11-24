@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Projects carry intent lines.** Each line is a label and one sentence
+  saying why the project exists or what it is; an earlier line wins where two
+  pull apart. ⏎ on the projects screen opens the list: `a` adds, ⏎ edits,
+  `d` removes, `K`/`J` reorder and `y` accepts a pending line. `voro intent
+  show <project>` prints the accepted lines in order for agents, and `voro
+  intent propose <project> <label> <sentence>` lets an agent suggest one,
+  which stays out of `show` until accepted. A project with pending lines reads
+  `[N intent pending]` on its row; a project with none shows nothing new.
 - **`p` turns mouse reporting off so text can be selected.** The TUI captured
   every drag for click-to-select, so a command, branch name or PR URL could
   not be copied out of it. `p` on any screen hands drags back to the

@@ -14,7 +14,8 @@ use crate::app::App;
 /// path, open task count, and the viewer when the project names one (§8). The
 /// open count is the project's non-terminal tasks, from the loaded task list.
 /// An archived project stays on this screen, dim and tagged, so it can be
-/// found and unarchived (§5).
+/// found and unarchived (§5). Intent lines an agent proposed and the operator
+/// has not yet accepted are counted on the row (§3); with none, nothing shows.
 pub(super) fn draw_projects(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     let [list_area, status] = Layout::vertical([
         Constraint::Min(3),
@@ -41,6 +42,10 @@ pub(super) fn draw_projects(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 None => String::new(),
             };
             let archived = if p.archived { "  [archived]" } else { "" };
+            let pending = match app.intent_pending(p.id) {
+                0 => String::new(),
+                n => format!("  [{n} intent pending]"),
+            };
             // The path column shows the default repo, so a single-repo project
             // reads as it always did; extra checkouts are tagged (DESIGN.md §3).
             let extra = match app.repo_count(p.id) {
@@ -49,7 +54,7 @@ pub(super) fn draw_projects(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             };
             ListItem::new(Line::from(Span::styled(
                 format!(
-                    "{:>2}  {:14} {:28} {} open{extra}{viewer}{archived}",
+                    "{:>2}  {:14} {:28} {} open{extra}{pending}{viewer}{archived}",
                     p.weight,
                     p.name,
                     app.project_path(p.id),
@@ -155,5 +160,49 @@ mod tests {
     /// Drive the app onto the projects screen with the real key handler.
     fn key_to_projects(app: &mut crate::app::App) {
         alt_screen(app, '3');
+    }
+
+    /// A project with no intent lines shows nothing new on its row or the key
+    /// line; one with a pending line counts it on the row, and any line puts
+    /// ⏎ on the key line.
+    #[test]
+    fn intent_appears_on_the_projects_screen_only_once_a_project_has_lines() {
+        use crate::ui::tests::{screen_text, test_app};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use voro_core::Store;
+
+        let render = |app: &crate::app::App| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 8)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw(f, app);
+                })
+                .unwrap();
+            screen_text(&terminal)
+        };
+
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.create_project("voro", "/tmp/voro").unwrap().id;
+        let mut app = test_app(store);
+        key_to_projects(&mut app);
+        let bare = render(&app);
+        assert!(!bare.contains("intent"), "{bare}");
+
+        app.store.add_intent_line(p, "what", "one screen").unwrap();
+        app.refresh().unwrap();
+        let accepted = render(&app);
+        assert!(accepted.contains("intent"), "{accepted}");
+        assert!(!accepted.contains("pending"), "{accepted}");
+
+        app.store
+            .propose_intent_line(p, "glance", "at a glance")
+            .unwrap();
+        app.store
+            .propose_intent_line(p, "truth", "no silent state")
+            .unwrap();
+        app.refresh().unwrap();
+        let pending = render(&app);
+        assert!(pending.contains("[2 intent pending]"), "{pending}");
     }
 }

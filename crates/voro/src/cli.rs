@@ -46,6 +46,17 @@ projects
                                   the medium is not a project setting)
   weight <project> <0-5>          set a project's weight (0 parks it)
 
+intent                            why a project exists and what it is, as
+                                  ordered lines the operator owns; an earlier
+                                  line wins where two pull apart
+  intent show <project>           print the project's accepted lines in order,
+                                  one `label: sentence` per line; prints
+                                  nothing for a project with none
+  intent propose <project> <label> <sentence>
+                                  propose a line; it stays pending, and out of
+                                  `intent show`, until the operator accepts it
+                                  on the projects screen
+
 repos                             a project allocates attention; its repos
                                   locate the checkouts its tasks run in
   repo add <project> <name> <path>
@@ -329,6 +340,10 @@ enum Verb {
         #[command(subcommand)]
         cmd: DocCmd,
     },
+    Intent {
+        #[command(subcommand)]
+        cmd: IntentCmd,
+    },
     Weight {
         project: String,
         weight: i64,
@@ -525,6 +540,21 @@ enum DocCmd {
     },
     Remove {
         doc: String,
+    },
+}
+
+/// A project's intent lines (DESIGN.md §3/§5). Agents read and propose; every
+/// other edit is the operator's, on the projects screen.
+#[derive(Subcommand)]
+enum IntentCmd {
+    Show {
+        project: String,
+    },
+    Propose {
+        project: String,
+        label: String,
+        #[arg(value_name = "SENTENCE", required = true)]
+        sentence: Vec<String>,
     },
 }
 
@@ -769,6 +799,7 @@ pub fn run(store: &mut Store, args: Vec<String>, ctx: &DispatchCtx) -> Result<St
         Verb::Project { cmd } => project_verb(store, cmd),
         Verb::Repo { cmd } => repo_verb(store, cmd),
         Verb::Doc { cmd } => doc_verb(store, cmd),
+        Verb::Intent { cmd } => intent_verb(store, cmd),
         Verb::Weight { project, weight } => weight_verb(store, &project, weight),
         Verb::Add(args) => add_verb(store, args),
         Verb::Propose(args) => propose_verb(store, args),
@@ -1178,6 +1209,32 @@ fn resolve_repo(store: &Store, project: &Project, name: &str) -> Result<Repo, St
 /// a path outside the checkout it names, a duplicate registration — comes from
 /// the store API; this only resolves which project, repo, doc, and tasks are
 /// meant.
+fn intent_verb(store: &mut Store, cmd: IntentCmd) -> Result<String, String> {
+    match cmd {
+        IntentCmd::Show { project } => {
+            let project = resolve_project(store, &project)?;
+            let lines = store
+                .accepted_intent(project.id)
+                .map_err(|e| e.to_string())?;
+            Ok(lines.iter().map(|l| l.render() + "\n").collect())
+        }
+        IntentCmd::Propose {
+            project,
+            label,
+            sentence,
+        } => {
+            let project = resolve_project(store, &project)?;
+            let line = store
+                .propose_intent_line(project.id, &label, &sentence.join(" "))
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "intent line '{}' proposed for {} — pending until the operator accepts it",
+                line.label, project.name
+            ))
+        }
+    }
+}
+
 fn doc_verb(store: &mut Store, cmd: DocCmd) -> Result<String, String> {
     match cmd {
         DocCmd::Add {
@@ -6307,5 +6364,40 @@ mod tests {
         // A repo of another project cannot be the reader.
         ok(&mut s, &["project", "add", "voro", "/tmp/voro"]);
         assert!(err(&mut s, &["doc", "add", "voro", "x.md", "--repo", "oats"]).contains("no repo"));
+    }
+
+    /// Agents read the accepted lines in order and can only ever add a pending
+    /// one, which `intent show` leaves out until the operator accepts it.
+    #[test]
+    fn intent_show_prints_accepted_lines_and_propose_stays_pending() {
+        let mut s = store();
+        ok(&mut s, &["project", "add", "voro", "/tmp/voro"]);
+        assert_eq!(ok(&mut s, &["intent", "show", "voro"]), "");
+
+        let p = s.projects().unwrap()[0].id;
+        s.add_intent_line(p, "what", "one screen over all projects")
+            .unwrap();
+        let why = s.add_intent_line(p, "why", "attention is scarce").unwrap();
+        let control = s.add_intent_line(p, "control", "never decides").unwrap();
+        s.move_intent_line(control.id, true).unwrap();
+        assert_eq!(why.position, 2);
+
+        let out = ok(
+            &mut s,
+            &[
+                "intent", "propose", "voro", "glance", "read", "at", "a", "glance",
+            ],
+        );
+        assert!(out.contains("'glance'") && out.contains("pending"), "{out}");
+        assert_eq!(
+            ok(&mut s, &["intent", "show", "voro"]),
+            "what: one screen over all projects\n\
+             control: never decides\n\
+             why: attention is scarce\n"
+        );
+
+        let refusal = err(&mut s, &["intent", "propose", "voro", "why", "dup"]);
+        assert!(refusal.contains("already has"), "{refusal}");
+        assert!(err(&mut s, &["intent", "show", "nope"]).contains("no project"));
     }
 }

@@ -4,7 +4,10 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use voro_core::{Action, AgentsConfig, Priority, Task};
 
-use super::{App, CreateFlow, DefaultKind, ViewerFormState, ViewerOption, transition_actions};
+use super::{
+    App, CreateFlow, DefaultKind, IntentFormState, ViewerFormState, ViewerOption,
+    transition_actions,
+};
 use crate::dispatch::Filing;
 
 /// What a text prompt is collecting, and the transition it feeds — or, for the
@@ -153,6 +156,15 @@ pub enum Mode {
     /// a command template. Both paths — the Config screen and the review-action
     /// picker's "new viewer…" — share it.
     ViewerForm(ViewerFormState),
+    /// A project's intent lines (DESIGN.md §3/§9), opened with ⏎ on the
+    /// projects screen. The lines themselves are the App's, reloaded on every
+    /// refresh, so an edit needs no copy here kept in step.
+    Intent {
+        project_id: i64,
+        sel: usize,
+    },
+    /// Adding or editing one intent line, over the drill-down it returns to.
+    IntentForm(IntentFormState),
     /// The current screen's full key map (DESIGN.md §9), opened with `?`. It is
     /// a peek rather than a screen — any key but `tab` dismisses it — and the
     /// page is the only state it carries, since the screen it describes is the
@@ -183,6 +195,7 @@ impl Mode {
             | Mode::DocPicker { sel, .. }
             | Mode::MilestonePicker { sel, .. }
             | Mode::ViewerPicker { sel, .. }
+            | Mode::Intent { sel, .. }
             | Mode::DefaultPicker { sel, .. } => Some(*sel),
             _ => None,
         }
@@ -196,6 +209,7 @@ impl Mode {
             | Mode::DocPicker { sel, .. }
             | Mode::MilestonePicker { sel, .. }
             | Mode::ViewerPicker { sel, .. }
+            | Mode::Intent { sel, .. }
             | Mode::DefaultPicker { sel, .. } => Some(sel),
             _ => None,
         }

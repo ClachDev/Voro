@@ -2,6 +2,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 mod cockpit;
 mod config;
+mod intent;
 pub(crate) mod milestones;
 mod modes;
 mod probes;
@@ -12,6 +13,7 @@ mod tasks;
 mod tree;
 
 pub use config::{DefaultKind, ViewerFormState, ViewerOption, viewer_label};
+pub use intent::IntentFormState;
 pub use modes::{Mode, PromptKind};
 pub use rows::{
     BrowserRow, CockpitRow, ConfigAgentRow, ConfigRow, ConfigSettingRow, ConfigViewerRow,
@@ -209,6 +211,10 @@ pub struct App {
     /// joined onto its checkout. Resolved once per refresh beside `docs`, so
     /// the render path can show the real location without querying the store.
     pub doc_locations: std::collections::HashMap<i64, String>,
+    /// Every project's intent lines in precedence order, keyed by project id
+    /// (DESIGN.md §3); loaded whole per refresh, the lists being a handful of
+    /// lines each.
+    pub intent: std::collections::HashMap<i64, Vec<voro_core::IntentLine>>,
     /// Each task's newest session, keyed by task id: what the
     /// detail views render — a stalled task's post-mortem (DESIGN.md §8), an
     /// open session's agent and log — and what gates the `l` log key. Loaded per
@@ -402,6 +408,7 @@ impl App {
             dependents: std::collections::HashMap::new(),
             docs: std::collections::HashMap::new(),
             doc_locations: std::collections::HashMap::new(),
+            intent: std::collections::HashMap::new(),
             last_sessions: std::collections::HashMap::new(),
             conflict_selected: None,
             probe: crate::probe::ConflictProbe::default(),
@@ -511,6 +518,7 @@ impl App {
         crate::reconcile::reconcile_live_sessions(&mut self.store, &self.dispatch_ctx)?;
 
         self.projects = self.store.projects()?;
+        self.intent = self.store.all_intent_lines()?;
         let candidates = self.store.candidates()?;
 
         self.deps = self.store.deps_by_task()?;
@@ -925,6 +933,8 @@ impl App {
                 sel,
             } => self.key_viewer_picker(key, project_id, options, current, sel),
             Mode::ViewerForm(form) => self.key_viewer_form(key, form),
+            Mode::Intent { project_id, sel } => self.key_intent(key, project_id, sel),
+            Mode::IntentForm(form) => self.key_intent_form(key, form),
             // `tab` turns the page; every other key dismisses the map, and
             // `on_key` has already restored `Mode::Normal` for it.
             Mode::KeyMap { page } => {

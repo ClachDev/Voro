@@ -7,6 +7,7 @@ use crate::app::{App, Mode, Screen};
 
 mod cockpit;
 mod config;
+mod intent;
 mod milestones;
 mod modes;
 mod projects;
@@ -67,6 +68,11 @@ impl HitMap {
                 hit(item),
             ));
         }
+    }
+
+    /// One target of a single row, for a popup whose items span several rows.
+    fn push(&mut self, rect: Rect, hit: Hit) {
+        self.0.push((rect, hit));
     }
 
     /// Drop every target, for when a modal takes the pointer.
