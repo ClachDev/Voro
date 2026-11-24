@@ -1,75 +1,116 @@
 ---
 name: voro-cli
-description: Track work in Voro from the command line — check the inbox or the next task, create and propose tasks, record questions and completion, and transition task states across any project. Use whenever the current work should be tracked in Voro, when asked what to work on next, or when proposing follow-up work discovered mid-task. Never modify the Voro database with raw SQL.
+description: Record your work in Voro from the command line — claim a task, ask a blocking question, report it done, read the queue, and file follow-up proposals. Use when you were dispatched on or asked to work on a Voro task, when asked what to work on next, or when you discover follow-up work mid-task. Never modify the Voro database with raw SQL.
 ---
 
 # Voro CLI
 
-Voro is a single-operator command centre that prioritises tasks across many
-projects and dispatches them to coding agents. All state lives in one SQLite
-database; every mutation must go through the `voro` CLI so the state machine and
-event log stay honest. **Never write to the database with raw SQL or a sqlite
+Voro is the operator's task queue across many projects. Change it only
+through the `voro` CLI; **never write to its database with raw SQL or a sqlite
 client.**
 
 ## Invocation
 
-Run `voro` directly — it is expected on your `PATH`.
+**Always pass a verb.** A bare `voro` launches the interactive TUI, which hangs
+a headless session.
 
-Database resolution: `--db PATH` flag → `VORO_DB` env var → the real one at
-`~/.local/share/voro/voro.db`. Tests and experiments must use `--db` with a
-scratch path; only deliberate task management touches the real database.
+Run `voro` from your `PATH`. In a checkout of Voro itself with no binary
+installed, run `cargo run -q -p voro -- <verb> [args]` instead. `voro help`
+prints the full verb reference.
 
-`voro help` prints the full verb reference.
+The CLI writes to `--db PATH`, else `$VORO_DB`, else the operator's real
+database. Pass `--db` with a scratch path for any test or experiment.
+
+## What is yours and what is the operator's
+
+You run your own lifecycle (`start`, `ask`, `resume`, `done`, and `abort` when
+backing out), read anything, file proposals (`propose`, `add`), and edit your
+own task (`set`). Leave every other verb to the operator, because verdicts and
+side effects are theirs: the verdicts `triage`, `accept`, `reject` and
+`abandon`; the hand-offs `wait`, `reclaim`, `park` and `unpark`; the
+configuration verbs `project`, `weight`, `repo`, `doc`, `intent`, `agent` and
+`viewer`, bar the reads `repo list`, `doc list`, `doc show` and `intent show`;
+and `dispatch`, `pr`, `open`, `import`, `migrate` and `seed`, which reach
+outside the database.
+
+## Lifecycle
+
+```
+voro start <id>                      # ready → running: claim the task
+voro ask <id> --question "A or B?"   # running → needs-input
+voro resume <id>                     # needs-input → running
+voro done <id> --summary-file pr.md --branch <name>   # running → review
+voro abort <id>                      # running → ready: back out
+```
+
+When asked to work on a task, run `voro start <id>` before anything else; if
+the id is unclear, ask. A dispatched task is already running, so skip `start`.
+
+After `voro ask`, stop and wait. The operator answers in your own session and
+Voro records no answer text, so once you have the answer, run `voro resume
+<id>` yourself and carry on.
+
+`done`'s summary (`--summary TEXT` or `--summary-file PATH`) becomes the pull
+request's description: write what changed and why, then how you verified it.
+`--branch` names the branch your work is committed on. After `done`, tell the
+operator the task is in review; `voro pr`, `voro open` and `voro accept` are
+theirs.
 
 ## Reading
 
 ```
-voro inbox              # the next-action queue: questions, reviews, proposals, top ready tasks — one list by score
-voro next               # the single top ready task, with its full body
-voro list [--state ready] [--project NAME]
-voro show <id>          # body, deps, event history
-voro show <id> --event <event-id>   # one event's detail alone, undecorated
-voro tree <id>          # the task and its blockers, nested; a repeat prints as ↑ #N
-voro explain <id>       # score decomposition (weight × priority + age bonus)
+voro inbox              # the next-action queue, ranked by score
+voro next               # the single top ready task, with its body
+voro list [--state STATE] [--project P] [--doc DOC]
+voro show <id>          # body, docs, deps, event history
+voro show <id> --event <event-id>   # one event's detail, e.g. a lost body
+voro tree <id>          # the task and its blockers, nested
+voro explain <id>       # score decomposition
+voro milestones         # open milestones and their open task counts
+voro doc list [project] # registered documents
+voro doc show <doc>     # a document and every task linked to it
+voro intent show <project>   # why the project exists, in priority order
 ```
 
-## Writing
+Dispatch names a task's linked documents by location; read the file itself.
+`voro doc show` lists the other tasks derived from the same plan.
+
+## Which project and repo is this checkout?
+
+A project is one queue of work; a repo is a checkout its tasks run in. A task
+runs in the project's default repo unless it names another with `--repo`.
 
 ```
-voro add <project> <title> --body-file plan.md [--priority 0-3]
-         [--blocked-by 3,7] [--blocks 9] [--repo NAME] [--deep]
-voro set <id> [--title T] [--priority N] [--body-file F]
-              [--append-body-file F] # add to the body instead of replacing it
-              [--blocked-by IDS] [--blocks IDS] [--unlink KIND:ID]
-              [--branch NAME]        # intended git branch dispatch injects
-              [--repo NAME | --no-repo]   # which checkout the task runs in
-              [--deep | --no-deep]   # dispatch on the agent's strongest model
-voro project add <name> <path>
-voro weight <project> <0-5>          # 0 parks/hides the project
+voro repo list          # project, repo name, path; * marks each default
 ```
 
-Dependency flags mean exactly what they say: `--blocked-by 3,7` makes the
-task wait on tasks 3 and 7; `--blocks 9` makes task 9 wait on this one (the
-discovered-prerequisite pattern). On `set`, `--blocked-by` *replaces* the
-task's own blocker list while `--blocks` is *additive*. Both directions echo
-their effect and are cycle-checked; `show` renders the edge as `blocked by #N`.
+Match your cwd (or its enclosing repo root) to a listed path. That row's
+project name is what `add`, `propose` and `list --project` expect. **If the
+matched repo is not its project's default (no `*`), pass `--repo <name>` on
+`add`**, or the task dispatches into the default checkout, which is the wrong
+one. `propose` takes no `--repo`: name the repo in the body instead.
 
-`--unlink KIND:ID` drops a single edge of any kind — `blocks:9`,
-`discovered-from:4`, `parent:2`, `related:7` — naming it as `show` lists it
-under that task, and leaves any other edge to the same task standing. Repeat
-the flag for several. Naming an edge that is not there fails rather than
-reporting a success it did not perform.
+If no listed path contains your cwd, the checkout is unregistered. Do not
+register it. Say to the operator: "This checkout (`<path>`) is not registered
+in Voro; add it as a repo of the project it belongs to, then I can file the
+task."
 
-`--body-file` on `set` replaces the **whole** body, so reach for
-`--append-body-file` when you mean to add a finding to a task rather than
-rewrite its brief. A replacement that would leave the body empty is refused
-unless you pass `--allow-empty`, and the text any replacement discards is kept
-on the event log — `show` marks the `body` event with the command that prints
-it back (`voro show <id> --event <event-id> > body.md`).
+## Filing work
 
-`add` defaults to state `proposed`, which is what an agent should almost
-always want: proposed tasks wait for human triage and never enter the queues
-untriaged.
+```
+voro propose <project> "<title>" --body-file plan.md [--from <id>]
+             [--blocks IDS]
+voro add <project> "<title>" --body-file plan.md [--priority 0-3]
+         [--blocked-by IDS] [--blocks IDS] [--repo NAME] [--deep]
+```
+
+Both verbs leave the task `proposed`; never pass `add` a `--state`. A
+proposal waits for the operator's triage, so tell the operator what you filed
+and its id, and do not chase it. `--from <id>` links the proposal
+discovered-from the task you are working on.
+
+`--blocked-by 3,7` makes the new task wait on tasks 3 and 7; `--blocks 9`
+makes task 9 wait on it. `--deep` asks for the agent's strongest model.
 
 Write the body as a dispatchable prompt. The agent starts in the project
 checkout, so its harness loads the repo's agent instructions, and Voro also
@@ -83,136 +124,28 @@ decisions already made, and concrete acceptance criteria. It does not restate
 the repo's working rules (those belong in the repo's agent instructions), the
 plan (link the document), or how to report back.
 
-`--deep` marks work that warrants the strongest model the dispatching agent
-offers rather than its workhorse. It changes only which model runs the task,
-never its place in the queue — that is priority's job — and an agent whose
-config names no models ignores it. It is refused on a `--human` task, which is
-never dispatched at all.
+## Editing your own task
+
+```
+voro set <id> --append-body-file notes.md   # add a finding to the body
+voro set <id> --branch <name>               # record your branch
+voro set <id> --summary-file pr.md          # rewrite the summary in review
+voro set <id> --blocked-by IDS | --blocks IDS | --unlink KIND:ID
+```
+
+`--body-file` on `set` replaces the **whole** body; use `--append-body-file`
+to add to it. `--blocked-by` replaces the task's blocker list; `--blocks` adds
+the task to the listed tasks' blockers. `--unlink` drops one edge as `show`
+names it, such as `blocks:9`.
 
 ## Milestones
 
-A milestone is an outcome the operator watches happen, such as
-"Carpet crossing". It is a task that waits on the tasks blocking
-it.
+A milestone is an outcome the operator watches happen, such as "Carpet
+crossing"; a fix or a refactor is a task. Before you file a task, run `voro
+milestones` and `voro show` the one it belongs to, so you do not duplicate a
+member. Pass `--blocks <milestone id>` if the milestone cannot pass without the
+task, and say why in one sentence of the body.
 
-    voro milestones        # open milestones: id, state, title, open tasks
-    voro show <id>         # acceptance statement and member tasks
-    voro propose <project> "<title>" --milestone --body-file <path>
-
-Run `voro milestones` before you file one. File a milestone with
-`--milestone` only if none listed covers the outcome. A milestone
-is something the operator can watch the robot or the system do; a
-fix or a refactor is a task. Only the operator closes one.
-
-Keep a milestone's title to four words or fewer, and write its
-body as the acceptance statement: what the operator will watch
-happen, in measurable terms.
-
-Before you add or propose a task, read the member tasks of the
-milestone it belongs to and do not file one that is already there.
-Pass `--blocks <milestone id>` if the milestone cannot pass until
-the task is done, and say why in one sentence in the body. If no
-milestone fits, pass nothing.
-
-## Projects and repos
-
-A **project** allocates attention (name, weight, one queue); a **repo** locates
-a checkout. A project owns one or more repos, exactly one of which is its
-default, and a task runs in the repo it names — or the project's default when
-it names none. One stream of work spanning several repositories is therefore
-*one* project with several repos, not several projects.
-
-```
-voro repo list [project]              # every repo; * marks each project's default
-voro repo add <project> <name> <path>
-voro repo path <project> <name> <path>
-voro repo default <project> <name>    # the repo tasks that name none run in
-voro repo remove <project> <name>
-```
-
-`repo remove` refuses a project's last repo, its default while others remain,
-and one any task still names — the message says which and what to do first.
-
-## Project intent
-
-A project may carry **intent lines**: why it exists and what it is, each a
-label and one sentence, owned by the operator. Order is precedence — where two
-lines pull apart, the earlier one wins.
-
-```
-voro intent show <project>                         # accepted lines, in order: `label: sentence`
-voro intent propose <project> <label> <sentence>   # stays pending until the operator accepts it
-```
-
-`intent show` prints nothing for a project with no lines. A proposed line
-never appears in `intent show` until the operator accepts it on the projects
-screen; you cannot accept, edit, reorder or remove a line.
-
-## Working from an arbitrary project directory
-
-Voro tracks checkouts by repo, independent of where you invoke the CLI. To find
-which registered project *and repo* the current directory belongs to, list the
-repos and match your cwd against their paths:
-
-```
-voro repo list          # project, repo name, path — one line per repo
-```
-
-Match the cwd (or its enclosing repo root) to a listed path. That row's project
-name is what `add`, `propose`, `list --project`, and `weight` expect, and its
-repo name is what `--repo` expects. **If the matched repo is not the project's
-default (no `*`), pass `--repo <name>` when filing the task** — otherwise it
-will dispatch into the project's default checkout, which is the wrong one. If
-no listed path contains the cwd, the checkout is unregistered: add it to the
-project it belongs to with `voro repo add <project> <name> <path>`, or register
-a whole new project with `voro project add <name> <path>` if it is genuinely a
-separate stream of work.
-
-Propose follow-up work discovered here against the matched project:
-
-```
-voro propose <project> <title> --body-file plan.md [--from <task-id>] [--blocks IDS]
-```
-
-`propose` creates a `proposed` task; `--from` links it discovered-from the task
-you were working on (dispatch renders the flag with the running task's id).
-`propose` takes no `--repo` — a proposal is untriaged, so name the repo in the
-body and let triage set it with `voro set <id> --repo NAME`.
-
-## Transitions
-
-States: `proposed → parked|ready → running → needs-input|review → done/rejected`.
-`blocks` deps gate readiness automatically: a parked task promotes to ready
-when its last blocker closes.
-
-```
-voro start <id>                      # ready → running (claim the task)
-voro ask <id> --question "A or B?"   # running → needs-input (blocked on human)
-voro resume <id>                     # needs-input → running, once the question
-                                     #   is answered in your session (Voro
-                                     #   records no answer text)
-voro done <id> [--summary TEXT] [--branch NAME]
-                                     # running → review; --branch records the
-                                     #   git branch your work landed on
-voro abort <id>                      # running → ready (backing out)
-```
-
-`done`'s `--summary` (or `--summary-file PATH`, for a multi-line one) is your
-account of the work, and it is the pull request's description: `voro pr` opens
-the PR with it as the body, so write it as one — what changed and why, then how
-you verified it — rather than a status line.
-
-**When you are asked to work on a task, run `voro start <id>` before you do
-anything else.** This claims the task and moves it to `running`, so the queue
-reflects that it is being worked rather than still waiting. The task id is in
-the request (e.g. "implement task 35"); if it is unclear, ask.
-
-Your lifecycle as an agent is exactly: `start` when you begin, `ask` when
-blocked on a decision, `done` when finished. **Do not** `triage`, `accept`,
-`reject`, or `abandon` — closing the loop is the human's job, and proposed
-tasks you create must be left proposed.
-
-## Working inside the Voro repository itself
-
-When you are in a checkout of Voro with no `voro` binary installed,
-`cargo run -q -p voro -- <verb> [args]` runs the CLI straight from source.
+Propose a new milestone (`propose ... --milestone`) only if no listed one
+covers the outcome. Give it a title of four words or fewer and a body that
+states, in measurable terms, what the operator will watch happen.
