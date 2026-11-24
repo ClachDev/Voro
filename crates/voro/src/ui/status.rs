@@ -222,6 +222,7 @@ fn hint_candidates(app: &App) -> Vec<(&'static str, &'static str, bool)> {
         // their own slots.
         Screen::Projects => vec![
             ("0-5", "weight", true),
+            ("⏎", "intent", app.selected_project_has_intent()),
             ("r", "rename", true),
             ("a", "add", true),
             ("A", "archive", true),
@@ -432,6 +433,7 @@ fn key_map(screen: Screen, no_projects: bool) -> Vec<KeySection> {
                 "Actions",
                 vec![
                     ("0-5", "set the project's weight"),
+                    ("⏎", "open the project's intent lines"),
                     ("r", "rename or re-path the project"),
                     ("a", "add a project"),
                     ("A", "archive or unarchive the project"),

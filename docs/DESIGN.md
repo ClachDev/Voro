@@ -178,6 +178,21 @@ legitimately external document, and a URL is stored verbatim. Which checkout a
 relative path is read from is the same question a task's repo answers and takes
 the same shape: a document names a repo of its project, or none for the default.
 
+A project's **intent** is why it exists and what it is, at the level above
+design decisions. Each task the operator files states a little of it, and an
+agent fills the rest with choices of its own; the intent lines record the part
+the operator has already settled, where agents and Voro can read it. Intent is
+a short ordered list of lines rather than a paragraph, so the whole list fits
+in a prompt. Each line is a label and one sentence: the label (`what`, `why`,
+`control`) is how a prompt, a proposal or a rejection names the line, and is
+unique within the project. Order is precedence. Where two lines pull apart, the
+earlier one wins, so correcting a choice that order produced is a reorder. The
+operator owns the list and edits, removes and reorders it. An agent may only
+propose a line, which waits *pending* until the operator accepts it; only
+accepted lines are shown to agents. Lines are optional, and a project with none
+behaves exactly as before. No line carries a success test: the list states
+intent, it does not grade work against it.
+
 An **agent** is a named dispatch template — a command line into which the
 prompt and working directory are substituted. Agent selection is resolved at the
 moment of dispatch (§8), because the two real reasons to switch agent — a
@@ -388,6 +403,18 @@ CREATE TABLE docs (              -- the plan a body of work derives from (§3)
   UNIQUE (project_id, location)
 );
 
+CREATE TABLE intent_lines (      -- why a project exists, in precedence order (§3)
+  id         INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  label      TEXT NOT NULL,        -- how prompts and proposals name the line
+  sentence   TEXT NOT NULL,
+  position   INTEGER NOT NULL,     -- lower first; earlier wins
+  accepted   INTEGER NOT NULL DEFAULT 0 CHECK (accepted IN (0,1)),
+                                   -- 0 = proposed by an agent, shown to none
+  created_at TEXT NOT NULL,
+  UNIQUE (project_id, label)
+);
+
 CREATE TABLE task_docs (         -- deliberately not constrained to one project
   task_id INTEGER NOT NULL REFERENCES tasks(id),
   doc_id  INTEGER NOT NULL REFERENCES docs(id),
@@ -536,6 +563,23 @@ absence costs a task nothing but the pointer. Both halves are logged on the
 append-only event log — each link and unlink against the task it changed, each
 registration and removal with a null `task_id`, the column being nullable for
 exactly this.
+
+The **intent_lines** table (§3) is additive as well, and its rules sit in the
+store API beside the others. A label and a sentence are each trimmed, must be
+non-empty and must hold no line break, and a label may not contain a colon,
+since agents read a line back as `label: sentence`. Labels are unique within a
+project with case folded, pending lines included, so a proposal cannot shadow
+an accepted line under another capitalisation. A new line, the operator's or
+an agent's, goes last. Moving a line swaps it with its neighbour across
+accepted and pending lines alike and renumbers the project's positions, so the
+order never depends on two equal positions. Accepting a line leaves it where
+it stands. Removing a line deletes the row; deleting a project deletes its
+lines with its repos. Every change is written to the event log with a null
+`task_id`, an edit carrying the old text beside the new, since the row keeps
+only the new. The CLI gives agents two verbs: `voro intent show` prints the
+accepted lines in order and `voro intent propose` stores a pending one.
+Nothing an agent can call creates an accepted line; every other edit is the
+operator's, on the projects screen (§9).
 
 A project that has stopped mattering is **archived** rather than deleted: `voro
 project archive` (and the projects screen's `A` key) sets the flag, and every
@@ -2523,8 +2567,8 @@ pointing at the projects screen.
 
 Beyond the cockpit, the TUI cycles (Tab, or `alt-1`–`alt-5`, subject to the gate
 above while no project is registered) through four further full-screen views:
-the **task browser**, the **projects screen** (weights, archive, and the
-per-project viewer), the **Milestones tab** described below, and a **Config
+the **task browser**, the **projects screen** (weights, archive, the
+per-project viewer and the intent lines), the **Milestones tab** described below, and a **Config
 screen** that renders and edits the
 `voro.toml` surface (§5) — the effective agents read-only with provenance and
 the default marked, then the settings list of §5, then the named viewers
@@ -2556,6 +2600,21 @@ Config screen is the voro.toml view. The projects screen's viewer picker also
 offers a "new viewer…" entry that opens the same add-viewer form and selects the
 new viewer for that project, so first-time viewer setup needs no detour through
 the Config screen.
+
+**A project's intent lines (§3) open over the projects screen on ⏎.** The
+popup lists every line in precedence order. An accepted line is numbered by
+the place agents read it in. A pending line takes no number and carries a
+`pending` tag. Its sentence wraps beside the label column rather than being
+cut. `a` adds a line, accepted and last; ⏎ or `e` edits the selected one in a
+two-field form; `d` removes it, which for a pending line is the discard; `y`
+accepts a pending line; and `K` and `J` move the selected line up and down a
+place, the cursor following it. Esc closes. The operator needs no CLI verb to
+edit intent. A project with no lines shows nothing new on the projects screen:
+⏎ joins the key line only once the selected project has a line, and the key
+map names it for writing the first. A project with pending lines shows
+`[N intent pending]` on its row, so a proposal is visible without opening the
+popup. `K` and `J` are uppercase keys with no lowercase sibling in this popup,
+where `k` and `j` move the cursor: shift carries the line with the cursor.
 
 **Milestones (§3) have a screen of their own, the Milestones tab, fifth on the
 Tab ring and on `alt-5`.** It lists milestones and not their members: the

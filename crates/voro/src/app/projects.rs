@@ -12,8 +12,8 @@ impl App {
     /// rather than a task's priority; `r` opens the AddProject form pre-filled
     /// to rename/re-path, `a` opens it blank, `d` deletes behind the store's own
     /// guard (only projects with no tasks), `v` picks the viewer, `A`
-    /// toggles archived (DESIGN.md §5). Movement and screen switching are
-    /// handled by `key_normal`.
+    /// toggles archived (DESIGN.md §5), and ⏎ opens the project's intent lines
+    /// (§3). Movement and screen switching are handled by `key_normal`.
     pub(super) fn key_projects(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c @ '0'..='5') => {
@@ -24,6 +24,12 @@ impl App {
                         .set_weight(id, c.to_digit(10).unwrap() as i64)
                         .and_then(|_| self.refresh());
                     self.report(result);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(project) = self.projects.get(self.projects_sel) {
+                    let id = project.id;
+                    self.open_intent(id);
                 }
             }
             KeyCode::Char('r') => {

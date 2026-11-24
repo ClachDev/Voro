@@ -133,6 +133,21 @@ voro repo remove <project> <name>
 `repo remove` refuses a project's last repo, its default while others remain,
 and one any task still names — the message says which and what to do first.
 
+## Project intent
+
+A project may carry **intent lines**: why it exists and what it is, each a
+label and one sentence, owned by the operator. Order is precedence — where two
+lines pull apart, the earlier one wins.
+
+```
+voro intent show <project>                         # accepted lines, in order: `label: sentence`
+voro intent propose <project> <label> <sentence>   # stays pending until the operator accepts it
+```
+
+`intent show` prints nothing for a project with no lines. A proposed line
+never appears in `intent show` until the operator accepts it on the projects
+screen; you cannot accept, edit, reorder or remove a line.
+
 ## Working from an arbitrary project directory
 
 Voro tracks checkouts by repo, independent of where you invoke the CLI. To find

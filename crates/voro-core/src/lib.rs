@@ -9,6 +9,7 @@ pub mod config_edit;
 pub mod cost;
 mod error;
 mod import;
+mod intent;
 mod milestone;
 mod model;
 mod pr;
@@ -33,6 +34,7 @@ pub use cap::{
 };
 pub use error::{Error, Result};
 pub use import::{GithubIssue, already_imported, issue_new_task, issue_task_body};
+pub use intent::IntentLine;
 pub use milestone::MilestoneMembers;
 pub use model::{
     Dep, DepKind, DepRef, Doc, Event, LivenessSource, NextAction, Priority, Project, RefineOutcome,

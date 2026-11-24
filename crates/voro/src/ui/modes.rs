@@ -399,6 +399,10 @@ pub(super) fn draw_mode(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 .block(Block::default().borders(Borders::ALL).title(title));
             frame.render_widget(para, area);
         }
+        Mode::Intent { project_id, sel } => {
+            super::intent::draw_intent(frame, app, *project_id, *sel, hits);
+        }
+        Mode::IntentForm(form) => super::intent::draw_intent_form(frame, form),
         Mode::DefaultPicker {
             kind,
             names,

@@ -31,6 +31,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0019_session_liveness_source.sql"),
     include_str!("../migrations/0020_store_meta.sql"),
     include_str!("../migrations/0021_add_milestone.sql"),
+    include_str!("../migrations/0022_intent_lines.sql"),
 ];
 
 /// Whether a path lies inside a Cargo build directory — a `target` component
@@ -146,6 +147,7 @@ impl Store {
         for table in [
             "task_docs",
             "docs",
+            "intent_lines",
             "deps",
             "events",
             "sessions",
@@ -628,7 +630,8 @@ impl Store {
     /// Delete a project outright — only safe when it has no tasks, since tasks
     /// reference their project by id and deleting would orphan history. A project
     /// with tasks in any state refuses; weight 0 snoozes without losing history.
-    /// Its repos go with it: no task references them, so nothing is orphaned.
+    /// Its repos and intent lines go with it: no task references them, so nothing
+    /// is orphaned.
     pub fn delete_project(&mut self, project_id: i64) -> Result<()> {
         self.project(project_id)?;
         let task_count: i64 = self.conn.query_row(
@@ -644,6 +647,10 @@ impl Store {
         }
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM repos WHERE project_id = ?1", [project_id])?;
+        tx.execute(
+            "DELETE FROM intent_lines WHERE project_id = ?1",
+            [project_id],
+        )?;
         tx.execute("DELETE FROM projects WHERE id = ?1", [project_id])?;
         tx.commit()?;
         Ok(())
