@@ -30,11 +30,18 @@ impl GithubIssue {
     }
 }
 
-/// The task body for an imported issue: the URL and issue number stamped at
-/// the top (both for human reference and as the idempotency marker checked
-/// by [`already_imported`]), followed by the issue body verbatim.
+/// The first line of an imported task's body: the issue's URL and number,
+/// for human reference and as the idempotency marker [`already_imported`]
+/// compares against.
+fn import_stamp(issue: &GithubIssue) -> String {
+    format!("Imported from {} (issue #{})", issue.url, issue.number)
+}
+
+/// The task body for an imported issue: [`import_stamp`] on the first line,
+/// followed by the issue body verbatim.
 pub fn issue_task_body(issue: &GithubIssue) -> String {
-    let mut body = format!("Imported from {} (issue #{})\n", issue.url, issue.number);
+    let mut body = import_stamp(issue);
+    body.push('\n');
     if !issue.body.trim().is_empty() {
         body.push('\n');
         body.push_str(&issue.body);
@@ -62,11 +69,13 @@ pub fn issue_new_task(project_id: i64, repo_id: Option<i64>, issue: &GithubIssue
     }
 }
 
-/// Whether `body` (an existing task's body) already carries this issue's
-/// URL — the idempotency check that lets import be run repeatedly without
-/// creating duplicate tasks.
+/// Whether `body` (an existing task's body) was imported from this issue —
+/// the idempotency check that lets import be run repeatedly without creating
+/// duplicate tasks. Only the first line counts, compared whole: a substring
+/// search would match issue #4 against #42's URL, and the issue text below
+/// the stamp may cite other issues' URLs.
 pub fn already_imported(body: &str, issue: &GithubIssue) -> bool {
-    body.contains(&issue.url)
+    body.lines().next() == Some(import_stamp(issue).as_str())
 }
 
 #[cfg(test)]
@@ -153,5 +162,29 @@ mod tests {
         assert!(already_imported(&body, &issues[0]));
         assert!(!already_imported(&body, &issues[1]));
         assert!(!already_imported("unrelated body", &issues[0]));
+    }
+
+    fn issue(number: i64) -> GithubIssue {
+        GithubIssue {
+            number,
+            title: format!("Issue {number}"),
+            body: String::new(),
+            url: format!("https://github.com/acme/widget/issues/{number}"),
+        }
+    }
+
+    #[test]
+    fn already_imported_does_not_match_a_url_prefix() {
+        assert!(!already_imported(&issue_task_body(&issue(42)), &issue(4)));
+        assert!(already_imported(&issue_task_body(&issue(4)), &issue(4)));
+    }
+
+    #[test]
+    fn already_imported_ignores_issue_urls_cited_below_the_stamp() {
+        let mut citing = issue(42);
+        citing.body = "Duplicate of https://github.com/acme/widget/issues/7".into();
+        let body = issue_task_body(&citing);
+        assert!(!already_imported(&body, &issue(7)));
+        assert!(already_imported(&body, &citing));
     }
 }
