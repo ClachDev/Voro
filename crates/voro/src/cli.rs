@@ -3185,9 +3185,11 @@ mod tests {
     /// A context whose `claude` agent records what its `stop` verb was fired at,
     /// plus that marker's path and the directory to clean up.
     fn stop_ctx(name: &str) -> (DispatchCtx, std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("voro-cli-stop-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("voro-cli-stop-{name}-"))
+            .tempdir()
+            .unwrap()
+            .keep();
         let marker = dir.join("stopped");
         let agents_path = dir.join("voro.toml");
         std::fs::write(
@@ -3298,10 +3300,11 @@ mod tests {
     #[test]
     fn a_failing_or_absent_stop_leaves_the_transition_committed() {
         for (name, stop) in [("failing", "false # {session}"), ("absent", "")] {
-            let dir =
-                std::env::temp_dir().join(format!("voro-cli-stop-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("voro-cli-stop-{name}-"))
+                .tempdir()
+                .unwrap()
+                .keep();
             let agents_path = dir.join("voro.toml");
             let stop_line = if stop.is_empty() {
                 String::new()
@@ -3552,7 +3555,12 @@ mod tests {
         .unwrap();
         let session = s.sessions_for(1).unwrap()[0].id;
 
-        let path = std::env::temp_dir().join(format!("voro-refine-{}.md", std::process::id()));
+        let path = tempfile::Builder::new()
+            .prefix("voro-refine-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("body.md");
         std::fs::write(&path, "# Rewritten\n\nNames real files and criteria.\n").unwrap();
         let out = ok(&mut s, &["set", "1", "--body-file", path.to_str().unwrap()]);
         std::fs::remove_file(&path).unwrap();
@@ -3653,7 +3661,12 @@ mod tests {
         s.conclude_refine(1, RefineOutcome::Failed).unwrap();
         assert!(s.refine_failed_flag(1).unwrap());
 
-        let path = std::env::temp_dir().join(format!("voro-late-refine-{}.md", std::process::id()));
+        let path = tempfile::Builder::new()
+            .prefix("voro-late-refine-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("body.md");
         std::fs::write(&path, "# Rewritten\n\nNames real files and criteria.\n").unwrap();
         let out = ok(&mut s, &["set", "1", "--body-file", path.to_str().unwrap()]);
         std::fs::remove_file(&path).unwrap();
@@ -3743,7 +3756,12 @@ mod tests {
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "An idea", "--body", "the brief\n"]);
 
-        let path = std::env::temp_dir().join(format!("voro-append-{}.md", std::process::id()));
+        let path = tempfile::Builder::new()
+            .prefix("voro-append-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("body.md");
         std::fs::write(&path, "a finding\n").unwrap();
         ok(
             &mut s,
@@ -5532,7 +5550,12 @@ mod tests {
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
         ok(&mut s, &["start", "1"]);
-        let path = std::env::temp_dir().join(format!("voro-summary-{}.md", std::process::id()));
+        let path = tempfile::Builder::new()
+            .prefix("voro-summary-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("body.md");
         std::fs::write(&path, "## What\nDid the thing\n").unwrap();
 
         let out = ok(
@@ -5707,7 +5730,12 @@ mod tests {
         ok(&mut s, &["project", "add", "demo", "/tmp"]);
         ok(&mut s, &["add", "demo", "T", "--state", "ready"]);
         ok(&mut s, &["start", "1"]);
-        let path = std::env::temp_dir().join(format!("voro-set-summary-{}.md", std::process::id()));
+        let path = tempfile::Builder::new()
+            .prefix("voro-set-summary-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("body.md");
         std::fs::write(&path, "## What\nAmended account\n").unwrap();
 
         ok(

@@ -236,8 +236,11 @@ mod tests {
     /// listing path.
     fn no_config() -> DispatchCtx {
         ctx_at(
-            std::env::temp_dir()
-                .join(format!("voro-reconcile-none-{}", std::process::id()))
+            tempfile::Builder::new()
+                .prefix("voro-reconcile-none-")
+                .tempdir()
+                .unwrap()
+                .keep()
                 .join("voro.toml"),
         )
     }
@@ -319,10 +322,12 @@ mod tests {
         let dead_pid = child.id() as i64;
         child.wait().unwrap();
 
-        let log = std::env::temp_dir().join(format!(
-            "voro-reconcile-test-{}-{dead_pid}.log",
-            std::process::id()
-        ));
+        let log = tempfile::Builder::new()
+            .prefix("voro-reconcile-test-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join(format!("{dead_pid}.log"));
         std::fs::write(&log, "sorry, hit the 5-hour usage limit — try again later").unwrap();
 
         s.create_session(
@@ -483,12 +488,11 @@ mod tests {
     /// An `voro.toml` whose `claude` agent lists sessions by catting a
     /// canned JSON file, plus that file's path for the test to fill in.
     fn sessions_fixture(name: &str, listing_json: &str) -> (DispatchCtx, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "voro-reconcile-verbs-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("voro-reconcile-verbs-{name}-"))
+            .tempdir()
+            .unwrap()
+            .keep();
         let listing = dir.join("sessions.json");
         std::fs::write(&listing, listing_json).unwrap();
         let agents_path = dir.join("voro.toml");
@@ -690,12 +694,11 @@ mod tests {
     /// leave the session alone rather than guessing either way.
     #[test]
     fn a_failing_sessions_command_leaves_the_session_alone() {
-        let dir = std::env::temp_dir().join(format!(
-            "voro-reconcile-verbs-failcmd-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("voro-reconcile-verbs-failcmd-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let agents_path = dir.join("voro.toml");
         std::fs::write(
             &agents_path,
@@ -723,10 +726,11 @@ mod tests {
     /// records the reference it was fired at, plus that marker's path — so a
     /// test can tell a stop that happened from one that did not.
     fn stop_fixture_listing(name: &str, listing: &str) -> (DispatchCtx, PathBuf, PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("voro-reconcile-stop-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("voro-reconcile-stop-{name}-"))
+            .tempdir()
+            .unwrap()
+            .keep();
         let marker = dir.join("stopped");
         let listing_path = dir.join("sessions.json");
         std::fs::write(&listing_path, listing).unwrap();
@@ -874,10 +878,11 @@ mod tests {
     /// `logs_output` for any session, plus the log file path a launch would
     /// have written, so a test can set the two channels against each other.
     fn logs_fixture(name: &str, logs_output: &str) -> (DispatchCtx, PathBuf, PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("voro-reconcile-logs-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("voro-reconcile-logs-{name}-"))
+            .tempdir()
+            .unwrap()
+            .keep();
         let agents_path = dir.join("voro.toml");
         std::fs::write(
             &agents_path,
@@ -959,10 +964,12 @@ mod tests {
     fn a_verbless_agent_still_classifies_from_the_launch_log() {
         let (mut s, task_id) = running_task();
         let dead = dead_pid();
-        let log = std::env::temp_dir().join(format!(
-            "voro-reconcile-verbless-{}-{dead}.log",
-            std::process::id()
-        ));
+        let log = tempfile::Builder::new()
+            .prefix("voro-reconcile-verbless-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join(format!("{dead}.log"));
         std::fs::write(&log, "Session limit reached · resets 9pm").unwrap();
 
         let session = s

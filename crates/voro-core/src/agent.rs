@@ -1824,7 +1824,12 @@ mod tests {
 
     #[test]
     fn loads_from_disk() {
-        let path = std::env::temp_dir().join(format!("voro-agents-{}.toml", std::process::id()));
+        let path = tempfile::Builder::new()
+            .prefix("voro-agents-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("voro.toml");
         std::fs::write(&path, CONFIG).unwrap();
         let config = AgentsConfig::load(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -2936,9 +2941,12 @@ mod tests {
 
     #[test]
     fn write_starter_creates_parent_and_refuses_to_clobber() {
-        let dir = std::env::temp_dir().join(format!("voro-init-{}", std::process::id()));
+        let dir = tempfile::Builder::new()
+            .prefix("voro-init-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let path = dir.join("voro/voro.toml");
-        let _ = std::fs::remove_dir_all(&dir);
 
         AgentsConfig::write_starter(&path).unwrap();
         let config = AgentsConfig::load(&path).unwrap();

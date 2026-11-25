@@ -483,14 +483,11 @@ mod tests {
         use ratatui::backend::TestBackend;
         use voro_core::Store;
 
-        let dir = std::env::temp_dir().join(format!(
-            "voro-ui-config-settings-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = tempfile::Builder::new()
+            .prefix("voro-ui-config-settings-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let agents_path = dir.join("voro.toml");
         std::fs::create_dir_all(&dir).unwrap();
         // the cap and the default agent are the operator's; the default viewer

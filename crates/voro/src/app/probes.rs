@@ -584,8 +584,12 @@ pub(crate) mod tests {
     /// never runs it at all.
     #[test]
     fn a_healthy_fleet_never_asks_the_account() {
-        let asked = std::env::temp_dir().join(format!("voro-cap-asked-{}", std::process::id()));
-        let _ = std::fs::remove_file(&asked);
+        let asked = tempfile::Builder::new()
+            .prefix("voro-cap-asked-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("asked");
         let (mut app, _, project_path) = cap_env_with(
             true,
             "running the test suite",
@@ -607,8 +611,12 @@ pub(crate) mod tests {
     /// subprocess.
     #[test]
     fn a_retrying_session_never_asks_the_account() {
-        let asked = std::env::temp_dir().join(format!("voro-cap-retry-{}", std::process::id()));
-        let _ = std::fs::remove_file(&asked);
+        let asked = tempfile::Builder::new()
+            .prefix("voro-cap-retry-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("asked");
         let (mut app, task_id, project_path) = cap_env_with(
             true,
             "Session limit reached - Retrying in 5m (9:50pm) - attempt 2/10",
@@ -642,8 +650,12 @@ pub(crate) mod tests {
     #[test]
     fn a_capped_fleet_asks_the_account_once() {
         let now = crate::session_probe::local_epoch().expect("a clock");
-        let asked = std::env::temp_dir().join(format!("voro-cap-once-{}", std::process::id()));
-        let _ = std::fs::remove_file(&asked);
+        let asked = tempfile::Builder::new()
+            .prefix("voro-cap-once-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("asked");
         let (mut app, task_id, project_path) = cap_env_with(
             true,
             "Session limit reached",
