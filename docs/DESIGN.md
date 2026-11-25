@@ -92,7 +92,7 @@ body therefore states what is specific to the task — the outcome, the files,
 the decisions already made, the acceptance criteria — and leaves the repo's
 working rules, the plan, and the report-back instructions to those other
 channels. Every prompt that drafts a body renders this guidance from one
-constant in `dispatch.rs`, and a test holds the `voro-cli` skill to the same
+constant in `voro-core`'s `prompts` module, and a test holds the `voro-cli` skill to the same
 words.
 
 A task may additionally be flagged **human**, marking work no agent can
@@ -1858,7 +1858,7 @@ prompt it writes, ahead of the task body — the dispatcher already owns the
 prompt file, so prepending a known-good preamble reaches any agent runtime with
 no per-project install and no reliance on a CLAUDE.md/AGENTS.md snippet or a
 loaded skill. The preamble is rendered per dispatch from a single template in
-the `voro` crate — so its wording still cannot drift — with the task's
+`voro-core`'s `prompts` module — so its wording still cannot drift — with the task's
 concrete id and, where needed, its database written *into the verb commands
 themselves* rather than left to inherited environment variables:
 
