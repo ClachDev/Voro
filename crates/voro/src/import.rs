@@ -37,8 +37,9 @@ pub fn fetch_issues(checkout: &str, gh_repo: Option<&str>) -> Result<String, Str
 }
 
 /// Map `gh issue list` JSON onto tasks in `project`, creating one per issue
-/// not already imported. Idempotent: an issue already captured (its URL
-/// appears in an existing task's body, this project's or a prior run's) is
+/// not already imported. Idempotent: an issue already captured (an existing
+/// task in this project, from a prior run or earlier in this one, carries its
+/// import stamp) is
 /// skipped rather than duplicated. Takes no dependency on `gh` itself, so it
 /// is fully testable against canned JSON. `repo_id` is the repo the issues
 /// were fetched from — carried onto each imported task so it dispatches into
@@ -144,6 +145,33 @@ mod tests {
         let summary = import_issues(&mut s, &p, None, DOUBLED).unwrap();
         assert_eq!(summary.imported.len(), 1);
         assert_eq!(summary.skipped, 1);
+    }
+
+    const PREFIXED: &str = r#"[
+        {
+            "number": 42,
+            "title": "Crash on empty input",
+            "body": "",
+            "url": "https://github.com/acme/widget/issues/42"
+        },
+        {
+            "number": 4,
+            "title": "Typo in README",
+            "body": "",
+            "url": "https://github.com/acme/widget/issues/4"
+        }
+    ]"#;
+
+    #[test]
+    fn an_issue_whose_url_prefixes_an_earlier_one_is_still_imported() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = project(&mut s);
+        let summary = import_issues(&mut s, &p, None, PREFIXED).unwrap();
+        assert_eq!(summary.imported.len(), 2);
+        assert_eq!(summary.skipped, 0);
+        let again = import_issues(&mut s, &p, None, PREFIXED).unwrap();
+        assert_eq!(again.imported.len(), 0);
+        assert_eq!(again.skipped, 2);
     }
 
     #[test]
